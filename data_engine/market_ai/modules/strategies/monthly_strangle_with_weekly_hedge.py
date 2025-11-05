@@ -8,12 +8,18 @@ import time
 import json
 from dataclasses import dataclass, asdict, field
 from datetime import date, timedelta, datetime
-from typing import Any, Dict, Optional, Tuple, List, cast
+from typing import Any, Dict, Optional, Tuple, List, cast, TYPE_CHECKING
 
 import pandas as pd
 from pathlib import Path
 
 from market_ai.modules.data_fetch.option_chain_ingestor import OptionChainIngestor, ChainConfig
+from market_ai.modules.analytics import summarize_market_state
+from market_ai.modules.agents.strategy_recommender import serialize_recommendations
+
+if TYPE_CHECKING:
+    from market_ai.modules.analytics import MarketRegimeAnalyzer, MarketState
+    from market_ai.modules.agents.strategy_recommender import StrategyRecommender, StrategyCandidate
 
 # __all__ for explicit exports and to suppress unused import warnings
 __all__ = [
@@ -205,6 +211,40 @@ def _record_feature(cfg: "LiveConfig", row: Dict[str, Any]) -> None:
         row,
         max_bytes=_FEATURE_ROTATE_MAX_BYTES,
     )
+
+
+def _record_environment_snapshot(
+    cfg: "LiveConfig",
+    state: "MarketState",
+    candidates: List["StrategyCandidate"],
+) -> None:
+    feature_path = getattr(cfg, "feature_log_path", None)
+    if not feature_path:
+        return
+    context = {
+        "market_state": summarize_market_state(state),
+        "strategy_candidates": serialize_recommendations(candidates),
+    }
+    row = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "strategy": "environment",
+        "expiry": "",
+        "exchange_seg": cfg.trade_mode,
+        "spot": state.features.get("spot"),
+        "ce_strike": None,
+        "pe_strike": None,
+        "ce_ltp": None,
+        "pe_ltp": None,
+        "ce_delta": None,
+        "pe_delta": None,
+        "ce_entry": None,
+        "pe_entry": None,
+        "net_credit": None,
+        "warn_only": int(bool(getattr(cfg, "warn_only", False))),
+        "trade_mode": cfg.trade_mode,
+        "context": json.dumps(context, default=str),
+    }
+    _append_csv_row(feature_path, FEATURE_FIELDS, row, max_bytes=_FEATURE_ROTATE_MAX_BYTES)
 
 
 # ----------------- utilities -----------------
@@ -938,6 +978,8 @@ class LiveConfig:
     batman: BatmanConfig = field(default_factory=BatmanConfig)
     feature_log_path: Optional[str] = None
     enable_strangle_entry: bool = True
+    regime_refresh_minutes: float = 5.0
+    auto_disable_strangle_when_unfavored: bool = True
     last_spot: Optional[float] = field(default=None, repr=False, compare=False)
     _last_spot_warn_at: Optional[datetime] = field(default=None, repr=False, compare=False)
 
@@ -2052,7 +2094,14 @@ def execute_new_strangle(dw, cfg: LiveConfig) -> None:
     _place_strangle_and_hedge(dw, cfg, spot)
 
 
-def run_live(dw, cfg: Optional[LiveConfig] = None) -> None:  # type: ignore[override]
+def run_live(
+    dw,
+    cfg: Optional[LiveConfig] = None,  # type: ignore[override]
+    *,
+    regime_analyzer: Optional["MarketRegimeAnalyzer"] = None,
+    recommender: Optional["StrategyRecommender"] = None,
+    feature_history_path: Optional[Path] = None,
+) -> None:
     cfg = cfg or LiveConfig()
     try:
         chain_ingestor = OptionChainIngestor(ChainConfig(NIFTY_SCRIP, NIFTY_FNO_SEG))
@@ -2061,6 +2110,16 @@ def run_live(dw, cfg: Optional[LiveConfig] = None) -> None:  # type: ignore[over
         chain_ingestor = None
 
     bat_cfg = getattr(cfg, "batman", BatmanConfig())
+
+    if feature_history_path is None and cfg.feature_log_path:
+        feature_history_path = Path(cfg.feature_log_path)
+
+    refresh_iters: Optional[int] = None
+    if regime_analyzer:
+        interval_seconds = max(60.0, cfg.regime_refresh_minutes * 60.0)
+        refresh_iters = max(1, int(interval_seconds / max(float(getattr(cfg, "poll_sec", 5.0)), 1.0)))
+
+    loop_iter = 0
 
     while True:
         try:
@@ -2072,6 +2131,46 @@ def run_live(dw, cfg: Optional[LiveConfig] = None) -> None:  # type: ignore[over
                 and (r.get("exchangeSegment") or "").upper().startswith("NSE_FNO")
                 and int(float(r.get("netQty") or 0)) != 0
             ]
+
+            if regime_analyzer and (refresh_iters is None or loop_iter % refresh_iters == 0):
+                history_df = pd.DataFrame()
+                if feature_history_path and feature_history_path.exists():
+                    try:
+                        history_df = pd.read_csv(feature_history_path)
+                        if len(history_df.index) > 600:
+                            history_df = history_df.tail(600)
+                    except Exception:
+                        history_df = pd.DataFrame()
+                last_state = getattr(cfg, "_last_market_state", None)
+                state = regime_analyzer.analyze_feature_history(history_df, fallback_state=last_state)
+                if state:
+                    cfg._last_market_state = state
+                    cfg.last_spot = state.features.get("spot")
+                    candidates: List["StrategyCandidate"] = []
+                    if recommender:
+                        candidates = recommender.recommend(state)
+                        cfg._last_strategy_candidates = candidates
+                    _record_environment_snapshot(cfg, state, candidates)
+                    top = candidates[0] if candidates else None
+                    if top:
+                        LOG.info(
+                            "[env] trend=%s vol=%s top=%s score=%.2f conf=%.2f",
+                            state.trend,
+                            state.volatility,
+                            top.name,
+                            top.score,
+                            top.confidence,
+                        )
+                        if not open_deriv_rows and cfg.auto_disable_strangle_when_unfavored:
+                            cfg.enable_strangle_entry = top.name == "monthly_strangle_with_weekly_hedge"
+                    else:
+                        LOG.info(
+                            "[env] trend=%s vol=%s (no recommendation)",
+                            state.trend,
+                            state.volatility,
+                        )
+                else:
+                    LOG.debug("[env] insufficient data for market state analysis")
 
             if open_deriv_rows and bat_cfg.enabled:
                 monitor_batman_positions(dw, cfg, bat_cfg, open_deriv_rows, chain_ingestor)
@@ -2091,3 +2190,4 @@ def run_live(dw, cfg: Optional[LiveConfig] = None) -> None:  # type: ignore[over
             LOG.exception("[live] loop error: %s", exc)
 
         time.sleep(max(1.0, float(getattr(cfg, "poll_sec", 5.0))))
+        loop_iter += 1

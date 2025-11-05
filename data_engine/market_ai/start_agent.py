@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Tuple, Any
 import json
 from logging.handlers import RotatingFileHandler
+from datetime import timedelta
+
+import pandas as pd
 
 # ───────────────────────── Path resolver (must be first) ─────────────────────
 THIS_FILE = Path(__file__).resolve()                   # .../data_engine/market_ai/start_agent.py
@@ -183,6 +186,8 @@ def _import_strategy() -> Tuple[Any, Any, Any]:
 
 # Try now so any error appears in the log immediately
 from market_ai.modules.strategies.strategy_selector import select_preferred_strategy
+from market_ai.modules.analytics import MarketRegimeAnalyzer
+from market_ai.modules.agents.strategy_recommender import StrategyRecommender
 
 run_live, LiveConfig, BatmanConfig = _import_strategy()
 
@@ -289,36 +294,85 @@ def main() -> None:
         ),
         feature_log_path=feature_log,
     )
+    cfg.regime_refresh_minutes = pick("REGIME_REFRESH_MINUTES", "regime_refresh_minutes", cfg.regime_refresh_minutes, _as_float)
+    cfg.auto_disable_strangle_when_unfavored = pick_bool(
+        "AUTO_DISABLE_STRANGLE",
+        "auto_disable_strangle",
+        cfg.auto_disable_strangle_when_unfavored,
+    )
+
     selector_model_path = Path(
         os.getenv(
             "STRATEGY_MODEL_PATH",
             settings.get("strategy_model_path", str(ENGINE_DIR / "state" / "strategy_selector_model.json")),
         )
     )
-    recommendation = None
-    if selector_model_path.exists():
-        recommendation = select_preferred_strategy(selector_model_path, Path(feature_log))
+    feature_path = Path(feature_log)
+    feature_path.parent.mkdir(parents=True, exist_ok=True)
+    if not feature_path.exists():
+        feature_path.write_text("")
 
-    if recommendation:
-        log.info(
-            "Selector recommendation: %s (expected_credit=%.2f, samples=%d, confidence=%.2f)",
-            recommendation.name,
-            recommendation.expected_credit,
-            recommendation.samples,
-            recommendation.confidence,
-        )
-        if recommendation.name.lower() == "strangle":
-            cfg.enable_strangle_entry = True
-        elif recommendation.name.lower() == "batman":
-            cfg.enable_strangle_entry = False
-            if not cfg.batman.enabled:
-                log.warning("Selector favours Batman but it is disabled via settings")
+    lookback_minutes = pick("REGIME_LOOKBACK_MINUTES", "regime_lookback_minutes", 180.0, _as_float)
+    regime_analyzer = MarketRegimeAnalyzer(lookback=timedelta(minutes=float(lookback_minutes)))
+    recommender = StrategyRecommender(
+        selector_model_path if selector_model_path.exists() else None,
+        feature_path,
+    )
+
+    initial_state = None
+    if feature_path.exists() and feature_path.stat().st_size > 0:
+        try:
+            history_df = pd.read_csv(feature_path).tail(600)
+            initial_state = regime_analyzer.analyze_feature_history(history_df)
+        except Exception as exc:
+            log.debug("Failed to compute initial market state: %s", exc)
+
+    if initial_state:
+        setattr(cfg, "_last_market_state", initial_state)
+        candidates = recommender.recommend(initial_state)
+        setattr(cfg, "_last_strategy_candidates", candidates)
+        if candidates:
+            top = candidates[0]
+            log.info(
+                "Initial environment trend=%s vol=%s -> top strategy=%s score=%.2f",
+                initial_state.trend,
+                initial_state.volatility,
+                top.name,
+                top.score,
+            )
+            if cfg.auto_disable_strangle_when_unfavored:
+                cfg.enable_strangle_entry = top.name == "monthly_strangle_with_weekly_hedge"
     else:
-        log.info("Selector model unavailable or insufficient data; using configured defaults")
+        if selector_model_path.exists():
+            recommendation = select_preferred_strategy(selector_model_path, feature_path)
+        else:
+            recommendation = None
+        if recommendation:
+            log.info(
+                "Selector recommendation: %s (expected_credit=%.2f, samples=%d, confidence=%.2f)",
+                recommendation.name,
+                recommendation.expected_credit,
+                recommendation.samples,
+                recommendation.confidence,
+            )
+            if recommendation.name.lower() == "strangle":
+                cfg.enable_strangle_entry = True
+            elif recommendation.name.lower() == "batman" and cfg.auto_disable_strangle_when_unfavored:
+                cfg.enable_strangle_entry = False
+                if not cfg.batman.enabled:
+                    log.warning("Selector favours Batman but it is disabled via settings")
+        else:
+            log.info("Strategy selector model unavailable; using configured defaults")
 
     _debug_positions_once(dw)
     log.info("Starting strategy run_live with cfg=%s", cfg)
-    run_live(dw, cfg)
+    run_live(
+        dw,
+        cfg,
+        regime_analyzer=regime_analyzer,
+        recommender=recommender,
+        feature_history_path=feature_path,
+    )
 
 
 def _debug_positions_once(dw) -> None:

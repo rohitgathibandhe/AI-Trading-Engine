@@ -1076,7 +1076,25 @@ def _render_agent_activity(feature_df: Optional[pd.DataFrame]) -> None:
     for _, row in recent.iterrows():
         ts = row.get("timestamp")
         ts_text = _fmt_optional(ts)
-        strategy_name = str(row.get("strategy") or "unknown").title()
+        raw_strategy = str(row.get("strategy") or "unknown")
+        strategy_name = raw_strategy.title()
+
+        if raw_strategy == "environment":
+            ctx = _parse_context_blob(row.get("context"))
+            state = ctx.get("market_state", {})
+            candidates = ctx.get("strategy_candidates", [])
+            trend = str(state.get("trend", "—")).replace("_", " ").title()
+            vol = str(state.get("volatility", "—")).replace("_", " ").title()
+            ivr = state.get("iv_rank")
+            bullet = [f"Trend {trend}", f"Vol {vol}"]
+            if ivr is not None:
+                bullet.append(f"IV rank {_fmt_optional(ivr)}")
+            if candidates:
+                top = candidates[0]
+                bullet.append(f"Top: {top.get('name', '—')} (score {top.get('score')})")
+            st.markdown(f"**{ts_text}** · Market Environment\n\n- " + " | ".join(bullet))
+            continue
+
         details = []
         spot_val = row.get("spot")
         if not _is_missing(spot_val):
@@ -1094,12 +1112,12 @@ def _render_agent_activity(feature_df: Optional[pd.DataFrame]) -> None:
         net_credit = row.get("net_credit")
         if not _is_missing(net_credit):
             details.append(f"Net credit ₹ {_fmt_optional(net_credit)}")
-        ctx = _format_context_summary(_parse_context_blob(row.get("context")))
+        ctx_summary = _format_context_summary(_parse_context_blob(row.get("context")))
         bullet_lines = []
         if details:
             bullet_lines.append(" | ".join(details))
-        if ctx:
-            bullet_lines.append(f"Context: {ctx}")
+        if ctx_summary:
+            bullet_lines.append(f"Context: {ctx_summary}")
         trade_mode = row.get("trade_mode")
         if trade_mode:
             bullet_lines.append(f"Mode: {trade_mode}")
@@ -1112,7 +1130,8 @@ def _render_plan_snapshot(feature_df: Optional[pd.DataFrame]) -> None:
     if feature_df is None:
         st.info("Decision feed not available yet.")
         return
-    if feature_df.empty:
+    feature_df = feature_df[feature_df.get("strategy") != "environment"] if not feature_df.empty else feature_df
+    if feature_df is None or feature_df.empty:
         st.info("No active plan information recorded yet.")
         return
     latest = feature_df.sort_values("timestamp").groupby("strategy", as_index=False).last()
@@ -1137,6 +1156,37 @@ def _render_plan_snapshot(feature_df: Optional[pd.DataFrame]) -> None:
         st.markdown(f"**{strategy_name}**\n\n" + "\n".join(f"- {line}" for line in lines))
 
 
+def _render_environment_summary(feature_df: Optional[pd.DataFrame]) -> None:
+    st.markdown("#### Market Regime")
+    if feature_df is None or feature_df.empty:
+        st.info("No regime data yet.")
+        return
+    env_rows = feature_df[feature_df.get("strategy") == "environment"]
+    if env_rows.empty:
+        st.info("No regime data yet.")
+        return
+    latest = env_rows.sort_values("timestamp").iloc[-1]
+    ctx = _parse_context_blob(latest.get("context"))
+    state = ctx.get("market_state", {})
+    candidates = ctx.get("strategy_candidates", [])
+
+    cols = st.columns(3)
+    cols[0].metric("Trend", str(state.get("trend", "—")).replace("_", " ").title())
+    cols[1].metric("Volatility", str(state.get("volatility", "—")).replace("_", " ").title())
+    cols[2].metric("IV Rank", _fmt_optional(state.get("iv_rank")))
+
+    cols2 = st.columns(3)
+    cols2[0].metric("Realized Vol", _fmt_optional(state.get("realized_vol")))
+    cols2[1].metric("Drift", _fmt_optional(state.get("drift_pct")))
+    cols2[2].metric("ATR %", _fmt_optional(state.get("atr_pct")))
+
+    if candidates:
+        df = pd.DataFrame(candidates)
+        st.dataframe(df[[c for c in ["name", "score", "confidence", "sizing_hint", "rationale"] if c in df.columns]], width="stretch")
+    else:
+        st.caption("Strategy recommender idle – waiting for sufficient data.")
+
+
 def _strategy_monitor_tab() -> None:
     st.markdown("### Strategy Monitor")
     blotter_df, summary = _load_blotter()
@@ -1146,6 +1196,8 @@ def _strategy_monitor_tab() -> None:
     with left:
         _render_blotter_panel(blotter_df, summary)
     with right:
+        _render_environment_summary(feature_df)
+        st.divider()
         _render_agent_activity(feature_df)
         st.divider()
         _render_plan_snapshot(feature_df)
