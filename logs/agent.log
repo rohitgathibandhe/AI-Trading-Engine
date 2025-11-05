@@ -1,0 +1,221 @@
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+[start_agent] Loading adaptive agent from: /Users/Rohit/Algotrade_ai/data_engine/market_ai/agents/adaptive_agent.py
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 83, in <module>
+    main()
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 61, in main
+    AgentConfig   = getattr(mod, "AgentConfig")
+AttributeError: module 'adaptive_agent_mod' has no attribute 'AgentConfig'
+Traceback (most recent call last):
+  File "/Users/Rohit/Algotrade_ai/data_engine/market_ai/start_agent.py", line 8, in <module>
+    from data_engine.market_ai.dhan_wrapper import DhanWrapper
+ModuleNotFoundError: No module named 'data_engine.market_ai.dhan_wrapper'

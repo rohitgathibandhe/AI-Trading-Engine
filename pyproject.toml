@@ -1,0 +1,12 @@
+[project]
+name = "market_ai"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "data_engine"}
+packages = ["market_ai"]

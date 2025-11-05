@@ -1,0 +1,12 @@
+{
+  // Make Pylance index the same interpreter you run with
+  "python.defaultInterpreterPath": "/Users/Rohit/.venvs/data_engine_py310/bin/python",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}",
+    "${workspaceFolder}/data_engine",
+    "${workspaceFolder}/data_engine/market_ai"
+  ],
+  // Keep problems panel focused on real issues
+  "python.analysis.typeCheckingMode": "basic",
+  "liveServer.settings.multiRootWorkspaceName": "AI-Trading-Engine"
+}
