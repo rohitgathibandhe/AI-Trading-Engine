@@ -1,0 +1,55 @@
+general:
+  timezone: Asia/Kolkata
+  symbol: NIFTY
+  use_wings: true
+  log_level: INFO
+  backoff_seconds: 5
+  trade_mode: PAPER
+schedules:
+  trading_window_start: 09:25
+  trading_window_end: '15:10'
+  mandatory_square_off: '15:23'
+strangle_mode:
+  short_expiry: monthly
+  hedge_expiry: weekly
+  weekly_expiry_day: Tuesday
+  monthly_roll_window_days: 5
+entry:
+  target_delta_abs: 0.18
+  delta_tolerance: 0.03
+  min_abs_delta: 0.15
+  dte_min_days: 0.2
+  iv_percentile_floor: 40
+  iv_floor_raw: 0
+  pcr_band:
+    lo: 0.8
+    hi: 1.2
+  atr_cap_multiple: 1.5
+  symmetry_max_misprice_pct: 15
+  event_blackout_minutes_before: 15
+  skip_open_minutes: 10
+  skip_last_minutes: 15
+wings:
+  price_target_min: 2.5
+  price_target_max: 3.0
+  enforce_strict: true
+  fallback_max: 3.5
+adjustments:
+  premium_x_soft: 1.8
+  premium_x_hard: 2.2
+  delta_breach: 0.38
+  breakeven_buffer_credit_x: 0.3
+  option_tape_bars_confirm: 2
+exits:
+  take_profit_credit_capture_pct: 55
+  structure_mtm_stop_pct: 1.25
+  time_exit: true
+  event_exit_minutes_before: 10
+risk:
+  per_structure_capital_pct: 2.0
+  max_open_structures: 3
+  slippage_bps: 2.5
+data:
+  iv_history_days: 60
+  roll_store_path: iv_store.json
+  event_calendar_path: events_calendar.json

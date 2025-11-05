@@ -1,0 +1,5 @@
+lot_size: 75
+delta_target: 0.15
+hedge_price_target: 3.0
+margin_per_lot: 60000
+adjustment_trigger_pct: 0.25

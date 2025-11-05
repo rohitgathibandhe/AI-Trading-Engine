@@ -1,0 +1,8 @@
+lot_size: 75
+sell_distance: 500
+wing_width: 300
+min_credit_per_lot: 1200
+hedge_price_limit: 5
+vix_min_threshold: 12
+vix_max_threshold: 25
+max_positions: 3

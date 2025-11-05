@@ -1,0 +1,9 @@
+fallback_capital: 250000
+max_margin_usage_pct: 0.5
+per_strategy_cap_pct: 0.2
+min_deploy_cap: 100000
+safety_buffer_pct: 0.1
+max_margin_pct: 0.8
+stop_loss_pct: 0.25
+profit_target_pct: 0.6
+risk_reward_ratio: 2.0

@@ -1,0 +1,9 @@
+log_level: INFO
+timezone: "Asia/Kolkata"
+data_path: "data/"
+use_live_data: false
+use_mock_mode: true
+model_update_interval_days: 7
+filters:
+  disable_vix_filter: false   # if true -> ignore vix gating; useful for testing/all-strategies runs
+  override_vix_value: null    # numeric or null; if numeric, forces VIX to this value (float)

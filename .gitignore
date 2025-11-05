@@ -1,1 +1,59 @@
 project_snapshot.tar
+
+# General Python ignores
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Virtual environments & local env files
+.env*
+.venv/
+venv/
+
+# Runtime state at repo root
+logs/
+state/
+*.log
+
+# Ignore everything under data_engine by default
+data_engine/*
+
+# Allow the actual package and documentation
+!data_engine/README.md
+!data_engine/__init__.py
+!data_engine/market_ai/
+!data_engine/market_ai/**
+
+# Within market_ai, ignore runtime outputs
+data_engine/market_ai/logs/
+data_engine/market_ai/state/
+data_engine/market_ai/tmp_results/
+data_engine/market_ai/optionchain_cache/
+data_engine/market_ai/oc_history.sqlite
+data_engine/market_ai/creds.json
+data_engine/market_ai/runtime/*.jsonl
+
+# Ignore generated artifacts at package root
+data_engine/market_ai/*.csv
+data_engine/market_ai/*.json
+data_engine/market_ai/*.png
+data_engine/market_ai/*.sqlite
+data_engine/market_ai/*.zip
+
+# But keep template config
+!data_engine/market_ai/modules/config/broker_credentials.example.json
+
+# Ignore real secrets
+data_engine/market_ai/modules/config/broker_credentials.json
+
+# Cache artifacts everywhere
+**/__pycache__/
+*.pyc

@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Virtual envs and OS
+.Python
+.env
+.env.local
+.env.*.local
+*.env
+
+# IDEs
+.vscode/
+.idea/
+*.iml
+
+# Databases, results, models, large files (do not commit)
+*.db
+*.sqlite3
+*.csv
+backtest_*.png
+backtest_*.csv
+model_*.pkl
+*.h5
+*.pth
+
+# Secrets / credentials
+*.key
+*.pem
+secrets.json
+credentials.json
+dh*.env
+.DS_Store
+
+# Logs
+*.log
+
+# Mac
+.DS_Store
+
+# optionally, if you use git-lfs for big binaries:
+# *.zip
+# *.tar.gz

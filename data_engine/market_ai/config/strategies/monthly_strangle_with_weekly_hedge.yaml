@@ -1,0 +1,97 @@
+# config/strategies/monthly_strangle_with_weekly_hedge.yaml
+strategy_name: monthly_strangle_with_weekly_hedge
+description: >-
+  Sell a monthly OTM strangle (naked) targeting delta ~0.15 each side.
+  Reduce margin & tail-risk by buying cheap weekly hedges and rolling them weekly.
+  Weekly hedges are rolled ONE trading day before expiry (user preference).
+
+core:   # core monthly short strangle parameters
+  expiry_choice: next_month
+  sell_delta_target: 0.15             # target delta for each short leg
+  min_total_credit_per_lot: 3000.0    # minimal monthly credit acceptable per lot (INR)
+  max_total_credit_per_lot: 12000.0   # cap, for sanity checks
+  max_lots: 2
+  hold_days_min: 14
+  hold_days_max: 30
+  profit_take_pct: 0.60               # take profit at 60% of initial credit
+  max_loss_per_lot: 20000.0
+  stop_loss_on_core_hit: true
+
+adjustments:
+  # existing fields kept...
+  delta_rebalance_threshold: 0.25
+  one_side_roll_multiplier: 1.5
+  weekly_hedge_reprice_threshold: 1.5
+
+  # NEW: hold-until-max-profit / trailing logic
+  hold_policy:
+    # enable hold-until-max-profit behavior
+    hold_until_max_enabled: true
+
+    # target taking some profit of initial credit (same as profit_take_pct)
+    initial_profit_take_pct: 0.60   # (keep existing 0.60 if you want)
+
+    # if enabled: after we've seen a new peak in unrealized profit,
+    # we *trail* the peak by this drop fraction before taking profits.
+    # Example: trailing_drop_pct=0.2 -> if peak profit was 60% and then falls by 20% (to 48%) we close.
+    trailing_drop_pct: 0.20
+
+    # minimum days we should hold before considering trailing exit (avoid intra-day noise)
+    min_hold_days_before_trailing: 2
+
+    # hard upper bound to the hold period (force close when reached)
+    max_hold_days: 45
+
+    # re-evaluate profit/close decision at this frequency (days)
+    check_interval_days: 1
+
+    # when True, prefer to extend hold as long as trailing condition not hit
+    prefer_hold_over_rolls: true
+
+hedge:   # weekly hedge parameters (rolled weekly)
+  use_weekly_hedge: true
+  hedge_expiry: current_week
+  hedge_roll_offset_days: 1           # roll 1 trading day before weekly expiry
+  hedge_roll_time: "15:00"            # local time (24h) to execute roll
+  hedge_target_price: 3.0             # prefer to buy hedge at <= this price (INR)
+  hedge_max_price: 5.0                # if higher, agent will apply fallback logic
+  hedge_qty_per_core_lot: 1           # number of weekly hedge lots per core lot
+  buy_first_then_sell_old: true       # safe sequence: buy new hedges first
+  limit_order_timeout_sec: 30
+  retry_attempts: 3
+  price_slippage_pct: 0.10
+  market_buy_threshold: 4.0           # if avg hedge price <= this, use market buy instead of limit
+
+sizing:
+  estimate_margin_per_core_lot: 150000    # conservative estimate (INR)
+  estimate_margin_per_hedge_lot: 20000    # conservative weekly hedge estimate
+  max_lots_by_capital_pct: 0.20           # fraction of per-strategy capital used
+
+risk_management:
+  projected_margin_max_pct_of_usable: 0.80 # accept projected margin up to X% of usable capital
+  safety_buffer_pct: 0.10                 # keep some buffer of usable capital
+  portfolio_sl_pct: 0.05                  # if strategy loses >5% of usable, unwind
+  vix_spike_pct_for_unwind: 0.20          # if VIX spikes >20% from entry, consider unwind
+
+adjustments:
+  delta_rebalance_threshold: 0.25
+  one_side_roll_multiplier: 1.5           # when short leg hits this × initial premium, do a one-side roll
+  weekly_hedge_reprice_threshold: 1.5     # if weekly hedge price has risen > x × since last buy, escalate
+
+market_filters:
+  vix_min: 9
+  vix_max: 22
+  iv_percentile_min: 20
+  avoid_event_days: true
+
+execution:
+  order_safety_sequence:
+    - buy_new_hedges
+    - sell_old_hedges
+  dry_run_mode: false
+  notify_on_roll: true
+
+logging:
+  audit_trades: true
+  save_roll_history: true
+  keep_trade_state_file: "state/monthly_strangle_state.json"

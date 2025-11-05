@@ -1,0 +1,7 @@
+broker: "DHAN"
+api_base: "https://api.dhan.co"
+client_id: "1000678336"
+access_token: "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzYwMzc1MjA1LCJpYXQiOjE3NjAyODg4MDUsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMDAwNjc4MzM2In0.Il6lCKSgGjWFo2MsU8hDeC9X5ggdpMJM2fpr0J5Ewm2Gq9qTWCM2pkU7yRSKvMw6YU7JsmKjn1ZmfgtvMLgCeA"
+funds_endpoint: "/account/funds"
+option_chain_endpoint: "/optionchain"
+expiry_list_endpoint: "/optionchain/expirylist"

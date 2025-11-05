@@ -1,0 +1,56 @@
+# Directional credit spread (vertical) configuration
+# Save as: config/strategies/credit_spread.yaml
+
+strategy_name: credit_spread
+description: >-
+  Directional vertical credit spread. Can be bull or bear or auto (based on model bias).
+  Sells a short leg targeting a delta, buys a protective leg at predefined width.
+
+lot_params:
+  lot_size: 75
+  max_lots: 3
+  allow_fractional_lots: false
+
+entry:
+  mode: auto         # "auto" | "bull" | "bear"  (auto uses model bias)
+  delta_target: 0.20 # target delta for the short leg (0.10-0.30 typical)
+  max_width_points: 800     # maximum width for the bought protective leg (in points)
+  min_credit_per_lot: 1500  # min premium collected per lot (INR) to accept trade
+  min_credit_per_leg: 100   # optional per-leg floor
+
+sizing:
+  estimate_margin_per_lot: 120000   # conservative margin estimate (INR)
+  max_margin_pct_of_capital: 0.20   # fraction of per-strategy capital used
+
+risk_management:
+  stop_loss:
+    enabled: true
+    leg_sl_multiplier: 1.8     # if short leg price >= multiplier * sold_price -> SL trigger
+    portfolio_sl_pct: 0.02     # stop whole strategy if loss > 2% of deploy capital
+  take_profit:
+    enabled: true
+    profit_target_pct: 0.60    # take profit at 60% of initial credit
+  max_loss_per_lot: 15000.0    # absolute (conservative) hard cap per lot (INR)
+
+adjustments:
+  delta_rebalance_threshold: 0.25   # net delta beyond which rebalancing kicks in
+  roll_distance_points: 200        # distance to roll when rebalancing
+  max_rolls_per_month: 2
+
+market_filters:
+  vix_min: 8
+  vix_max: 20
+  iv_percentile_min: 15   # require at least this IV percentile to consider entry
+  avoid_event_days: true
+
+execution:
+  order:
+    limit_order_timeout_sec: 30
+    retry_attempts: 3
+    retry_backoff_sec: 5
+    allow_mkt_on_timeout: false
+
+notifications:
+  notify_on_fill: true
+  notify_on_sl: true
+  audit_trades: true
