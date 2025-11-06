@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Tuple, Any
 import json
 from logging.handlers import RotatingFileHandler
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pandas as pd
 
@@ -326,6 +326,18 @@ def main() -> None:
             initial_state = regime_analyzer.analyze_feature_history(history_df)
         except Exception as exc:
             log.debug("Failed to compute initial market state: %s", exc)
+
+    if initial_state is None and feature_path.exists() and feature_path.stat().st_size == 0:
+        spot_val = _as_float(dw.get_ltp_once("IDX_I", 13), 0.0)
+        spot = spot_val if spot_val > 0 else None
+        if spot is not None:
+            history_df = pd.DataFrame([
+                {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "spot": spot,
+                }
+            ])
+            initial_state = regime_analyzer.analyze_feature_history(history_df, min_required=1)
 
     if initial_state:
         setattr(cfg, "_last_market_state", initial_state)

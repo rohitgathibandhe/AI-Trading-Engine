@@ -41,6 +41,7 @@ class MarketRegimeAnalyzer:
         *,
         vix: Optional[float] = None,
         fallback_state: Optional[MarketState] = None,
+        min_required: Optional[int] = None,
     ) -> Optional[MarketState]:
         if df.empty:
             return fallback_state
@@ -53,7 +54,8 @@ class MarketRegimeAnalyzer:
         cutoff = frame["timestamp"].max() - self.lookback
         frame = frame[frame["timestamp"] >= cutoff]
         frame = frame.dropna(subset=["spot"])  # type: ignore[arg-type]
-        if len(frame) < max(self.min_points, 5):
+        min_points = min_required if min_required is not None else self.min_points
+        if len(frame) < max(min_points, 1):
             return fallback_state
 
         # Derived metrics

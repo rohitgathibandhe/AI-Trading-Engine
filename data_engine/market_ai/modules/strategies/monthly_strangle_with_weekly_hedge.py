@@ -1689,6 +1689,35 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
     data = _coerce_dict(oc_dict.get("data")) or oc_dict
 
     def _find_by_strike(strike: int, typ: str) -> Optional[Tuple[int, Optional[float]]]:
+        key_candidates = [str(int(strike)), str(float(strike)), int(strike)]
+        for raw_key in key_candidates:
+            key = str(raw_key)
+            direct = data.get(key)
+            if isinstance(direct, dict):
+                leg_key = "ce" if typ == "CALL" else "pe"
+                leg_dict = _coerce_dict(direct.get(leg_key)) or {}
+                if leg_dict:
+                    sec_id = _extract_security_id(leg_dict) or _extract_security_id(direct)
+                    if sec_id is None:
+                        sec_candidate = _safe_float(
+                            leg_dict.get("securityId")
+                            or direct.get("securityId")
+                            or direct.get("id"),
+                            None,
+                        )
+                        if sec_candidate:
+                            try:
+                                sec_id = int(sec_candidate)
+                            except Exception:
+                                sec_id = None
+                    if sec_id is not None:
+                        price_val = None
+                        for price_key in ("last_price", "LTP", "ltp", "price", "lastPrice"):
+                            if leg_dict.get(price_key) is not None:
+                                price_val = _safe_float(leg_dict.get(price_key), None)
+                                break
+                        return sec_id, price_val
+
         series = _iter_option_rows(data)
         for row_dict in series:
             row_strike_val = row_dict.get("strike", row_dict.get("strikePrice"))
@@ -2141,8 +2170,19 @@ def run_live(
                             history_df = history_df.tail(600)
                     except Exception:
                         history_df = pd.DataFrame()
+                if history_df.empty:
+                    spot_val = _safe_float(dw.get_ltp_once(NIFTY_SEG, NIFTY_SCRIP), None)
+                    if spot_val is None or spot_val <= 0:
+                        spot_val = cfg.last_spot
+                    if spot_val and spot_val > 0:
+                        history_df = pd.DataFrame([
+                            {
+                                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                                "spot": spot_val,
+                            }
+                        ])
                 last_state = getattr(cfg, "_last_market_state", None)
-                state = regime_analyzer.analyze_feature_history(history_df, fallback_state=last_state)
+                state = regime_analyzer.analyze_feature_history(history_df, fallback_state=last_state, min_required=1)
                 if state:
                     cfg._last_market_state = state
                     cfg.last_spot = state.features.get("spot")
