@@ -699,8 +699,32 @@ def _positions_tab(dw) -> None:
     def _net_qty(r: Dict[str, Any]) -> int:
         return I(r, "netQty", 0)
 
+    def _security_id(r: Dict[str, Any]) -> Optional[int]:
+        raw = r.get("securityId") or r.get("security_id") or r.get("id")
+        try:
+            return int(str(raw)) if raw is not None else None
+        except Exception:
+            return None
+
     # ================= OPEN POSITIONS (netQty != 0) =================
     open_src = [r for r in rows if _net_qty(r) != 0 and _pt(r) in ("LONG", "SHORT")]
+    ltp_pairs: List[tuple[str, int]] = []
+    seen_pairs: set[tuple[str, int]] = set()
+    for r in open_src:
+        seg = S(r, "exchangeSegment")
+        sid = _security_id(r)
+        if seg and sid is not None:
+            key = (seg, sid)
+            if key not in seen_pairs:
+                ltp_pairs.append(key)
+                seen_pairs.add(key)
+
+    ltp_map: Dict[tuple[str, int], Optional[float]] = {}
+    if ltp_pairs:
+        try:
+            ltp_map = dw.get_ltp_bulk(ltp_pairs)  # type: ignore[attr-defined]
+        except Exception as exc:
+            st.warning(f"Could not fetch live LTPs: {exc}")
 
     # ---- Payoff Analyzer Button ----
     with st.container():
@@ -729,11 +753,21 @@ def _positions_tab(dw) -> None:
             buy_avg = F(r, "buyAvg", 0.0)
             sell_avg = F(r, "sellAvg", 0.0)
             unreal = F(r, "unrealizedProfit", 0.0)
+            seg = S(r, "exchangeSegment")
+            sid = _security_id(r)
+            live_ltp = ltp_map.get((seg, sid)) if seg and sid is not None else None
             # Per Dhan mapping:
             # SHORT  -> Qty = sellQty,  Avg Price = sellAvg
             # LONG   -> Qty = buyQty,   Avg Price = buyAvg
             avg_disp = sell_avg if typ == "SHORT" else buy_avg
-            ltp_val = cost_price  # LTP must be costPrice for both LONG/SHORT
+            if live_ltp is not None:
+                ltp_val = float(live_ltp)
+            else:
+                fallback = r.get("ltp") or r.get("lastPrice") or r.get("last_price")
+                try:
+                    ltp_val = float(fallback)
+                except Exception:
+                    ltp_val = cost_price
             qty_val = I(r, "sellQty", abs(_net_qty(r))) if typ == "SHORT" else I(r, "buyQty", _net_qty(r))
 
             mapped_open.append({
