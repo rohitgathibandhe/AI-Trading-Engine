@@ -6,6 +6,7 @@ import sys
 import logging
 import importlib.util
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Tuple, Any, Dict
 import json
 from logging.handlers import RotatingFileHandler
@@ -136,15 +137,25 @@ def _pick_json(env_name: str, setting_name: str, default: Any, settings: Dict[st
         return settings[setting_name]
     return default
 # ───────────────────────── DhanWrapper import (robust) ───────────────────────
-try:
-    from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
-    log.info("DhanWrapper import: data_engine.market_ai.dhan_wrapper")
-except ModuleNotFoundError:
-    dw_path = ENGINE_DIR / "dhan_wrapper.py"
-    if not dw_path.exists():
-        raise
-    DhanWrapper = _lazy_symbol(dw_path, "DhanWrapper")  # type: ignore
-    log.info("DhanWrapper import: file %s", dw_path)
+def _import_dhan_wrapper():
+    try:
+        from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
+        log.info("DhanWrapper import: data_engine.market_ai.dhan_wrapper")
+        return DhanWrapper
+    except ModuleNotFoundError as exc:
+        candidates = [
+            ENGINE_DIR / "dhan_wrapper.py",
+            PROJECT_ROOT / "data_engine" / "market_ai" / "dhan_wrapper.py",
+        ]
+        for path in candidates:
+            if path.exists():
+                DhanWrapper = _lazy_symbol(path, "DhanWrapper")  # type: ignore
+                log.info("DhanWrapper import: file %s", path)
+                return DhanWrapper
+        raise exc
+
+
+DhanWrapper = _import_dhan_wrapper()
 
 # ───────────────────────── Strategy import (robust) ─────────────────────────
 STRAT_FILENAME = "monthly_strangle_with_weekly_hedge.py"
@@ -295,7 +306,15 @@ def _maybe_run_adaptive() -> bool:
     log.info("Loading adaptive agent from: %s", agent_file)
     mod = _load_module_from_path("adaptive_agent_mod", agent_file)
     AdaptiveAgent = getattr(mod, "AdaptiveAgent")
-    AgentConfig   = getattr(mod, "AgentConfig")
+    AgentConfig   = getattr(mod, "AgentConfig", None)
+
+    if AgentConfig is None:
+        log.warning("adaptive_agent.py missing AgentConfig; using fallback dataclass")
+
+        @dataclass
+        class AgentConfig:  # type: ignore[redefinition]
+            state_path: str
+            control_dir: str
 
     state_dir = ENGINE_DIR / "state"
     control_dir = ENGINE_DIR / "control"
