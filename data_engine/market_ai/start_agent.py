@@ -190,6 +190,29 @@ from market_ai.modules.analytics import MarketRegimeAnalyzer
 from market_ai.modules.agents.strategy_recommender import StrategyRecommender
 
 run_live, LiveConfig, BatmanConfig = _import_strategy()
+strategy_module = sys.modules.get(run_live.__module__)
+if strategy_module is None or not hasattr(strategy_module, "FEATURE_FIELDS"):
+    FEATURE_FIELDS = [
+        "timestamp",
+        "strategy",
+        "expiry",
+        "exchange_seg",
+        "spot",
+        "ce_strike",
+        "pe_strike",
+        "ce_ltp",
+        "pe_ltp",
+        "ce_delta",
+        "pe_delta",
+        "ce_entry",
+        "pe_entry",
+        "net_credit",
+        "warn_only",
+        "trade_mode",
+        "context",
+    ]
+else:
+    FEATURE_FIELDS = list(getattr(strategy_module, "FEATURE_FIELDS"))
 
 # ───────────────────────── Optional adaptive agent support ───────────────────
 def _maybe_run_adaptive() -> bool:
@@ -310,7 +333,8 @@ def main() -> None:
     feature_path = Path(feature_log)
     feature_path.parent.mkdir(parents=True, exist_ok=True)
     if not feature_path.exists():
-        feature_path.write_text("")
+        header = ",".join(FEATURE_FIELDS) + "\n"
+        feature_path.write_text(header)
 
     lookback_minutes = pick("REGIME_LOOKBACK_MINUTES", "regime_lookback_minutes", 180.0, _as_float)
     regime_analyzer = MarketRegimeAnalyzer(lookback=timedelta(minutes=float(lookback_minutes)))

@@ -2174,6 +2174,19 @@ def run_live(
                     spot_val = _safe_float(dw.get_ltp_once(NIFTY_SEG, NIFTY_SCRIP), None)
                     if spot_val is None or spot_val <= 0:
                         spot_val = cfg.last_spot
+                    if (spot_val is None or spot_val <= 0) and rows:
+                        for row in rows:
+                            if not isinstance(row, dict):
+                                continue
+                            base = (
+                                row.get("underlyingValue")
+                                or row.get("underlying_value")
+                                or row.get("underlyingPrice")
+                                or row.get("indexPrice")
+                            )
+                            spot_val = _safe_float(base, None)
+                            if spot_val and spot_val > 0:
+                                break
                     if spot_val and spot_val > 0:
                         history_df = pd.DataFrame([
                             {

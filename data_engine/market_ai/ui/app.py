@@ -1071,6 +1071,9 @@ def _render_agent_activity(feature_df: Optional[pd.DataFrame]) -> None:
     if feature_df.empty:
         st.info("Waiting for the first strategy telemetry event.")
         return
+    if "timestamp" not in feature_df.columns:
+        st.info("Feature log missing timestamp column.")
+        return
     recent = feature_df.dropna(subset=["timestamp"]).tail(25)
     recent = recent.sort_values("timestamp", ascending=False)
     for _, row in recent.iterrows():
@@ -1130,7 +1133,10 @@ def _render_plan_snapshot(feature_df: Optional[pd.DataFrame]) -> None:
     if feature_df is None:
         st.info("Decision feed not available yet.")
         return
-    feature_df = feature_df[feature_df.get("strategy") != "environment"] if not feature_df.empty else feature_df
+    if "strategy" not in feature_df.columns:
+        st.info("No active plan information recorded yet.")
+        return
+    feature_df = feature_df[feature_df["strategy"] != "environment"] if not feature_df.empty else feature_df
     if feature_df is None or feature_df.empty:
         st.info("No active plan information recorded yet.")
         return
@@ -1161,7 +1167,10 @@ def _render_environment_summary(feature_df: Optional[pd.DataFrame]) -> None:
     if feature_df is None or feature_df.empty:
         st.info("No regime data yet.")
         return
-    env_rows = feature_df[feature_df.get("strategy") == "environment"]
+    if "strategy" not in feature_df.columns:
+        st.info("No regime data yet.")
+        return
+    env_rows = feature_df.loc[feature_df["strategy"] == "environment"]
     if env_rows.empty:
         st.info("No regime data yet.")
         return
