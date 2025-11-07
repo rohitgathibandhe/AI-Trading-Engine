@@ -111,6 +111,37 @@ BLOTTER_CSV = STATE_DIR / "trade_blotter.csv"
 BLOTTER_SUMMARY = STATE_DIR / "trade_blotter_summary.json"
 FEATURE_LOG_CSV = STATE_DIR / "feature_history.csv"
 
+try:
+    from market_ai.modules.strategies.monthly_strangle_with_weekly_hedge import BLOTTER_FIELDS as STRAT_BLOTTER_FIELDS  # type: ignore
+except Exception:
+    STRAT_BLOTTER_FIELDS = [
+        "timestamp",
+        "trade_mode",
+        "warn_only",
+        "executed",
+        "side",
+        "order_type",
+        "exchange_seg",
+        "product_type",
+        "security_id",
+        "quantity",
+        "price",
+        "strike",
+        "tag",
+        "notes",
+    ]
+
+
+def _ensure_csv_exists(path: Path, headers: List[str]) -> None:
+    try:
+        if path.exists() and path.stat().st_size > 0:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            handle.write(",".join(headers) + "\n")
+    except Exception:
+        pass
+
 # =============================================================================
 # Dhan wrapper import
 # =============================================================================
@@ -183,6 +214,7 @@ def _load_blotter() -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
     df: Optional[pd.DataFrame] = None
     summary: Dict[str, Any] = {}
 
+    _ensure_csv_exists(BLOTTER_CSV, STRAT_BLOTTER_FIELDS)
     if BLOTTER_CSV.exists():
         try:
             df = pd.read_csv(BLOTTER_CSV)

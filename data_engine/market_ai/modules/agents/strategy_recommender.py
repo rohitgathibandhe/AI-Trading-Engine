@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from market_ai.modules.analytics import MarketState
 from market_ai.modules.strategies.strategy_selector import StrategyScore, StrategySelector, select_preferred_strategy
@@ -26,12 +26,21 @@ class StrategyRecommender:
         self,
         selector_model_path: Optional[Path] = None,
         feature_log_path: Optional[Path] = None,
+        bias: Optional[Dict[str, float]] = None,
+        whitelist: Optional[Iterable[str]] = None,
     ) -> None:
         self.selector_model_path = selector_model_path
         self.feature_log_path = feature_log_path
         self._selector: Optional[StrategySelector] = None
         if selector_model_path and selector_model_path.exists():
             self._selector = StrategySelector(selector_model_path)
+        self._bias: Dict[str, float] = {}
+        for name, value in (bias or {}).items():
+            try:
+                self._bias[str(name)] = float(value)
+            except Exception:
+                continue
+        self._whitelist: Set[str] = {str(name) for name in (whitelist or []) if name}
 
     def recommend(self, state: MarketState) -> List[StrategyCandidate]:
         heuristics = self._heuristic_scores(state)
@@ -62,6 +71,32 @@ class StrategyRecommender:
                     confidence=selector_score.confidence,
                     rationale=rationale,
                     sizing_hint=1.0,
+                )
+
+        if self._whitelist:
+            for name in self._whitelist:
+                if name not in blended:
+                    blended[name] = StrategyCandidate(
+                        name=name,
+                        score=self._bias.get(name, 0.0),
+                        confidence=0.4,
+                        rationale="Whitelist override",
+                        sizing_hint=1.0,
+                    )
+
+        if self._bias:
+            for name, boost in self._bias.items():
+                if name not in blended:
+                    continue
+                if boost == 0:
+                    continue
+                existing = blended[name]
+                blended[name] = StrategyCandidate(
+                    name=name,
+                    score=existing.score + boost,
+                    confidence=existing.confidence,
+                    rationale=f"{existing.rationale}; bias+{boost:.2f}",
+                    sizing_hint=existing.sizing_hint,
                 )
 
         ranked = sorted(blended.values(), key=lambda c: c.score, reverse=True)

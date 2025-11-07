@@ -6,7 +6,7 @@ import sys
 import logging
 import importlib.util
 from pathlib import Path
-from typing import Tuple, Any
+from typing import Tuple, Any, Dict
 import json
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
@@ -124,6 +124,17 @@ def _as_int(value: Any, default: int) -> int:
         return int(round(float(value)))
     except Exception:
         return int(default)
+
+
+def _pick_json(env_name: str, setting_name: str, default: Any, settings: Dict[str, Any]) -> Any:
+    if env_name in os.environ:
+        try:
+            return json.loads(os.environ[env_name])
+        except Exception as exc:
+            log.warning("Failed to parse %s: %s", env_name, exc)
+    if setting_name in settings:
+        return settings[setting_name]
+    return default
 # ───────────────────────── DhanWrapper import (robust) ───────────────────────
 try:
     from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
@@ -318,6 +329,17 @@ def main() -> None:
             return _as_bool(settings[setting_name], default)
         return default
 
+    strategy_bias_cfg = _pick_json("STRATEGY_BIAS", "strategy_bias", {}, settings)
+    if not isinstance(strategy_bias_cfg, dict):
+        strategy_bias_cfg = {}
+    strategy_whitelist_cfg = _pick_json("STRATEGY_WHITELIST", "strategy_whitelist", [], settings)
+    if isinstance(strategy_whitelist_cfg, str):
+        strategy_whitelist = [x.strip() for x in strategy_whitelist_cfg.split(",") if x.strip()]
+    elif isinstance(strategy_whitelist_cfg, list):
+        strategy_whitelist = [str(x) for x in strategy_whitelist_cfg]
+    else:
+        strategy_whitelist = []
+
     blotter_path = os.getenv("BLOTTER_PATH", str(ENGINE_DIR / "state" / "trade_blotter.csv"))
     summary_path = os.getenv("BLOTTER_SUMMARY_PATH", str(ENGINE_DIR / "state" / "trade_blotter_summary.json"))
     trade_mode = os.getenv("TRADE_MODE", settings.get("trade_mode", "live"))
@@ -374,6 +396,8 @@ def main() -> None:
     recommender = StrategyRecommender(
         selector_model_path if selector_model_path.exists() else None,
         feature_path,
+        bias=strategy_bias_cfg,
+        whitelist=strategy_whitelist,
     )
 
     initial_state = None
