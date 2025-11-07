@@ -10,6 +10,7 @@ from typing import Tuple, Any
 import json
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
+import csv
 
 import pandas as pd
 
@@ -214,6 +215,35 @@ if strategy_module is None or not hasattr(strategy_module, "FEATURE_FIELDS"):
 else:
     FEATURE_FIELDS = list(getattr(strategy_module, "FEATURE_FIELDS"))
 
+if strategy_module is None or not hasattr(strategy_module, "BLOTTER_FIELDS"):
+    BLOTTER_FIELDS = [
+        "timestamp",
+        "trade_mode",
+        "warn_only",
+        "executed",
+        "side",
+        "order_type",
+        "exchange_seg",
+        "product_type",
+        "security_id",
+        "quantity",
+        "price",
+        "strike",
+        "tag",
+        "notes",
+    ]
+else:
+    BLOTTER_FIELDS = list(getattr(strategy_module, "BLOTTER_FIELDS"))
+
+
+def _ensure_csv_file(path: Path, headers: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.stat().st_size > 0:
+        return
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=headers)
+        writer.writeheader()
+
 # ───────────────────────── Optional adaptive agent support ───────────────────
 def _maybe_run_adaptive() -> bool:
     """
@@ -288,10 +318,13 @@ def main() -> None:
             return _as_bool(settings[setting_name], default)
         return default
 
-    blotter_path = os.getenv("BLOTTER_PATH", str(ENGINE_DIR / "state" / "blotter.csv"))
-    summary_path = os.getenv("BLOTTER_SUMMARY_PATH", str(ENGINE_DIR / "state" / "blotter_summary.json"))
+    blotter_path = os.getenv("BLOTTER_PATH", str(ENGINE_DIR / "state" / "trade_blotter.csv"))
+    summary_path = os.getenv("BLOTTER_SUMMARY_PATH", str(ENGINE_DIR / "state" / "trade_blotter_summary.json"))
     trade_mode = os.getenv("TRADE_MODE", settings.get("trade_mode", "live"))
     feature_log = os.getenv("FEATURE_LOG_PATH", settings.get("feature_log_path", str(ENGINE_DIR / "state" / "feature_history.csv")))
+
+    blotter_path_obj = Path(blotter_path)
+    _ensure_csv_file(blotter_path_obj, BLOTTER_FIELDS)
 
     cfg = LiveConfig(
         max_strangles=pick("MAX_STRANGLES", "max_legs", 1, _as_int),
