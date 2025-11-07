@@ -920,6 +920,77 @@ def _collect_open_option_legs(rows):
             continue
     return legs
 
+
+def _fallback_plan_from_positions() -> Optional[pd.DataFrame]:
+    dw = st.session_state.get("dw")
+    if not dw or not st.session_state.get("creds_verified"):
+        return None
+    try:
+        rows = dw.get_positions_live_with_ltp()
+    except Exception:
+        return None
+    legs = _collect_open_option_legs(rows)
+    if not legs:
+        return None
+    combos: List[Dict[str, Any]] = []
+    short_calls = [leg for leg in legs if leg["side"] == "SHORT" and leg["type"] == "CALL"]
+    short_puts = [leg for leg in legs if leg["side"] == "SHORT" and leg["type"] == "PUT"]
+    expiries = sorted({leg["expiry"] for leg in short_calls + short_puts if leg.get("expiry")})
+    for expiry in expiries:
+        ce_candidates = [leg for leg in short_calls if leg["expiry"] == expiry]
+        pe_candidates = [leg for leg in short_puts if leg["expiry"] == expiry]
+        if not ce_candidates or not pe_candidates:
+            continue
+        ce_leg = max(ce_candidates, key=lambda l: l["strike"])
+        pe_leg = min(pe_candidates, key=lambda l: l["strike"])
+        qty = min(ce_leg["qty"], pe_leg["qty"])
+        net_credit = qty * ((ce_leg.get("premium") or 0.0) + (pe_leg.get("premium") or 0.0))
+        combos.append({
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "strategy": "live_positions",
+            "expiry": expiry,
+            "ce_strike": ce_leg["strike"],
+            "pe_strike": pe_leg["strike"],
+            "ce_ltp": ce_leg.get("ltp"),
+            "pe_ltp": pe_leg.get("ltp"),
+            "ce_delta": None,
+            "pe_delta": None,
+            "net_credit": net_credit,
+            "context": json.dumps({"source": "open_positions", "qty": qty}, default=str),
+        })
+    if not combos:
+        return None
+    return pd.DataFrame(combos)
+
+
+def _fallback_blotter_from_positions() -> Optional[pd.DataFrame]:
+    dw = st.session_state.get("dw")
+    if not dw or not st.session_state.get("creds_verified"):
+        return None
+    try:
+        rows = dw.get_positions_live_with_ltp()
+    except Exception:
+        return None
+    events: List[Dict[str, Any]] = []
+    for row in rows:
+        qty = row.get("qty")
+        if not qty:
+            continue
+        side = "BUY" if qty > 0 else "SELL"
+        strike = (row.get("_raw") or {}).get("drvStrikePrice")
+        events.append({
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "trade_mode": st.session_state.get("trade_mode", "live"),
+            "side": side,
+            "quantity": abs(int(qty)),
+            "price": row.get("avg_price"),
+            "strike": strike or "",
+            "notes": row.get("symbol") or "",
+        })
+    if not events:
+        return None
+    return pd.DataFrame(events)
+
 # --- Colours roughly matching Dhan ---
 _DHAN_COLORS = {
     "today": "#2e7d32",   # green
@@ -1147,7 +1218,12 @@ def _render_blotter_panel(blotter_df: Optional[pd.DataFrame], summary: Dict[str,
         st.info("Blotter file not available yet. Start the agent to capture trades.")
         return
     if blotter_df.empty:
-        st.info("No trades recorded yet.")
+        fallback = _fallback_blotter_from_positions()
+        if fallback is not None:
+            st.info("No agent trades recorded yet. Showing live positions (read-only).")
+            st.dataframe(fallback, hide_index=True, width="stretch")
+        else:
+            st.info("No trades recorded yet.")
         return
     table = blotter_df.copy()
     if "timestamp" in table.columns:
@@ -1225,16 +1301,22 @@ def _render_agent_activity(feature_df: Optional[pd.DataFrame]) -> None:
 
 def _render_plan_snapshot(feature_df: Optional[pd.DataFrame]) -> None:
     st.markdown("#### Active Plan Snapshot")
+    fallback_df: Optional[pd.DataFrame] = None
+    if feature_df is None or "strategy" not in feature_df.columns:
+        fallback_df = _fallback_plan_from_positions()
+        feature_df = fallback_df
     if feature_df is None:
         st.info("Decision feed not available yet.")
         return
-    if "strategy" not in feature_df.columns:
-        st.info("No active plan information recorded yet.")
-        return
     feature_df = feature_df[feature_df["strategy"] != "environment"] if not feature_df.empty else feature_df
     if feature_df is None or feature_df.empty:
-        st.info("No active plan information recorded yet.")
-        return
+        if fallback_df is None:
+            fallback_df = _fallback_plan_from_positions()
+        if fallback_df is not None and not fallback_df.empty:
+            feature_df = fallback_df
+        else:
+            st.info("No active plan information recorded yet.")
+            return
     latest = feature_df.sort_values("timestamp").groupby("strategy", as_index=False).last()
     for _, row in latest.iterrows():
         strategy_name = str(row.get("strategy") or "unknown").title()

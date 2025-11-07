@@ -629,10 +629,19 @@ class DhanWrapper:
             sell_qty = int(sell_qty_f) if sell_qty_f is not None else None
             unrealized = self._as_float(raw.get("unrealizedProfit"))
             realized = self._as_float(raw.get("realizedProfit"))
+            derived_ltp = None
+            if ltp_live is None and unrealized is not None and net_qty:
+                qty_abs = abs(net_qty)
+                if qty_abs > 0:
+                    if net_qty > 0 and buy_avg is not None:
+                        derived_ltp = buy_avg + (unrealized / qty_abs)
+                    elif net_qty < 0 and sell_avg is not None:
+                        derived_ltp = sell_avg - (unrealized / qty_abs)
 
             if position_type == "LONG" or (isinstance(net_qty, int) and net_qty > 0):
                 qty_disp = buy_qty if buy_qty is not None else net_qty
-                ltp_val = ltp_live if ltp_live is not None else raw.get("ltp") or raw.get("lastPrice") or buy_avg or cost_price
+                candidate_ltp = ltp_live if ltp_live is not None else derived_ltp
+                ltp_val = candidate_ltp if candidate_ltp is not None else raw.get("ltp") or raw.get("lastPrice") or buy_avg or cost_price
                 ltp_val = self._as_float(ltp_val) or self._as_float(cost_price)
                 avg_val = buy_avg if buy_avg is not None else cost_price
                 pnl_val = unrealized if unrealized is not None else r.get("pnl") or 0.0
@@ -642,7 +651,8 @@ class DhanWrapper:
                 r["avg_price"] = avg_val
             elif position_type == "SHORT" or (isinstance(net_qty, int) and net_qty < 0):
                 qty_disp = -(sell_qty if sell_qty is not None else abs(net_qty))
-                ltp_val = ltp_live if ltp_live is not None else raw.get("ltp") or raw.get("lastPrice") or sell_avg or cost_price
+                candidate_ltp = ltp_live if ltp_live is not None else derived_ltp
+                ltp_val = candidate_ltp if candidate_ltp is not None else raw.get("ltp") or raw.get("lastPrice") or sell_avg or cost_price
                 ltp_val = self._as_float(ltp_val) or self._as_float(cost_price)
                 avg_val = sell_avg if sell_avg is not None else cost_price
                 pnl_val = unrealized if unrealized is not None else r.get("pnl") or 0.0
