@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 PKG_ROOT = ROOT / "data_engine"
@@ -102,6 +103,9 @@ def _make_monthly_df() -> pd.DataFrame:
         },
     ]
     return pd.DataFrame(rows)
+
+
+pytestmark = pytest.mark.integration
 
 
 class LiveOrchestrationTests(unittest.TestCase):

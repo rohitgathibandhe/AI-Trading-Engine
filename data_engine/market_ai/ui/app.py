@@ -880,23 +880,34 @@ def _collect_open_option_legs(rows):
     legs = []
     for r in rows or []:
         try:
-            pt = str(r.get("positionType", "")).upper()
+            raw = r.get("_raw") or {}
+            pt = str(r.get("positionType") or raw.get("positionType") or "").upper()
             if pt not in ("LONG", "SHORT"):
                 continue
-            nqty = int(float(r.get("netQty", 0) or 0))
+            nqty = r.get("qty")
+            if nqty is None:
+                nqty = r.get("net_qty") or r.get("netQty") or raw.get("netQty")
+            nqty = int(float(nqty or 0))
             if nqty == 0:
                 continue
             side = pt
             qty = abs(nqty)
-            strike = float(r.get("drvStrikePrice", 0) or 0)
-            otype = str(r.get("drvOptionType", "")).upper()
+            strike = r.get("strike") or r.get("drvStrikePrice") or raw.get("drvStrikePrice")
+            strike = float(strike or 0)
+            otype = str(r.get("type") or r.get("drvOptionType") or raw.get("drvOptionType") or "").upper()
             if otype not in ("CALL", "PUT") or strike == 0:
                 continue
-            premium = float(r.get("sellAvg") if side == "SHORT" else r.get("buyAvg") or 0.0)
-            ltp = float(r.get("costPrice", 0.0))
-            expiry = str(r.get("drvExpiryDate") or "")
+            premium = r.get("sell_avg") if side == "SHORT" else r.get("buy_avg")
+            if premium is None:
+                premium = r.get("sellAvg") if side == "SHORT" else r.get("buyAvg")
+            if premium is None:
+                premium = raw.get("sellAvg") if side == "SHORT" else raw.get("buyAvg")
+            premium = float(premium or 0.0)
+            ltp = r.get("ltp") or r.get("cost_price") or r.get("costPrice") or raw.get("costPrice") or 0.0
+            ltp = float(ltp)
+            expiry = str(r.get("expiry") or r.get("drvExpiryDate") or raw.get("drvExpiryDate") or "")
             legs.append({
-                "symbol": r.get("tradingSymbol"),
+                "symbol": r.get("symbol") or raw.get("tradingSymbol"),
                 "type": otype,          # CALL / PUT
                 "side": side,           # LONG / SHORT
                 "qty": qty,

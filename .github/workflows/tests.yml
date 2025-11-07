@@ -1,0 +1,56 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - "**"
+  schedule:
+    - cron: "30 21 * * *"  # 03:00 IST == 21:30 UTC previous day
+
+jobs:
+  unit_integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run unit/integration tests
+        env:
+          PYTHONPATH: data_engine
+        run: |
+          pytest -m "unit or integration" -v --junitxml=reports/unit_integration.xml
+      - name: Upload unit/integration artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-integration-results
+          path: reports/unit_integration.xml
+
+  backtest:
+    runs-on: ubuntu-latest
+    needs: unit_integration
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run backtest smoke
+        env:
+          PYTHONPATH: data_engine
+        run: |
+          pytest -m backtest -v --junitxml=reports/backtest.xml
+      - name: Upload backtest artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: reports/backtest.xml

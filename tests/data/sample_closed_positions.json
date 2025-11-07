@@ -1,0 +1,17 @@
+[
+  {
+    "positionType": "CLOSED",
+    "tradingSymbol": "NIFTY 04 NOV 25000 CALL",
+    "exchangeSegment": "NSE_FNO",
+    "productType": "MARGIN",
+    "buyAvg": 5.0,
+    "sellAvg": 12.0,
+    "costPrice": 12.0,
+    "buyQty": 75,
+    "sellQty": 75,
+    "netQty": 0,
+    "realizedProfit": 525.0,
+    "unrealizedProfit": 0.0,
+    "securityId": "40001"
+  }
+]

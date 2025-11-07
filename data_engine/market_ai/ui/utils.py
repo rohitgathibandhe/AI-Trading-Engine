@@ -6,10 +6,11 @@ import re
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
+
+from market_ai.utils import last_tuesday_of_month, next_tuesday, normalize_expiry
 
 # ---------- Paths ----------
 ROOT = Path(__file__).resolve().parents[3]        # .../Algotrade_ai
@@ -21,52 +22,6 @@ STATE_DIR = DATA_ENGINE / "state"
 KILL_FILE = STATE_DIR / "kill.switch"             # kill-switch file
 PID_FILE = LOG_DIR / "daemon.pid"                 # daemon pid
 MANUAL_EXIT_FLAG = STATE_DIR / "manual_exit.flag" # manual exit request
-
-
-# =========================
-# NSE calendar helpers
-# =========================
-def _is_tuesday(d: date) -> bool:
-    return d.weekday() == 1
-
-def last_tuesday_of_month(y: int, m: int) -> date:
-    if m == 12:
-        nm = date(y + 1, 1, 1)
-    else:
-        nm = date(y, m + 1, 1)
-    d = nm - timedelta(days=1)
-    while not _is_tuesday(d):
-        d -= timedelta(days=1)
-    return d
-
-def next_tuesday(d: Optional[date] = None) -> date:
-    d = d or date.today()
-    ahead = (1 - d.weekday()) % 7
-    if ahead == 0:
-        ahead = 7
-    return d + timedelta(days=ahead)
-
-def normalize_expiry(mode: str, user_expiry: Optional[str] = None) -> str:
-    """Return ISO date string for desired expiry mode."""
-    if mode == "auto_weekly":
-        return next_tuesday().isoformat()
-    if mode == "auto_monthly":
-        today = date.today()
-        d = last_tuesday_of_month(today.year, today.month)
-        if d < today:
-            # move to next month
-            yy, mm = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
-            d = last_tuesday_of_month(yy, mm)
-        return d.isoformat()
-    # manual
-    if user_expiry:
-        try:
-            y, m, dd = map(int, user_expiry.split("-"))
-            return date(y, m, dd).isoformat()
-        except Exception:
-            pass
-    # fallback
-    return next_tuesday().isoformat()
 
 
 # =========================

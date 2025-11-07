@@ -1,0 +1,10 @@
+{
+  "name": "ai-trading-engine",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "test:fast": "PYTHONPATH=data_engine /Users/Rohit/.venvs/data_engine_py310/bin/python -m pytest -m \"unit or integration\" -q",
+    "test:all": "PYTHONPATH=data_engine /Users/Rohit/.venvs/data_engine_py310/bin/python -m pytest -m \"unit or integration or backtest\" -q",
+    "test:cov": "PYTHONPATH=data_engine /Users/Rohit/.venvs/data_engine_py310/bin/python -m pytest -m \"unit or integration\" --cov=data_engine --cov-report=term-missing"
+  }
+}

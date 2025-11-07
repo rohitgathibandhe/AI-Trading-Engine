@@ -1,0 +1,14 @@
+{
+  "25000": {
+    "ce": {"last_price": 35.0, "greeks": {"delta": 0.18}, "spot": 25050},
+    "pe": {"last_price": 42.0, "greeks": {"delta": -0.22}, "spot": 25050}
+  },
+  "25250": {
+    "ce": {"last_price": 22.0, "greeks": {"delta": 0.12}, "spot": 25050},
+    "pe": {"last_price": 58.0, "greeks": {"delta": -0.32}, "spot": 25050}
+  },
+  "24750": {
+    "ce": {"last_price": 12.0, "greeks": {"delta": 0.08}, "spot": 25050},
+    "pe": {"last_price": 78.0, "greeks": {"delta": -0.38}, "spot": 25050}
+  }
+}
