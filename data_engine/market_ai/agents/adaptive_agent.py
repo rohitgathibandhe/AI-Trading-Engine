@@ -134,6 +134,12 @@ class PaperBroker:
 
 # ---------- agent state
 @dataclass
+class AgentConfig:
+    state_path: str
+    control_dir: str
+
+
+@dataclass
 class AgentState:
     mode: str = "paper"                   # "paper" | "live"
     running: bool = False
@@ -156,6 +162,8 @@ class AgentState:
 # ---------- AdaptiveAgent
 class AdaptiveAgent:
     def __init__(self, cfg: Optional[dict] = None, risk_cfg: Optional[dict] = None):
+        if isinstance(cfg, AgentConfig):
+            cfg = asdict(cfg)
         self.cfg = cfg or {}
         self.risk_cfg = risk_cfg or {}
         self.state = AgentState(indices=[], last_prices={})

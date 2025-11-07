@@ -246,6 +246,22 @@ if strategy_module is None or not hasattr(strategy_module, "BLOTTER_FIELDS"):
 else:
     BLOTTER_FIELDS = list(getattr(strategy_module, "BLOTTER_FIELDS"))
 
+if strategy_module is None or not hasattr(strategy_module, "EQUITY_FIELDS"):
+    EQUITY_FIELDS = [
+        "timestamp",
+        "available",
+        "collateral",
+        "utilized",
+        "withdrawable",
+        "gross_exposure",
+        "net_exposure",
+        "unrealized",
+        "realized",
+        "equity_estimate",
+    ]
+else:
+    EQUITY_FIELDS = list(getattr(strategy_module, "EQUITY_FIELDS"))
+
 
 def _ensure_csv_file(path: Path, headers: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -344,9 +360,12 @@ def main() -> None:
     summary_path = os.getenv("BLOTTER_SUMMARY_PATH", str(ENGINE_DIR / "state" / "trade_blotter_summary.json"))
     trade_mode = os.getenv("TRADE_MODE", settings.get("trade_mode", "live"))
     feature_log = os.getenv("FEATURE_LOG_PATH", settings.get("feature_log_path", str(ENGINE_DIR / "state" / "feature_history.csv")))
+    equity_log = os.getenv("EQUITY_LOG_PATH", settings.get("equity_log_path", str(ENGINE_DIR / "state" / "equity_history.csv")))
 
     blotter_path_obj = Path(blotter_path)
     _ensure_csv_file(blotter_path_obj, BLOTTER_FIELDS)
+    equity_path = Path(equity_log)
+    _ensure_csv_file(equity_path, EQUITY_FIELDS)
 
     cfg = LiveConfig(
         max_strangles=pick("MAX_STRANGLES", "max_legs", 1, _as_int),
@@ -371,6 +390,13 @@ def main() -> None:
             salvage_wing_ltp=pick("BATMAN_SALVAGE_WING_LTP", "batman_salvage_wing_ltp", 5.0, _as_float),
         ),
         feature_log_path=feature_log,
+        equity_log_path=equity_log,
+        equity_snapshot_minutes=pick(
+            "EQUITY_SNAPSHOT_MINUTES",
+            "equity_snapshot_minutes",
+            getattr(LiveConfig, "equity_snapshot_minutes", 10.0),
+            _as_float,
+        ),
     )
     cfg.regime_refresh_minutes = pick("REGIME_REFRESH_MINUTES", "regime_refresh_minutes", cfg.regime_refresh_minutes, _as_float)
     cfg.auto_disable_strangle_when_unfavored = pick_bool(

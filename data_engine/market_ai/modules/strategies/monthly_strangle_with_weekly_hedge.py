@@ -33,6 +33,8 @@ __all__ = [
     "run_strategy",
     "run_live",
     "_normalize_positions",
+    "_collect_option_chain_sources",
+    "_extract_leg_from_chain_sources",
 ]
 
 LOG = logging.getLogger(__name__)
@@ -72,6 +74,19 @@ FEATURE_FIELDS = [
     "warn_only",
     "trade_mode",
     "context",
+]
+
+EQUITY_FIELDS = [
+    "timestamp",
+    "available",
+    "collateral",
+    "utilized",
+    "withdrawable",
+    "gross_exposure",
+    "net_exposure",
+    "unrealized",
+    "realized",
+    "equity_estimate",
 ]
 
 _BLOTTER_ROTATE_MAX_BYTES = 5 * 1024 * 1024
@@ -214,6 +229,56 @@ def _record_feature(cfg: "LiveConfig", row: Dict[str, Any]) -> None:
     )
 
 
+def _record_equity_snapshot(cfg: "LiveConfig", dw, positions: List[Dict[str, Any]]) -> None:
+    path = getattr(cfg, "equity_log_path", None)
+    if not path:
+        return
+    try:
+        funds = dw.get_funds()
+    except Exception:
+        return
+
+    def _f(val: Any) -> Optional[float]:
+        return _safe_float(val, None)
+
+    available = _f(funds.get("available"))
+    collateral = _f(funds.get("collateral"))
+    utilized = _f(funds.get("utilized"))
+    withdrawable = _f(funds.get("withdrawable"))
+
+    gross_exposure = 0.0
+    net_exposure = 0.0
+    unrealized = 0.0
+    realized = 0.0
+
+    for row in positions or []:
+        qty = _safe_float(row.get("qty") or row.get("net_qty"), 0.0) or 0.0
+        price = _safe_float(row.get("avg_price") or row.get("cost_price"), 0.0) or 0.0
+        gross_exposure += abs(qty) * price
+        net_exposure += qty * price
+        unrealized += _safe_float(row.get("pnl"), 0.0) or 0.0
+        realized += _safe_float((row.get("_raw") or {}).get("realizedProfit"), 0.0) or 0.0
+
+    equity_estimate = 0.0
+    for part in (available, collateral, utilized):
+        if part:
+            equity_estimate += part
+
+    row = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "available": available,
+        "collateral": collateral,
+        "utilized": utilized,
+        "withdrawable": withdrawable,
+        "gross_exposure": gross_exposure,
+        "net_exposure": net_exposure,
+        "unrealized": unrealized,
+        "realized": realized,
+        "equity_estimate": equity_estimate or withdrawable or available,
+    }
+    _append_csv_row(path, EQUITY_FIELDS, row, max_bytes=_FEATURE_ROTATE_MAX_BYTES)
+
+
 def _record_environment_snapshot(
     cfg: "LiveConfig",
     state: "MarketState",
@@ -303,6 +368,138 @@ def _iter_option_rows(payload: Any) -> List[Dict[str, Any]]:
                 rows.append(item)
             stack.extend(item.values())
     return rows
+
+
+def _collect_option_chain_sources(root: Any) -> List[Dict[str, Any]]:
+    sources: List[Dict[str, Any]] = []
+    if root is None:
+        return sources
+    stack: List[Any] = [root]
+    seen: set[int] = set()
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            node_id = id(node)
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            sources.append(node)
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    stack.append(item)
+    return sources
+
+
+def _extract_leg_from_chain_sources(
+    chain_sources: List[Dict[str, Any]],
+    strike: float,
+    opt_type: str,
+    symbol: str,
+    expiry: str,
+) -> Optional[Tuple[int, Optional[float]]]:
+    if not chain_sources:
+        return None
+
+    leg_key = "ce" if opt_type == "CALL" else "pe"
+    opt_prefix = "C" if opt_type == "CALL" else "P"
+    strike_val = float(strike)
+
+    price_fields = (
+        "last_price",
+        "LTP",
+        "ltp",
+        "price",
+        "lastPrice",
+    )
+
+    def _extract_price(source: Dict[str, Any]) -> Optional[float]:
+        for key in price_fields:
+            if key in source and source[key] is not None:
+                price_val = _safe_float(source[key], None)
+                if price_val is not None:
+                    return price_val
+        return None
+
+    def _extract_strike(source: Dict[str, Any], key_hint: Optional[Any]) -> Optional[float]:
+        for candidate in ("strike", "strikePrice", "strike_price"):
+            if candidate in source and source[candidate] is not None:
+                val = _safe_float(source[candidate], None)
+                if val is not None:
+                    return val
+        if key_hint is not None:
+            return _safe_float(key_hint, None)
+        return None
+
+    def _maybe_leg(entry: Any, key_hint: Optional[Any]) -> Optional[Tuple[int, Optional[float]]]:
+        if not isinstance(entry, dict):
+            return None
+
+        strike_hint = _extract_strike(entry, key_hint)
+        if strike_hint is None or abs(strike_hint - strike_val) > 0.1:
+            return None
+
+        leg_dict = _coerce_dict(entry.get(leg_key)) if isinstance(entry.get(leg_key), dict) else None
+        parent_dict = entry
+        if leg_dict is None:
+            opt_val = str(entry.get("optionType") or entry.get("type") or "").upper()
+            if opt_val.startswith(opt_prefix):
+                leg_dict = entry
+        if leg_dict is None:
+            return None
+
+        sec_id = _extract_security_id(leg_dict) or _extract_security_id(parent_dict)
+        if sec_id is None:
+            raw_sec = (
+                leg_dict.get("securityId")
+                or parent_dict.get("securityId")
+                or parent_dict.get("id")
+                or parent_dict.get("symbolToken")
+            )
+            sec_val = _safe_float(raw_sec, None)
+            if sec_val is not None:
+                try:
+                    sec_id = int(sec_val)
+                except Exception:
+                    sec_id = None
+        if sec_id is None:
+            sec_id = resolve_option_security_id(symbol, expiry, strike_val, opt_type)
+        if sec_id is None:
+            return None
+
+        price_val = _extract_price(leg_dict)
+        if price_val is None:
+            price_val = _extract_price(parent_dict)
+        return int(sec_id), price_val
+
+    str_keys = set()
+    str_int = str(int(round(strike_val)))
+    str_float = str(float(strike_val))
+    str_keys.update({str_int, str_float})
+    str_keys.add(f"{strike_val:.1f}")
+    str_keys.add(f"{strike_val:.2f}")
+    str_keys.add(f"{strike_val:.3f}")
+    str_keys.add(f"{strike_val:.6f}")
+
+    for source in chain_sources:
+        if not isinstance(source, dict):
+            continue
+        direct_match = _maybe_leg(source, None)
+        if direct_match:
+            return direct_match
+        for key in str_keys:
+            if key in source:
+                result = _maybe_leg(source.get(key), key)
+                if result:
+                    return result
+        for raw_key, entry in source.items():
+            result = _maybe_leg(entry, raw_key)
+            if result:
+                return result
+    return None
 
 def _normalize_positions(rows: Any) -> List[Dict[str, Any]]:
     """
@@ -979,11 +1176,14 @@ class LiveConfig:
     blotter_summary_path: Optional[str] = None
     batman: BatmanConfig = field(default_factory=BatmanConfig)
     feature_log_path: Optional[str] = None
+    equity_log_path: Optional[str] = None
+    equity_snapshot_minutes: float = 10.0
     enable_strangle_entry: bool = True
     regime_refresh_minutes: float = 5.0
     auto_disable_strangle_when_unfavored: bool = True
     last_spot: Optional[float] = field(default=None, repr=False, compare=False)
     _last_spot_warn_at: Optional[datetime] = field(default=None, repr=False, compare=False)
+    _last_equity_logged_at: Optional[datetime] = field(default=None, repr=False, compare=False)
 
 
 
@@ -1689,67 +1889,17 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
     oc_raw = dw.get_option_chain(underlying_security_id=NIFTY_SCRIP, underlying_seg=NIFTY_FNO_SEG, expiry=expiry)
     oc_dict = _coerce_dict(oc_raw) or {}
     data = _coerce_dict(oc_dict.get("data")) or oc_dict
-
-    chain_sources: List[Dict[str, Any]] = []
-
-    def _push_source(node: Any) -> None:
-        if isinstance(node, dict):
-            chain_sources.append(node)
-
-    _push_source(data)
-    if isinstance(data, dict):
-        inner = _coerce_dict(data.get("data"))
-        _push_source(inner)
-        if isinstance(inner, dict):
-            _push_source(inner.get("oc"))
-        _push_source(data.get("oc"))
-    if not chain_sources:
-        chain_sources.append(data if isinstance(data, dict) else {})
+    chain_sources = _collect_option_chain_sources(data)
 
     def _find_by_strike(strike: int, typ: str) -> Optional[Tuple[int, Optional[float]]]:
-        key_candidates = [str(int(strike)), str(float(strike)), int(strike)]
-        for source in chain_sources:
-            if not isinstance(source, dict):
-                continue
-            for raw_key in key_candidates:
-                key = str(raw_key)
-                direct = source.get(key)
-                if not isinstance(direct, dict):
-                    continue
-                leg_key = "ce" if typ == "CALL" else "pe"
-                leg_dict = _coerce_dict(direct.get(leg_key)) or {}
-                if not leg_dict:
-                    continue
-                sec_id = _extract_security_id(leg_dict) or _extract_security_id(direct)
-                if sec_id is None:
-                    sec_candidate = _safe_float(
-                        leg_dict.get("securityId")
-                        or direct.get("securityId")
-                        or direct.get("id"),
-                        None,
-                    )
-                    if sec_candidate:
-                        try:
-                            sec_id = int(sec_candidate)
-                        except Exception:
-                            sec_id = None
-                if sec_id is None:
-                    sec_id = resolve_option_security_id(NIFTY_SYMBOL, expiry, strike, typ)
-                price_val = None
-                for price_key in ("last_price", "LTP", "ltp", "price", "lastPrice"):
-                    if leg_dict.get(price_key) is not None:
-                        price_val = _safe_float(leg_dict.get(price_key), None)
-                        break
-                if sec_id is not None:
-                    return sec_id, price_val
-
+        result = _extract_leg_from_chain_sources(chain_sources, strike, typ, NIFTY_SYMBOL, expiry)
+        if result:
+            return result
         series = _iter_option_rows(chain_sources)
         for row_dict in series:
             row_strike_val = row_dict.get("strike", row_dict.get("strikePrice"))
             row_strike = _safe_float(row_strike_val, None)
-            if row_strike is None:
-                continue
-            if abs(row_strike - float(strike)) > 0.1:
+            if row_strike is None or abs(row_strike - float(strike)) > 0.1:
                 continue
             opt = str(
                 row_dict.get("optionType")
@@ -1773,8 +1923,6 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
                     sec_id = resolve_option_security_id(NIFTY_SYMBOL, expiry, strike, typ)
                 else:
                     sec_id = int(sec_candidate)
-            else:
-                sec_id = int(sec_id)
             if sec_id is None:
                 continue
             price_val = None
@@ -2183,6 +2331,7 @@ def run_live(
     while True:
         try:
             rows = dw.get_positions_live() or []
+            normalized_rows: Optional[List[Dict[str, Any]]] = None
             open_deriv_rows = [
                 r
                 for r in rows
@@ -2190,6 +2339,22 @@ def run_live(
                 and (r.get("exchangeSegment") or "").upper().startswith("NSE_FNO")
                 and int(float(r.get("netQty") or 0)) != 0
             ]
+
+            equity_interval_min = max(0.0, float(getattr(cfg, "equity_snapshot_minutes", 0.0) or 0.0))
+            last_equity_at = getattr(cfg, "_last_equity_logged_at", None)
+            equity_path = getattr(cfg, "equity_log_path", None)
+            if (
+                equity_path
+                and equity_interval_min > 0
+                and (
+                    last_equity_at is None
+                    or (datetime.now() - last_equity_at).total_seconds() >= equity_interval_min * 60.0
+                )
+            ):
+                if normalized_rows is None:
+                    normalized_rows = _normalize_positions(rows)
+                _record_equity_snapshot(cfg, dw, normalized_rows)
+                cfg._last_equity_logged_at = datetime.now()
 
             if regime_analyzer and (refresh_iters is None or loop_iter % refresh_iters == 0):
                 history_df = pd.DataFrame()

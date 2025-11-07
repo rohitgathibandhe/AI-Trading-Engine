@@ -110,6 +110,7 @@ DEFAULT_SETTINGS = {
 BLOTTER_CSV = STATE_DIR / "trade_blotter.csv"
 BLOTTER_SUMMARY = STATE_DIR / "trade_blotter_summary.json"
 FEATURE_LOG_CSV = STATE_DIR / "feature_history.csv"
+EQUITY_LOG_CSV = STATE_DIR / "equity_history.csv"
 
 try:
     from market_ai.modules.strategies.monthly_strangle_with_weekly_hedge import BLOTTER_FIELDS as STRAT_BLOTTER_FIELDS  # type: ignore
@@ -252,6 +253,45 @@ def _load_feature_history(limit: int = 200) -> Optional[pd.DataFrame]:
     return df.reset_index(drop=True)
 
 
+def _load_equity_history(limit: Optional[int] = None) -> Optional[pd.DataFrame]:
+    if not EQUITY_LOG_CSV.exists():
+        return None
+    try:
+        df = pd.read_csv(EQUITY_LOG_CSV)
+    except Exception:
+        return None
+    if df.empty or "timestamp" not in df.columns:
+        return None
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+    numeric_cols = [
+        "available",
+        "collateral",
+        "utilized",
+        "withdrawable",
+        "gross_exposure",
+        "net_exposure",
+        "unrealized",
+        "realized",
+        "equity_estimate",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "equity_estimate" not in df.columns:
+        df["equity_estimate"] = np.nan
+    zero_series = pd.Series(0.0, index=df.index)
+    available = df["available"] if "available" in df.columns else zero_series
+    collateral = df["collateral"] if "collateral" in df.columns else zero_series
+    utilized = df["utilized"] if "utilized" in df.columns else zero_series
+    fallback_equity = (available.fillna(0.0) + collateral.fillna(0.0) + utilized.fillna(0.0))
+    df["equity_estimate"] = df["equity_estimate"].fillna(fallback_equity)
+    df = df.sort_values("timestamp")
+    if limit and len(df.index) > limit:
+        df = df.tail(limit)
+    return df.reset_index(drop=True)
+
+
 def _parse_context_blob(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -290,6 +330,18 @@ def _fmt_optional(val: Any, digits: Optional[int] = 2, placeholder: str = "—")
         return str(val)
 
 
+def _fmt_rupee(val: Optional[float], digits: int = 0) -> str:
+    if val is None:
+        return "—"
+    try:
+        value = float(val)
+    except Exception:
+        return "—"
+    if np.isnan(value):
+        return "—"
+    return f"₹ {value:,.{digits}f}"
+
+
 def _format_context_summary(ctx: Dict[str, Any], limit: int = 6) -> str:
     if not ctx:
         return ""
@@ -309,6 +361,26 @@ def _format_context_summary(ctx: Dict[str, Any], limit: int = 6) -> str:
         if len(items) >= limit:
             break
     return ", ".join(items)
+
+
+def _compute_equity_change(df: pd.DataFrame, days: float) -> Optional[Tuple[float, Optional[float]]]:
+    if df is None or df.empty:
+        return None
+    if "timestamp" not in df.columns or "equity_estimate" not in df.columns:
+        return None
+    if df["timestamp"].empty:
+        return None
+    window_start = df["timestamp"].iloc[-1] - pd.Timedelta(days=days)
+    window = df.loc[df["timestamp"] >= window_start]
+    if window.empty:
+        return None
+    start_val = float(window["equity_estimate"].iloc[0])
+    end_val = float(window["equity_estimate"].iloc[-1])
+    if np.isnan(start_val) or np.isnan(end_val) or start_val == 0:
+        return None
+    delta = end_val - start_val
+    pct = (delta / start_val) * 100 if start_val else None
+    return delta, pct
 
 def _fmt_size(num: Optional[int]) -> str:
     if num is None:
@@ -1389,6 +1461,108 @@ def _strategy_monitor_tab() -> None:
         _render_plan_snapshot(feature_df)
 
 
+def _render_capital_telemetry() -> None:
+    st.markdown("#### Capital Telemetry")
+    df = _load_equity_history(limit=1500)
+    if df is None or df.empty or "equity_estimate" not in df.columns:
+        st.info("No equity telemetry yet. Keep the agent running to build history.")
+        return
+    df = df.dropna(subset=["equity_estimate"])
+    if df.empty:
+        st.info("No equity telemetry yet. Keep the agent running to build history.")
+        return
+    equity_series = df["equity_estimate"].astype(float)
+    current_equity = float(equity_series.iloc[-1])
+    previous = float(equity_series.iloc[-2]) if len(equity_series) > 1 else None
+    delta_label = None
+    if previous is not None and previous != 0 and not np.isnan(previous):
+        delta_val = current_equity - previous
+        pct = (delta_val / previous) * 100 if previous else None
+        delta_label = f"{delta_val:+,.0f}"
+        if pct is not None and not np.isnan(pct):
+            delta_label = f"{delta_val:+,.0f} ({pct:+.2f}%)"
+
+    rolling_max = equity_series.cummax().replace(0, np.nan)
+    drawdown_series = (equity_series / rolling_max) - 1.0
+    max_drawdown_pct = float(drawdown_series.min()) * 100 if not drawdown_series.empty else None
+    current_drawdown_pct = float(drawdown_series.iloc[-1]) * 100 if not drawdown_series.empty else None
+
+    header_cols = st.columns(3)
+    header_cols[0].metric("Current Equity", _fmt_rupee(current_equity, digits=0), delta=delta_label)
+    header_cols[1].metric(
+        "Max Drawdown",
+        f"{max_drawdown_pct:.2f}%" if max_drawdown_pct is not None and not np.isnan(max_drawdown_pct) else "—",
+    )
+    header_cols[2].metric(
+        "Current Drawdown",
+        f"{current_drawdown_pct:.2f}%" if current_drawdown_pct is not None and not np.isnan(current_drawdown_pct) else "—",
+    )
+
+    timeframe_cols = st.columns(4)
+    frames = [("Day Δ", 1), ("Week Δ", 7), ("Month Δ", 30), ("Year Δ", 365)]
+    for col, (label, days) in zip(timeframe_cols, frames):
+        change = _compute_equity_change(df, days)
+        if not change:
+            col.metric(label, "—", delta=None)
+            continue
+        delta_val, delta_pct = change
+        col.metric(
+            label,
+            _fmt_rupee(delta_val, digits=0),
+            delta=f"{delta_pct:+.2f}%" if delta_pct is not None else None,
+        )
+
+    chart_df = df.tail(720).copy()
+    rolling_max_chart = chart_df["equity_estimate"].cummax().replace(0, np.nan)
+    chart_df["drawdown_pct"] = ((chart_df["equity_estimate"] / rolling_max_chart) - 1.0) * 100
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=chart_df["timestamp"],
+            y=chart_df["equity_estimate"],
+            name="Equity",
+            mode="lines",
+            line=dict(width=2, color="#1f77b4"),
+            hovertemplate="Time %{x|%Y-%m-%d %H:%M}<br>Equity ₹%{y:,.0f}<extra></extra>",
+        )
+    )
+    if chart_df["drawdown_pct"].notna().any():
+        fig.add_trace(
+            go.Scatter(
+                x=chart_df["timestamp"],
+                y=chart_df["drawdown_pct"],
+                name="Drawdown %",
+                mode="lines",
+                line=dict(width=1.5, color="#d62728", dash="dot"),
+                fill="tozeroy",
+                opacity=0.35,
+                yaxis="y2",
+                hovertemplate="Time %{x|%Y-%m-%d %H:%M}<br>Drawdown %{y:.2f}%<extra></extra>",
+            )
+        )
+        fig.update_layout(
+            yaxis=dict(title="Equity (₹)", rangemode="tozero"),
+            yaxis2=dict(
+                title="Drawdown %",
+                overlaying="y",
+                side="right",
+                showgrid=False,
+                rangemode="tozero",
+            ),
+        )
+    else:
+        fig.update_layout(yaxis=dict(title="Equity (₹)", rangemode="tozero"))
+
+    fig.update_layout(
+        xaxis=dict(title="Timestamp"),
+        margin=dict(l=10, r=10, t=35, b=35),
+        height=320,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
 def _observability_tab() -> None:
     st.markdown("### Observability")
     ss = st.session_state
@@ -1458,6 +1632,7 @@ def _observability_tab() -> None:
         ("Agent Log", _collect_file_info(AGENT_LOG)),
         ("Trade Blotter", _collect_file_info(BLOTTER_CSV)),
         ("Feature Feed", _collect_file_info(FEATURE_LOG_CSV)),
+        ("Equity Telemetry", _collect_file_info(EQUITY_LOG_CSV)),
         ("PID File", _collect_file_info(PID_FILE)),
     ]
     info_cols = st.columns(len(file_infos))
@@ -1468,6 +1643,8 @@ def _observability_tab() -> None:
             st.write(f"Size: {_fmt_size(info.get('size'))}")
             st.write(f"Updated: {_age_string(info.get('updated'))}")
 
+    st.divider()
+    _render_capital_telemetry()
     st.divider()
     tail_lines = _read_tail(AGENT_LOG, 30)
     if tail_lines:
