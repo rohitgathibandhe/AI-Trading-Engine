@@ -229,6 +229,47 @@ def _record_feature(cfg: "LiveConfig", row: Dict[str, Any]) -> None:
     )
 
 
+def _record_activity_event(
+    cfg: "LiveConfig",
+    label: str,
+    message: str,
+    *,
+    severity: str = "info",
+    context: Optional[Dict[str, Any]] = None,
+    spot: Optional[float] = None,
+) -> None:
+    feature_path = getattr(cfg, "feature_log_path", None)
+    if not feature_path:
+        return
+    ctx = {
+        "label": label,
+        "message": message,
+        "severity": severity,
+    }
+    if context:
+        ctx.update(context)
+    row = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "strategy": "risk_event",
+        "expiry": "",
+        "exchange_seg": cfg.trade_mode,
+        "spot": spot,
+        "ce_strike": None,
+        "pe_strike": None,
+        "ce_ltp": None,
+        "pe_ltp": None,
+        "ce_delta": None,
+        "pe_delta": None,
+        "ce_entry": None,
+        "pe_entry": None,
+        "net_credit": None,
+        "warn_only": int(bool(getattr(cfg, "warn_only", False))),
+        "trade_mode": cfg.trade_mode,
+        "context": json.dumps(ctx, default=str),
+    }
+    _append_csv_row(feature_path, FEATURE_FIELDS, row, max_bytes=_FEATURE_ROTATE_MAX_BYTES)
+
+
 def _record_equity_snapshot(cfg: "LiveConfig", dw, positions: List[Dict[str, Any]]) -> None:
     path = getattr(cfg, "equity_log_path", None)
     if not path:
@@ -1394,7 +1435,7 @@ def _place_option_order(
         raise
 
 
-def _close_leg(dw, cfg: LiveConfig, row: Dict[str, Any]) -> None:
+def _close_leg(dw, cfg: LiveConfig, row: Dict[str, Any], *, reason: Optional[str] = None) -> None:
     seg = row.get("exchangeSegment") or row.get("segment") or NIFTY_FNO_SEG
     qty = int(abs(float(row.get("netQty") or row.get("qty") or 0)))
     if qty <= 0:
@@ -1428,6 +1469,20 @@ def _close_leg(dw, cfg: LiveConfig, row: Dict[str, Any]) -> None:
     )
     if not placed:
         LOG.debug("[live] close leg suppressed (warn_only=%s)", cfg.warn_only)
+    severity = "warning" if reason == "STOP_LOSS" else "info"
+    message = f"{reason or 'Exit'} {context.get('symbol')} qty={qty}"
+    _record_activity_event(
+        cfg,
+        "leg_exit",
+        message,
+        severity=severity,
+        context={
+            "reason": reason or "EXIT",
+            "side": side,
+            "qty": qty,
+            "strike": context.get("strike"),
+        },
+    )
 
 
 def _roll_short_leg(
@@ -1469,6 +1524,19 @@ def _roll_short_leg(
             new_row.get("strike"),
             qty,
         )
+        _record_activity_event(
+            cfg,
+            "roll_execute",
+            f"{opt_type} rolled to {new_row.get('strike')}",
+            severity="warning",
+            context={
+                "leg": opt_type,
+                "reason": reason,
+                "prev_strike": prev_strike,
+                "new_strike": new_row.get("strike"),
+                "qty": qty,
+            },
+        )
     except Exception as exc:
         LOG.warning("[live] roll order failed for %s: %s", opt_type, exc)
 
@@ -1498,9 +1566,9 @@ def _needs_exit(row: Dict[str, Any], sl_pct: float, tp_pct: float) -> Optional[s
         return None
     pnl = _pnl_from_positions_row(row)
     if pnl >= tp_pct * deployed:
-        return "EXIT"
+        return "TAKE_PROFIT"
     if pnl <= -sl_pct * deployed:
-        return "EXIT"
+        return "STOP_LOSS"
     return None
 
 
@@ -1753,6 +1821,13 @@ def _ensure_batman_hedges(
                     "CALL",
                     context={"tag": "batman_hedge_call", "action": "HEDGE"},
                 )
+                _record_activity_event(
+                    cfg,
+                    "hedge_add",
+                    f"Added CALL hedge {row_dict.get('strike')}",
+                    severity="info",
+                    context={"structure": "batman", "leg": "CALL", "qty": qty_needed},
+                )
 
     if short_put_qty > long_put_qty:
         subset = chain_df.loc[chain_df["strike"] < structure.short_put_strike].copy()
@@ -1775,6 +1850,13 @@ def _ensure_batman_hedges(
                     row_dict,
                     "PUT",
                     context={"tag": "batman_hedge_put", "action": "HEDGE"},
+                )
+                _record_activity_event(
+                    cfg,
+                    "hedge_add",
+                    f"Added PUT hedge {row_dict.get('strike')}",
+                    severity="info",
+                    context={"structure": "batman", "leg": "PUT", "qty": qty_needed},
                 )
 
 
@@ -1984,6 +2066,13 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
                 price=hedge_price,
                 context={"tag": "hedge_put", "action": "HEDGE", "strike": hedge[1]},
             )
+            _record_activity_event(
+                cfg,
+                "hedge_add",
+                f"Added PUT hedge {hedge[1]}",
+                severity="info",
+                context={"structure": "strangle", "leg": "PUT", "qty": qty},
+            )
         hedge = _find_fno_option_by_price(oc_dict, cfg.hedge_price_min, cfg.hedge_price_max, "CALL", above_spot=True)
         if hedge:
             hedge_price = None
@@ -2001,6 +2090,13 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
                 price=hedge_price,
                 context={"tag": "hedge_call", "action": "HEDGE", "strike": hedge[1]},
             )
+            _record_activity_event(
+                cfg,
+                "hedge_add",
+                f"Added CALL hedge {hedge[1]}",
+                severity="info",
+                context={"structure": "strangle", "leg": "CALL", "qty": qty},
+            )
 
 
 def monitor_and_manage_positions(
@@ -2012,8 +2108,15 @@ def monitor_and_manage_positions(
     for row in positions:
         try:
             decision = _needs_exit(row, cfg.sl_pct, cfg.tp_pct)
-            if decision == "EXIT":
-                _close_leg(dw, cfg, row)
+            if decision:
+                _record_activity_event(
+                    cfg,
+                    "exit_signal",
+                    f"{decision} triggered for {row.get('tradingSymbol') or row.get('symbol')}",
+                    severity="warning" if decision == "STOP_LOSS" else "info",
+                    context={"reason": decision},
+                )
+                _close_leg(dw, cfg, row, reason=decision)
         except Exception:
             LOG.exception("[live] exit check failed for %s", row.get("symbol"))
 
@@ -2094,6 +2197,19 @@ def monitor_and_manage_positions(
             ce_roll_reason = "delta_breach"
 
         if ce_roll_needed and ce_strike is not None:
+            _record_activity_event(
+                cfg,
+                "roll_trigger",
+                f"CALL {ce_strike:.0f} {ce_roll_reason.replace('_', ' ')}",
+                severity="warning",
+                context={
+                    "leg": "CALL",
+                    "reason": ce_roll_reason,
+                    "ltp": ce_ltp,
+                    "entry": ce_entry,
+                    "delta": ce_delta,
+                },
+            )
             target = ce_strike + roll_step
             replacement = _select_replacement(monthly_chain, target, "CALL", "UP")
             if replacement:
@@ -2117,6 +2233,19 @@ def monitor_and_manage_positions(
             pe_roll_reason = "delta_breach"
 
         if pe_roll_needed and pe_strike is not None:
+            _record_activity_event(
+                cfg,
+                "roll_trigger",
+                f"PUT {pe_strike:.0f} {pe_roll_reason.replace('_', ' ')}",
+                severity="warning",
+                context={
+                    "leg": "PUT",
+                    "reason": pe_roll_reason,
+                    "ltp": pe_ltp,
+                    "entry": pe_entry,
+                    "delta": pe_delta,
+                },
+            )
             target = pe_strike - roll_step
             replacement = _select_replacement(monthly_chain, target, "PUT", "DOWN")
             if replacement:

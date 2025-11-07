@@ -382,6 +382,59 @@ def _compute_equity_change(df: pd.DataFrame, days: float) -> Optional[Tuple[floa
     pct = (delta / start_val) * 100 if start_val else None
     return delta, pct
 
+
+def _recent_risk_events(feature_df: Optional[pd.DataFrame], limit: int = 5) -> List[Dict[str, Any]]:
+    if feature_df is None or feature_df.empty or "strategy" not in feature_df.columns:
+        return []
+    risk_rows = feature_df.loc[feature_df["strategy"] == "risk_event"].copy()
+    if risk_rows.empty:
+        return []
+    if "timestamp" in risk_rows.columns:
+        risk_rows = risk_rows.dropna(subset=["timestamp"]).sort_values("timestamp")
+    risk_rows = risk_rows.tail(limit)
+    events: List[Dict[str, Any]] = []
+    for _, row in risk_rows.iterrows():
+        ctx = _parse_context_blob(row.get("context"))
+        events.append(
+            {
+                "timestamp": row.get("timestamp"),
+                "label": ctx.get("label", "Risk Event"),
+                "severity": ctx.get("severity", "info"),
+                "message": ctx.get("message", ""),
+                "details": {
+                    k: v for k, v in ctx.items() if k not in {"label", "message", "severity"} and v not in (None, "")
+                },
+            }
+        )
+    return list(reversed(events))
+
+
+def _render_risk_alerts(feature_df: Optional[pd.DataFrame]) -> None:
+    events = _recent_risk_events(feature_df, limit=5)
+    st.caption("Recent Risk Alerts")
+    if not events:
+        st.write("None")
+        return
+    severity_colors = {
+        "INFO": "#2563eb",
+        "WARNING": "#b45309",
+        "ERROR": "#b91c1c",
+    }
+    for ev in events:
+        severity = str(ev["severity"]).upper()
+        color = severity_colors.get(severity, "#374151")
+        ts = ev.get("timestamp")
+        header = f"{_fmt_optional(ts)} · {ev.get('label', 'Risk Event')} ({severity})"
+        lines = [ev.get("message") or "—"]
+        details = ev.get("details") or {}
+        if details:
+            detail_text = ", ".join(f"{k}={v}" for k, v in details.items())
+            lines.append(detail_text)
+        st.markdown(
+            f"<div style='border-left:4px solid {color}; padding-left:8px; margin-bottom:6px;'>"
+            f"<strong>{header}</strong><br>{'<br>'.join(lines)}</div>",
+            unsafe_allow_html=True,
+        )
 def _fmt_size(num: Optional[int]) -> str:
     if num is None:
         return "—"
@@ -1341,6 +1394,23 @@ def _render_agent_activity(feature_df: Optional[pd.DataFrame]) -> None:
             st.markdown(f"**{ts_text}** · Market Environment\n\n- " + " | ".join(bullet))
             continue
 
+        if raw_strategy == "risk_event":
+            ctx = _parse_context_blob(row.get("context"))
+            label = str(ctx.get("label", "Risk Event")).title()
+            severity = str(ctx.get("severity", "info")).upper()
+            message = ctx.get("message") or ""
+            extras = [
+                f"{k}={v}"
+                for k, v in ctx.items()
+                if k not in {"label", "message", "severity"} and v not in (None, "", [], {})
+            ]
+            extra_text = (" | ".join(extras)) if extras else ""
+            lines = [message or "—"]
+            if extra_text:
+                lines.append(extra_text)
+            st.markdown(f"**{ts_text}** · {label} ({severity})\n\n" + "\n".join(f"- {line}" for line in lines))
+            continue
+
         details = []
         spot_val = row.get("spot")
         if not _is_missing(spot_val):
@@ -1566,6 +1636,7 @@ def _render_capital_telemetry() -> None:
 def _observability_tab() -> None:
     st.markdown("### Observability")
     ss = st.session_state
+    feature_df = _load_feature_history(limit=400)
 
     pid = ss.get("agent_pid")
     running_flag = bool(ss.get("agent_running"))
@@ -1602,6 +1673,8 @@ def _observability_tab() -> None:
     with cols[2]:
         st.metric("Credentials", "Verified" if ss.get("creds_verified") else "Missing")
 
+    st.divider()
+    _render_risk_alerts(feature_df)
     st.divider()
     action_cols = st.columns([1, 1, 1])
     with action_cols[0]:

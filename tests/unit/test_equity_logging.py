@@ -1,4 +1,5 @@
 import csv
+import json
 from pathlib import Path
 
 import pytest
@@ -6,6 +7,7 @@ import pytest
 from market_ai.modules.strategies.monthly_strangle_with_weekly_hedge import (
     LiveConfig,
     _record_equity_snapshot,
+    _record_activity_event,
 )
 
 pytestmark = pytest.mark.unit
@@ -48,3 +50,27 @@ def test_record_equity_snapshot_accumulates_exposures(tmp_path: Path) -> None:
     assert gross == pytest.approx(expected_gross)
     assert float(row["unrealized"]) == pytest.approx(200.0)
     assert float(row["realized"]) == pytest.approx(150.0)
+
+
+def test_record_activity_event_writes_feature_row(tmp_path: Path) -> None:
+    cfg = LiveConfig()
+    cfg.feature_log_path = str(tmp_path / "feature.csv")
+
+    _record_activity_event(
+        cfg,
+        "test_alert",
+        "Something happened",
+        severity="warning",
+        context={"foo": "bar"},
+    )
+
+    with open(cfg.feature_log_path, newline="") as fh:
+        rows = list(csv.DictReader(fh))
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["strategy"] == "risk_event"
+    ctx = json.loads(row["context"])
+    assert ctx["label"] == "test_alert"
+    assert ctx["message"] == "Something happened"
+    assert ctx["severity"] == "warning"
