@@ -17,6 +17,7 @@ from market_ai.modules.data_fetch.option_chain_ingestor import OptionChainIngest
 from market_ai.modules.data_fetch.dhan_scrip_cache import resolve_option_security_id
 from market_ai.modules.analytics import summarize_market_state
 from market_ai.modules.agents.strategy_recommender import serialize_recommendations
+from market_ai.modules.risk_manager import RiskLimits, RiskManager
 
 if TYPE_CHECKING:
     from market_ai.modules.analytics import MarketRegimeAnalyzer, MarketState
@@ -270,6 +271,24 @@ def _record_activity_event(
     _append_csv_row(feature_path, FEATURE_FIELDS, row, max_bytes=_FEATURE_ROTATE_MAX_BYTES)
 
 
+def _get_risk_manager(cfg: "LiveConfig") -> Optional[RiskManager]:
+    risk_mgr = getattr(cfg, "_risk_manager", None)
+    if risk_mgr:
+        return risk_mgr
+    limits = RiskLimits(
+        max_daily_loss=float(getattr(cfg, "risk_max_daily_loss", 75000.0)),
+        per_leg_sl_mult=float(getattr(cfg, "risk_per_leg_sl_mult", 2.0)),
+        max_rolls_per_day=int(getattr(cfg, "risk_max_rolls_per_day", 6)),
+        equity=float(getattr(cfg, "risk_account_equity", 500000.0)),
+        max_exposure_pct=float(getattr(cfg, "risk_max_exposure_pct", 0.05)),
+        overall_sl_pct=float(getattr(cfg, "risk_overall_sl_pct", 2.5)),
+        max_portfolio_delta=float(getattr(cfg, "risk_max_portfolio_delta", 0.25)),
+    )
+    risk_mgr = RiskManager(limits)
+    cfg._risk_manager = risk_mgr
+    return risk_mgr
+
+
 def _record_equity_snapshot(cfg: "LiveConfig", dw, positions: List[Dict[str, Any]]) -> None:
     path = getattr(cfg, "equity_log_path", None)
     if not path:
@@ -318,6 +337,15 @@ def _record_equity_snapshot(cfg: "LiveConfig", dw, positions: List[Dict[str, Any
         "equity_estimate": equity_estimate or withdrawable or available,
     }
     _append_csv_row(path, EQUITY_FIELDS, row, max_bytes=_FEATURE_ROTATE_MAX_BYTES)
+
+
+def _aggregate_position_stats(rows: List[Dict[str, Any]]) -> Tuple[float, float]:
+    total_pnl = 0.0
+    deployed = 0.0
+    for row in rows or []:
+        total_pnl += _safe_float(row.get("pnl"), 0.0) or 0.0
+        deployed += _deployed_amount(row)
+    return total_pnl, deployed
 
 
 def _record_environment_snapshot(
@@ -1222,9 +1250,18 @@ class LiveConfig:
     enable_strangle_entry: bool = True
     regime_refresh_minutes: float = 5.0
     auto_disable_strangle_when_unfavored: bool = True
+    risk_max_daily_loss: float = 75000.0
+    risk_max_exposure_pct: float = 0.05
+    risk_account_equity: float = 500000.0
+    risk_max_rolls_per_day: int = 6
+    risk_overall_sl_pct: float = 2.5
+    risk_max_portfolio_delta: float = 0.25
+    risk_per_leg_sl_mult: float = 2.0
     last_spot: Optional[float] = field(default=None, repr=False, compare=False)
     _last_spot_warn_at: Optional[datetime] = field(default=None, repr=False, compare=False)
     _last_equity_logged_at: Optional[datetime] = field(default=None, repr=False, compare=False)
+    _risk_manager: Optional[RiskManager] = field(default=None, repr=False, compare=False)
+    _auto_blocked_by_risk: bool = field(default=False, repr=False, compare=False)
 
 
 
@@ -1537,6 +1574,9 @@ def _roll_short_leg(
                 "qty": qty,
             },
         )
+        risk_mgr = _get_risk_manager(cfg)
+        if risk_mgr:
+            risk_mgr.on_roll()
     except Exception as exc:
         LOG.warning("[live] roll order failed for %s: %s", opt_type, exc)
 
@@ -1948,6 +1988,7 @@ def monitor_batman_positions(
         _record_feature(cfg, feature_row)
 
 def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
+    risk_mgr = _get_risk_manager(cfg)
     try:
         picker = globals().get("pick_atm_strangle") or _pick_strangle_strikes_simple
         pe_strike, ce_strike = picker(nifty_spot)
@@ -2023,6 +2064,30 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
 
     pe_id, pe_price = pe_info
     ce_id, ce_price = ce_info
+    entry_credit = cfg.lot_size * ((pe_price or 0.0) + (ce_price or 0.0))
+    notional = cfg.lot_size * nifty_spot * 2.0
+    if risk_mgr:
+        if not risk_mgr.allow_trade():
+            reason = getattr(risk_mgr, "last_block_reason", None) or "risk_block"
+            cfg.enable_strangle_entry = False
+            cfg._auto_blocked_by_risk = True
+            _record_activity_event(
+                cfg,
+                "risk_block",
+                f"Entry blocked ({reason})",
+                severity="error",
+                context={"reason": reason},
+            )
+            return
+        if not risk_mgr.can_allocate(notional):
+            _record_activity_event(
+                cfg,
+                "risk_block",
+                "Entry blocked (exposure cap)",
+                severity="warning",
+                context={"notional": notional, "equity": getattr(risk_mgr.l, 'equity', None)},
+            )
+            return
 
     qty = cfg.lot_size
     _submit_order(
@@ -2097,6 +2162,13 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
                 severity="info",
                 context={"structure": "strangle", "leg": "CALL", "qty": qty},
             )
+    _record_activity_event(
+        cfg,
+        "entry",
+        f"Opened strangle CE {ce_strike} / PE {pe_strike}",
+        severity="info",
+        context={"credit": entry_credit, "spot": nifty_spot},
+    )
 
 
 def monitor_and_manage_positions(
@@ -2456,6 +2528,7 @@ def run_live(
         refresh_iters = max(1, int(interval_seconds / max(float(getattr(cfg, "poll_sec", 5.0)), 1.0)))
 
     loop_iter = 0
+    risk_mgr = _get_risk_manager(cfg)
 
     while True:
         try:
@@ -2468,6 +2541,21 @@ def run_live(
                 and (r.get("exchangeSegment") or "").upper().startswith("NSE_FNO")
                 and int(float(r.get("netQty") or 0)) != 0
             ]
+
+            if risk_mgr is None:
+                risk_mgr = _get_risk_manager(cfg)
+            if risk_mgr:
+                total_pnl, deployed_cap = _aggregate_position_stats(rows)
+                risk_mgr.on_mtm(total_pnl)
+                if cfg._auto_blocked_by_risk and risk_mgr.allow_trade():
+                    cfg.enable_strangle_entry = True
+                    cfg._auto_blocked_by_risk = False
+                    _record_activity_event(
+                        cfg,
+                        "risk_reset",
+                        "Risk gate cleared; entries re-enabled",
+                        severity="info",
+                    )
 
             equity_interval_min = max(0.0, float(getattr(cfg, "equity_snapshot_minutes", 0.0) or 0.0))
             last_equity_at = getattr(cfg, "_last_equity_logged_at", None)

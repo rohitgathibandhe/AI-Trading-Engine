@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Optional
 
 LOG = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ class RiskManager:
         self.l = limits
         self.roll_count = 0
         self.day_pnl = 0.0
+        self.last_block_reason: Optional[str] = None
 
     def on_roll(self):
         self.roll_count += 1
@@ -30,13 +32,17 @@ class RiskManager:
         self.day_pnl = day_pnl
 
     def allow_trade(self) -> bool:
+        self.last_block_reason = None
         if self.l.hard_kill:
+            self.last_block_reason = "hard_kill"
             LOG.warning("Hard kill active; trading blocked.")
             return False
         if self.day_pnl <= -abs(self.l.max_daily_loss):
+            self.last_block_reason = "daily_loss"
             LOG.warning("Max daily loss breached; trading blocked.")
             return False
         if self.roll_count >= self.l.max_rolls_per_day:
+            self.last_block_reason = "max_rolls"
             LOG.warning("Max rolls per day reached; trading blocked.")
             return False
         return True

@@ -416,6 +416,13 @@ def main() -> None:
             getattr(LiveConfig, "equity_snapshot_minutes", 10.0),
             _as_float,
         ),
+        risk_max_daily_loss=pick("RISK_MAX_DAILY_LOSS", "risk_max_daily_loss", getattr(LiveConfig, "risk_max_daily_loss", 75000.0), _as_float),
+        risk_max_exposure_pct=pick("RISK_MAX_EXPOSURE_PCT", "risk_max_exposure_pct", getattr(LiveConfig, "risk_max_exposure_pct", 0.05), _as_float),
+        risk_account_equity=pick("RISK_ACCOUNT_EQUITY", "risk_account_equity", getattr(LiveConfig, "risk_account_equity", 500000.0), _as_float),
+        risk_max_rolls_per_day=pick("RISK_MAX_ROLLS_PER_DAY", "risk_max_rolls_per_day", getattr(LiveConfig, "risk_max_rolls_per_day", 6), _as_int),
+        risk_overall_sl_pct=pick("RISK_OVERALL_SL_PCT", "risk_overall_sl_pct", getattr(LiveConfig, "risk_overall_sl_pct", 2.5), _as_float),
+        risk_max_portfolio_delta=pick("RISK_MAX_PORTFOLIO_DELTA", "risk_max_portfolio_delta", getattr(LiveConfig, "risk_max_portfolio_delta", 0.25), _as_float),
+        risk_per_leg_sl_mult=pick("RISK_PER_LEG_SL_MULT", "risk_per_leg_sl_mult", getattr(LiveConfig, "risk_per_leg_sl_mult", 2.0), _as_float),
     )
     cfg.regime_refresh_minutes = pick("REGIME_REFRESH_MINUTES", "regime_refresh_minutes", cfg.regime_refresh_minutes, _as_float)
     cfg.auto_disable_strangle_when_unfavored = pick_bool(

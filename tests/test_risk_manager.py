@@ -9,6 +9,7 @@ def test_allow_trade_blocks_on_daily_loss():
     rm = RiskManager(RiskLimits(max_daily_loss=1000.0, per_leg_sl_mult=2.0, max_rolls_per_day=3))
     rm.on_mtm(-1500.0)
     assert rm.allow_trade() is False
+    assert rm.last_block_reason == "daily_loss"
 
 
 def test_per_leg_stop_hit_triggers_when_threshold_crossed():
@@ -34,9 +35,11 @@ def test_daily_drawdown_flat_and_lock():
     rm = RiskManager(RiskLimits(max_daily_loss=2000.0, per_leg_sl_mult=2.0, max_rolls_per_day=5))
     rm.on_mtm(-2500.0)
     assert rm.allow_trade() is False  # breach triggers lock
+    assert rm.last_block_reason == "daily_loss"
     rm.on_mtm(0.0)
     rm.l.hard_kill = True  # manual flat-and-lock
     assert rm.allow_trade() is False
+    assert rm.last_block_reason == "hard_kill"
 
 
 def test_portfolio_stop_and_delta_guard():
