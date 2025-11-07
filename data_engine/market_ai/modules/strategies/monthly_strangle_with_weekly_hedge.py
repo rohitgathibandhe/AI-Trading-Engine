@@ -14,6 +14,7 @@ import pandas as pd
 from pathlib import Path
 
 from market_ai.modules.data_fetch.option_chain_ingestor import OptionChainIngestor, ChainConfig
+from market_ai.modules.data_fetch.dhan_scrip_cache import resolve_option_security_id
 from market_ai.modules.analytics import summarize_market_state
 from market_ai.modules.agents.strategy_recommender import serialize_recommendations
 
@@ -921,6 +922,7 @@ def run_strategy(df: pd.DataFrame, cfg: Dict[str, Any], market: Optional[Any] = 
 # ===== Enhanced live orchestration layer =====
 NIFTY_SEG = "IDX_I"
 NIFTY_SCRIP = 13
+NIFTY_SYMBOL = "NIFTY"
 NIFTY_FNO_SEG = "NSE_FNO"
 
 
@@ -1688,37 +1690,60 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
     oc_dict = _coerce_dict(oc_raw) or {}
     data = _coerce_dict(oc_dict.get("data")) or oc_dict
 
+    chain_sources: List[Dict[str, Any]] = []
+
+    def _push_source(node: Any) -> None:
+        if isinstance(node, dict):
+            chain_sources.append(node)
+
+    _push_source(data)
+    if isinstance(data, dict):
+        inner = _coerce_dict(data.get("data"))
+        _push_source(inner)
+        if isinstance(inner, dict):
+            _push_source(inner.get("oc"))
+        _push_source(data.get("oc"))
+    if not chain_sources:
+        chain_sources.append(data if isinstance(data, dict) else {})
+
     def _find_by_strike(strike: int, typ: str) -> Optional[Tuple[int, Optional[float]]]:
         key_candidates = [str(int(strike)), str(float(strike)), int(strike)]
-        for raw_key in key_candidates:
-            key = str(raw_key)
-            direct = data.get(key)
-            if isinstance(direct, dict):
+        for source in chain_sources:
+            if not isinstance(source, dict):
+                continue
+            for raw_key in key_candidates:
+                key = str(raw_key)
+                direct = source.get(key)
+                if not isinstance(direct, dict):
+                    continue
                 leg_key = "ce" if typ == "CALL" else "pe"
                 leg_dict = _coerce_dict(direct.get(leg_key)) or {}
-                if leg_dict:
-                    sec_id = _extract_security_id(leg_dict) or _extract_security_id(direct)
-                    if sec_id is None:
-                        sec_candidate = _safe_float(
-                            leg_dict.get("securityId")
-                            or direct.get("securityId")
-                            or direct.get("id"),
-                            None,
-                        )
-                        if sec_candidate:
-                            try:
-                                sec_id = int(sec_candidate)
-                            except Exception:
-                                sec_id = None
-                    if sec_id is not None:
-                        price_val = None
-                        for price_key in ("last_price", "LTP", "ltp", "price", "lastPrice"):
-                            if leg_dict.get(price_key) is not None:
-                                price_val = _safe_float(leg_dict.get(price_key), None)
-                                break
-                        return sec_id, price_val
+                if not leg_dict:
+                    continue
+                sec_id = _extract_security_id(leg_dict) or _extract_security_id(direct)
+                if sec_id is None:
+                    sec_candidate = _safe_float(
+                        leg_dict.get("securityId")
+                        or direct.get("securityId")
+                        or direct.get("id"),
+                        None,
+                    )
+                    if sec_candidate:
+                        try:
+                            sec_id = int(sec_candidate)
+                        except Exception:
+                            sec_id = None
+                if sec_id is None:
+                    sec_id = resolve_option_security_id(NIFTY_SYMBOL, expiry, strike, typ)
+                price_val = None
+                for price_key in ("last_price", "LTP", "ltp", "price", "lastPrice"):
+                    if leg_dict.get(price_key) is not None:
+                        price_val = _safe_float(leg_dict.get(price_key), None)
+                        break
+                if sec_id is not None:
+                    return sec_id, price_val
 
-        series = _iter_option_rows(data)
+        series = _iter_option_rows(chain_sources)
         for row_dict in series:
             row_strike_val = row_dict.get("strike", row_dict.get("strikePrice"))
             row_strike = _safe_float(row_strike_val, None)
@@ -1745,8 +1770,13 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
                 )
                 sec_candidate = _safe_float(raw_sec, None)
                 if sec_candidate is None:
-                    continue
-                sec_id = int(sec_candidate)
+                    sec_id = resolve_option_security_id(NIFTY_SYMBOL, expiry, strike, typ)
+                else:
+                    sec_id = int(sec_candidate)
+            else:
+                sec_id = int(sec_id)
+            if sec_id is None:
+                continue
             price_val = None
             for key in ("last_price", "LTP", "ltp", "price", "lastPrice"):
                 if row_dict.get(key) is not None:
