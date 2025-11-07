@@ -659,29 +659,28 @@ def _positions_tab(dw) -> None:
         st.info("Save & verify credentials to view live positions.")
         return
 
-    # --- fetch raw positions (Dhan schema exactly as in your curl output) ---
     try:
-        resp = dw.http.get(dw.endpoints.positions)  # type: ignore[attr-defined]
+        rows = dw.get_positions_live_with_ltp()  # type: ignore[attr-defined]
     except Exception as e:
         st.error(f"Failed to fetch positions: {e}")
         return
 
-    if isinstance(resp, dict):
-        rows = resp.get("data") or resp.get("positions") or resp.get("netPositions") or []
-    elif isinstance(resp, list):
-        rows = resp
-    else:
-        st.error(f"Unexpected payload type: {type(resp).__name__}")
-        return
+    def _raw(r: Dict[str, Any]) -> Dict[str, Any]:
+        val = r.get("_raw")
+        return val if isinstance(val, dict) else {}
 
-    # ---- helpers over raw rows ----
+    # ---- helpers over normalized rows (with raw fallback) ----
     def S(r, k, default=""):
         v = r.get(k)
+        if v is None:
+            v = _raw(r).get(k)  # fallback
         return v if v is not None else default
 
     def F(r, k, default=0.0):
         try:
             v = r.get(k)
+            if v is None:
+                v = _raw(r).get(k)
             return float(v) if v is not None else float(default)
         except Exception:
             return float(default)
@@ -689,18 +688,24 @@ def _positions_tab(dw) -> None:
     def I(r, k, default=0):
         try:
             v = r.get(k)
+            if v is None:
+                v = _raw(r).get(k)
             return int(float(v)) if v is not None else int(default)
         except Exception:
             return int(default)
 
     def _pt(r: Dict[str, Any]) -> str:
-        return str(S(r, "positionType")).upper()
+        return str(r.get("position_type") or r.get("side") or S(r, "positionType")).upper()
 
     def _net_qty(r: Dict[str, Any]) -> int:
+        if r.get("qty") is not None:
+            return int(r.get("qty"))
         return I(r, "netQty", 0)
 
     def _security_id(r: Dict[str, Any]) -> Optional[int]:
-        raw = r.get("securityId") or r.get("security_id") or r.get("id")
+        raw = r.get("security_id") or r.get("securityId") or r.get("id")
+        if raw is None:
+            raw = _raw(r).get("securityId")
         try:
             return int(str(raw)) if raw is not None else None
         except Exception:
@@ -708,18 +713,17 @@ def _positions_tab(dw) -> None:
 
     # ================= OPEN POSITIONS (netQty != 0) =================
     open_src = [r for r in rows if _net_qty(r) != 0 and _pt(r) in ("LONG", "SHORT")]
+    ltp_map: Dict[tuple[str, int], Optional[float]] = {}
     ltp_pairs: List[tuple[str, int]] = []
     seen_pairs: set[tuple[str, int]] = set()
     for r in open_src:
-        seg = S(r, "exchangeSegment")
+        seg = r.get("exchange_seg") or S(r, "exchangeSegment")
         sid = _security_id(r)
-        if seg and sid is not None:
+        if isinstance(seg, str) and sid is not None:
             key = (seg, sid)
             if key not in seen_pairs:
-                ltp_pairs.append(key)
                 seen_pairs.add(key)
-
-    ltp_map: Dict[tuple[str, int], Optional[float]] = {}
+                ltp_pairs.append(key)
     if ltp_pairs:
         try:
             ltp_map = dw.get_ltp_bulk(ltp_pairs)  # type: ignore[attr-defined]
@@ -747,28 +751,42 @@ def _positions_tab(dw) -> None:
         total_unreal = 0.0
         for r in open_src:
             typ = _pt(r)
-            sym = S(r, "tradingSymbol")
-            prod = S(r, "productType")
-            cost_price = F(r, "costPrice", 0.0)
-            buy_avg = F(r, "buyAvg", 0.0)
-            sell_avg = F(r, "sellAvg", 0.0)
-            unreal = F(r, "unrealizedProfit", 0.0)
-            seg = S(r, "exchangeSegment")
+            sym = r.get("symbol") or S(r, "tradingSymbol")
+            prod = r.get("product") or S(r, "productType")
+            cost_price = F(r, "cost_price", F(r, "avg_price", 0.0))
+            buy_avg = r.get("buy_avg")
+            if buy_avg is None:
+                buy_avg = F(r, "buyAvg", None)
+            sell_avg = r.get("sell_avg")
+            if sell_avg is None:
+                sell_avg = F(r, "sellAvg", None)
+            unreal = r.get("unrealized_profit")
+            if unreal is None:
+                unreal = F(r, "unrealizedProfit", 0.0)
+            seg = r.get("exchange_seg") or S(r, "exchangeSegment")
             sid = _security_id(r)
             live_ltp = ltp_map.get((seg, sid)) if seg and sid is not None else None
-            # Per Dhan mapping:
-            # SHORT  -> Qty = sellQty,  Avg Price = sellAvg
-            # LONG   -> Qty = buyQty,   Avg Price = buyAvg
-            avg_disp = sell_avg if typ == "SHORT" else buy_avg
-            if live_ltp is not None:
-                ltp_val = float(live_ltp)
-            else:
-                fallback = r.get("ltp") or r.get("lastPrice") or r.get("last_price")
+            if live_ltp is None and seg and sid is not None:
                 try:
-                    ltp_val = float(fallback)
+                    live_single = dw.get_ltp_once(seg, sid)  # type: ignore[attr-defined]
+                    if live_single is not None:
+                        live_ltp = live_single
                 except Exception:
-                    ltp_val = cost_price
-            qty_val = I(r, "sellQty", abs(_net_qty(r))) if typ == "SHORT" else I(r, "buyQty", _net_qty(r))
+                    pass
+
+            avg_disp = sell_avg if typ == "SHORT" else buy_avg
+            if avg_disp is None:
+                avg_disp = cost_price
+            qty_val = abs(_net_qty(r))
+            if typ == "SHORT":
+                qty_val = I(r, "sellQty", qty_val)
+            else:
+                qty_val = I(r, "buyQty", qty_val)
+            qty_val = abs(int(qty_val or 0))
+
+            ltp_val = live_ltp if live_ltp is not None else r.get("ltp")
+            if ltp_val is None:
+                ltp_val = cost_price
 
             mapped_open.append({
                 "B/S": "S" if typ == "SHORT" else "B",

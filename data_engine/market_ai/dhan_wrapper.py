@@ -632,22 +632,24 @@ class DhanWrapper:
 
             if position_type == "LONG" or (isinstance(net_qty, int) and net_qty > 0):
                 qty_disp = buy_qty if buy_qty is not None else net_qty
-                ltp_val = buy_avg if buy_avg is not None else ltp_live if ltp_live is not None else cost_price
+                ltp_val = ltp_live if ltp_live is not None else raw.get("ltp") or raw.get("lastPrice") or buy_avg or cost_price
                 ltp_val = self._as_float(ltp_val) or self._as_float(cost_price)
+                avg_val = buy_avg if buy_avg is not None else cost_price
                 pnl_val = unrealized if unrealized is not None else r.get("pnl") or 0.0
                 r["qty"] = int(qty_disp or 0)
                 r["ltp"] = ltp_val
                 r["pnl"] = pnl_val
-                r["avg_price"] = cost_price
+                r["avg_price"] = avg_val
             elif position_type == "SHORT" or (isinstance(net_qty, int) and net_qty < 0):
                 qty_disp = -(sell_qty if sell_qty is not None else abs(net_qty))
-                ltp_val = sell_avg if sell_avg is not None else ltp_live if ltp_live is not None else cost_price
+                ltp_val = ltp_live if ltp_live is not None else raw.get("ltp") or raw.get("lastPrice") or sell_avg or cost_price
                 ltp_val = self._as_float(ltp_val) or self._as_float(cost_price)
+                avg_val = sell_avg if sell_avg is not None else cost_price
                 pnl_val = unrealized if unrealized is not None else r.get("pnl") or 0.0
                 r["qty"] = int(qty_disp or 0)
                 r["ltp"] = ltp_val
                 r["pnl"] = pnl_val
-                r["avg_price"] = cost_price
+                r["avg_price"] = avg_val
             else:
                 qty_disp = sell_qty or buy_qty or net_qty
                 ltp_val = ltp_live if ltp_live is not None else cost_price
