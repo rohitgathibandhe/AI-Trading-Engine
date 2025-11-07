@@ -10,6 +10,7 @@
 
 import logging
 import os
+import time
 from enum import Enum
 from json import dumps as json_dumps, loads as json_loads
 
@@ -77,9 +78,26 @@ class DhanHTTP:
                     self.max_retries,
                     self.timeout,
                 )
+            except req_exc.ConnectionError as e:
+                last_error = e
+                logging.warning(
+                    'Connection error in DhanHQConnection.%s (attempt %d/%d): %s',
+                    method.value.upper(),
+                    attempt,
+                    self.max_retries,
+                    e,
+                )
+                try:
+                    self.session.close()
+                except Exception:
+                    pass
+                self.session = requests.Session()
             except Exception as e:  # noqa: BLE001
                 last_error = e
                 break
+            if attempt < self.max_retries:
+                sleep_for = min(1.0 * attempt, 3.0)
+                time.sleep(sleep_for)
         if last_error:
             logging.error('Exception in DhanHQConnection.%s: %s', method.value.upper(), last_error)
         return {
