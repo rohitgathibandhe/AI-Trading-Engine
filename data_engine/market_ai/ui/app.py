@@ -21,6 +21,7 @@ import time
 import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta, time as datetime_time
+from typing import Iterable
 from typing import Optional, Dict, Any, Tuple, List
 from queue import Queue, Empty
 
@@ -653,13 +654,6 @@ def _render_entry_block_status() -> None:
             msg = status.get("message")
             if msg:
                 st.write(msg)
-    history = _load_playbook_history(limit=5)
-    if history:
-        st.caption("Recent Playbook Steps")
-        for entry in history:
-            meta = entry.get("meta") or {}
-            st.markdown(
-                f"- {_fmt_optional(entry.get('timestamp'))} · {entry.get('step')} – {meta}")
 def _fmt_size(num: Optional[int]) -> str:
     if num is None:
         return "—"
@@ -2015,6 +2009,112 @@ def _filter_df_by_range(df: Optional[pd.DataFrame], start: datetime, end: dateti
     return temp.loc[mask].reset_index(drop=True)
 
 
+ORDER_AUDIT_LOG = STATE_DIR / "order_audit.jsonl"
+ORDER_INTENT_QUEUE = STATE_DIR / "order_intents.jsonl"
+PLAYBOOK_STATUS_LOG = STATE_DIR / "playbook_status.jsonl"
+
+
+def _load_jsonl(path: Path, limit: int = 200) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            rows = fh.readlines()
+    except Exception:
+        return []
+    if limit and len(rows) > limit:
+        rows = rows[-limit:]
+    out = []
+    for line in rows:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out
+
+
+def _render_order_audit_panel() -> None:
+    st.markdown("#### Order Router / Circuit Status")
+    intents = _load_jsonl(ORDER_INTENT_QUEUE, limit=200)
+    audits = _load_jsonl(ORDER_AUDIT_LOG, limit=400)
+    circuit = None
+    try:
+        cfg_state = json.loads(ENTRY_BLOCK_STATE.read_text()) if ENTRY_BLOCK_STATE.exists() else {}
+        circuit = cfg_state.get("circuit_state")
+    except Exception:
+        circuit = None
+
+    cols = st.columns(3)
+    with cols[0]:
+        st.metric("Pending Intents", len(intents))
+    with cols[1]:
+        if circuit and circuit.get("status") == "tripped":
+            st.metric("Circuit", "Tripped", f"Resume {circuit.get('resume_at','—')}")
+        else:
+            st.metric("Circuit", "Clear")
+    with cols[2]:
+        last_audit = audits[-1] if audits else None
+        st.metric("Last Audit", last_audit.get("stage") if isinstance(last_audit, dict) else "—")
+
+    if intents:
+        st.caption("Pending Order Intents")
+        intent_df = pd.DataFrame(intents)
+        if "timestamp" in intent_df.columns:
+            intent_df["timestamp"] = pd.to_datetime(intent_df["timestamp"], errors="coerce")
+        st.dataframe(intent_df.tail(50), use_container_width=True)
+    else:
+        st.info("No queued order intents.")
+
+    if audits:
+        st.caption("Recent Audit Events")
+        audit_df = pd.DataFrame(audits)
+        if "timestamp" in audit_df.columns:
+            audit_df["timestamp"] = pd.to_datetime(audit_df["timestamp"], errors="coerce")
+        st.dataframe(audit_df.tail(50), use_container_width=True)
+    else:
+        st.info("No audit entries yet.")
+
+
+def _render_playbook_panel() -> None:
+    st.markdown("#### Playbook Activity")
+    history = _load_playbook_history(limit=10)
+    status_rows = _load_jsonl(PLAYBOOK_STATUS_LOG, limit=100)
+    if status_rows:
+        status_df = pd.DataFrame(status_rows)
+        if "timestamp" in status_df.columns:
+            status_df["timestamp"] = pd.to_datetime(status_df["timestamp"], errors="coerce")
+        st.dataframe(status_df.tail(20), use_container_width=True)
+    if history:
+        st.caption("Recent Steps")
+        for entry in history:
+            meta = entry.get("meta") or {}
+            st.markdown(f"- {_fmt_optional(entry.get('timestamp'))} · {entry.get('step')} – {meta}")
+    note = st.text_input("Playbook note", key="playbook_note")
+    if st.button("Attach Note", key="playbook_note_btn"):
+        if note:
+            _log_manual_playbook_note(note)
+            st.success("Note recorded")
+        else:
+            st.warning("Enter a note first")
+
+
+def _log_manual_playbook_note(note: str) -> None:
+    record = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "action": "manual_note",
+        "status": "info",
+        "meta": {"note": note},
+    }
+    try:
+        with PLAYBOOK_STATUS_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        pass
+
+
 def _observability_tab() -> None:
     st.markdown("### Observability")
     ss = st.session_state
@@ -2082,9 +2182,13 @@ def _observability_tab() -> None:
     st.divider()
     _render_exposure_monitor(equity_df, risk_limits, feature_df, start_dt, end_dt)
     st.divider()
+    _render_order_audit_panel()
+    st.divider()
     _render_risk_alerts(feature_df)
     st.divider()
     _render_entry_block_status()
+    st.divider()
+    _render_playbook_panel()
     st.divider()
     action_cols = st.columns([1, 1, 1, 1])
     with action_cols[0]:

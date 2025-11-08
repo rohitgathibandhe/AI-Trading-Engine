@@ -6,6 +6,7 @@ import logging
 import math
 import time
 import json
+import uuid
 from dataclasses import dataclass, asdict, field
 from datetime import date, timedelta, datetime
 from typing import Any, Dict, Optional, Tuple, List, cast, TYPE_CHECKING
@@ -58,6 +59,8 @@ STATE_DIR = MARKET_AI_DIR / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 ENTRY_BLOCK_STATE = STATE_DIR / "entry_block_status.json"
 MANUAL_ACTION_STATUS = STATE_DIR / "manual_action_status.json"
+ORDER_AUDIT_LOG = STATE_DIR / "order_audit.jsonl"
+ORDER_INTENT_QUEUE = STATE_DIR / "order_intents.jsonl"
 
 BLOTTER_FIELDS = [
     "timestamp",
@@ -319,6 +322,62 @@ def _record_activity_event(
             LOG.debug("[risk] failed to persist entry-block status")
 
 
+def _record_order_audit(entry: Dict[str, Any]) -> None:
+    try:
+        ORDER_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with ORDER_AUDIT_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, default=str) + "\n")
+    except Exception:
+        LOG.debug("[audit] failed to append order audit entry")
+
+
+def _enqueue_order_intent(intent: Dict[str, Any]) -> None:
+    try:
+        ORDER_INTENT_QUEUE.parent.mkdir(parents=True, exist_ok=True)
+        with ORDER_INTENT_QUEUE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(intent, default=str) + "\n")
+    except Exception:
+        LOG.debug("[router] failed to enqueue order intent")
+
+
+def _log_playbook_status(action: str, status: str, meta: Optional[Dict[str, Any]] = None) -> None:
+    record = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "action": action,
+        "status": status,
+        "meta": meta or {},
+    }
+    try:
+        path = STATE_DIR / "playbook_status.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        LOG.debug("[playbook] failed to log status for %s", action)
+
+
+def _increment_order_failure(cfg: "LiveConfig", reason: str, meta: Optional[Dict[str, Any]] = None) -> None:
+    cfg._order_fail_count = int(getattr(cfg, "_order_fail_count", 0) or 0) + 1
+    limit = max(1, int(getattr(cfg, "max_consecutive_order_failures", 3)))
+    if cfg._order_fail_count < limit:
+        return
+    cooldown = max(1.0, float(getattr(cfg, "circuit_cooldown_minutes", 5.0)))
+    cfg._circuit_tripped_until = datetime.now() + timedelta(minutes=cooldown)
+    cfg.enable_strangle_entry = False
+    _record_activity_event(
+        cfg,
+        "circuit_tripped",
+        f"Order circuit breaker tripped ({reason})",
+        severity="warning",
+        context={"cooldown_min": cooldown, "meta": meta or {}},
+    )
+    _log_playbook_status("circuit_breaker", "tripped", {"reason": reason, **(meta or {})})
+
+
+def _reset_order_failures(cfg: "LiveConfig") -> None:
+    if getattr(cfg, "_order_fail_count", 0):
+        cfg._order_fail_count = 0
+        _log_playbook_status("circuit_breaker", "reset", {})
 def _persist_manual_action(payload: Dict[str, Any]) -> None:
     try:
         data = dict(payload)
@@ -333,12 +392,15 @@ def _maybe_trigger_auto_playbook(cfg: "LiveConfig", kind: str, detail: Dict[str,
     if kind == "delta" and playbook.get("hedge_on_delta") and not getattr(cfg, "_force_hedge_refresh", False):
         cfg._force_hedge_refresh = True
         _record_playbook_step(cfg, "auto_hedge_refresh", detail)
+        _log_playbook_status("auto_hedge_refresh", "queued", detail)
     if kind == "delta" and playbook.get("flatten_on_delta") and not getattr(cfg, "_force_flatten", False):
         cfg._force_flatten = True
         _record_playbook_step(cfg, "auto_flatten_delta", detail)
+        _log_playbook_status("auto_flatten_delta", "queued", detail)
     if kind == "exposure" and playbook.get("flatten_on_exposure") and not getattr(cfg, "_force_flatten", False):
         cfg._force_flatten = True
         _record_playbook_step(cfg, "auto_flatten_exposure", detail)
+        _log_playbook_status("auto_flatten_exposure", "queued", detail)
 
 
 def _record_playbook_step(cfg: "LiveConfig", step: str, meta: Dict[str, Any]) -> None:
@@ -728,6 +790,7 @@ def _handle_risk_reset_signal(cfg: "LiveConfig") -> None:
             "message": "Hedge refresh queued",
         }
         _persist_manual_action(cfg._manual_action_ack)
+        _log_playbook_status("force_hedge_refresh", "queued", {"source": "operator"})
         _record_activity_event(
             cfg,
             "hedge_refresh_requested",
@@ -743,6 +806,7 @@ def _handle_risk_reset_signal(cfg: "LiveConfig") -> None:
             "message": "Flatten requested",
         }
         _persist_manual_action(cfg._manual_action_ack)
+        _log_playbook_status("flatten_positions", "queued", {"source": "operator"})
         _record_activity_event(
             cfg,
             "flatten_requested",
@@ -764,7 +828,18 @@ def _last_tuesday_of_month(y: int, m: int) -> date:
 # --- PATCH: Robust normalization and live runner (single version) ---
 def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     try:
+        if x is None or x == "":
+            return default
         return float(x)
+    except Exception:
+        return default
+
+
+def _safe_int(x: Any, default: Optional[int] = None) -> Optional[int]:
+    try:
+        if x is None or x == "":
+            return default
+        return int(round(float(x)))
     except Exception:
         return default
 
@@ -904,7 +979,7 @@ def _extract_leg_from_chain_sources(
                 except Exception:
                     sec_id = None
         if sec_id is None:
-            sec_id = resolve_option_security_id(symbol, expiry, strike_val, opt_type)
+            sec_id = _resolve_security_id_with_refresh(symbol, expiry, strike_val, opt_type, allow_refresh=True)
         if sec_id is None:
             return None
 
@@ -1626,6 +1701,11 @@ class LiveConfig:
     risk_overall_sl_pct: float = 2.5
     risk_max_portfolio_delta: float = 0.25
     risk_per_leg_sl_mult: float = 2.0
+    order_retry_limit: int = 2
+    order_retry_delay_sec: float = 0.75
+    order_slippage_limit_pct: float = 1.5
+    max_consecutive_order_failures: int = 3
+    circuit_cooldown_minutes: float = 5.0
     last_spot: Optional[float] = field(default=None, repr=False, compare=False)
     _last_spot_warn_at: Optional[datetime] = field(default=None, repr=False, compare=False)
     _last_equity_logged_at: Optional[datetime] = field(default=None, repr=False, compare=False)
@@ -1638,6 +1718,8 @@ class LiveConfig:
     _force_hedge_refresh: bool = field(default=False, repr=False, compare=False)
     _force_flatten: bool = field(default=False, repr=False, compare=False)
     _manual_action_ack: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)
+    _order_fail_count: int = field(default=0, repr=False, compare=False)
+    _circuit_tripped_until: Optional[datetime] = field(default=None, repr=False, compare=False)
     auto_playbook: Dict[str, Any] = field(default_factory=lambda: {
         "hedge_on_delta": True,
         "flatten_on_delta": False,
@@ -1738,6 +1820,31 @@ def _select_replacement(
     return None
 
 
+def _extract_from_response(resp: Any, keys: List[str]) -> Optional[Any]:
+    if resp is None:
+        return None
+    queue: List[Any] = [resp]
+    visited: set[int] = set()
+    while queue:
+        node = queue.pop()
+        if isinstance(node, dict):
+            oid = id(node)
+            if oid in visited:
+                continue
+            visited.add(oid)
+            for key in keys:
+                if key in node and node[key] not in (None, "", []):
+                    return node[key]
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    queue.append(value)
+        elif isinstance(node, list):
+            for value in node:
+                if isinstance(value, (dict, list)):
+                    queue.append(value)
+    return None
+
+
 def _submit_order(
     dw,
     cfg: LiveConfig,
@@ -1754,45 +1861,32 @@ def _submit_order(
     if quantity <= 0:
         return False
 
-    context = context or {}
-    price_val: Optional[float]
-    try:
-        price_val = float(price) if price is not None else None
-    except Exception:
-        price_val = None
-
-    placed = False
+    context = dict(context or {})
+    price_val = _safe_float(price, None)
     warn_only = bool(getattr(cfg, "warn_only", False))
-    try:
-        if warn_only:
-            LOG.info(
-                "[live][warn-only] would place order side=%s seg=%s security_id=%s qty=%s product=%s order_type=%s",
-                side,
-                exchange_seg,
-                security_id,
-                quantity,
-                product_type,
-                order_type,
-            )
-        else:
-            dw.place_order(
-                side=side,
-                exchange_seg=exchange_seg,
-                security_id=security_id,
-                quantity=quantity,
-                product_type=product_type,
-                order_type=order_type,
-            )
-            placed = True
-    except Exception:
-        LOG.exception("[live] place_order failed (side=%s, sec_id=%s)", side, security_id)
-        raise
-    finally:
-        event = {
+    intent_id = uuid.uuid4().hex
+    intent_payload = {
+        "intent_id": intent_id,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "side": side,
+        "security_id": security_id,
+        "quantity": int(quantity),
+        "product_type": product_type,
+        "order_type": order_type,
+        "price": price_val,
+        "trade_mode": getattr(cfg, "trade_mode", "live"),
+    }
+    context.setdefault("intent_id", intent_id)
+    _enqueue_order_intent(intent_payload)
+    _record_order_audit({**intent_payload, "stage": "intent"})
+
+    if warn_only:
+        _record_order_audit({**intent_payload, "stage": "simulated", "status": "skipped"})
+        simulated_event = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "trade_mode": getattr(cfg, "trade_mode", "live"),
-            "warn_only": 1 if warn_only else 0,
-            "executed": 1 if placed else 0,
+            "warn_only": 1,
+            "executed": 0,
             "side": side,
             "order_type": order_type,
             "exchange_seg": exchange_seg,
@@ -1804,8 +1898,158 @@ def _submit_order(
             "tag": context.get("tag") or context.get("action") or context.get("reason") or "",
             "notes": json.dumps(context, default=str) if context else "",
         }
-        _record_trade(cfg, event)
+        _record_trade(cfg, simulated_event)
+        return False
 
+    remaining = int(quantity)
+    attempts = 0
+    fills: List[Tuple[int, Optional[float]]] = []
+    placed = False
+    last_resp: Optional[Dict[str, Any]] = None
+
+    retry_limit = max(1, int(getattr(cfg, "order_retry_limit", 1)))
+    retry_delay = max(0.1, float(getattr(cfg, "order_retry_delay_sec", 0.5)))
+
+    while remaining > 0:
+        attempts += 1
+        try:
+            resp = dw.place_order(
+                side=side,
+                exchange_seg=exchange_seg,
+                security_id=security_id,
+                quantity=remaining,
+                product_type=product_type,
+                order_type=order_type,
+            )
+            last_resp = resp if isinstance(resp, dict) else None
+        except Exception as exc:
+            LOG.exception("[live] place_order failed (side=%s, sec_id=%s)", side, security_id)
+            _record_order_audit(
+                {
+                    **intent_payload,
+                    "stage": "error",
+                    "attempt": attempts,
+                    "error": str(exc),
+                }
+            )
+            _increment_order_failure(cfg, "exception", {"intent_id": intent_id})
+            raise
+
+        fill_qty = _safe_int(
+            _extract_from_response(
+                last_resp,
+                ["filled_quantity", "filledQty", "filledQuantity", "quantity", "qty"],
+            ),
+            remaining,
+        )
+        if fill_qty is None or fill_qty <= 0:
+            fill_qty = remaining
+        elif fill_qty > remaining:
+            fill_qty = remaining
+        remaining -= fill_qty
+
+        fill_price = _safe_float(
+            _extract_from_response(
+                last_resp,
+                ["average_price", "avg_price", "price", "trade_price", "fill_price"],
+            ),
+            None,
+        )
+        fills.append((fill_qty, fill_price))
+
+        _record_order_audit(
+            {
+                **intent_payload,
+                "stage": "fill",
+                "attempt": attempts,
+                "order_id": _extract_from_response(last_resp, ["order_id", "orderId", "id"]),
+                "status": _extract_from_response(last_resp, ["status", "order_status", "orderStatus"]) or "filled",
+                "filled_qty": fill_qty,
+                "remaining": remaining,
+                "fill_price": fill_price,
+            }
+        )
+
+        if remaining <= 0:
+            placed = True
+            break
+        if attempts >= retry_limit:
+            break
+        time.sleep(retry_delay)
+
+    filled_total = sum(q for q, _ in fills)
+    weighted_price = None
+    priced_rows = [(q, p) for q, p in fills if q and p is not None]
+    if priced_rows:
+        numer = sum(q * float(p) for q, p in priced_rows)
+        denom = sum(q for q, _ in priced_rows)
+        if denom:
+            weighted_price = numer / denom
+
+    slippage_pct = None
+    if weighted_price is not None and price_val:
+        slippage_pct = abs(weighted_price - price_val) / price_val * 100.0
+
+    if not placed:
+        _increment_order_failure(cfg, "partial_fill", {"intent_id": intent_id, "filled": filled_total})
+        _record_activity_event(
+            cfg,
+            "order_partial",
+            f"Order {intent_id} partially filled",
+            severity="warning",
+            context={"filled": filled_total, "requested": quantity},
+        )
+    else:
+        _reset_order_failures(cfg)
+
+    if slippage_pct is not None:
+        limit_pct = float(getattr(cfg, "order_slippage_limit_pct", 1.5))
+        if slippage_pct > limit_pct:
+            _record_activity_event(
+                cfg,
+                "order_slippage",
+                f"Slippage {slippage_pct:.2f}% exceeded limit",
+                severity="warning",
+                context={"intent_id": intent_id, "limit_pct": limit_pct},
+            )
+            _increment_order_failure(cfg, "slippage", {"intent_id": intent_id, "slippage_pct": slippage_pct})
+
+    event = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "trade_mode": getattr(cfg, "trade_mode", "live"),
+        "warn_only": 0,
+        "executed": 1 if placed else 0,
+        "side": side,
+        "order_type": order_type,
+        "exchange_seg": exchange_seg,
+        "product_type": product_type,
+        "security_id": security_id,
+        "quantity": int(quantity),
+        "price": price_val if price_val is not None else "",
+        "strike": context.get("strike", ""),
+        "tag": context.get("tag") or context.get("action") or context.get("reason") or "",
+        "notes": json.dumps(
+            {
+                **context,
+                "intent_id": intent_id,
+                "filled_qty": filled_total,
+                "slippage_pct": slippage_pct,
+                "attempts": attempts,
+            },
+            default=str,
+        ),
+    }
+    _record_trade(cfg, event)
+
+    _record_order_audit(
+        {
+            **intent_payload,
+            "stage": "complete",
+            "placed": placed,
+            "filled_qty": filled_total,
+            "slippage_pct": slippage_pct,
+        }
+    )
     return placed
 
 
@@ -2390,6 +2634,27 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
         LOG.info("[live] could not determine expiry; skip entry")
         return
 
+    breaker_until = getattr(cfg, "_circuit_tripped_until", None)
+    if breaker_until:
+        now = datetime.now()
+        if now < breaker_until:
+            _record_activity_event(
+                cfg,
+                "circuit_blocked",
+                "Entry suppressed by circuit breaker",
+                severity="warning",
+                context={"resume_at": breaker_until.isoformat()},
+            )
+            return
+        cfg._circuit_tripped_until = None
+        _reset_order_failures(cfg)
+        _record_activity_event(
+            cfg,
+            "circuit_reset",
+            "Circuit breaker window elapsed; entries re-enabled",
+            severity="info",
+        )
+
     oc_raw = dw.get_option_chain(underlying_security_id=NIFTY_SCRIP, underlying_seg=NIFTY_FNO_SEG, expiry=expiry)
     oc_dict = _coerce_dict(oc_raw) or {}
     data = _coerce_dict(oc_dict.get("data")) or oc_dict
@@ -2445,7 +2710,7 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
             cfg,
             {
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "strategy": cfg.strategy_name if hasattr(cfg, "strategy_name") else "monthly_strangle_with_weekly_hedge",
+        "strategy": getattr(cfg, "strategy_name", "monthly_strangle_with_weekly_hedge"),
                 "trade_mode": cfg.trade_mode,
                 "warn_only": True,
                 "context": json.dumps(
@@ -2826,6 +3091,7 @@ def monitor_and_manage_positions(
             }
             _persist_manual_action(status_payload)
             cfg._manual_action_ack = status_payload
+            _log_playbook_status("force_hedge_refresh", "completed", {"structure": "weekly"})
         cfg._force_hedge_refresh = False
 
 
@@ -3015,6 +3281,7 @@ def run_live(
                 }
                 _persist_manual_action(status_payload)
                 cfg._manual_action_ack = status_payload
+                _log_playbook_status("flatten_positions", "completed", {"closed_legs": len(normalized_rows or [])})
 
             if regime_analyzer and (refresh_iters is None or loop_iter % refresh_iters == 0):
                 history_df = pd.DataFrame()
