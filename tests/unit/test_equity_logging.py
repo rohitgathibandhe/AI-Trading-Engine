@@ -50,6 +50,8 @@ def test_record_equity_snapshot_accumulates_exposures(tmp_path: Path) -> None:
     assert gross == pytest.approx(expected_gross)
     assert float(row["unrealized"]) == pytest.approx(200.0)
     assert float(row["realized"]) == pytest.approx(150.0)
+    assert float(row["net_delta"]) == pytest.approx(0.0)
+    assert float(row["total_notional"]) == pytest.approx(expected_gross)
 
 
 def test_record_activity_event_writes_feature_row(tmp_path: Path) -> None:

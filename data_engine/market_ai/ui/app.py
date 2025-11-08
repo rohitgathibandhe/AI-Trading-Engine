@@ -20,7 +20,7 @@ import json
 import time
 import subprocess
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as datetime_time
 from typing import Optional, Dict, Any, Tuple, List
 from queue import Queue, Empty
 
@@ -76,6 +76,10 @@ if str(ROOT) not in sys.path:
 
 STATE_DIR = ENGINE_DIR / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
+CONTROL_DIR = ENGINE_DIR / "control"
+CONTROL_DIR.mkdir(parents=True, exist_ok=True)
+RISK_RESET_FILE = CONTROL_DIR / "risk_reset.json"
+ENTRY_BLOCK_STATE = STATE_DIR / "entry_block_status.json"
 
 AGENT_LOG = STATE_DIR / "agent.log"
 SETTINGS_JSON = STATE_DIR / "agent_settings.json"
@@ -105,6 +109,9 @@ DEFAULT_SETTINGS = {
     "batman_hedge_delta_max": 0.12,
     "batman_hedge_price_max": 35.0,
     "batman_salvage_wing_ltp": 5.0,
+    "risk_max_portfolio_delta": 0.25,
+    "risk_max_exposure_pct": 0.05,
+    "risk_account_equity": 500000.0,
 }
 
 BLOTTER_CSV = STATE_DIR / "trade_blotter.csv"
@@ -140,6 +147,17 @@ def _ensure_csv_exists(path: Path, headers: List[str]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", newline="", encoding="utf-8") as handle:
             handle.write(",".join(headers) + "\n")
+    except Exception:
+        pass
+
+
+def _request_risk_reset() -> None:
+    payload = {
+        "action": "reset_risk",
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        RISK_RESET_FILE.write_text(json.dumps(payload, indent=2))
     except Exception:
         pass
 
@@ -208,6 +226,9 @@ def _load_settings() -> Dict[str, Any]:
     merged["batman_hedge_delta_max"] = float(merged.get("batman_hedge_delta_max", DEFAULT_SETTINGS["batman_hedge_delta_max"]))
     merged["batman_hedge_price_max"] = float(merged.get("batman_hedge_price_max", DEFAULT_SETTINGS["batman_hedge_price_max"]))
     merged["batman_salvage_wing_ltp"] = float(merged.get("batman_salvage_wing_ltp", DEFAULT_SETTINGS["batman_salvage_wing_ltp"]))
+    merged["risk_max_portfolio_delta"] = float(merged.get("risk_max_portfolio_delta", DEFAULT_SETTINGS["risk_max_portfolio_delta"]))
+    merged["risk_max_exposure_pct"] = float(merged.get("risk_max_exposure_pct", DEFAULT_SETTINGS["risk_max_exposure_pct"]))
+    merged["risk_account_equity"] = float(merged.get("risk_account_equity", DEFAULT_SETTINGS["risk_account_equity"]))
     return merged
 
 
@@ -274,6 +295,8 @@ def _load_equity_history(limit: Optional[int] = None) -> Optional[pd.DataFrame]:
         "unrealized",
         "realized",
         "equity_estimate",
+        "net_delta",
+        "total_notional",
     ]
     for col in numeric_cols:
         if col in df.columns:
@@ -363,6 +386,15 @@ def _format_context_summary(ctx: Dict[str, Any], limit: int = 6) -> str:
     return ", ".join(items)
 
 
+def _load_risk_limits() -> Dict[str, float]:
+    settings = _load_settings()
+    return {
+        "delta_cap": float(settings.get("risk_max_portfolio_delta", DEFAULT_SETTINGS["risk_max_portfolio_delta"])),
+        "exposure_pct": float(settings.get("risk_max_exposure_pct", DEFAULT_SETTINGS["risk_max_exposure_pct"])),
+        "account_equity": float(settings.get("risk_account_equity", DEFAULT_SETTINGS["risk_account_equity"])),
+    }
+
+
 def _compute_equity_change(df: pd.DataFrame, days: float) -> Optional[Tuple[float, Optional[float]]]:
     if df is None or df.empty:
         return None
@@ -435,6 +467,34 @@ def _render_risk_alerts(feature_df: Optional[pd.DataFrame]) -> None:
             f"<strong>{header}</strong><br>{'<br>'.join(lines)}</div>",
             unsafe_allow_html=True,
         )
+
+
+def _render_entry_block_status() -> None:
+    st.caption("Entry Gate Status")
+    if not ENTRY_BLOCK_STATE.exists():
+        st.write("Entries enabled")
+        return
+    try:
+        data = json.loads(ENTRY_BLOCK_STATE.read_text())
+    except Exception:
+        st.write("Entries enabled")
+        return
+    entry_enabled = bool(data.get("entry_enabled", True))
+    label = data.get("label", "block").replace("_", " ").title()
+    message = data.get("message", "")
+    ts = data.get("timestamp")
+    severity = str(data.get("severity", "info")).upper()
+    color = "#22c55e" if entry_enabled else "#b91c1c"
+    details = data.get("context") or {}
+    detail_text = ", ".join(f"{k}={v}" for k, v in details.items() if v not in (None, ""))
+    st.markdown(
+        f"<div style='border-left:4px solid {color}; padding-left:8px;'>"
+        f"<strong>{label} ({severity})</strong><br>"
+        f"{_fmt_optional(ts)} · {message or '—'}"
+        f"{('<br>'+detail_text) if detail_text else ''}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 def _fmt_size(num: Optional[int]) -> str:
     if num is None:
         return "—"
@@ -1339,6 +1399,15 @@ def _render_blotter_panel(blotter_df: Optional[pd.DataFrame], summary: Dict[str,
         for col, (label, value) in zip(cols, metrics):
             with col:
                 st.metric(label, _fmt_optional(value, digits=None))
+        extra_metrics = [
+            ("Rolls", summary.get("roll_orders")),
+            ("Hedges", summary.get("hedge_orders")),
+            ("Exits", summary.get("exit_orders")),
+        ]
+        cols_extra = st.columns(len(extra_metrics))
+        for col, (label, value) in zip(cols_extra, extra_metrics):
+            with col:
+                st.metric(label, _fmt_optional(value, digits=None))
     if blotter_df is None:
         st.info("Blotter file not available yet. Start the agent to capture trades.")
         return
@@ -1531,16 +1600,21 @@ def _strategy_monitor_tab() -> None:
         _render_plan_snapshot(feature_df)
 
 
-def _render_capital_telemetry() -> None:
-    st.markdown("#### Capital Telemetry")
-    df = _load_equity_history(limit=1500)
+def _render_capital_telemetry(
+    equity_df: Optional[pd.DataFrame] = None,
+    *,
+    section_title: str = "Capital Telemetry",
+    chart_key: Optional[str] = None,
+) -> Optional[pd.DataFrame]:
+    st.markdown(f"#### {section_title}")
+    df = equity_df if equity_df is not None else _load_equity_history(limit=1500)
     if df is None or df.empty or "equity_estimate" not in df.columns:
         st.info("No equity telemetry yet. Keep the agent running to build history.")
-        return
+        return df
     df = df.dropna(subset=["equity_estimate"])
     if df.empty:
         st.info("No equity telemetry yet. Keep the agent running to build history.")
-        return
+        return df
     equity_series = df["equity_estimate"].astype(float)
     current_equity = float(equity_series.iloc[-1])
     previous = float(equity_series.iloc[-2]) if len(equity_series) > 1 else None
@@ -1630,13 +1704,96 @@ def _render_capital_telemetry() -> None:
         height=320,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
     )
-    st.plotly_chart(fig, width="stretch")
+    chart_kwargs = {"width": "stretch"}
+    if chart_key:
+        chart_kwargs["key"] = chart_key
+    st.plotly_chart(fig, **chart_kwargs)
+    return df
+
+
+def _render_exposure_monitor(equity_df: Optional[pd.DataFrame], risk_limits: Dict[str, float]) -> None:
+    st.markdown("#### Exposure Monitor")
+    if equity_df is None or equity_df.empty or "net_delta" not in equity_df.columns:
+        st.info("No exposure telemetry yet.")
+        return
+    df = equity_df.dropna(subset=["net_delta"]).tail(720)
+    if df.empty:
+        st.info("No exposure telemetry yet.")
+        return
+    delta_cap = float(risk_limits.get("delta_cap", 0.25))
+    exposure_pct = float(risk_limits.get("exposure_pct", 0.05))
+    latest = df.iloc[-1]
+    current_delta = float(latest.get("net_delta") or 0.0)
+    current_equity = float(latest.get("equity_estimate") or 0.0)
+    notional = float(latest.get("total_notional") or 0.0)
+    notional_cap = current_equity * exposure_pct if current_equity else None
+
+    cols = st.columns(3)
+    cols[0].metric("Net Δ", f"{current_delta:.3f}", f"±{delta_cap}")
+    cols[1].metric("Total Notional", _fmt_rupee(notional, digits=0), None if notional_cap is None else f"Cap {_fmt_rupee(notional_cap, digits=0)}")
+    cols[2].metric("Equity Ref", _fmt_rupee(current_equity, digits=0))
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df["timestamp"],
+            y=df["net_delta"],
+            name="Net Δ",
+            mode="lines",
+            line=dict(width=2, color="#22c55e"),
+            hovertemplate="Time %{x|%Y-%m-%d %H:%M}<br>Δ %{y:.3f}<extra></extra>",
+        )
+    )
+    fig.add_hline(y=delta_cap, line=dict(color="#f97316", dash="dash"), annotation_text=f"+{delta_cap:.2f}", annotation_position="top left")
+    fig.add_hline(y=-delta_cap, line=dict(color="#f97316", dash="dash"), annotation_text=f"-{delta_cap:.2f}", annotation_position="bottom left")
+    fig.update_layout(
+        xaxis=dict(title="Timestamp"),
+        yaxis=dict(title="Net Delta"),
+        margin=dict(l=10, r=10, t=35, b=35),
+        height=260,
+    )
+    st.plotly_chart(fig, width="stretch", key="exposure_monitor_chart")
+
+
+def _date_range_controls(key_prefix: str = "date_range") -> Tuple[datetime, datetime]:
+    today = datetime.now().date()
+    default_range = (today, today)
+    date_range = st.date_input(
+        "Date range",
+        default_range,
+        key=f"{key_prefix}_picker",
+        help="Filter telemetry/logs to the selected dates.",
+    )
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        start_date, end_date = date_range
+    else:
+        start_date = end_date = date_range
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    start_dt = datetime.combine(start_date, datetime_time.min)
+    end_dt = datetime.combine(end_date, datetime_time.max)
+    return start_dt, end_dt
+
+
+def _filter_df_by_range(df: Optional[pd.DataFrame], start: datetime, end: datetime, column: str = "timestamp") -> Optional[pd.DataFrame]:
+    if df is None or df.empty or column not in df.columns:
+        return df
+    temp = df.copy()
+    temp[column] = pd.to_datetime(temp[column], errors="coerce")
+    mask = (temp[column] >= start) & (temp[column] <= end)
+    return temp.loc[mask].reset_index(drop=True)
 
 
 def _observability_tab() -> None:
     st.markdown("### Observability")
     ss = st.session_state
     feature_df = _load_feature_history(limit=400)
+    equity_df = _load_equity_history(limit=1500)
+    risk_limits = _load_risk_limits()
+    start_dt, end_dt = _date_range_controls("obsv")
+    st.caption(f"Showing data from {start_dt.date()} to {end_dt.date()}")
+    feature_df = _filter_df_by_range(feature_df, start_dt, end_dt)
+    equity_df = _filter_df_by_range(equity_df, start_dt, end_dt)
 
     pid = ss.get("agent_pid")
     running_flag = bool(ss.get("agent_running"))
@@ -1674,9 +1831,15 @@ def _observability_tab() -> None:
         st.metric("Credentials", "Verified" if ss.get("creds_verified") else "Missing")
 
     st.divider()
+    equity_df = _render_capital_telemetry(equity_df, chart_key="observability_capital_chart")
+    st.divider()
+    _render_exposure_monitor(equity_df, risk_limits)
+    st.divider()
     _render_risk_alerts(feature_df)
     st.divider()
-    action_cols = st.columns([1, 1, 1])
+    _render_entry_block_status()
+    st.divider()
+    action_cols = st.columns([1, 1, 1, 1])
     with action_cols[0]:
         restart_disabled = not ss.get("creds_verified")
         if st.button("Restart Agent", key="obs_restart", disabled=restart_disabled, help="Stop then start the agent process."):
@@ -1699,6 +1862,10 @@ def _observability_tab() -> None:
         if st.button("Clear Stale PID", key="obs_clear_pid", disabled=clear_disabled, help="Remove PID file when the process is already gone."):
             _clear_stale_pid_file()
             st.rerun()
+    with action_cols[3]:
+        if st.button("Reset Risk Block", key="obs_risk_reset", help="Instruct the agent to clear risk pause and re-enable entries."):
+            _request_risk_reset()
+            st.success("Risk reset signal sent.")
 
     st.divider()
     file_infos = [
@@ -1716,8 +1883,6 @@ def _observability_tab() -> None:
             st.write(f"Size: {_fmt_size(info.get('size'))}")
             st.write(f"Updated: {_age_string(info.get('updated'))}")
 
-    st.divider()
-    _render_capital_telemetry()
     st.divider()
     tail_lines = _read_tail(AGENT_LOG, 30)
     if tail_lines:

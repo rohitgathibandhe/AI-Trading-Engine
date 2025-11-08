@@ -40,6 +40,14 @@ __all__ = [
 
 LOG = logging.getLogger(__name__)
 
+MARKET_AI_DIR = Path(__file__).resolve().parents[2]
+CONTROL_DIR = MARKET_AI_DIR / "control"
+CONTROL_DIR.mkdir(parents=True, exist_ok=True)
+RISK_RESET_FILE = CONTROL_DIR / "risk_reset.json"
+STATE_DIR = MARKET_AI_DIR / "state"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+ENTRY_BLOCK_STATE = STATE_DIR / "entry_block_status.json"
+
 BLOTTER_FIELDS = [
     "timestamp",
     "trade_mode",
@@ -88,6 +96,8 @@ EQUITY_FIELDS = [
     "unrealized",
     "realized",
     "equity_estimate",
+    "net_delta",
+    "total_notional",
 ]
 
 _BLOTTER_ROTATE_MAX_BYTES = 5 * 1024 * 1024
@@ -137,6 +147,9 @@ def _update_blotter_summary(cfg: "LiveConfig") -> None:
             "debit_value": 0.0,
             "net_value": 0.0,
             "last_timestamp": None,
+            "roll_orders": 0,
+            "hedge_orders": 0,
+            "exit_orders": 0,
         }
     else:
         exec_series = df["executed"] if "executed" in df.columns else pd.Series([0] * len(df))
@@ -157,6 +170,10 @@ def _update_blotter_summary(cfg: "LiveConfig") -> None:
         executed_df = df[df["executed"] == 1]
         credit = executed_df.loc[executed_df["side"] == "SELL", "notional"].sum()
         debit = executed_df.loc[executed_df["side"] == "BUY", "notional"].sum()
+        tags = df["tag"].astype(str) if "tag" in df.columns else pd.Series([""] * len(df))
+        summary_rolls = int(tags.str.contains("roll", case=False, na=False).sum())
+        summary_hedges = int(tags.str.contains("hedge", case=False, na=False).sum())
+        summary_exits = int((tags == "close_leg").sum())
         summary = {
             "total_orders": int(len(df)),
             "executed_orders": int(executed_df["executed"].sum()),
@@ -165,6 +182,9 @@ def _update_blotter_summary(cfg: "LiveConfig") -> None:
             "debit_value": round(float(debit), 2),
             "net_value": round(float(credit - debit), 2),
             "last_timestamp": df["timestamp"].iloc[-1],
+            "roll_orders": summary_rolls,
+            "hedge_orders": summary_hedges,
+            "exit_orders": summary_exits,
         }
     summary_path = Path(summary_path_str)
     try:
@@ -269,6 +289,19 @@ def _record_activity_event(
         "context": json.dumps(ctx, default=str),
     }
     _append_csv_row(feature_path, FEATURE_FIELDS, row, max_bytes=_FEATURE_ROTATE_MAX_BYTES)
+    if label in {"risk_block", "delta_block", "exposure_block", "risk_manual_reset"}:
+        try:
+            payload = {
+                "label": label,
+                "message": message,
+                "severity": severity,
+                "timestamp": row["timestamp"],
+                "context": context or {},
+                "entry_enabled": bool(getattr(cfg, "enable_strangle_entry", True)),
+            }
+            ENTRY_BLOCK_STATE.write_text(json.dumps(payload, indent=2))
+        except Exception:
+            LOG.debug("[risk] failed to persist entry-block status")
 
 
 def _get_risk_manager(cfg: "LiveConfig") -> Optional[RiskManager]:
@@ -287,6 +320,74 @@ def _get_risk_manager(cfg: "LiveConfig") -> Optional[RiskManager]:
     risk_mgr = RiskManager(limits)
     cfg._risk_manager = risk_mgr
     return risk_mgr
+
+
+def _apply_exposure_throttles(
+    cfg: "LiveConfig",
+    net_delta: float,
+    total_notional: float,
+) -> None:
+    delta_cap = abs(float(getattr(cfg, "risk_max_portfolio_delta", 0.0) or 0.0))
+    exposure_pct = float(getattr(cfg, "risk_max_exposure_pct", 0.0) or 0.0)
+    equity_ref = float(getattr(cfg, "risk_account_equity", 0.0) or 0.0)
+    notional_cap = equity_ref * exposure_pct if equity_ref and exposure_pct else None
+
+    delta_breach = delta_cap > 0 and abs(net_delta) > delta_cap
+    notional_breach = notional_cap is not None and total_notional > notional_cap
+
+    if delta_breach and not getattr(cfg, "_delta_breach_active", False):
+        cfg._delta_breach_active = True
+        cfg.enable_strangle_entry = False
+        cfg._auto_blocked_by_risk = True
+        ts = datetime.now().isoformat(timespec="seconds")
+        cfg._last_block_reason = "delta_block"
+        cfg._last_block_timestamp = ts
+        _record_activity_event(
+            cfg,
+            "delta_block",
+            f"Net delta {net_delta:.3f} breached cap ±{delta_cap}",
+            severity="error",
+            context={"net_delta": net_delta, "cap": delta_cap},
+        )
+    elif not delta_breach and getattr(cfg, "_delta_breach_active", False):
+        cfg._delta_breach_active = False
+        if not cfg._notional_breach_active:
+            cfg._auto_blocked_by_risk = False
+            cfg.enable_strangle_entry = True
+        _record_activity_event(
+            cfg,
+            "delta_normalized",
+            f"Net delta back within cap ({net_delta:.3f})",
+            severity="info",
+            context={"net_delta": net_delta, "cap": delta_cap},
+        )
+
+    if notional_breach and not getattr(cfg, "_notional_breach_active", False):
+        cfg._notional_breach_active = True
+        cfg.enable_strangle_entry = False
+        cfg._auto_blocked_by_risk = True
+        ts = datetime.now().isoformat(timespec="seconds")
+        cfg._last_block_reason = "exposure_block"
+        cfg._last_block_timestamp = ts
+        _record_activity_event(
+            cfg,
+            "exposure_block",
+            f"Total notional ₹{total_notional:,.0f} > cap",
+            severity="error",
+            context={"total_notional": total_notional, "cap": notional_cap},
+        )
+    elif not notional_breach and getattr(cfg, "_notional_breach_active", False):
+        cfg._notional_breach_active = False
+        if not cfg._delta_breach_active:
+            cfg._auto_blocked_by_risk = False
+            cfg.enable_strangle_entry = True
+        _record_activity_event(
+            cfg,
+            "exposure_normalized",
+            "Total notional back within cap",
+            severity="info",
+            context={"total_notional": total_notional, "cap": notional_cap},
+        )
 
 
 def _record_equity_snapshot(cfg: "LiveConfig", dw, positions: List[Dict[str, Any]]) -> None:
@@ -311,6 +412,7 @@ def _record_equity_snapshot(cfg: "LiveConfig", dw, positions: List[Dict[str, Any
     unrealized = 0.0
     realized = 0.0
 
+    net_delta, total_notional = _summarize_exposure(positions or [])
     for row in positions or []:
         qty = _safe_float(row.get("qty") or row.get("net_qty"), 0.0) or 0.0
         price = _safe_float(row.get("avg_price") or row.get("cost_price"), 0.0) or 0.0
@@ -335,6 +437,8 @@ def _record_equity_snapshot(cfg: "LiveConfig", dw, positions: List[Dict[str, Any
         "unrealized": unrealized,
         "realized": realized,
         "equity_estimate": equity_estimate or withdrawable or available,
+        "net_delta": net_delta,
+        "total_notional": total_notional,
     }
     _append_csv_row(path, EQUITY_FIELDS, row, max_bytes=_FEATURE_ROTATE_MAX_BYTES)
 
@@ -346,6 +450,42 @@ def _aggregate_position_stats(rows: List[Dict[str, Any]]) -> Tuple[float, float]
         total_pnl += _safe_float(row.get("pnl"), 0.0) or 0.0
         deployed += _deployed_amount(row)
     return total_pnl, deployed
+
+
+def _infer_position_delta(row: Dict[str, Any]) -> Optional[float]:
+    sources = []
+    sources.append(row)
+    raw = row.get("_raw") or {}
+    if isinstance(raw, dict):
+        sources.append(raw)
+        greeks = raw.get("greeks") or raw.get("Greeks")
+        if isinstance(greeks, dict):
+            sources.append(greeks)
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ("delta_ce", "delta_pe", "delta", "Delta", "optionDelta"):
+            if source.get(key) is not None:
+                val = _safe_float(source.get(key), None)
+                if val is not None:
+                    return val
+    return None
+
+
+def _summarize_exposure(rows: List[Dict[str, Any]]) -> Tuple[float, float]:
+    net_delta = 0.0
+    total_notional = 0.0
+    for row in rows or []:
+        qty = _safe_float(row.get("qty") or row.get("net_qty") or row.get("netQty"), 0.0) or 0.0
+        delta_val = _infer_position_delta(row)
+        if delta_val is not None:
+            net_delta += qty * delta_val
+        price = _safe_float(row.get("ltp") or row.get("avg_price") or row.get("cost_price"), None)
+        if price is None:
+            price = _safe_float((row.get("_raw") or {}).get("ltp"), None)
+        if price is not None:
+            total_notional += abs(qty) * price
+    return net_delta, total_notional
 
 
 def _record_environment_snapshot(
@@ -380,6 +520,39 @@ def _record_environment_snapshot(
         "context": json.dumps(context, default=str),
     }
     _append_csv_row(feature_path, FEATURE_FIELDS, row, max_bytes=_FEATURE_ROTATE_MAX_BYTES)
+
+
+def _handle_risk_reset_signal(cfg: "LiveConfig") -> None:
+    try:
+        path = RISK_RESET_FILE
+        if not path.exists():
+            return
+        data = json.loads(path.read_text())
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    except Exception:
+        LOG.warning("[risk] failed to read reset signal")
+        return
+    if not isinstance(data, dict):
+        return
+    action = data.get("action")
+    if action != "reset_risk":
+        return
+    risk_mgr = _get_risk_manager(cfg)
+    if risk_mgr:
+        risk_mgr.l.hard_kill = False
+        risk_mgr.roll_count = 0
+        risk_mgr.last_block_reason = None
+    cfg.enable_strangle_entry = True
+    cfg._auto_blocked_by_risk = False
+    _record_activity_event(
+        cfg,
+        "risk_manual_reset",
+        "Operator cleared risk block",
+        severity="info",
+    )
 
 
 # ----------------- utilities -----------------
@@ -1262,6 +1435,10 @@ class LiveConfig:
     _last_equity_logged_at: Optional[datetime] = field(default=None, repr=False, compare=False)
     _risk_manager: Optional[RiskManager] = field(default=None, repr=False, compare=False)
     _auto_blocked_by_risk: bool = field(default=False, repr=False, compare=False)
+    _delta_breach_active: bool = field(default=False, repr=False, compare=False)
+    _notional_breach_active: bool = field(default=False, repr=False, compare=False)
+    _last_block_reason: Optional[str] = field(default=None, repr=False, compare=False)
+    _last_block_timestamp: Optional[str] = field(default=None, repr=False, compare=False)
 
 
 
@@ -2071,14 +2248,17 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
             reason = getattr(risk_mgr, "last_block_reason", None) or "risk_block"
             cfg.enable_strangle_entry = False
             cfg._auto_blocked_by_risk = True
-            _record_activity_event(
-                cfg,
-                "risk_block",
-                f"Entry blocked ({reason})",
-                severity="error",
-                context={"reason": reason},
-            )
-            return
+        ts = datetime.now().isoformat(timespec="seconds")
+        cfg._last_block_reason = reason
+        cfg._last_block_timestamp = ts
+        _record_activity_event(
+            cfg,
+            "risk_block",
+            f"Entry blocked ({reason})",
+            severity="error",
+            context={"reason": reason},
+        )
+        return
         if not risk_mgr.can_allocate(notional):
             _record_activity_event(
                 cfg,
@@ -2162,13 +2342,15 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
                 severity="info",
                 context={"structure": "strangle", "leg": "CALL", "qty": qty},
             )
-    _record_activity_event(
-        cfg,
-        "entry",
-        f"Opened strangle CE {ce_strike} / PE {pe_strike}",
-        severity="info",
-        context={"credit": entry_credit, "spot": nifty_spot},
-    )
+        _record_activity_event(
+            cfg,
+            "entry",
+            f"Opened strangle CE {ce_strike} / PE {pe_strike}",
+            severity="info",
+            context={"credit": entry_credit, "spot": nifty_spot},
+        )
+    cfg._last_block_reason = None
+    cfg._last_block_timestamp = None
 
 
 def monitor_and_manage_positions(
@@ -2532,6 +2714,7 @@ def run_live(
 
     while True:
         try:
+            _handle_risk_reset_signal(cfg)
             rows = dw.get_positions_live() or []
             normalized_rows: Optional[List[Dict[str, Any]]] = None
             open_deriv_rows = [
@@ -2572,6 +2755,11 @@ def run_live(
                     normalized_rows = _normalize_positions(rows)
                 _record_equity_snapshot(cfg, dw, normalized_rows)
                 cfg._last_equity_logged_at = datetime.now()
+
+            if normalized_rows is None:
+                normalized_rows = _normalize_positions(rows)
+            net_delta, total_notional = _summarize_exposure(normalized_rows)
+            _apply_exposure_throttles(cfg, net_delta, total_notional)
 
             if regime_analyzer and (refresh_iters is None or loop_iter % refresh_iters == 0):
                 history_df = pd.DataFrame()
