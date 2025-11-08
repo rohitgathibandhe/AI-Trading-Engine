@@ -80,6 +80,8 @@ CONTROL_DIR = ENGINE_DIR / "control"
 CONTROL_DIR.mkdir(parents=True, exist_ok=True)
 RISK_RESET_FILE = CONTROL_DIR / "risk_reset.json"
 ENTRY_BLOCK_STATE = STATE_DIR / "entry_block_status.json"
+ACTION_STATUS_FILE = STATE_DIR / "manual_action_status.json"
+PLAYBOOK_HISTORY_FILE = STATE_DIR / "playbook_history.jsonl"
 
 AGENT_LOG = STATE_DIR / "agent.log"
 SETTINGS_JSON = STATE_DIR / "agent_settings.json"
@@ -112,6 +114,11 @@ DEFAULT_SETTINGS = {
     "risk_max_portfolio_delta": 0.25,
     "risk_max_exposure_pct": 0.05,
     "risk_account_equity": 500000.0,
+    "auto_playbook": {
+        "hedge_on_delta": True,
+        "flatten_on_delta": False,
+        "flatten_on_exposure": False,
+    },
 }
 
 BLOTTER_CSV = STATE_DIR / "trade_blotter.csv"
@@ -154,6 +161,18 @@ def _ensure_csv_exists(path: Path, headers: List[str]) -> None:
 def _request_risk_reset() -> None:
     payload = {
         "action": "reset_risk",
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        RISK_RESET_FILE.write_text(json.dumps(payload, indent=2))
+    except Exception:
+        pass
+
+
+def _request_risk_action(action: str, reason: Optional[str] = None) -> None:
+    payload = {
+        "action": action,
+        "reason": reason,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
     try:
@@ -229,6 +248,12 @@ def _load_settings() -> Dict[str, Any]:
     merged["risk_max_portfolio_delta"] = float(merged.get("risk_max_portfolio_delta", DEFAULT_SETTINGS["risk_max_portfolio_delta"]))
     merged["risk_max_exposure_pct"] = float(merged.get("risk_max_exposure_pct", DEFAULT_SETTINGS["risk_max_exposure_pct"]))
     merged["risk_account_equity"] = float(merged.get("risk_account_equity", DEFAULT_SETTINGS["risk_account_equity"]))
+    playbook = merged.get("auto_playbook") or DEFAULT_SETTINGS["auto_playbook"].copy()
+    merged["auto_playbook"] = {
+        "hedge_on_delta": bool(playbook.get("hedge_on_delta", True)),
+        "flatten_on_delta": bool(playbook.get("flatten_on_delta", False)),
+        "flatten_on_exposure": bool(playbook.get("flatten_on_exposure", False)),
+    }
     return merged
 
 
@@ -441,6 +466,91 @@ def _recent_risk_events(feature_df: Optional[pd.DataFrame], limit: int = 5) -> L
     return list(reversed(events))
 
 
+def _risk_events_in_range(feature_df: Optional[pd.DataFrame], start: datetime, end: datetime) -> List[Dict[str, Any]]:
+    events = _recent_risk_events(feature_df, limit=500)
+    filtered: List[Dict[str, Any]] = []
+    for ev in events:
+        ts = ev.get("timestamp")
+        if not ts:
+            continue
+        try:
+            ts_dt = pd.to_datetime(ts)
+        except Exception:
+            continue
+        if start <= ts_dt <= end:
+            enriched = dict(ev)
+            enriched["timestamp_dt"] = ts_dt
+            details = enriched.get("details") or {}
+            enriched["net_delta"] = details.get("net_delta")
+            enriched["total_notional"] = details.get("total_notional")
+            enriched["block_reason"] = details.get("reason") or enriched.get("label")
+            filtered.append(enriched)
+    return filtered
+
+
+def _predict_delta_breach(equity_df: Optional[pd.DataFrame], risk_limits: Dict[str, float]) -> Optional[Dict[str, Any]]:
+    if equity_df is None or equity_df.empty or "net_delta" not in equity_df.columns:
+        return None
+    df = equity_df.dropna(subset=["net_delta"]).tail(30)
+    if len(df) < 5:
+        return None
+    x = list(range(len(df)))
+    y = df["net_delta"].astype(float)
+    try:
+        slope, intercept = np.polyfit(x, y, 1)
+    except Exception:
+        return None
+    delta_cap = abs(float(risk_limits.get("delta_cap", 0.25)))
+    if slope == 0:
+        return None
+    last_idx = len(df) - 1
+    remaining = None
+    try:
+        target = delta_cap if slope > 0 else -delta_cap
+        steps = (target - (slope * last_idx + intercept)) / slope
+        if steps > 0:
+            remaining = steps
+    except Exception:
+        remaining = None
+    if remaining is None:
+        return None
+    forecast_minutes = remaining * float((st.session_state.get("refresh_sec") or 5)) / 60.0
+    return {
+        "slope": slope,
+        "forecast_minutes": forecast_minutes,
+        "target": target,
+        "current": float(y.iloc[-1]),
+    }
+
+
+def _predict_notional_breach(equity_df: Optional[pd.DataFrame], risk_limits: Dict[str, float]) -> Optional[Dict[str, Any]]:
+    if equity_df is None or equity_df.empty or "total_notional" not in equity_df.columns:
+        return None
+    df = equity_df.dropna(subset=["total_notional"]).tail(30)
+    if len(df) < 5:
+        return None
+    series = df["total_notional"].astype(float)
+    x = list(range(len(series)))
+    try:
+        slope, intercept = np.polyfit(x, series, 1)
+    except Exception:
+        return None
+    cap = float(risk_limits.get("account_equity", 0.0)) * float(risk_limits.get("exposure_pct", 0.0))
+    if cap <= 0 or slope == 0:
+        return None
+    last_idx = len(series) - 1
+    steps = (cap - (slope * last_idx + intercept)) / slope
+    if steps <= 0:
+        return None
+    forecast_minutes = steps * float((st.session_state.get("refresh_sec") or 5)) / 60.0
+    return {
+        "slope": slope,
+        "forecast_minutes": forecast_minutes,
+        "target": cap,
+        "current": float(series.iloc[-1]),
+    }
+
+
 def _render_risk_alerts(feature_df: Optional[pd.DataFrame]) -> None:
     events = _recent_risk_events(feature_df, limit=5)
     st.caption("Recent Risk Alerts")
@@ -469,6 +579,23 @@ def _render_risk_alerts(feature_df: Optional[pd.DataFrame]) -> None:
         )
 
 
+def _load_playbook_history(limit: int = 10) -> List[Dict[str, Any]]:
+    if not PLAYBOOK_HISTORY_FILE.exists():
+        return []
+    entries: List[Dict[str, Any]] = []
+    try:
+        with PLAYBOOK_HISTORY_FILE.open("r", encoding="utf-8") as fh:
+            lines = fh.readlines()[-limit:]
+        for line in lines:
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return list(reversed(entries))
+
+
 def _render_entry_block_status() -> None:
     st.caption("Entry Gate Status")
     if not ENTRY_BLOCK_STATE.exists():
@@ -495,6 +622,44 @@ def _render_entry_block_status() -> None:
         f"</div>",
         unsafe_allow_html=True,
     )
+    action_cols = st.columns(2)
+    with action_cols[0]:
+        if st.button("Acknowledge Risk Event", key="ack_risk"):
+            _request_risk_action("ack_risk", reason=label)
+            st.success("Acknowledged risk event.")
+    with action_cols[1]:
+        if st.button("Snapshot State", key="snapshot_state"):
+            _request_risk_action("snapshot_state")
+        st.success("Snapshot requested.")
+    action_cols2 = st.columns(2)
+    with action_cols2[0]:
+        if st.button("Force Hedge Refresh", key="force_hedge_refresh"):
+            _request_risk_action("force_hedge_refresh")
+            st.success("Hedge refresh signal sent.")
+    with action_cols2[1]:
+        if st.button("Flatten Positions", key="flatten_positions"):
+            _request_risk_action("flatten_positions")
+            st.warning("Flatten request sent.")
+    if ACTION_STATUS_FILE.exists():
+        try:
+            status = json.loads(ACTION_STATUS_FILE.read_text())
+        except Exception:
+            status = None
+        if status:
+            st.caption(
+                f"Latest manual action: {status.get('action')} ({status.get('status')})"
+                f" · {_fmt_optional(status.get('timestamp'))}"
+            )
+            msg = status.get("message")
+            if msg:
+                st.write(msg)
+    history = _load_playbook_history(limit=5)
+    if history:
+        st.caption("Recent Playbook Steps")
+        for entry in history:
+            meta = entry.get("meta") or {}
+            st.markdown(
+                f"- {_fmt_optional(entry.get('timestamp'))} · {entry.get('step')} – {meta}")
 def _fmt_size(num: Optional[int]) -> str:
     if num is None:
         return "—"
@@ -555,6 +720,13 @@ def _clear_stale_pid_file() -> None:
             PID_FILE.unlink()
     except Exception:
         pass
+
+
+def _seconds_since(ts: Optional[datetime]) -> Optional[float]:
+    if ts is None:
+        return None
+    now = datetime.now(ts.tzinfo) if ts.tzinfo else datetime.now()
+    return (now - ts).total_seconds()
     ss = st.session_state
     ss["agent_pid"] = None
     ss["agent_running"] = False
@@ -816,7 +988,8 @@ def _nifty_tile() -> None:
     v = st.session_state.get("ltp_value")
     ts = st.session_state.get("ltp_ts")
 
-    if dw and (v is None or (ts and (datetime.now() - ts) > timedelta(seconds=max(5, int(st.session_state.get("refresh_sec", 5)) * 2)))):
+    ts_age = _seconds_since(ts)
+    if dw and (v is None or (ts_age is not None and ts_age > max(5, int(st.session_state.get("refresh_sec", 5)) * 2))):
         try:
             ltp = dw.get_ltp_once("IDX_I", 13)
             if ltp is not None:
@@ -1372,6 +1545,8 @@ def _render_payoff_analyzer(open_rows, dw):
 # =============================================================================
 def _agent_logs_tab() -> None:
     st.markdown("### Agent Logs")
+    start_dt, end_dt = _date_range_controls("agent_logs")
+    st.caption(f"Showing log entries from {start_dt.date()} to {end_dt.date()}")
     try:
         if not AGENT_LOG.exists():
             st.info("No agent log found yet.")
@@ -1381,8 +1556,18 @@ def _agent_logs_tab() -> None:
         if not lines:
             st.info("Log file is empty.")
             return
-        tail = lines[-800:]
-        st.code("".join(tail), language="log")
+        tail_raw = lines[-800:]
+        filtered = []
+        for line in tail_raw:
+            try:
+                ts_str = line.split(" ", 1)[0]
+                ts = datetime.fromisoformat(ts_str)
+            except Exception:
+                ts = None
+            if ts and start_dt <= ts <= end_dt:
+                filtered.append(line)
+        view_lines = filtered if filtered else tail_raw
+        st.code("".join(view_lines), language="log")
     except Exception as e:
         st.error(f"Failed to read agent logs: {e}")
 
@@ -1588,16 +1773,20 @@ def _strategy_monitor_tab() -> None:
     st.markdown("### Strategy Monitor")
     blotter_df, summary = _load_blotter()
     feature_df = _load_feature_history(limit=250)
+    start_dt, end_dt = _date_range_controls("strategy_monitor")
+    st.caption(f"Showing data from {start_dt.date()} to {end_dt.date()}")
+    blotter_filtered = _filter_df_by_range(blotter_df, start_dt, end_dt)
+    feature_filtered = _filter_df_by_range(feature_df, start_dt, end_dt)
 
     left, right = st.columns([0.55, 0.45])
     with left:
-        _render_blotter_panel(blotter_df, summary)
+        _render_blotter_panel(blotter_filtered, summary)
     with right:
-        _render_environment_summary(feature_df)
+        _render_environment_summary(feature_filtered)
         st.divider()
-        _render_agent_activity(feature_df)
+        _render_agent_activity(feature_filtered)
         st.divider()
-        _render_plan_snapshot(feature_df)
+        _render_plan_snapshot(feature_filtered)
 
 
 def _render_capital_telemetry(
@@ -1711,7 +1900,13 @@ def _render_capital_telemetry(
     return df
 
 
-def _render_exposure_monitor(equity_df: Optional[pd.DataFrame], risk_limits: Dict[str, float]) -> None:
+def _render_exposure_monitor(
+    equity_df: Optional[pd.DataFrame],
+    risk_limits: Dict[str, float],
+    feature_df: Optional[pd.DataFrame],
+    start: datetime,
+    end: datetime,
+) -> None:
     st.markdown("#### Exposure Monitor")
     if equity_df is None or equity_df.empty or "net_delta" not in equity_df.columns:
         st.info("No exposure telemetry yet.")
@@ -1752,6 +1947,32 @@ def _render_exposure_monitor(equity_df: Optional[pd.DataFrame], risk_limits: Dic
         margin=dict(l=10, r=10, t=35, b=35),
         height=260,
     )
+    # annotate risk events
+    events = _risk_events_in_range(feature_df, start, end)
+    for ev in events:
+        ts = ev.get("timestamp_dt")
+        if not ts:
+            continue
+        label = ev.get("label", "")
+        fig.add_vline(
+            x=ts,
+            line=dict(color="#f97316", width=1, dash="dot"),
+            annotation_text=label,
+            annotation_position="top right",
+        )
+        net_delta = ev.get("net_delta")
+        if net_delta is not None:
+            fig.add_annotation(
+                x=ts,
+                y=net_delta,
+                text=f"Δ {net_delta:.2f}",
+                showarrow=True,
+                arrowhead=1,
+                ax=0,
+                ay=-40,
+                bgcolor="rgba(249,115,22,0.2)",
+            )
+
     st.plotly_chart(fig, width="stretch", key="exposure_monitor_chart")
 
 
@@ -1794,6 +2015,8 @@ def _observability_tab() -> None:
     st.caption(f"Showing data from {start_dt.date()} to {end_dt.date()}")
     feature_df = _filter_df_by_range(feature_df, start_dt, end_dt)
     equity_df = _filter_df_by_range(equity_df, start_dt, end_dt)
+    forecast = _predict_delta_breach(equity_df, risk_limits)
+    notional_forecast = _predict_notional_breach(equity_df, risk_limits)
 
     pid = ss.get("agent_pid")
     running_flag = bool(ss.get("agent_running"))
@@ -1832,8 +2055,22 @@ def _observability_tab() -> None:
 
     st.divider()
     equity_df = _render_capital_telemetry(equity_df, chart_key="observability_capital_chart")
+    if forecast:
+        minutes = forecast.get("forecast_minutes")
+        if minutes is not None and minutes < 60:
+            st.warning(f"Net delta trending toward cap in ~{minutes:.1f} min (Δ {forecast['current']:.2f} → {forecast['target']:.2f}).")
+    if notional_forecast:
+        minutes = notional_forecast.get("forecast_minutes")
+        if minutes is not None and minutes < 60:
+            st.warning(
+                "Total notional trending toward cap in ~{:.1f} min (₹ {:,.0f} → {:,.0f}).".format(
+                    minutes,
+                    notional_forecast["current"],
+                    notional_forecast["target"],
+                )
+            )
     st.divider()
-    _render_exposure_monitor(equity_df, risk_limits)
+    _render_exposure_monitor(equity_df, risk_limits, feature_df, start_dt, end_dt)
     st.divider()
     _render_risk_alerts(feature_df)
     st.divider()
@@ -1975,6 +2212,24 @@ def _settings_tab() -> None:
             "batman_salvage_wing_ltp": float(batman_salvage),
         }, indent=2))
         st.success("Settings saved.")
+    with st.expander("Auto Playbook"):
+        pb = current.get("auto_playbook", DEFAULT_SETTINGS["auto_playbook"])
+        hedge_on_delta = st.checkbox("Auto refresh hedges on delta breach", value=pb.get("hedge_on_delta", True))
+        flatten_on_delta = st.checkbox("Auto flatten on delta breach", value=pb.get("flatten_on_delta", False))
+        flatten_on_exposure = st.checkbox("Auto flatten on exposure breach", value=pb.get("flatten_on_exposure", False))
+        if st.button("Save Playbook Settings"):
+            merged = _load_settings()
+            merged["auto_playbook"] = {
+                "hedge_on_delta": hedge_on_delta,
+                "flatten_on_delta": flatten_on_delta,
+                "flatten_on_exposure": flatten_on_exposure,
+            }
+            SETTINGS_JSON.write_text(json.dumps(merged, indent=2))
+            st.success("Playbook settings saved.")
+        st.caption(
+            "These toggles control automated responses when risk events trigger (delta/exposure blocks).\n"
+            "Hedge refresh uses weekly hedges; flatten closes all legs."
+        )
 
 
 def _paper_pnl_tab() -> None:

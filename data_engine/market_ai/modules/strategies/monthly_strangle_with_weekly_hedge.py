@@ -47,6 +47,7 @@ RISK_RESET_FILE = CONTROL_DIR / "risk_reset.json"
 STATE_DIR = MARKET_AI_DIR / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 ENTRY_BLOCK_STATE = STATE_DIR / "entry_block_status.json"
+MANUAL_ACTION_STATUS = STATE_DIR / "manual_action_status.json"
 
 BLOTTER_FIELDS = [
     "timestamp",
@@ -83,6 +84,10 @@ FEATURE_FIELDS = [
     "warn_only",
     "trade_mode",
     "context",
+    "block_reason",
+    "net_delta",
+    "total_notional",
+    "positions_summary",
 ]
 
 EQUITY_FIELDS = [
@@ -304,6 +309,59 @@ def _record_activity_event(
             LOG.debug("[risk] failed to persist entry-block status")
 
 
+def _persist_manual_action(payload: Dict[str, Any]) -> None:
+    try:
+        data = dict(payload)
+        data.setdefault("timestamp", datetime.now().isoformat(timespec="seconds"))
+        MANUAL_ACTION_STATUS.write_text(json.dumps(data, indent=2))
+    except Exception:
+        LOG.debug("[risk] failed to persist manual action status")
+
+
+def _maybe_trigger_auto_playbook(cfg: "LiveConfig", kind: str, detail: Dict[str, Any]) -> None:
+    playbook = getattr(cfg, "auto_playbook", {}) or {}
+    if kind == "delta" and playbook.get("hedge_on_delta") and not getattr(cfg, "_force_hedge_refresh", False):
+        cfg._force_hedge_refresh = True
+        _record_playbook_step(cfg, "auto_hedge_refresh", detail)
+    if kind == "delta" and playbook.get("flatten_on_delta") and not getattr(cfg, "_force_flatten", False):
+        cfg._force_flatten = True
+        _record_playbook_step(cfg, "auto_flatten_delta", detail)
+    if kind == "exposure" and playbook.get("flatten_on_exposure") and not getattr(cfg, "_force_flatten", False):
+        cfg._force_flatten = True
+        _record_playbook_step(cfg, "auto_flatten_exposure", detail)
+
+
+def _record_playbook_step(cfg: "LiveConfig", step: str, meta: Dict[str, Any]) -> None:
+    record = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "step": step,
+        "meta": meta,
+    }
+    try:
+        path = STATE_DIR / "playbook_history.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        LOG.debug("[playbook] failed to append playbook step")
+
+
+def _write_manual_action_status(action: str, status: str, message: str) -> None:
+    try:
+        MANUAL_ACTION_STATUS.write_text(
+            json.dumps(
+                {
+                    "action": action,
+                    "status": status,
+                    "message": message,
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                },
+                indent=2,
+            )
+        )
+    except Exception:
+        LOG.debug("[risk] failed to write manual action status")
+
+
 def _get_risk_manager(cfg: "LiveConfig") -> Optional[RiskManager]:
     risk_mgr = getattr(cfg, "_risk_manager", None)
     if risk_mgr:
@@ -326,7 +384,7 @@ def _apply_exposure_throttles(
     cfg: "LiveConfig",
     net_delta: float,
     total_notional: float,
-) -> None:
+) -> Dict[str, Optional[Dict[str, Any]]]:
     delta_cap = abs(float(getattr(cfg, "risk_max_portfolio_delta", 0.0) or 0.0))
     exposure_pct = float(getattr(cfg, "risk_max_exposure_pct", 0.0) or 0.0)
     equity_ref = float(getattr(cfg, "risk_account_equity", 0.0) or 0.0)
@@ -335,6 +393,9 @@ def _apply_exposure_throttles(
     delta_breach = delta_cap > 0 and abs(net_delta) > delta_cap
     notional_breach = notional_cap is not None and total_notional > notional_cap
 
+    delta_block_detail: Optional[Dict[str, Any]] = None
+    exposure_block_detail: Optional[Dict[str, Any]] = None
+
     if delta_breach and not getattr(cfg, "_delta_breach_active", False):
         cfg._delta_breach_active = True
         cfg.enable_strangle_entry = False
@@ -342,13 +403,47 @@ def _apply_exposure_throttles(
         ts = datetime.now().isoformat(timespec="seconds")
         cfg._last_block_reason = "delta_block"
         cfg._last_block_timestamp = ts
+        detail = {
+            "reason": "delta",
+            "net_delta": net_delta,
+            "cap": delta_cap,
+            "total_notional": total_notional,
+        }
         _record_activity_event(
             cfg,
             "delta_block",
             f"Net delta {net_delta:.3f} breached cap ±{delta_cap}",
             severity="error",
-            context={"net_delta": net_delta, "cap": delta_cap},
+            context=detail,
         )
+        _record_playbook_step(cfg, "auto_block_delta", detail)
+        _record_feature(
+            cfg,
+            {
+                "timestamp": ts,
+                "strategy": "risk_event",
+                "expiry": "",
+                "exchange_seg": cfg.trade_mode,
+                "spot": cfg.last_spot,
+                "ce_strike": None,
+                "pe_strike": None,
+                "ce_ltp": None,
+                "pe_ltp": None,
+                "ce_delta": None,
+                "pe_delta": None,
+                "ce_entry": None,
+                "pe_entry": None,
+                "net_credit": None,
+                "warn_only": int(bool(getattr(cfg, "warn_only", False))),
+                "trade_mode": cfg.trade_mode,
+                "context": json.dumps(detail, default=str),
+                "block_reason": "delta",
+                "net_delta": net_delta,
+                "total_notional": total_notional,
+                "positions_summary": json.dumps(detail, default=str),
+            },
+        )
+        delta_block_detail = detail
     elif not delta_breach and getattr(cfg, "_delta_breach_active", False):
         cfg._delta_breach_active = False
         if not cfg._notional_breach_active:
@@ -369,13 +464,47 @@ def _apply_exposure_throttles(
         ts = datetime.now().isoformat(timespec="seconds")
         cfg._last_block_reason = "exposure_block"
         cfg._last_block_timestamp = ts
+        detail = {
+            "reason": "exposure",
+            "total_notional": total_notional,
+            "cap": notional_cap,
+            "net_delta": net_delta,
+        }
         _record_activity_event(
             cfg,
             "exposure_block",
             f"Total notional ₹{total_notional:,.0f} > cap",
             severity="error",
-            context={"total_notional": total_notional, "cap": notional_cap},
+            context=detail,
         )
+        _record_playbook_step(cfg, "auto_block_exposure", detail)
+        _record_feature(
+            cfg,
+            {
+                "timestamp": ts,
+                "strategy": "risk_event",
+                "expiry": "",
+                "exchange_seg": cfg.trade_mode,
+                "spot": cfg.last_spot,
+                "ce_strike": None,
+                "pe_strike": None,
+                "ce_ltp": None,
+                "pe_ltp": None,
+                "ce_delta": None,
+                "pe_delta": None,
+                "ce_entry": None,
+                "pe_entry": None,
+                "net_credit": None,
+                "warn_only": int(bool(getattr(cfg, "warn_only", False))),
+                "trade_mode": cfg.trade_mode,
+                "context": json.dumps(detail, default=str),
+                "block_reason": "exposure",
+                "net_delta": net_delta,
+                "total_notional": total_notional,
+                "positions_summary": json.dumps(detail, default=str),
+            },
+        )
+        exposure_block_detail = detail
     elif not notional_breach and getattr(cfg, "_notional_breach_active", False):
         cfg._notional_breach_active = False
         if not cfg._delta_breach_active:
@@ -388,6 +517,8 @@ def _apply_exposure_throttles(
             severity="info",
             context={"total_notional": total_notional, "cap": notional_cap},
         )
+
+    return {"delta_block": delta_block_detail, "exposure_block": exposure_block_detail}
 
 
 def _record_equity_snapshot(cfg: "LiveConfig", dw, positions: List[Dict[str, Any]]) -> None:
@@ -538,21 +669,76 @@ def _handle_risk_reset_signal(cfg: "LiveConfig") -> None:
     if not isinstance(data, dict):
         return
     action = data.get("action")
-    if action != "reset_risk":
+    if action == "reset_risk":
+        risk_mgr = _get_risk_manager(cfg)
+        if risk_mgr:
+            risk_mgr.l.hard_kill = False
+            risk_mgr.roll_count = 0
+            risk_mgr.last_block_reason = None
+        cfg.enable_strangle_entry = True
+        cfg._auto_blocked_by_risk = False
+        _persist_manual_action({"action": "reset_risk", "status": "completed", "message": "Risk block cleared"})
+        _record_activity_event(
+            cfg,
+            "risk_manual_reset",
+            "Operator cleared risk block",
+            severity="info",
+        )
         return
-    risk_mgr = _get_risk_manager(cfg)
-    if risk_mgr:
-        risk_mgr.l.hard_kill = False
-        risk_mgr.roll_count = 0
-        risk_mgr.last_block_reason = None
-    cfg.enable_strangle_entry = True
-    cfg._auto_blocked_by_risk = False
-    _record_activity_event(
-        cfg,
-        "risk_manual_reset",
-        "Operator cleared risk block",
-        severity="info",
-    )
+    if action == "ack_risk":
+        reason = data.get("reason")
+        _persist_manual_action({"action": "ack_risk", "status": "completed", "message": f"Acknowledged {reason or 'risk'}"})
+        _record_activity_event(
+            cfg,
+            "risk_acknowledged",
+            f"Operator acknowledged {reason or 'risk'}",
+            severity="info",
+        )
+        return
+    if action == "snapshot_state":
+        try:
+            snapshot = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "last_block_reason": getattr(cfg, "_last_block_reason", None),
+                "last_block_at": getattr(cfg, "_last_block_timestamp", None),
+            }
+            (STATE_DIR / "manual_snapshots").mkdir(parents=True, exist_ok=True)
+            out = STATE_DIR / "manual_snapshots" / f"snapshot_{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+            out.write_text(json.dumps(snapshot, indent=2))
+        except Exception:
+            LOG.warning("[risk] failed to write snapshot_state")
+        else:
+            _persist_manual_action({"action": "snapshot_state", "status": "completed", "message": "Snapshot written"})
+        return
+    if action == "force_hedge_refresh":
+        setattr(cfg, "_force_hedge_refresh", True)
+        cfg._manual_action_ack = {
+            "action": "force_hedge_refresh",
+            "status": "pending",
+            "message": "Hedge refresh queued",
+        }
+        _persist_manual_action(cfg._manual_action_ack)
+        _record_activity_event(
+            cfg,
+            "hedge_refresh_requested",
+            "Operator requested hedge refresh",
+            severity="info",
+        )
+        return
+    if action == "flatten_positions":
+        setattr(cfg, "_force_flatten", True)
+        cfg._manual_action_ack = {
+            "action": "flatten_positions",
+            "status": "pending",
+            "message": "Flatten requested",
+        }
+        _persist_manual_action(cfg._manual_action_ack)
+        _record_activity_event(
+            cfg,
+            "flatten_requested",
+            "Operator requested flatten positions",
+            severity="warning",
+        )
 
 
 # ----------------- utilities -----------------
@@ -1439,6 +1625,14 @@ class LiveConfig:
     _notional_breach_active: bool = field(default=False, repr=False, compare=False)
     _last_block_reason: Optional[str] = field(default=None, repr=False, compare=False)
     _last_block_timestamp: Optional[str] = field(default=None, repr=False, compare=False)
+    _force_hedge_refresh: bool = field(default=False, repr=False, compare=False)
+    _force_flatten: bool = field(default=False, repr=False, compare=False)
+    _manual_action_ack: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)
+    auto_playbook: Dict[str, Any] = field(default_factory=lambda: {
+        "hedge_on_delta": True,
+        "flatten_on_delta": False,
+        "flatten_on_exposure": False,
+    })
 
 
 
@@ -2542,7 +2736,7 @@ def monitor_and_manage_positions(
                 if price is not None and cfg.hedge_price_min <= price <= cfg.hedge_price_max:
                     hedge_present = True
                     break
-        if not hedge_present:
+        if not hedge_present or getattr(cfg, "_force_hedge_refresh", False):
             spot = spot_hint
             if spot is None and "underlying_ltp" in weekly_chain.columns:
                 vals = weekly_chain["underlying_ltp"].dropna()
@@ -2590,6 +2784,15 @@ def monitor_and_manage_positions(
                         LOG.info("[live] hedge CALL bought strike %.0f premium %.2f", row_dict.get("strike"), row_dict.get("ltp_ce"))
                     except Exception as exc:
                         LOG.warning("[live] failed to buy hedge CALL: %s", exc)
+        if getattr(cfg, "_force_hedge_refresh", False):
+            status_payload = {
+                "action": "force_hedge_refresh",
+                "status": "completed",
+                "message": "Hedges refreshed",
+            }
+            _persist_manual_action(status_payload)
+            cfg._manual_action_ack = status_payload
+        cfg._force_hedge_refresh = False
 
 
 def execute_new_strangle(dw, cfg: LiveConfig) -> None:
@@ -2759,7 +2962,25 @@ def run_live(
             if normalized_rows is None:
                 normalized_rows = _normalize_positions(rows)
             net_delta, total_notional = _summarize_exposure(normalized_rows)
-            _apply_exposure_throttles(cfg, net_delta, total_notional)
+            block_info = _apply_exposure_throttles(cfg, net_delta, total_notional)
+            if block_info.get("delta_block"):
+                _maybe_trigger_auto_playbook(cfg, "delta", block_info["delta_block"])
+            if block_info.get("exposure_block"):
+                _maybe_trigger_auto_playbook(cfg, "exposure", block_info["exposure_block"])
+            if getattr(cfg, "_force_flatten", False):
+                for row in normalized_rows:
+                    try:
+                        _close_leg(dw, cfg, row, reason="MANUAL")
+                    except Exception:
+                        LOG.exception("[live] manual flatten failed for %s", row.get("symbol"))
+                cfg._force_flatten = False
+                status_payload = {
+                    "action": "flatten_positions",
+                    "status": "completed",
+                    "message": "Flatten executed",
+                }
+                _persist_manual_action(status_payload)
+                cfg._manual_action_ack = status_payload
 
             if regime_analyzer and (refresh_iters is None or loop_iter % refresh_iters == 0):
                 history_df = pd.DataFrame()

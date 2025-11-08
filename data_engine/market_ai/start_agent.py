@@ -138,21 +138,40 @@ def _pick_json(env_name: str, setting_name: str, default: Any, settings: Dict[st
     return default
 # ───────────────────────── DhanWrapper import (robust) ───────────────────────
 def _import_dhan_wrapper():
+    """
+    Import the DhanWrapper class even if Python packages are not installed
+    properly (e.g. when start_agent.py is launched from a copied folder).
+    """
     try:
         from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
         log.info("DhanWrapper import: data_engine.market_ai.dhan_wrapper")
         return DhanWrapper
-    except ModuleNotFoundError as exc:
+    except (ModuleNotFoundError, ImportError) as exc:
         candidates = [
             ENGINE_DIR / "dhan_wrapper.py",
             PROJECT_ROOT / "data_engine" / "market_ai" / "dhan_wrapper.py",
+            PROJECT_ROOT / "market_ai" / "dhan_wrapper.py",
         ]
         for path in candidates:
             if path.exists():
                 DhanWrapper = _lazy_symbol(path, "DhanWrapper")  # type: ignore
                 log.info("DhanWrapper import: file %s", path)
                 return DhanWrapper
-        raise exc
+
+        # as a last resort search the repo to help misconfigured deployments
+        hits = sorted(PROJECT_ROOT.rglob("dhan_wrapper.py"))
+        for path in hits:
+            try:
+                DhanWrapper = _lazy_symbol(path, "DhanWrapper")  # type: ignore
+                log.info("DhanWrapper import: discovered %s", path)
+                return DhanWrapper
+            except Exception:
+                continue
+
+        raise ModuleNotFoundError(
+            "Unable to import DhanWrapper. Ensure data_engine/market_ai is on PYTHONPATH "
+            "or keep dhan_wrapper.py under the project root."
+        ) from exc
 
 
 DhanWrapper = _import_dhan_wrapper()
@@ -306,7 +325,7 @@ def _maybe_run_adaptive() -> bool:
     log.info("Loading adaptive agent from: %s", agent_file)
     mod = _load_module_from_path("adaptive_agent_mod", agent_file)
     AdaptiveAgent = getattr(mod, "AdaptiveAgent")
-    AgentConfig   = getattr(mod, "AgentConfig", None)
+    AgentConfig = getattr(mod, "AgentConfig", None)
 
     if AgentConfig is None:
         log.warning("adaptive_agent.py missing AgentConfig; using fallback dataclass")
@@ -423,6 +442,7 @@ def main() -> None:
         risk_overall_sl_pct=pick("RISK_OVERALL_SL_PCT", "risk_overall_sl_pct", getattr(LiveConfig, "risk_overall_sl_pct", 2.5), _as_float),
         risk_max_portfolio_delta=pick("RISK_MAX_PORTFOLIO_DELTA", "risk_max_portfolio_delta", getattr(LiveConfig, "risk_max_portfolio_delta", 0.25), _as_float),
         risk_per_leg_sl_mult=pick("RISK_PER_LEG_SL_MULT", "risk_per_leg_sl_mult", getattr(LiveConfig, "risk_per_leg_sl_mult", 2.0), _as_float),
+        auto_playbook=settings.get("auto_playbook", getattr(LiveConfig, "auto_playbook", {})),
     )
     cfg.regime_refresh_minutes = pick("REGIME_REFRESH_MINUTES", "regime_refresh_minutes", cfg.regime_refresh_minutes, _as_float)
     cfg.auto_disable_strangle_when_unfavored = pick_bool(
