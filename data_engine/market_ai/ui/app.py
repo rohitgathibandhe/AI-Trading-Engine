@@ -1949,16 +1949,26 @@ def _render_exposure_monitor(
     )
     # annotate risk events
     events = _risk_events_in_range(feature_df, start, end)
+    y_min = float(np.nanmin(df["net_delta"])) if df["net_delta"].notna().any() else -delta_cap
+    y_max = float(np.nanmax(df["net_delta"])) if df["net_delta"].notna().any() else delta_cap
     for ev in events:
         ts = ev.get("timestamp_dt")
         if not ts:
             continue
+        try:
+            ts = pd.to_datetime(ts).to_pydatetime()
+        except Exception:
+            continue
         label = ev.get("label", "")
-        fig.add_vline(
-            x=ts,
-            line=dict(color="#f97316", width=1, dash="dot"),
-            annotation_text=label,
-            annotation_position="top right",
+        fig.add_trace(
+            go.Scatter(
+                x=[ts, ts],
+                y=[y_min, y_max],
+                mode="lines",
+                line=dict(color="#f97316", width=1, dash="dot"),
+                hoverinfo="skip",
+                showlegend=False,
+            )
         )
         net_delta = ev.get("net_delta")
         if net_delta is not None:

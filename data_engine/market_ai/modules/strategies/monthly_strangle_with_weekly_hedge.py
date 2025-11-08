@@ -2431,6 +2431,30 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
     ce_info = _find_by_strike(ce_strike, "CALL")
     if not pe_info or not ce_info:
         LOG.warning("[live] could not resolve security ids for strangle entry (pe=%s ce=%s)", pe_strike, ce_strike)
+        _record_feature(
+            cfg,
+            {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "strategy": cfg.strategy_name if hasattr(cfg, "strategy_name") else "monthly_strangle_with_weekly_hedge",
+                "trade_mode": cfg.trade_mode,
+                "warn_only": True,
+                "context": json.dumps(
+                    {
+                        "event": "security_id_missing",
+                        "pe_strike": pe_strike,
+                        "ce_strike": ce_strike,
+                        "expiry": expiry,
+                    }
+                ),
+            },
+        )
+        cfg._last_strangle_entry_attempt = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "reason": "security_id_missing",
+            "pe_strike": pe_strike,
+            "ce_strike": ce_strike,
+            "expiry": expiry,
+        }
         return
 
     pe_id, pe_price = pe_info
