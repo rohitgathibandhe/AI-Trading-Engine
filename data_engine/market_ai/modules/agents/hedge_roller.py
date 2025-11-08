@@ -16,8 +16,8 @@ import time
 import logging
 from typing import Dict, Any, Tuple, Optional
 
-from modules.utils.config_loader import load_all_configs
-from modules.agent.risk_manager import RiskManager
+from market_ai.modules.utils.config_loader import load_all_configs
+from market_ai.modules.risk_manager import RiskManager
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)

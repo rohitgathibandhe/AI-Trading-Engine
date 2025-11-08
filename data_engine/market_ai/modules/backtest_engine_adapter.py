@@ -30,7 +30,6 @@ def import_strategy(strategy_name: str):
     candidates = [
         f"market_ai.modules.strategies.{strategy_name}",
         f"market_ai.modules.{strategy_name}",
-        f"modules.strategies.{strategy_name}",
         strategy_name,
     ]
     errs = []

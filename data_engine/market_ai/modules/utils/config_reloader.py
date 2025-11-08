@@ -9,7 +9,7 @@ import os
 import time
 import threading
 from typing import Callable, Dict
-from modules.utils.config_loader import load_all_configs
+from market_ai.modules.utils.config_loader import load_all_configs
 
 
 class ConfigReloader:

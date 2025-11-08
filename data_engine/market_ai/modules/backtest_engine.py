@@ -31,7 +31,6 @@ log.addHandler(logging.NullHandler())
 def _import_strategy(strategy_name: str):
     """Try a set of module import paths for strategy_name"""
     attempts = [
-        f"modules.strategies.{strategy_name}",
         f"market_ai.modules.strategies.{strategy_name}",
         strategy_name,
     ]

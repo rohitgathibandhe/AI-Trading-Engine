@@ -9,7 +9,7 @@ Exports:
   should_skip_sells(vix: float, cfg: dict) -> (bool, str)
 
 Notes:
- - This module performs lazy import of your Dhan helper (modules.data_fetch.dhan_option_chain or modules.data_fetch.dhan_api)
+ - This module performs lazy import of your Dhan helper (market_ai.modules.data_fetch.*)
  - It caches the last successful option-chain fetch for `underlying_id` for a short time window to reduce 429s.
  - `should_skip_sells` centralizes the gate logic used by the backtest engine/adapter.
 """
@@ -108,19 +108,18 @@ def _fetch_remote_chain_and_infer(underlying_id: Optional[int] = None, expiry: O
 
     # lazy-import Dhan api wrapper(s) - support multiple possible module names used in this repo
     rhoi = None
-    try:
-        # prefer exact helper if present
-        from modules.data_fetch import dhan_option_chain as dhan_helper  # type: ignore
-        rhoi = dhan_helper
-    except Exception:
+    for mod_path in (
+        "market_ai.modules.data_fetch.dhan_option_chain",
+        "market_ai.modules.data_fetch.dhan_api",
+    ):
         try:
-            from modules.data_fetch import dhan_api as dhan_helper  # type: ignore
-            rhoi = dhan_helper
+            rhoi = __import__(mod_path, fromlist=["*"])  # type: ignore
+            break
         except Exception:
-            rhoi = None
+            continue
 
     if rhoi is None:
-        logger.debug("vix_utils: no Dhan helper module found (modules.data_fetch.dhan_option_chain / dhan_api)")
+        logger.debug("vix_utils: no Dhan helper module found (market_ai.modules.data_fetch.*)")
         return None
 
     # call the helper: we try a few argument patterns defensively

@@ -1,4 +1,4 @@
-# modules/strategies/example_strategy.py
+# market_ai/modules/strategies/example_strategy.py
 """Minimal example strategy module used as fallback.
    Production-style, spaces-only indentation.
 """
@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 import logging
 import pandas as pd
 
-log = logging.getLogger("modules.strategies.example_strategy")
+log = logging.getLogger("market_ai.modules.strategies.example_strategy")
 log.addHandler(logging.NullHandler())
 
 

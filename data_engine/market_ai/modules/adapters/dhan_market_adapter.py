@@ -9,8 +9,8 @@ It MUST provide:
     (returns columns: ['datetime','open','high','low','close'])
 
 This version tries to pull a real spot from your existing modules:
-  - modules.data_fetch.dhan_option_chain (OptionChain / OptionChainAdapter)
-  - modules.data_fetch.dhan_wrapper.get_option_chain / get_option_price
+  - market_ai.modules.data_fetch.dhan_option_chain (OptionChain / OptionChainAdapter)
+  - market_ai.modules.data_fetch.dhan_wrapper.get_option_chain / get_option_price
 and falls back to a local synthetic generator so the agent keeps running.
 
 Replace the fallback parts with your live API calls whenever ready.
@@ -30,21 +30,22 @@ import pandas as pd
 # Option-chain adapter (to derive spot if available)
 _OptionChainCls = None
 try:
-    from modules.data_fetch import dhan_option_chain as _doc
-    for _cand in ("OptionChain", "OptionChainAdapter", "DhanOptionChainAdapter", "DhanOptionChain"):
-        if hasattr(_doc, _cand):
-            _OptionChainCls = getattr(_doc, _cand)
-            break
-except Exception:
-    _OptionChainCls = None
+    from market_ai.modules.data_fetch import dhan_option_chain as _doc
+except Exception as exc:  # pragma: no cover - import wiring issue
+    raise ImportError("market_ai.modules.data_fetch.dhan_option_chain missing") from exc
+
+for _cand in ("OptionChain", "OptionChainAdapter", "DhanOptionChainAdapter", "DhanOptionChain"):
+    if hasattr(_doc, _cand):
+        _OptionChainCls = getattr(_doc, _cand)
+        break
 
 # Wrapper with helper functions like get_option_chain / get_option_price
-_dhan_wrapper = None
 try:
-    from modules.data_fetch import dhan_wrapper as _dw
-    _dhan_wrapper = _dw
-except Exception:
-    _dhan_wrapper = None
+    from market_ai.modules.data_fetch import dhan_wrapper as _dw
+except Exception as exc:  # pragma: no cover
+    raise ImportError("market_ai.modules.data_fetch.dhan_wrapper missing") from exc
+
+_dhan_wrapper = _dw
 
 
 class DhanMarketAdapter:

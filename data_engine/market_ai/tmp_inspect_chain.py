@@ -21,9 +21,7 @@ def find_module_candidate():
     names = [
         "market_ai.modules.data_fetch.dhan_option_chain",
         "market_ai.modules.data_fetch.dhan_optionchain",
-        "modules.data_fetch.dhan_option_chain",
         "market_ai.modules.data_fetch.dhan_api",
-        "modules.data_fetch.dhan_optionchain",
     ]
     for n in names:
         try:

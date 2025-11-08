@@ -12,55 +12,66 @@ from .iv_store import IVStore
 from .market_features import summarize_timeframe, topdown_gate
 from .options_features import compute_pcr, symmetry_check, pick_delta_strikes
 
-from modules.data_fetch.option_chain_ingestor import OptionChainIngestor, ChainConfig
+from market_ai.modules.data_fetch.option_chain_ingestor import OptionChainIngestor, ChainConfig
+
+
+def _resolve_attr(module_paths: Tuple[str, ...], attr_candidates: Tuple[str, ...]):
+    for mod_path in module_paths:
+        try:
+            module = __import__(mod_path, fromlist=["*"])
+        except Exception:
+            continue
+        for attr in attr_candidates:
+            if hasattr(module, attr):
+                return getattr(module, attr)
+    return None
+
+
+def _import_first(module_paths: Tuple[str, ...]):
+    for mod_path in module_paths:
+        try:
+            return __import__(mod_path, fromlist=["*"])
+        except Exception:
+            continue
+    return None
 
 # === MarketAdapter (robust import) ===
 MarketAdapter = None
-try:
-    from modules.adapters import dhan_market_adapter as _dma
-    MarketAdapter = getattr(_dma, "MarketAdapter", None) or getattr(_dma, "DhanMarketAdapter", None)
-except Exception:
-    MarketAdapter = None
-if MarketAdapter is None:
-    try:
-        from modules.data_fetch import dhan_market_adapter as _dma
-        MarketAdapter = getattr(_dma, "MarketAdapter", None) or getattr(_dma, "DhanMarketAdapter", None)
-    except Exception:
-        MarketAdapter = None
+MarketAdapter = _resolve_attr(
+    (
+        "market_ai.modules.adapters.dhan_market_adapter",
+        "market_ai.modules.data_fetch.dhan_market_adapter",  # extreme fallback if mis-placed
+    ),
+    ("MarketAdapter", "DhanMarketAdapter"),
+)
 if MarketAdapter is None:
     raise ImportError("Could not resolve MarketAdapter/DhanMarketAdapter in adapters or data_fetch.")
 
 # === OptionChain (robust import) ===
-OptionChainAdapter = None
-try:
-    from modules.data_fetch import dhan_option_chain as _doc
-    for _cand in ("OptionChain", "OptionChainAdapter", "DhanOptionChainAdapter", "DhanOptionChain"):
-        if hasattr(_doc, _cand):
-            OptionChainAdapter = getattr(_doc, _cand)
-            break
-except Exception:
-    OptionChainAdapter = None
+OptionChainAdapter = _resolve_attr(
+    (
+        "market_ai.modules.data_fetch.dhan_option_chain",
+    ),
+    ("OptionChain", "OptionChainAdapter", "DhanOptionChainAdapter", "DhanOptionChain"),
+)
 # Wrapper (function-style) fallback
-_dhan_wrapper = None
-try:
-    from modules.data_fetch import dhan_wrapper as _dw
-    _dhan_wrapper = _dw
-except Exception:
-    _dhan_wrapper = None
+_dhan_wrapper = _import_first(
+    (
+        "market_ai.modules.data_fetch.dhan_wrapper",
+    )
+)
 
 # Extra fallbacks (other modules in your tree)
-_live_chain_mod = None
-_repo_chain_mod = None
-try:
-    from modules.data_fetch import live_option_chain as _lc
-    _live_chain_mod = _lc
-except Exception:
-    pass
-try:
-    from modules.data_fetch import optionchain_repo as _ocr
-    _repo_chain_mod = _ocr
-except Exception:
-    pass
+_live_chain_mod = _import_first(
+    (
+        "market_ai.modules.data_fetch.live_option_chain",
+    )
+)
+_repo_chain_mod = _import_first(
+    (
+        "market_ai.modules.data_fetch.optionchain_repo",
+    )
+)
 
 
 def _now_ist() -> datetime.datetime:
