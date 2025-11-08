@@ -14,7 +14,17 @@ import pandas as pd
 from pathlib import Path
 
 from market_ai.modules.data_fetch.option_chain_ingestor import OptionChainIngestor, ChainConfig
-from market_ai.modules.data_fetch.dhan_scrip_cache import resolve_option_security_id
+from market_ai.modules.data_fetch.dhan_scrip_cache import resolve_option_security_id, refresh_scrip_master
+
+def _resolve_security_id_with_refresh(symbol: str, expiry: str, strike: float, opt_type: str, *, allow_refresh: bool = True) -> Optional[int]:
+    sec_id = resolve_option_security_id(symbol, expiry, strike, opt_type)
+    if sec_id is not None or not allow_refresh:
+        return sec_id
+    try:
+        refresh_scrip_master(force=True)
+    except Exception:
+        return None
+    return resolve_option_security_id(symbol, expiry, strike, opt_type)
 from market_ai.modules.analytics import summarize_market_state
 from market_ai.modules.agents.strategy_recommender import serialize_recommendations
 from market_ai.modules.risk_manager import RiskLimits, RiskManager
@@ -2414,7 +2424,7 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
                 )
                 sec_candidate = _safe_float(raw_sec, None)
                 if sec_candidate is None:
-                    sec_id = resolve_option_security_id(NIFTY_SYMBOL, expiry, strike, typ)
+                    sec_id = _resolve_security_id_with_refresh(NIFTY_SYMBOL, expiry, strike, typ)
                 else:
                     sec_id = int(sec_candidate)
             if sec_id is None:
