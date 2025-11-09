@@ -26,6 +26,8 @@ from market_ai.modules.training.feature_dataset import (
     build_feature_matrix,
 )
 from market_ai.modules.training.rolling_option_features import build_dataset
+from market_ai.modules.data_fetch.dhan_rolling_option import RollingOptionIngestor, RollingOptionConfig
+from market_ai.modules.data_fetch.dhan_api import make_client
 
 MODEL_PATH_DEFAULT = Path(__file__).resolve().parents[2] / "state" / "strategy_selector_model.json"
 
@@ -55,15 +57,45 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Directory containing rolling_option parquet folders",
     )
+    parser.add_argument(
+        "--fetch-rolling-option",
+        action="store_true",
+        help="Fetch Dhan rolling option history before training",
+    )
+    parser.add_argument("--fetch-underlying", help="Underlying symbol for rolling option fetch (e.g., NIFTY)")
+    parser.add_argument("--fetch-segment", default="NSE_FNO", help="Underlying segment for fetch (default NSE_FNO)")
+    parser.add_argument("--fetch-security-id", type=int, help="Numeric securityId required for rolling option fetch")
+    parser.add_argument("--fetch-start", help="Fetch start date YYYY-MM-DD")
+    parser.add_argument("--fetch-end", help="Fetch end date YYYY-MM-DD")
+    parser.add_argument("--fetch-expiry", help="Optional expiry filter YYYY-MM-DD")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
+    rolling_dir = args.rolling_option_dir
+
+    if args.fetch_rolling_option:
+        if not all([args.fetch_underlying, args.fetch_security_id, args.fetch_start, args.fetch_end]):
+            raise SystemExit("--fetch-underlying, --fetch-security-id, --fetch-start and --fetch-end are required when --fetch-rolling-option is used")
+        rolling_dir = rolling_dir or Path(__file__).resolve().parents[2] / "state" / "rolling_option"
+        rolling_dir.mkdir(parents=True, exist_ok=True)
+        cfg = RollingOptionConfig(
+            underlying=args.fetch_underlying,
+            segment=args.fetch_segment,
+            security_id=args.fetch_security_id,
+            start=datetime.strptime(args.fetch_start, "%Y-%m-%d"),
+            end=datetime.strptime(args.fetch_end, "%Y-%m-%d"),
+            expiry=args.fetch_expiry,
+        )
+        ingestor = RollingOptionIngestor(client=make_client(), out_dir=rolling_dir)
+        written = ingestor.fetch_range(cfg)
+        print(f"Fetched {len(written)} rolling-option parquet files into {rolling_dir}")
+
     df_raw = load_feature_history(args.history)
-    if args.rolling_option_dir:
-        ro_features = build_dataset(args.rolling_option_dir)
+    if rolling_dir:
+        ro_features = build_dataset(rolling_dir)
         if not ro_features.empty:
             df_raw = pd.concat([df_raw, ro_features], ignore_index=True)
     if df_raw.empty:
