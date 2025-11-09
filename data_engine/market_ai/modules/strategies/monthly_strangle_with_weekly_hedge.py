@@ -1720,6 +1720,9 @@ class LiveConfig:
     _manual_action_ack: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)
     _order_fail_count: int = field(default=0, repr=False, compare=False)
     _circuit_tripped_until: Optional[datetime] = field(default=None, repr=False, compare=False)
+    _last_strangle_entry_attempt: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)
+    _last_market_state: Optional["MarketState"] = field(default=None, repr=False, compare=False)
+    _last_strategy_candidates: Optional[List["StrategyCandidate"]] = field(default=None, repr=False, compare=False)
     auto_playbook: Dict[str, Any] = field(default_factory=lambda: {
         "hedge_on_delta": True,
         "flatten_on_delta": False,
@@ -2271,7 +2274,13 @@ def _pick_monthly_expiry(ing: OptionChainIngestor) -> Optional[str]:
         return None
     today = date.today()
     future: List[date] = []
-    for item in exp_series.dropna().tolist():
+    if hasattr(exp_series, "dropna"):
+        iterable = exp_series.dropna().tolist()  # type: ignore[assignment]
+    elif isinstance(exp_series, (list, tuple)):
+        iterable = [item for item in exp_series if item not in (None, "")]
+    else:
+        iterable = []
+    for item in iterable:
         try:
             d = datetime.strptime(str(item), "%Y-%m-%d").date()
             if d >= today:
@@ -2741,25 +2750,29 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
             reason = getattr(risk_mgr, "last_block_reason", None) or "risk_block"
             cfg.enable_strangle_entry = False
             cfg._auto_blocked_by_risk = True
-        ts = datetime.now().isoformat(timespec="seconds")
-        cfg._last_block_reason = reason
-        cfg._last_block_timestamp = ts
-        _record_activity_event(
-            cfg,
-            "risk_block",
-            f"Entry blocked ({reason})",
-            severity="error",
-            context={"reason": reason},
-        )
-        return
+            ts = datetime.now().isoformat(timespec="seconds")
+            cfg._last_block_reason = reason
+            cfg._last_block_timestamp = ts
+            _record_activity_event(
+                cfg,
+                "risk_block",
+                f"Entry blocked ({reason})",
+                severity="error",
+                context={"reason": reason},
+            )
+            return
         if not risk_mgr.can_allocate(notional):
             _record_activity_event(
                 cfg,
                 "risk_block",
                 "Entry blocked (exposure cap)",
                 severity="warning",
-                context={"notional": notional, "equity": getattr(risk_mgr.l, 'equity', None)},
+                context={"notional": notional, "equity": getattr(risk_mgr.l, "equity", None)},
             )
+            cfg.enable_strangle_entry = False
+            cfg._auto_blocked_by_risk = True
+            cfg._last_block_reason = "exposure_cap"
+            cfg._last_block_timestamp = datetime.now().isoformat(timespec="seconds")
             return
 
     qty = cfg.lot_size
@@ -3263,10 +3276,12 @@ def run_live(
                 normalized_rows = _normalize_positions(rows)
             net_delta, total_notional = _summarize_exposure(normalized_rows)
             block_info = _apply_exposure_throttles(cfg, net_delta, total_notional)
-            if block_info.get("delta_block"):
-                _maybe_trigger_auto_playbook(cfg, "delta", block_info["delta_block"])
-            if block_info.get("exposure_block"):
-                _maybe_trigger_auto_playbook(cfg, "exposure", block_info["exposure_block"])
+            delta_block = block_info.get("delta_block")
+            exposure_block = block_info.get("exposure_block")
+            if delta_block:
+                _maybe_trigger_auto_playbook(cfg, "delta", delta_block)
+            if exposure_block:
+                _maybe_trigger_auto_playbook(cfg, "exposure", exposure_block)
             if getattr(cfg, "_force_flatten", False):
                 for row in normalized_rows:
                     try:
