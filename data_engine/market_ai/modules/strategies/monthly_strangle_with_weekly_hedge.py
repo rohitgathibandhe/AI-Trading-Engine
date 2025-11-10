@@ -436,18 +436,32 @@ def _write_manual_action_status(action: str, status: str, message: str) -> None:
 
 def _get_risk_manager(cfg: "LiveConfig") -> Optional[RiskManager]:
     risk_mgr = getattr(cfg, "_risk_manager", None)
+
+    def _pull_limits() -> Dict[str, float]:
+        return {
+            "max_daily_loss": float(getattr(cfg, "risk_max_daily_loss", 75000.0)),
+            "per_leg_sl_mult": float(getattr(cfg, "risk_per_leg_sl_mult", 2.0)),
+            "max_rolls_per_day": int(getattr(cfg, "risk_max_rolls_per_day", 6)),
+            "equity": float(getattr(cfg, "risk_account_equity", 500000.0)),
+            "max_exposure_pct": float(getattr(cfg, "risk_max_exposure_pct", 0.05)),
+            "overall_sl_pct": float(getattr(cfg, "risk_overall_sl_pct", 2.5)),
+            "max_portfolio_delta": float(getattr(cfg, "risk_max_portfolio_delta", 0.25)),
+        }
+
+    limits_kwargs = _pull_limits()
     if risk_mgr:
+        # Keep limits in sync with the latest config (available capital, exposure cap, etc.)
+        lm = risk_mgr.l
+        lm.max_daily_loss = limits_kwargs["max_daily_loss"]
+        lm.per_leg_sl_mult = limits_kwargs["per_leg_sl_mult"]
+        lm.max_rolls_per_day = limits_kwargs["max_rolls_per_day"]
+        lm.equity = limits_kwargs["equity"]
+        lm.max_exposure_pct = limits_kwargs["max_exposure_pct"]
+        lm.overall_sl_pct = limits_kwargs["overall_sl_pct"]
+        lm.max_portfolio_delta = limits_kwargs["max_portfolio_delta"]
         return risk_mgr
-    limits = RiskLimits(
-        max_daily_loss=float(getattr(cfg, "risk_max_daily_loss", 75000.0)),
-        per_leg_sl_mult=float(getattr(cfg, "risk_per_leg_sl_mult", 2.0)),
-        max_rolls_per_day=int(getattr(cfg, "risk_max_rolls_per_day", 6)),
-        equity=float(getattr(cfg, "risk_account_equity", 500000.0)),
-        max_exposure_pct=float(getattr(cfg, "risk_max_exposure_pct", 0.05)),
-        overall_sl_pct=float(getattr(cfg, "risk_overall_sl_pct", 2.5)),
-        max_portfolio_delta=float(getattr(cfg, "risk_max_portfolio_delta", 0.25)),
-    )
-    risk_mgr = RiskManager(limits)
+
+    risk_mgr = RiskManager(RiskLimits(**limits_kwargs))
     cfg._risk_manager = risk_mgr
     return risk_mgr
 
@@ -609,6 +623,11 @@ def _record_equity_snapshot(cfg: "LiveConfig", dw, positions: List[Dict[str, Any
     collateral = _f(funds.get("collateral"))
     utilized = _f(funds.get("utilized"))
     withdrawable = _f(funds.get("withdrawable"))
+
+    if available and available > 0:
+        cfg.risk_account_equity = float(available)
+        if getattr(cfg, "_risk_manager", None):
+            cfg._risk_manager.l.equity = float(available)
 
     gross_exposure = 0.0
     net_exposure = 0.0
@@ -2670,6 +2689,23 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
     chain_sources = _collect_option_chain_sources(data)
 
     def _find_by_strike(strike: int, typ: str) -> Optional[Tuple[int, Optional[float]]]:
+        def _fallback_leg_lookup() -> Optional[Tuple[int, Optional[float]]]:
+            sec_id = _resolve_security_id_with_refresh(NIFTY_SYMBOL, expiry, strike, typ)
+            if sec_id is None:
+                return None
+            price_val: Optional[float] = None
+            try:
+                price_val = dw.get_ltp_once(NIFTY_FNO_SEG, sec_id)
+            except Exception as exc:
+                LOG.warning(
+                    "[live] fallback LTP lookup failed for %s strike %s (%s): %s",
+                    typ,
+                    strike,
+                    expiry,
+                    exc,
+                )
+            return sec_id, price_val
+
         result = _extract_leg_from_chain_sources(chain_sources, strike, typ, NIFTY_SYMBOL, expiry)
         if result:
             return result
@@ -2709,6 +2745,9 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
                     price_val = _safe_float(row_dict.get(key), None)
                     break
             return sec_id, price_val
+        fallback = _fallback_leg_lookup()
+        if fallback:
+            return fallback
         return None
 
     pe_info = _find_by_strike(pe_strike, "PUT")
