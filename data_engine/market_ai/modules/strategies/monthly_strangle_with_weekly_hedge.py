@@ -9,7 +9,7 @@ import json
 import uuid
 from dataclasses import dataclass, asdict, field
 from datetime import date, timedelta, datetime
-from typing import Any, Dict, Optional, Tuple, List, cast, TYPE_CHECKING
+from typing import Any, Dict, Optional, Tuple, List, Set, cast, TYPE_CHECKING
 
 import pandas as pd
 from pathlib import Path
@@ -61,6 +61,7 @@ ENTRY_BLOCK_STATE = STATE_DIR / "entry_block_status.json"
 MANUAL_ACTION_STATUS = STATE_DIR / "manual_action_status.json"
 ORDER_AUDIT_LOG = STATE_DIR / "order_audit.jsonl"
 ORDER_INTENT_QUEUE = STATE_DIR / "order_intents.jsonl"
+MANAGED_LEG_STATE = STATE_DIR / "managed_legs.json"
 
 BLOTTER_FIELDS = [
     "timestamp",
@@ -432,6 +433,52 @@ def _write_manual_action_status(action: str, status: str, message: str) -> None:
         )
     except Exception:
         LOG.debug("[risk] failed to write manual action status")
+
+
+def _load_managed_leg_state(cfg: "LiveConfig") -> None:
+    try:
+        if MANAGED_LEG_STATE.exists():
+            raw = json.loads(MANAGED_LEG_STATE.read_text()) or {}
+            cfg._managed_entry_leg_ids = {int(k): v for k, v in raw.items()}
+        else:
+            cfg._managed_entry_leg_ids = {}
+    except Exception:
+        LOG.warning("[state] failed loading managed leg state; starting empty")
+        cfg._managed_entry_leg_ids = {}
+
+
+def _persist_managed_leg_state(cfg: "LiveConfig") -> None:
+    try:
+        MANAGED_LEG_STATE.write_text(json.dumps(cfg._managed_entry_leg_ids or {}, indent=2, default=str))
+    except Exception:
+        LOG.warning("[state] failed writing managed leg state")
+
+
+def _register_managed_leg(cfg: "LiveConfig", security_id: int, context: Optional[Dict[str, Any]] = None) -> None:
+    if security_id is None:
+        return
+    if not isinstance(cfg._managed_entry_leg_ids, dict):
+        cfg._managed_entry_leg_ids = {}
+    cfg._managed_entry_leg_ids[int(security_id)] = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "context": context or {},
+    }
+    _persist_managed_leg_state(cfg)
+
+
+def _sync_managed_leg_inventory(cfg: "LiveConfig", positions: List[Dict[str, Any]]) -> None:
+    current_ids: Set[int] = set()
+    for row in positions or []:
+        sec_id = _safe_int(row.get("security_id"), None)
+        if sec_id is not None:
+            current_ids.add(sec_id)
+    removed = False
+    for sec_id in list((cfg._managed_entry_leg_ids or {}).keys()):
+        if sec_id not in current_ids:
+            cfg._managed_entry_leg_ids.pop(sec_id, None)
+            removed = True
+    if removed:
+        _persist_managed_leg_state(cfg)
 
 
 def _get_risk_manager(cfg: "LiveConfig") -> Optional[RiskManager]:
@@ -1095,6 +1142,14 @@ def _normalize_positions(rows: Any) -> List[Dict[str, Any]]:
             qty = 0
 
         avg_price = _safe_float(r.get("avg_price") or r.get("costPrice"))
+        sec_id = _safe_int(
+            r.get("securityId")
+            or r.get("security_id")
+            or r.get("securityID")
+            or r.get("token")
+            or r.get("symbolToken"),
+            None,
+        )
 
         side = (r.get("side") or r.get("positionType") or "").upper()
         # LTP rule you wanted:
@@ -1121,6 +1176,7 @@ def _normalize_positions(rows: Any) -> List[Dict[str, Any]]:
             "ltp": ltp,
             "side": side,
             "pnl": pnl,
+            "security_id": sec_id,
             "_raw": r,
         })
 
@@ -1706,6 +1762,7 @@ class BatmanStructure:
 @dataclass
 class LiveConfig:
     max_strangles: int = 1
+    max_entry_lots: int = 2
     lot_size: int = 75
     sl_pct: float = 0.025
     tp_pct: float = 0.0225
@@ -1733,6 +1790,7 @@ class LiveConfig:
     risk_use_margin_capacity: bool = True
     risk_margin_leverage: float = 12.0
     risk_min_margin_buffer: float = 25000.0
+    strangle_margin_per_lot: float = 160000.0
     risk_account_equity: float = 500000.0
     risk_max_rolls_per_day: int = 6
     risk_overall_sl_pct: float = 2.5
@@ -1763,6 +1821,7 @@ class LiveConfig:
     _margin_available: float = field(default=0.0, repr=False, compare=False)
     _margin_utilized: float = field(default=0.0, repr=False, compare=False)
     _margin_capacity: float = field(default=0.0, repr=False, compare=False)
+    _managed_entry_leg_ids: Dict[int, Dict[str, Any]] = field(default_factory=dict, repr=False, compare=False)
     auto_playbook: Dict[str, Any] = field(default_factory=lambda: {
         "hedge_on_delta": True,
         "flatten_on_delta": False,
@@ -2093,6 +2152,8 @@ def _submit_order(
             "slippage_pct": slippage_pct,
         }
     )
+    if placed and context.get("tag") in {"entry_put", "entry_call"}:
+        _register_managed_leg(cfg, security_id, context)
     return placed
 
 
@@ -2702,19 +2763,29 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
 
     margin_available = float(getattr(cfg, "_margin_available", 0.0) or 0.0)
     min_margin_buffer = float(getattr(cfg, "risk_min_margin_buffer", 0.0) or 0.0)
-    if margin_available <= min_margin_buffer:
+    free_margin = margin_available - min_margin_buffer
+    lot_margin_cost = max(1.0, float(getattr(cfg, "strangle_margin_per_lot", 160000.0) or 1.0))
+    max_entry_lots = max(1, int(getattr(cfg, "max_entry_lots", 1)))
+    margin_based_lots = int(free_margin // lot_margin_cost)
+    if margin_based_lots <= 0:
         _record_activity_event(
             cfg,
             "margin_block",
             "Entry blocked (insufficient free margin)",
             severity="warning",
-            context={"available_margin": margin_available, "min_buffer": min_margin_buffer},
+            context={
+                "available_margin": margin_available,
+                "min_buffer": min_margin_buffer,
+                "per_lot_margin": lot_margin_cost,
+            },
         )
         cfg.enable_strangle_entry = False
         cfg._auto_blocked_by_risk = True
         cfg._last_block_reason = "margin_buffer"
         cfg._last_block_timestamp = datetime.now().isoformat(timespec="seconds")
         return
+
+    entry_lots = min(margin_based_lots, max_entry_lots)
 
     breaker_until = getattr(cfg, "_circuit_tripped_until", None)
     if breaker_until:
@@ -2868,7 +2939,7 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
             cfg._last_block_timestamp = datetime.now().isoformat(timespec="seconds")
             return
 
-    qty = cfg.lot_size
+    qty = cfg.lot_size * entry_lots
     _submit_order(
         dw,
         cfg,
@@ -2878,7 +2949,12 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
         quantity=qty,
         product_type="MARGIN",
         price=pe_price,
-        context={"tag": "entry_put", "action": "ENTRY", "strike": pe_strike},
+        context={
+            "tag": "entry_put",
+            "action": "ENTRY",
+            "strike": pe_strike,
+            "lots": entry_lots,
+        },
     )
     _submit_order(
         dw,
@@ -2889,7 +2965,12 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
         quantity=qty,
         product_type="MARGIN",
         price=ce_price,
-        context={"tag": "entry_call", "action": "ENTRY", "strike": ce_strike},
+        context={
+            "tag": "entry_call",
+            "action": "ENTRY",
+            "strike": ce_strike,
+            "lots": entry_lots,
+        },
     )
 
     if cfg.hedge_enable:
@@ -3302,6 +3383,7 @@ def run_live(
     feature_history_path: Optional[Path] = None,
 ) -> None:
     cfg = cfg or LiveConfig()
+    _load_managed_leg_state(cfg)
     try:
         chain_ingestor = OptionChainIngestor(ChainConfig(NIFTY_SCRIP, NIFTY_FNO_SEG))
     except Exception as exc:
@@ -3367,6 +3449,7 @@ def run_live(
 
             if normalized_rows is None:
                 normalized_rows = _normalize_positions(rows)
+            _sync_managed_leg_inventory(cfg, normalized_rows)
             net_delta, total_notional = _summarize_exposure(normalized_rows)
             block_info = _apply_exposure_throttles(cfg, net_delta, total_notional)
             delta_block = block_info.get("delta_block")
@@ -3458,17 +3541,19 @@ def run_live(
             if open_deriv_rows and bat_cfg.enabled:
                 monitor_batman_positions(dw, cfg, bat_cfg, open_deriv_rows, chain_ingestor)
 
-            active = 1 if open_deriv_rows else 0
-            if active >= cfg.max_strangles:
+            if open_deriv_rows:
                 monitor_and_manage_positions(dw, cfg, open_deriv_rows, chain_ingestor)
+
+            managed_legs = cfg._managed_entry_leg_ids or {}
+            agent_active = max(0, len(managed_legs) // 2)
+            max_strangles = max(0, int(getattr(cfg, "max_strangles", 1)))
+            if getattr(cfg, "enable_strangle_entry", True) and agent_active < max_strangles:
+                execute_new_strangle(dw, cfg)
             else:
-                if open_deriv_rows:
-                    monitor_and_manage_positions(dw, cfg, open_deriv_rows, chain_ingestor)
+                if not getattr(cfg, "enable_strangle_entry", True):
+                    LOG.debug("[live] strangle entry disabled by selector")
                 else:
-                    if getattr(cfg, "enable_strangle_entry", True):
-                        execute_new_strangle(dw, cfg)
-                    else:
-                        LOG.debug("[live] strangle entry disabled by selector")
+                    LOG.debug("[live] max agent strangles reached (%s)", agent_active)
         except Exception as exc:
             LOG.exception("[live] loop error: %s", exc)
 
