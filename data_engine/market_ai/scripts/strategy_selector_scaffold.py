@@ -68,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fetch-start", help="Fetch start date YYYY-MM-DD")
     parser.add_argument("--fetch-end", help="Fetch end date YYYY-MM-DD")
     parser.add_argument("--fetch-expiry", help="Optional expiry filter YYYY-MM-DD")
+    parser.add_argument("--fetch-interval", default="1", help="Rolling option interval (default 1)")
     return parser.parse_args()
 
 
@@ -88,6 +89,7 @@ def main() -> None:
             start=datetime.strptime(args.fetch_start, "%Y-%m-%d"),
             end=datetime.strptime(args.fetch_end, "%Y-%m-%d"),
             expiry=args.fetch_expiry,
+            interval=args.fetch_interval,
         )
         ingestor = RollingOptionIngestor(client=make_client(), out_dir=rolling_dir)
         written = ingestor.fetch_range(cfg)

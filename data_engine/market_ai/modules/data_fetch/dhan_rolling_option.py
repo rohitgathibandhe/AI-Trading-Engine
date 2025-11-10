@@ -33,6 +33,7 @@ class RollingOptionConfig:
     end: Optional[datetime] = None
     expiry: Optional[str] = None
     limit_per_page: int = 500
+    interval: str = "1"
 
 
 class RollingOptionIngestor:
@@ -48,8 +49,11 @@ class RollingOptionIngestor:
         payload = {
             "underlyingScrip": cfg.underlying,
             "underlyingSeg": cfg.segment,
+            "exchangeSegment": cfg.segment,
+            "instrument": cfg.underlying,
             "securityId": int(cfg.security_id),
             "pageSize": cfg.limit_per_page,
+            "interval": cfg.interval,
         }
         if cfg.expiry:
             payload["expiry"] = cfg.expiry
