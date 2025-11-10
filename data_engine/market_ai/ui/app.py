@@ -1699,6 +1699,9 @@ def _render_plan_snapshot(feature_df: Optional[pd.DataFrame]) -> None:
         st.info("Decision feed not available yet.")
         return
     feature_df = feature_df[feature_df["strategy"] != "environment"] if not feature_df.empty else feature_df
+    if feature_df is not None and not feature_df.empty and {"ce_strike", "pe_strike"}.issubset(feature_df.columns):
+        # Drop telemetry rows that carried no leg data (e.g. warning events)
+        feature_df = feature_df.dropna(subset=["ce_strike", "pe_strike"], how="all")
     if feature_df is None or feature_df.empty:
         if fallback_df is None:
             fallback_df = _fallback_plan_from_positions()
