@@ -2067,7 +2067,7 @@ def _render_order_audit_panel() -> None:
         intent_df = pd.DataFrame(intents)
         if "timestamp" in intent_df.columns:
             intent_df["timestamp"] = pd.to_datetime(intent_df["timestamp"], errors="coerce")
-        st.dataframe(intent_df.tail(50), use_container_width=True)
+        st.dataframe(intent_df.tail(50), width="stretch")
     else:
         st.info("No queued order intents.")
 
@@ -2076,7 +2076,7 @@ def _render_order_audit_panel() -> None:
         audit_df = pd.DataFrame(audits)
         if "timestamp" in audit_df.columns:
             audit_df["timestamp"] = pd.to_datetime(audit_df["timestamp"], errors="coerce")
-        st.dataframe(audit_df.tail(50), use_container_width=True)
+        st.dataframe(audit_df.tail(50), width="stretch")
     else:
         st.info("No audit entries yet.")
 
@@ -2089,7 +2089,7 @@ def _render_playbook_panel() -> None:
         status_df = pd.DataFrame(status_rows)
         if "timestamp" in status_df.columns:
             status_df["timestamp"] = pd.to_datetime(status_df["timestamp"], errors="coerce")
-        st.dataframe(status_df.tail(20), use_container_width=True)
+        st.dataframe(status_df.tail(20), width="stretch")
     if history:
         st.caption("Recent Steps")
         for entry in history:

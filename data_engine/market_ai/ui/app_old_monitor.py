@@ -103,13 +103,13 @@ if summary.empty:
     st.info("No completed trades yet. Current cycle is open.")
 else:
     show_cols = ["trade_id","entry_ts","exit_ts","duration","entry_credit","final_payback","exit_mtm","realized_pnl","last_ceK","last_peK"]
-    st.dataframe(summary[show_cols], use_container_width=True)
+    st.dataframe(summary[show_cols], width="stretch")
 
 # --- Ledger ---
 st.subheader("Action Ledger")
 st.dataframe(
     df_raw[["ts","action","spot","ceK","peK","entry_credit","payback","mtm","delta_ce","delta_pe","ivp","trend","notes"]],
-    use_container_width=True
+    width="stretch"
 )
 
 # --- Footer / Help ---
