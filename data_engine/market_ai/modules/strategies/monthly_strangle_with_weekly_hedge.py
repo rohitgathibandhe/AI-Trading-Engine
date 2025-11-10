@@ -438,12 +438,16 @@ def _get_risk_manager(cfg: "LiveConfig") -> Optional[RiskManager]:
     risk_mgr = getattr(cfg, "_risk_manager", None)
 
     def _pull_limits() -> Dict[str, float]:
+        exposure_cap = float(getattr(cfg, "risk_max_exposure_pct", 0.05))
+        margin_leverage = float(getattr(cfg, "risk_margin_leverage", 0.0) or 0.0)
+        if bool(getattr(cfg, "risk_use_margin_capacity", True)) and margin_leverage > 0:
+            exposure_cap = margin_leverage
         return {
             "max_daily_loss": float(getattr(cfg, "risk_max_daily_loss", 75000.0)),
             "per_leg_sl_mult": float(getattr(cfg, "risk_per_leg_sl_mult", 2.0)),
             "max_rolls_per_day": int(getattr(cfg, "risk_max_rolls_per_day", 6)),
             "equity": float(getattr(cfg, "risk_account_equity", 500000.0)),
-            "max_exposure_pct": float(getattr(cfg, "risk_max_exposure_pct", 0.05)),
+            "max_exposure_pct": exposure_cap,
             "overall_sl_pct": float(getattr(cfg, "risk_overall_sl_pct", 2.5)),
             "max_portfolio_delta": float(getattr(cfg, "risk_max_portfolio_delta", 0.25)),
         }
@@ -474,7 +478,13 @@ def _apply_exposure_throttles(
     delta_cap = abs(float(getattr(cfg, "risk_max_portfolio_delta", 0.0) or 0.0))
     exposure_pct = float(getattr(cfg, "risk_max_exposure_pct", 0.0) or 0.0)
     equity_ref = float(getattr(cfg, "risk_account_equity", 0.0) or 0.0)
-    notional_cap = equity_ref * exposure_pct if equity_ref and exposure_pct else None
+    margin_cap = float(getattr(cfg, "_margin_capacity", 0.0) or 0.0)
+    leverage = float(getattr(cfg, "risk_margin_leverage", 0.0) or 0.0)
+    use_margin = bool(getattr(cfg, "risk_use_margin_capacity", True)) and margin_cap > 0 and leverage > 0
+    if use_margin:
+        notional_cap = margin_cap * leverage
+    else:
+        notional_cap = equity_ref * exposure_pct if equity_ref and exposure_pct else None
 
     delta_breach = delta_cap > 0 and abs(net_delta) > delta_cap
     notional_breach = notional_cap is not None and total_notional > notional_cap
@@ -624,10 +634,15 @@ def _record_equity_snapshot(cfg: "LiveConfig", dw, positions: List[Dict[str, Any
     utilized = _f(funds.get("utilized"))
     withdrawable = _f(funds.get("withdrawable"))
 
-    if available and available > 0:
-        cfg.risk_account_equity = float(available)
+    margin_capacity = (available or 0.0) + (utilized or 0.0)
+    cfg._margin_available = float(available or 0.0)
+    cfg._margin_utilized = float(utilized or 0.0)
+    cfg._margin_capacity = float(margin_capacity)
+
+    if margin_capacity > 0:
+        cfg.risk_account_equity = float(margin_capacity)
         if getattr(cfg, "_risk_manager", None):
-            cfg._risk_manager.l.equity = float(available)
+            cfg._risk_manager.l.equity = float(margin_capacity)
 
     gross_exposure = 0.0
     net_exposure = 0.0
@@ -1715,6 +1730,9 @@ class LiveConfig:
     auto_disable_strangle_when_unfavored: bool = True
     risk_max_daily_loss: float = 75000.0
     risk_max_exposure_pct: float = 0.05
+    risk_use_margin_capacity: bool = True
+    risk_margin_leverage: float = 12.0
+    risk_min_margin_buffer: float = 25000.0
     risk_account_equity: float = 500000.0
     risk_max_rolls_per_day: int = 6
     risk_overall_sl_pct: float = 2.5
@@ -1742,6 +1760,9 @@ class LiveConfig:
     _last_strangle_entry_attempt: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)
     _last_market_state: Optional["MarketState"] = field(default=None, repr=False, compare=False)
     _last_strategy_candidates: Optional[List["StrategyCandidate"]] = field(default=None, repr=False, compare=False)
+    _margin_available: float = field(default=0.0, repr=False, compare=False)
+    _margin_utilized: float = field(default=0.0, repr=False, compare=False)
+    _margin_capacity: float = field(default=0.0, repr=False, compare=False)
     auto_playbook: Dict[str, Any] = field(default_factory=lambda: {
         "hedge_on_delta": True,
         "flatten_on_delta": False,
@@ -2660,6 +2681,39 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
 
     if expiry is None:
         LOG.info("[live] could not determine expiry; skip entry")
+        return
+
+    if getattr(cfg, "_margin_capacity", 0.0) <= 0:
+        try:
+            funds = dw.get_funds()
+        except Exception:
+            funds = None
+        if isinstance(funds, dict):
+            avail = _safe_float(funds.get("available"), None)
+            used = _safe_float(funds.get("utilized"), None)
+            cap = (avail or 0.0) + (used or 0.0)
+            cfg._margin_available = float(avail or 0.0)
+            cfg._margin_utilized = float(used or 0.0)
+            cfg._margin_capacity = float(cap)
+            if cap > 0:
+                cfg.risk_account_equity = float(cap)
+                if getattr(cfg, "_risk_manager", None):
+                    cfg._risk_manager.l.equity = float(cap)
+
+    margin_available = float(getattr(cfg, "_margin_available", 0.0) or 0.0)
+    min_margin_buffer = float(getattr(cfg, "risk_min_margin_buffer", 0.0) or 0.0)
+    if margin_available <= min_margin_buffer:
+        _record_activity_event(
+            cfg,
+            "margin_block",
+            "Entry blocked (insufficient free margin)",
+            severity="warning",
+            context={"available_margin": margin_available, "min_buffer": min_margin_buffer},
+        )
+        cfg.enable_strangle_entry = False
+        cfg._auto_blocked_by_risk = True
+        cfg._last_block_reason = "margin_buffer"
+        cfg._last_block_timestamp = datetime.now().isoformat(timespec="seconds")
         return
 
     breaker_until = getattr(cfg, "_circuit_tripped_until", None)
