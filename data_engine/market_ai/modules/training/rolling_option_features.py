@@ -43,6 +43,9 @@ def build_features_from_parquet(path: Path) -> pd.DataFrame:
     if not required.issubset(df.columns):
         return pd.DataFrame()
 
+    if "expiry" in df.columns:
+        df["expiry"] = df["expiry"].fillna(df["trade_date"])
+
     for col in ("strike", "ltp", "delta", "spot"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")

@@ -83,6 +83,8 @@ RISK_RESET_FILE = CONTROL_DIR / "risk_reset.json"
 ENTRY_BLOCK_STATE = STATE_DIR / "entry_block_status.json"
 ACTION_STATUS_FILE = STATE_DIR / "manual_action_status.json"
 PLAYBOOK_HISTORY_FILE = STATE_DIR / "playbook_history.jsonl"
+ROLLING_SUMMARY_FILE = STATE_DIR / "rolling_option_summary.json"
+SELECTOR_SUMMARY_FILE = STATE_DIR / "strategy_selector_training_summary.json"
 
 AGENT_LOG = STATE_DIR / "agent.log"
 SETTINGS_JSON = STATE_DIR / "agent_settings.json"
@@ -339,6 +341,84 @@ def _load_equity_history(limit: Optional[int] = None) -> Optional[pd.DataFrame]:
     if limit and len(df.index) > limit:
         df = df.tail(limit)
     return df.reset_index(drop=True)
+
+
+def _load_rolling_summary() -> Dict[str, Any]:
+    if not ROLLING_SUMMARY_FILE.exists():
+        return {}
+    try:
+        return json.loads(ROLLING_SUMMARY_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _load_selector_summary() -> Dict[str, Any]:
+    if not SELECTOR_SUMMARY_FILE.exists():
+        return {}
+    try:
+        return json.loads(SELECTOR_SUMMARY_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _render_rolling_data_quality(summary: Dict[str, Any]) -> None:
+    lookback = summary.get("lookback_days", 0)
+    st.markdown(f"#### Rolling Option Data Quality (last {lookback} days)")
+    cols = st.columns(4)
+    cols[0].metric("Weekdays Covered", summary.get("days_with_data", 0), f"/ {summary.get('weekdays_expected', 0)}")
+    cols[1].metric("Missing Days", summary.get("days_missing", 0))
+    cols[2].metric("Latest Day", summary.get("latest_day") or "—", summary.get("latest_file_updated", ""))
+    cols[3].metric("Rows Ingested", f"{summary.get('total_rows', 0):,}", f"avg {summary.get('average_rows_per_day', 0):.0f}/day")
+
+    coverage = summary.get("coverage_ratio") or {}
+    if coverage:
+        cov_df = pd.DataFrame(
+            [{"field": field.upper(), "coverage": round(float(val) * 100, 2)} for field, val in coverage.items()]
+        )
+        cov_df.set_index("field", inplace=True)
+        st.caption("Field coverage (% of rows with value)")
+        st.bar_chart(cov_df)
+
+    per_day = summary.get("per_day_counts") or {}
+    if per_day:
+        series = pd.Series(per_day, dtype="float64")
+        series.index = pd.to_datetime(series.index, errors="coerce")
+        series = series.dropna().sort_index().tail(90)
+        if not series.empty:
+            st.caption("Rows per trading day (last 90 sessions)")
+            st.line_chart(series)
+
+    selectors = summary.get("selector_counts") or []
+    if selectors:
+        sel_df = pd.DataFrame(selectors, columns=["Selector", "Rows"])
+        st.caption("Top selectors")
+        st.dataframe(sel_df.head(10), hide_index=True, use_container_width=True)
+
+    if summary.get("missing_dates"):
+        st.caption("Recent missing trading days")
+        st.write(", ".join(summary["missing_dates"][:10]))
+
+    if summary.get("errors"):
+            with st.expander("Ingestion warnings"):
+                for err in summary["errors"]:
+                    st.write(f"- {err}")
+
+
+def _render_selector_training_summary(summary: Dict[str, Any]) -> None:
+    st.markdown("#### Strategy Selector Training")
+    cols = st.columns(3)
+    cols[0].metric("Samples", summary.get("samples_total", 0))
+    cols[1].metric("Strategies", summary.get("strategies_trained", 0))
+    cols[2].metric("Val Fraction", f"{summary.get('val_fraction', 0.0):.2f}")
+    if summary.get("generated_at"):
+        st.caption(f"Trained at {summary['generated_at']}")
+
+    metrics = summary.get("metrics") or []
+    if metrics:
+        df = pd.DataFrame(metrics)
+        display_cols = ["strategy", "samples", "train_rmse", "val_rmse", "val_r2"]
+        df = df[display_cols]
+        st.dataframe(df.sort_values("val_rmse"), use_container_width=True)
 
 
 def _parse_context_blob(value: Any) -> Dict[str, Any]:
@@ -2130,6 +2210,14 @@ def _observability_tab() -> None:
     equity_df = _filter_df_by_range(equity_df, start_dt, end_dt)
     forecast = _predict_delta_breach(equity_df, risk_limits)
     notional_forecast = _predict_notional_breach(equity_df, risk_limits)
+    rolling_summary = _load_rolling_summary()
+    if rolling_summary:
+        _render_rolling_data_quality(rolling_summary)
+        st.divider()
+    selector_summary = _load_selector_summary()
+    if selector_summary:
+        _render_selector_training_summary(selector_summary)
+        st.divider()
 
     pid = ss.get("agent_pid")
     running_flag = bool(ss.get("agent_running"))

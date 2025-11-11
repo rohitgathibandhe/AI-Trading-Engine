@@ -11,13 +11,18 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, List
 
+SCRIPT_PATH = Path(__file__).resolve()
+ENGINE_DIR = SCRIPT_PATH.parents[1]
+REPO_ROOT = ENGINE_DIR.parents[1]
+
 if __package__ is None:
     import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 import pandas as pd
 
+from market_ai.modules.analytics.rolling_option_quality import write_summary as write_rolling_summary
 from market_ai.modules.data_fetch.option_chain_ingestor import ChainConfig, OptionChainIngestor
 from market_ai.modules.data_fetch.optionchain_repo import OptionChainRepo
 from market_ai.modules.data_fetch.dhan_rolling_option import RollingOptionConfig, RollingOptionIngestor
@@ -32,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start", help="Start date YYYY-MM-DD", required=True)
     parser.add_argument("--end", help="End date YYYY-MM-DD", required=True)
     parser.add_argument("--expiry", help="Target expiry date YYYY-MM-DD (defaults to inferred next monthly)")
-    parser.add_argument("--out", type=Path, help="Output directory (default state/rolling_option_ladder)")
+    parser.add_argument("--out", type=Path, help="Output directory (default ladder dir for chain mode / rolling_option for rolling mode)")
     parser.add_argument("--interval", default="5", help="Rolling option interval (default 5 minutes or '1' for rollingoption)")
     parser.add_argument("--throttle", type=float, default=0.3, help="Throttle seconds between DHAN calls (default 0.3, unused in fallback)")
     parser.add_argument("--limit", type=int, default=3, help="Maximum expiries to fetch per day (default 3)")
@@ -56,6 +61,17 @@ def parse_args() -> argparse.Namespace:
         dest="required_data",
         action="append",
         help="Optional list of requiredData fields for DHAN rollingoption (repeat or comma-separate).",
+    )
+    parser.add_argument(
+        "--summary-out",
+        type=Path,
+        help="Where to write the rolling-option data quality summary JSON (default state/rolling_option_summary.json).",
+    )
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=365,
+        help="Coverage window for the rolling-option summary report (default 365).",
     )
     return parser.parse_args()
 
@@ -114,11 +130,20 @@ def run_rolling_option(args: argparse.Namespace, out_dir: Path) -> None:
         print(f"[rollingoption] wrote {len(parquet_paths)} parquet files under {ingestor.out_dir}")
     else:
         print("[rollingoption] no data returned for the requested window")
+    summary_path = args.summary_out or (ENGINE_DIR / "state" / "rolling_option_summary.json")
+    summary = write_rolling_summary(ingestor.out_dir, summary_path=summary_path, lookback_days=int(args.lookback_days))
+    print(f"[rollingoption] summary saved to {summary_path} (days_with_data={summary.get('days_with_data')}, missing={summary.get('days_missing')})")
 
 
 def main() -> None:
     args = parse_args()
-    out_dir = args.out or (Path(__file__).resolve().parents[2] / "state" / "rolling_option_ladder")
+    base_state = ENGINE_DIR / "state"
+    default_chain_dir = base_state / "rolling_option_ladder"
+    default_rolling_dir = base_state / "rolling_option"
+    if args.mode == "rolling":
+        out_dir = args.out or default_rolling_dir
+    else:
+        out_dir = args.out or default_chain_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     start_date = datetime.strptime(args.start, "%Y-%m-%d").date()
     end_date = datetime.strptime(args.end, "%Y-%m-%d").date()

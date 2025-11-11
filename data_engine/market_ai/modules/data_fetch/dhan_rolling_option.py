@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -22,6 +22,7 @@ from .dhan_api import SimpleDhanClient, _raise_for_status
 LOG = logging.getLogger(__name__)
 
 ROLLING_OPTION_PATH = "/v2/charts/rollingoption"
+MAX_ROLLING_WINDOW_DAYS = 30
 DEFAULT_REQUIRED_DATA: tuple[str, ...] = (
     "open",
     "high",
@@ -67,6 +68,8 @@ class RollingOptionIngestor:
             raise ValueError("RollingOptionConfig requires start and end datetimes")
 
         expiry_code = cfg.expiry_code or self._infer_expiry_code(cfg.start.date(), cfg.expiry)
+        base_start = cfg.start.date()
+        base_end = cfg.end.date()
         base_payload = {
             "exchangeSegment": cfg.segment,
             "instrument": cfg.instrument,
@@ -74,8 +77,6 @@ class RollingOptionIngestor:
             "interval": cfg.interval,
             "expiryFlag": cfg.expiry_flag,
             "expiryCode": int(expiry_code),
-            "fromDate": cfg.start.strftime("%Y-%m-%d"),
-            "toDate": cfg.end.strftime("%Y-%m-%d"),
         }
 
         records: List[Dict[str, Any]] = []
@@ -83,37 +84,46 @@ class RollingOptionIngestor:
         option_types = cfg.option_types or ("CALL", "PUT")
         required = list(cfg.required_data or DEFAULT_REQUIRED_DATA)
 
-        for strike in strikes:
-            for option_type in option_types:
-                payload = {
-                    **base_payload,
-                    "strike": strike,
-                    "drvOptionType": option_type,
-                    "requiredData": required,
-                }
-                LOG.info(
-                    "Fetching rollingoption strike=%s option=%s range=%s→%s",
-                    strike,
-                    option_type,
-                    base_payload["fromDate"],
-                    base_payload["toDate"],
-                )
-                resp = requests.post(
-                    self.client._url(ROLLING_OPTION_PATH),
-                    headers=self.client.headers,
-                    json=payload,
-                    timeout=self.client.timeout,
-                )
-                _raise_for_status(resp)
-                data = resp.json()
-                records.extend(
-                    self._normalize_payload(
-                        data,
-                        option_type=option_type,
-                        selector=strike,
-                        expiry_hint=cfg.expiry,
+        chunk_start = base_start
+        while chunk_start <= base_end:
+            chunk_end = min(chunk_start + timedelta(days=MAX_ROLLING_WINDOW_DAYS - 1), base_end)
+            chunk_payload = {
+                **base_payload,
+                "fromDate": chunk_start.isoformat(),
+                "toDate": chunk_end.isoformat(),
+            }
+            for strike in strikes:
+                for option_type in option_types:
+                    payload = {
+                        **chunk_payload,
+                        "strike": strike,
+                        "drvOptionType": option_type,
+                        "requiredData": required,
+                    }
+                    LOG.info(
+                        "Fetching rollingoption strike=%s option=%s range=%s→%s",
+                        strike,
+                        option_type,
+                        payload["fromDate"],
+                        payload["toDate"],
                     )
-                )
+                    resp = requests.post(
+                        self.client._url(ROLLING_OPTION_PATH),
+                        headers=self.client.headers,
+                        json=payload,
+                        timeout=self.client.timeout,
+                    )
+                    _raise_for_status(resp)
+                    data = resp.json()
+                    records.extend(
+                        self._normalize_payload(
+                            data,
+                            option_type=option_type,
+                            selector=strike,
+                            expiry_hint=cfg.expiry,
+                        )
+                    )
+            chunk_start = chunk_end + timedelta(days=1)
 
         return self._write_records(records)
 
@@ -205,6 +215,9 @@ class RollingOptionIngestor:
                 merged = pd.read_json(json_path, lines=True)
             except ValueError:
                 merged = chunk.copy()
+            subset_cols = [c for c in ("tradeDate", "tradeTime", "optionType", "selector", "strikePrice") if c in merged.columns]
+            if subset_cols:
+                merged = merged.drop_duplicates(subset=subset_cols)
             parquet_path = folder / "rolling_option.parquet"
             merged.to_parquet(parquet_path, index=False)
             written.append(parquet_path)
