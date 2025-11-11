@@ -44,10 +44,15 @@ def _choose_last_idx_for_day(ts: List[int], target_day: date) -> Optional[int]:
     return last
 
 def _expiry_code(as_of: date, expiry: date) -> int:
-    if as_of.year == expiry.year and as_of.month == expiry.month:
-        return 0
+    """
+    DHAN's v2 rolling-option API expects expiryCode to be 1-indexed
+    (1 = front/current month, 2 = next, 3 = far). Older adapters used
+    0 for the front month which now triggers "expiryCode is required".
+    """
     diff = (expiry.year - as_of.year) * 12 + (expiry.month - as_of.month)
-    return 1 if diff == 1 else (2 if diff > 1 else 0)
+    if diff < 0:
+        return 1
+    return min(3, diff + 1)
 
 # -------------------- adapter --------------------
 class RollingExpiredOptionsMarket:

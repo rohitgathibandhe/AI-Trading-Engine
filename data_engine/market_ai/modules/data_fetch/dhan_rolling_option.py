@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, date
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
 import requests
@@ -22,6 +22,18 @@ from .dhan_api import SimpleDhanClient, _raise_for_status
 LOG = logging.getLogger(__name__)
 
 ROLLING_OPTION_PATH = "/v2/charts/rollingoption"
+DEFAULT_REQUIRED_DATA: tuple[str, ...] = (
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "oi",
+    "iv",
+    "spot",
+    "strike",
+    "timestamp",
+)
 
 
 @dataclass
@@ -29,11 +41,17 @@ class RollingOptionConfig:
     underlying: str
     segment: str = "NSE_FNO"
     security_id: Optional[int] = None
+    instrument: str = "OPTIDX"
     start: Optional[datetime] = None
     end: Optional[datetime] = None
     expiry: Optional[str] = None
-    limit_per_page: int = 500
     interval: str = "1"
+    expiry_flag: str = "MONTH"
+    expiry_code: Optional[int] = None
+    strike_selectors: Sequence[str] = field(default_factory=lambda: ("ATM",))
+    option_types: Sequence[str] = field(default_factory=lambda: ("CALL", "PUT"))
+    required_data: Sequence[str] = field(default_factory=lambda: DEFAULT_REQUIRED_DATA)
+    limit_per_page: int = 500  # retained for backward compatibility (unused)
 
 
 class RollingOptionIngestor:
@@ -45,76 +63,149 @@ class RollingOptionIngestor:
     def fetch_range(self, cfg: RollingOptionConfig) -> List[Path]:
         if not cfg.security_id:
             raise ValueError("RollingOptionConfig requires security_id")
+        if not cfg.start or not cfg.end:
+            raise ValueError("RollingOptionConfig requires start and end datetimes")
 
-        payload = {
-            "underlyingScrip": cfg.underlying,
-            "underlyingSeg": cfg.segment,
+        expiry_code = cfg.expiry_code or self._infer_expiry_code(cfg.start.date(), cfg.expiry)
+        base_payload = {
             "exchangeSegment": cfg.segment,
-            "instrument": cfg.underlying,
+            "instrument": cfg.instrument,
             "securityId": int(cfg.security_id),
-            "pageSize": cfg.limit_per_page,
             "interval": cfg.interval,
+            "expiryFlag": cfg.expiry_flag,
+            "expiryCode": int(expiry_code),
+            "fromDate": cfg.start.strftime("%Y-%m-%d"),
+            "toDate": cfg.end.strftime("%Y-%m-%d"),
         }
-        if cfg.expiry:
-            payload["expiry"] = cfg.expiry
-        if cfg.start:
-            payload["startDate"] = cfg.start.strftime("%Y-%m-%d")
-        if cfg.end:
-            payload["endDate"] = cfg.end.strftime("%Y-%m-%d")
 
-        page = 1
-        written: List[Path] = []
-        while True:
-            payload["pageNo"] = page
-            LOG.info("Fetching rollingoption page=%s params=%s", page, {k: payload.get(k) for k in ("startDate", "endDate", "expiry")})
-            resp = requests.post(
-                self.client._url(ROLLING_OPTION_PATH),
-                headers=self.client.headers,
-                json=payload,
-                timeout=self.client.timeout,
-            )
-            _raise_for_status(resp)
-            data = resp.json()
-            body = data.get("data") or []
-            if not body:
-                break
-            written.extend(self._write_page(body))
-            if not data.get("hasMore"):
-                break
-            page += 1
-        return written
+        records: List[Dict[str, Any]] = []
+        strikes = cfg.strike_selectors or ("ATM",)
+        option_types = cfg.option_types or ("CALL", "PUT")
+        required = list(cfg.required_data or DEFAULT_REQUIRED_DATA)
 
-    def _write_page(self, rows: Iterable[Dict[str, Any]]) -> List[Path]:
-        rows = list(rows)
-        paths: List[Path] = []
-        for row in rows:
+        for strike in strikes:
+            for option_type in option_types:
+                payload = {
+                    **base_payload,
+                    "strike": strike,
+                    "drvOptionType": option_type,
+                    "requiredData": required,
+                }
+                LOG.info(
+                    "Fetching rollingoption strike=%s option=%s range=%s→%s",
+                    strike,
+                    option_type,
+                    base_payload["fromDate"],
+                    base_payload["toDate"],
+                )
+                resp = requests.post(
+                    self.client._url(ROLLING_OPTION_PATH),
+                    headers=self.client.headers,
+                    json=payload,
+                    timeout=self.client.timeout,
+                )
+                _raise_for_status(resp)
+                data = resp.json()
+                records.extend(
+                    self._normalize_payload(
+                        data,
+                        option_type=option_type,
+                        selector=strike,
+                        expiry_hint=cfg.expiry,
+                    )
+                )
+
+        return self._write_records(records)
+
+    @staticmethod
+    def _infer_expiry_code(start_day: date, expiry_str: Optional[str]) -> int:
+        if not expiry_str:
+            return 1
+        try:
+            expiry_day = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+        except Exception:
+            return 1
+        diff = (expiry_day.year - start_day.year) * 12 + (expiry_day.month - start_day.month)
+        if diff < 0:
+            return 1
+        return min(3, diff + 1)
+
+    @staticmethod
+    def _normalize_payload(
+        payload: Dict[str, Any],
+        *,
+        option_type: str,
+        selector: str,
+        expiry_hint: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        block_key = "ce" if option_type.upper() == "CALL" else "pe"
+        node = (payload or {}).get("data") or {}
+        block = node.get(block_key) or {}
+        timestamps = block.get("timestamp") or []
+        if not timestamps:
+            return []
+
+        def _pick(seq: Iterable[Any], idx: int) -> Any:
+            if isinstance(seq, list):
+                return seq[idx] if idx < len(seq) else None
+            return None
+
+        rows: List[Dict[str, Any]] = []
+        for idx, raw_ts in enumerate(timestamps):
             try:
-                trade_date = datetime.fromisoformat(row.get("tradeDate")).date()
+                stamp = int(raw_ts)
+                dt = datetime.fromtimestamp(stamp)
             except Exception:
                 continue
-            folder = self.out_dir / trade_date.isoformat()
+            trade_date = dt.date().isoformat()
+            trade_time = dt.time().isoformat(timespec="seconds")
+            strike_price = _pick(block.get("strike") or [], idx)
+            expiry_date = _pick(block.get("expiryDate") or [], idx) or expiry_hint
+            close_px = _pick(block.get("close") or [], idx)
+            open_px = _pick(block.get("open") or [], idx)
+            record = {
+                "tradeDate": trade_date,
+                "tradeTime": trade_time,
+                "expiryDate": expiry_date,
+                "strikePrice": strike_price,
+                "optionType": "CE" if option_type.upper() == "CALL" else "PE",
+                "ltp": close_px if close_px is not None else open_px,
+                "open": open_px,
+                "high": _pick(block.get("high") or [], idx),
+                "low": _pick(block.get("low") or [], idx),
+                "close": close_px,
+                "volume": _pick(block.get("volume") or [], idx),
+                "oi": _pick(block.get("oi") or [], idx),
+                "iv": _pick(block.get("iv") or [], idx),
+                "spot": _pick(block.get("spot") or [], idx),
+                "delta": _pick(block.get("delta") or [], idx),
+                "gamma": _pick(block.get("gamma") or [], idx),
+                "theta": _pick(block.get("theta") or [], idx),
+                "vega": _pick(block.get("vega") or [], idx),
+                "selector": selector,
+                "raw_option_type": option_type,
+            }
+            rows.append(record)
+        return rows
+
+    def _write_records(self, records: Iterable[Dict[str, Any]]) -> List[Path]:
+        records = list(records)
+        if not records:
+            return []
+        df = pd.DataFrame(records)
+        written: List[Path] = []
+        for trade_date, chunk in df.groupby("tradeDate", dropna=True):
+            folder = self.out_dir / str(trade_date)
             folder.mkdir(parents=True, exist_ok=True)
             json_path = folder / "rolling_option_raw.jsonl"
             with json_path.open("a") as fh:
-                fh.write(json.dumps(row) + "\n")
-
-        # convert to parquet per date
-        day_dirs = set()
-        for r in rows:
-            trade_date = r.get("tradeDate")
-            if not trade_date:
-                continue
+                for row in chunk.to_dict(orient="records"):
+                    fh.write(json.dumps(row) + "\n")
             try:
-                day_dirs.add(self.out_dir / datetime.fromisoformat(trade_date).date().isoformat())
-            except Exception:
-                continue
-
-        for day_dir in day_dirs:
-            raw_path = day_dir / "rolling_option_raw.jsonl"
-            if not raw_path.exists():
-                continue
-            df = pd.read_json(raw_path, lines=True)
-            parquet_path = day_dir / "rolling_option.parquet"
-            df.to_parquet(parquet_path, index=False)
-            paths.append(parquet_path)
-        return paths
+                merged = pd.read_json(json_path, lines=True)
+            except ValueError:
+                merged = chunk.copy()
+            parquet_path = folder / "rolling_option.parquet"
+            merged.to_parquet(parquet_path, index=False)
+            written.append(parquet_path)
+        return written

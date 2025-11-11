@@ -1770,6 +1770,7 @@ class LiveConfig:
     hedge_price_min: float = 2.5
     hedge_price_max: float = 3.5
     poll_sec: float = 5.0
+    poll_backoff_when_idle: float = 12.0
     delta_breach: float = 0.38
     premium_soft_x: float = 1.8
     premium_hard_x: float = 2.2
@@ -3538,6 +3539,8 @@ def run_live(
                 else:
                     LOG.debug("[env] insufficient data for market state analysis")
 
+            has_live_strangle = bool(open_deriv_rows)
+
             if open_deriv_rows and bat_cfg.enabled:
                 monitor_batman_positions(dw, cfg, bat_cfg, open_deriv_rows, chain_ingestor)
 
@@ -3547,15 +3550,25 @@ def run_live(
             managed_legs = cfg._managed_entry_leg_ids or {}
             agent_active = max(0, len(managed_legs) // 2)
             max_strangles = max(0, int(getattr(cfg, "max_strangles", 1)))
-            if getattr(cfg, "enable_strangle_entry", True) and agent_active < max_strangles:
+            if (
+                not has_live_strangle
+                and getattr(cfg, "enable_strangle_entry", True)
+                and agent_active < max_strangles
+            ):
                 execute_new_strangle(dw, cfg)
             else:
-                if not getattr(cfg, "enable_strangle_entry", True):
+                if has_live_strangle:
+                    LOG.debug("[live] existing strangle detected; monitoring only")
+                elif not getattr(cfg, "enable_strangle_entry", True):
                     LOG.debug("[live] strangle entry disabled by selector")
                 else:
                     LOG.debug("[live] max agent strangles reached (%s)", agent_active)
         except Exception as exc:
             LOG.exception("[live] loop error: %s", exc)
 
-        time.sleep(max(1.0, float(getattr(cfg, "poll_sec", 5.0))))
+        idle = not open_deriv_rows and not getattr(cfg, "_managed_entry_leg_ids", {})
+        base_poll = max(1.0, float(getattr(cfg, "poll_sec", 5.0)))
+        if idle:
+            base_poll = max(base_poll, float(getattr(cfg, "poll_backoff_when_idle", base_poll)))
+        time.sleep(base_poll)
         loop_iter += 1
