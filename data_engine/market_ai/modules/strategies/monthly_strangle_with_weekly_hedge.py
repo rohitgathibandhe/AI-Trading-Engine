@@ -62,6 +62,7 @@ MANUAL_ACTION_STATUS = STATE_DIR / "manual_action_status.json"
 ORDER_AUDIT_LOG = STATE_DIR / "order_audit.jsonl"
 ORDER_INTENT_QUEUE = STATE_DIR / "order_intents.jsonl"
 MANAGED_LEG_STATE = STATE_DIR / "managed_legs.json"
+ROLLING_CACHE_DIR = MARKET_AI_DIR / "state" / "rolling_option"
 
 BLOTTER_FIELDS = [
     "timestamp",
@@ -1310,13 +1311,20 @@ class MonthlyStrangleWithWeeklyHedge:
         uid = int(self.cfg["underlying_id"])
         qty = _round_to(int(self.cfg["lot_size"]), int(self.cfg["round_multiple"]))
         expiry_str = sell_expiry.isoformat()
+        local_day_dir = ROLLING_CACHE_DIR / entry_day.isoformat()
+        local_only = entry_day < date.today() - timedelta(days=3) and local_day_dir.exists()
 
         LOG.info("Fetch chain as_of=%s for sell_expiry=%s (expect next-month)", entry_day, sell_expiry)
 
         oc: Dict[str, Dict[str, dict]] = {}
         df_chain = None
         ingestor = getattr(self, "chain_ingestor", None)
-        if ingestor is not None:
+        if ingestor is not None and not local_only:
+            resolved_expiry = _resolve_listed_expiry(ingestor, sell_expiry)
+            if resolved_expiry != sell_expiry:
+                LOG.info("Mapped requested expiry %s to listed %s", sell_expiry, resolved_expiry)
+                sell_expiry = resolved_expiry
+                expiry_str = sell_expiry.isoformat()
             try:
                 df_chain = ingestor.fetch(expiry_str)
             except Exception as exc:
@@ -1340,14 +1348,29 @@ class MonthlyStrangleWithWeeklyHedge:
                         pe_dict.setdefault("spot", uv)
                     oc[str(strike_val)] = {"ce": ce_dict, "pe": pe_dict}
 
-        if not oc:
+        if not oc and not local_only:
             try:
                 oc = self.market.get_option_chain(uid, expiry_str, as_of_date=entry_day.isoformat())
             except TypeError:
                 oc = self.market.get_option_chain(uid, expiry_str)
             except Exception as e:
                 LOG.warning("OC fetch failed on entry %s (expiry %s): %s", entry_day, expiry_str, e)
-                return
+                oc = {}
+
+        local_oc = _load_local_rolling_option_chain(entry_day, sell_expiry)
+        if local_oc:
+            merged = 0
+            for strike, legs in local_oc.items():
+                slot = oc.setdefault(strike, {})
+                for side, payload in legs.items():
+                    if side not in slot:
+                        slot[side] = payload
+                        merged += 1
+            LOG.info("Augmented option chain with %d legs from local rolling cache for %s", merged, entry_day)
+
+        if not oc:
+            LOG.warning("No option-chain data for %s after local fallback; skipping entry.", entry_day)
+            return
 
         # Resolve spot (prefer DF hint; else any spot in OC rows)
         def _spot_from_chain(ocha: dict) -> Optional[float]:
@@ -2396,6 +2419,72 @@ def _pick_monthly_expiry(ing: OptionChainIngestor) -> Optional[str]:
         if d.month != today.month or d.day >= 20:
             return d.isoformat()
     return future[-1].isoformat()
+
+
+def _resolve_listed_expiry(ing: OptionChainIngestor, target: date) -> date:
+    try:
+        exp_series = ing.list_expiries()
+    except Exception as exc:
+        LOG.debug("Could not list Dhan expiries: %s", exc)
+        return target
+    listings: List[date] = []
+    if hasattr(exp_series, "dropna"):
+        iterable = exp_series.dropna().tolist()  # type: ignore[assignment]
+    elif isinstance(exp_series, (list, tuple)):
+        iterable = [item for item in exp_series if item not in (None, "")]
+    else:
+        iterable = []
+    for item in iterable:
+        try:
+            listings.append(datetime.strptime(str(item), "%Y-%m-%d").date())
+        except Exception:
+            continue
+    if not listings:
+        return target
+    listings.sort()
+    for d in listings:
+        if d >= target:
+            if (d - target).days <= 45:
+                return d
+            break
+    # If earliest listing is too far in future, stick with target
+    return target
+
+
+def _load_local_rolling_option_chain(as_of: date, expiry: date) -> Dict[str, Any]:
+    day_dir = ROLLING_CACHE_DIR / as_of.isoformat()
+    path = day_dir / "rolling_option.parquet"
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_parquet(path)
+    except Exception as exc:
+        LOG.debug("Failed to read local rolling_option for %s: %s", as_of, exc)
+        return {}
+    expiry_iso = expiry.isoformat()
+    if "expiryDate" in df.columns:
+        df = df[df["expiryDate"].fillna("").astype(str).isin([expiry_iso, ""])]
+    oc: Dict[str, Dict[str, dict]] = {}
+    for _, row in df.iterrows():
+        strike_val = row.get("strikePrice") or row.get("strike")
+        opt_type = (row.get("optionType") or "").upper()
+        if strike_val is None or opt_type not in ("CE", "PE"):
+            continue
+        try:
+            strike = float(strike_val)
+        except Exception:
+            continue
+        node = {
+            "last_price": _safe_float(row.get("ltp") or row.get("close"), 0.0),
+            "open": _safe_float(row.get("open"), None),
+            "high": _safe_float(row.get("high"), None),
+            "low": _safe_float(row.get("low"), None),
+            "spot": _safe_float(row.get("spot"), None),
+            "iv": _safe_float(row.get("iv"), None),
+            "oi": _safe_float(row.get("oi"), None),
+        }
+        oc.setdefault(str(strike), {})["ce" if opt_type == "CE" else "pe"] = {k: v for k, v in node.items() if v is not None}
+    return oc
 
 
 def _find_fno_option_by_price(
