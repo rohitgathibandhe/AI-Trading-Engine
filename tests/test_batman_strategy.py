@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from market_ai.modules.strategies.monthly_strangle_with_weekly_hedge import (
-    BatmanConfig,
+    HedgeConfig,
     BatmanStructure,
     LiveConfig,
     _ensure_batman_hedges,
@@ -58,12 +58,12 @@ def test_ensure_batman_hedges_places_order_when_short_unhedged(monkeypatch):
     )
 
     cfg = LiveConfig(lot_size=150)
-    bat_cfg = BatmanConfig(hedge_price_max=10.0, hedge_delta_max=0.2)
+    hedge_cfg = HedgeConfig(hedge_price_max=10.0, hedge_delta_max=0.2)
 
     _ensure_batman_hedges(
         dw=SimpleNamespace(),
         cfg=cfg,
-        bat_cfg=bat_cfg,
+        hedge_cfg=hedge_cfg,
         structure=structure,
         chain_df=chain_df,
         spot=25600.0,

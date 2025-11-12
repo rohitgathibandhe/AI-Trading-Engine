@@ -102,6 +102,40 @@ def _load_agent_settings() -> dict:
     return {}
 
 
+LEGACY_HEDGE_ENV_ALIASES = {
+    "BATMAN_ENABLED": "HEDGE_ENABLE",
+    "BATMAN_DELTA_BREACH": "HEDGE_DELTA_BREACH",
+    "BATMAN_PREMIUM_HARD_X": "HEDGE_PREMIUM_HARD_X",
+    "BATMAN_ROLL_DISTANCE": "HEDGE_ROLL_DISTANCE",
+    "BATMAN_HEDGE_DELTA_MAX": "HEDGE_DELTA_MAX",
+    "BATMAN_HEDGE_PRICE_MAX": "HEDGE_PRICE_MAX",
+    "BATMAN_SALVAGE_WING_LTP": "HEDGE_SALVAGE_WING_LTP",
+}
+
+LEGACY_HEDGE_SETTING_ALIASES = {
+    "batman_enabled": "hedge_enabled",
+    "batman_delta_breach": "hedge_delta_breach",
+    "batman_premium_hard_x": "hedge_premium_hard_x",
+    "batman_roll_distance": "hedge_roll_distance",
+    "batman_hedge_delta_max": "hedge_delta_max",
+    "batman_hedge_price_max": "hedge_price_max",
+    "batman_salvage_wing_ltp": "hedge_salvage_wing_ltp",
+}
+
+
+def _apply_legacy_env_aliases() -> None:
+    for legacy, new in LEGACY_HEDGE_ENV_ALIASES.items():
+        if legacy in os.environ and new not in os.environ:
+            os.environ[new] = os.environ[legacy]
+
+
+def _migrate_legacy_hedge_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    for legacy, new in LEGACY_HEDGE_SETTING_ALIASES.items():
+        if legacy in settings and new not in settings:
+            settings[new] = settings[legacy]
+    return settings
+
+
 def _as_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -181,32 +215,32 @@ STRAT_FILENAME = "monthly_strangle_with_weekly_hedge.py"
 
 def _import_strategy() -> Tuple[Any, Any, Any]:
     """
-    Returns (run_live, LiveConfig, BatmanConfig).
+    Returns (run_live, LiveConfig, HedgeConfig).
     Prefers package imports; falls back to loading the .py file from known dirs.
     """
     # 1) package-style, preferred: modules/strategies
     try:
         from data_engine.market_ai.modules.strategies.monthly_strangle_with_weekly_hedge import (  # type: ignore
-            run_live, LiveConfig, BatmanConfig
+            run_live, LiveConfig, HedgeConfig
         )
         log.info("Strategy import: data_engine.market_ai.modules.strategies")
-        return run_live, LiveConfig, BatmanConfig
+        return run_live, LiveConfig, HedgeConfig
     except Exception:
         pass
 
     # 2) older package paths
     try:
         from data_engine.market_ai.strategies.monthly_strangle_with_weekly_hedge import (  # type: ignore
-            run_live, LiveConfig, BatmanConfig
+            run_live, LiveConfig, HedgeConfig
         )
         log.info("Strategy import: data_engine.market_ai.strategies")
-        return run_live, LiveConfig, BatmanConfig
+        return run_live, LiveConfig, HedgeConfig
     except Exception:
         pass
     try:
-        from strategies.monthly_strangle_with_weekly_hedge import run_live, LiveConfig, BatmanConfig  # type: ignore
+        from strategies.monthly_strangle_with_weekly_hedge import run_live, LiveConfig, HedgeConfig  # type: ignore
         log.info("Strategy import: 'strategies' on sys.path")
-        return run_live, LiveConfig, BatmanConfig
+        return run_live, LiveConfig, HedgeConfig
     except Exception:
         pass
 
@@ -217,7 +251,7 @@ def _import_strategy() -> Tuple[Any, Any, Any]:
         if path.exists():
             mod = _load_module_from_path("dyn_strategy", path)
             log.info("Strategy import: file '%s'", path)
-            return mod.run_live, mod.LiveConfig, mod.BatmanConfig  # type: ignore[attr-defined]
+            return mod.run_live, mod.LiveConfig, mod.HedgeConfig  # type: ignore[attr-defined]
 
     # 4) nothing found -> informative error
     lines = "\n".join(f" - {(Path(d)/STRAT_FILENAME).resolve()}" for d in search_dirs)
@@ -231,7 +265,7 @@ from market_ai.modules.strategies.strategy_selector import select_preferred_stra
 from market_ai.modules.analytics import MarketRegimeAnalyzer
 from market_ai.modules.agents.strategy_recommender import StrategyRecommender
 
-run_live, LiveConfig, BatmanConfig = _import_strategy()
+run_live, LiveConfig, HedgeConfig = _import_strategy()
 strategy_module = sys.modules.get(run_live.__module__)
 if strategy_module is None or not hasattr(strategy_module, "FEATURE_FIELDS"):
     FEATURE_FIELDS = [
@@ -367,7 +401,8 @@ def main() -> None:
     # DhanWrapper gets DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN from environment
     dw = DhanWrapper()
 
-    settings = _load_agent_settings()
+    settings = _migrate_legacy_hedge_settings(_load_agent_settings())
+    _apply_legacy_env_aliases()
 
     def pick(env_name: str, setting_name: str, default: Any, caster) -> Any:
         if env_name in os.environ:
@@ -410,7 +445,7 @@ def main() -> None:
         lot_size=pick("NIFTY_LOT", "lot_size", 75, _as_int),
         sl_pct=pick("SL_PCT", "leg_sl_pct", 0.025, _as_float),
         tp_pct=pick("TP_PCT", "profit_pct", 0.0225, _as_float),
-        hedge_enable=pick_bool("HEDGE_ENABLE", "hedge_enable", True),
+        hedge_enable=pick_bool("HEDGE_ENABLE", "hedge_enabled", True),
         hedge_price_min=pick("HEDGE_PRICE_MIN", "hedge_price_min", 2.5, _as_float),
         hedge_price_max=pick("HEDGE_PRICE_MAX", "hedge_price_max", 3.5, _as_float),
         poll_sec=pick("POLL_SEC", "poll_sec", 5.0, _as_float),
@@ -418,14 +453,14 @@ def main() -> None:
         trade_mode=trade_mode,
         blotter_path=blotter_path,
         blotter_summary_path=summary_path,
-        batman=BatmanConfig(
-            enabled=pick_bool("BATMAN_ENABLED", "batman_enabled", True),
-            delta_breach=pick("BATMAN_DELTA_BREACH", "batman_delta_breach", 0.30, _as_float),
-            premium_hard_x=pick("BATMAN_PREMIUM_HARD_X", "batman_premium_hard_x", 2.0, _as_float),
-            roll_distance=pick("BATMAN_ROLL_DISTANCE", "batman_roll_distance", 150.0, _as_float),
-            hedge_delta_max=pick("BATMAN_HEDGE_DELTA_MAX", "batman_hedge_delta_max", 0.12, _as_float),
-            hedge_price_max=pick("BATMAN_HEDGE_PRICE_MAX", "batman_hedge_price_max", 35.0, _as_float),
-            salvage_wing_ltp=pick("BATMAN_SALVAGE_WING_LTP", "batman_salvage_wing_ltp", 5.0, _as_float),
+        hedge=HedgeConfig(
+            enabled=pick_bool("HEDGE_ENABLED", "hedge_enabled", True),
+            delta_breach=pick("HEDGE_DELTA_BREACH", "hedge_delta_breach", 0.30, _as_float),
+            premium_hard_x=pick("HEDGE_PREMIUM_HARD_X", "hedge_premium_hard_x", 2.0, _as_float),
+            roll_distance=pick("HEDGE_ROLL_DISTANCE", "hedge_roll_distance", 150.0, _as_float),
+            hedge_delta_max=pick("HEDGE_DELTA_MAX", "hedge_delta_max", 0.12, _as_float),
+            hedge_price_max=pick("HEDGE_PRICE_MAX", "hedge_price_max", 35.0, _as_float),
+            salvage_wing_ltp=pick("HEDGE_SALVAGE_WING_LTP", "hedge_salvage_wing_ltp", 5.0, _as_float),
         ),
         feature_log_path=feature_log,
         equity_log_path=equity_log,
@@ -524,7 +559,7 @@ def main() -> None:
                 cfg.enable_strangle_entry = True
             elif recommendation.name.lower() == "batman" and cfg.auto_disable_strangle_when_unfavored:
                 cfg.enable_strangle_entry = False
-                if not cfg.batman.enabled:
+                if not cfg.hedge.enabled:
                     log.warning("Selector favours Batman but it is disabled via settings")
         else:
             log.info("Strategy selector model unavailable; using configured defaults")

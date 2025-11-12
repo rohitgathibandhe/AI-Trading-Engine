@@ -40,7 +40,7 @@ __all__ = [
     "TradeAction",
     "OpenPosition",
     "LiveConfig",
-    "BatmanConfig",
+    "HedgeConfig",
     "run_backtest",
     "run_strategy",
     "run_live",
@@ -1287,6 +1287,9 @@ class MonthlyStrangleWithWeeklyHedge:
         "max_rolls": 1,
 
         "capital": 500_000,
+        "min_distance_pct": 0.01,       # minimum |strike-spot| pct for entries
+        "max_entry_credit_pct": 0.015,   # skip cycles with combined entry >1.5% of spot
+        "delta_band": (0.20, 0.40),     # acceptable absolute delta range
     }
 
     def __init__(self, cfg: Dict[str, Any], market):
@@ -1405,6 +1408,9 @@ class MonthlyStrangleWithWeeklyHedge:
         ce_cands, pe_cands = [], []
         min_credit = float(self.cfg.get("min_entry_credit", 0.0))
         min_delta = float(self.cfg.get("min_delta_abs", 0.05))
+        delta_band = self.cfg.get("delta_band") or (None, None)
+        min_band, max_band = delta_band if isinstance(delta_band, (list, tuple)) else (None, None)
+
         for k, legs in (oc or {}).items():
             K = _safe_float(k, None)
             if K is None:
@@ -1418,8 +1424,16 @@ class MonthlyStrangleWithWeeklyHedge:
 
             # OTM filters
             if K >= spot and ce_p_tmp > 0 and ce_d is not None and abs(ce_d) >= min_delta and ce_p_tmp >= min_credit:
+                if min_band is not None and abs(ce_d) < min_band:
+                    continue
+                if max_band is not None and abs(ce_d) > max_band:
+                    continue
                 ce_cands.append((K, ce_leg, ce_d, ce_p_tmp))
             if K <= spot and pe_p_tmp > 0 and pe_d is not None and abs(pe_d) >= min_delta and pe_p_tmp >= min_credit:
+                if min_band is not None and abs(pe_d) < min_band:
+                    continue
+                if max_band is not None and abs(pe_d) > max_band:
+                    continue
                 pe_cands.append((K, pe_leg, pe_d, pe_p_tmp))
 
         def pick_ce(cands, thr):
@@ -1467,6 +1481,15 @@ class MonthlyStrangleWithWeeklyHedge:
         pe_leg = pe if isinstance(pe, dict) else {}
         ce_p = _safe_ltp(ce_leg)
         pe_p = _safe_ltp(pe_leg)
+
+        # Distance filter (skip cycles too close to spot)
+        min_dist_pct = float(self.cfg.get("min_distance_pct", 0.0))
+        if min_dist_pct > 0 and ce_strike is not None and pe_strike is not None:
+            ce_far = abs(ce_strike - spot) / max(spot, 1.0)
+            pe_far = abs(spot - pe_strike) / max(spot, 1.0)
+            if ce_far < min_dist_pct or pe_far < min_dist_pct:
+                LOG.info("Entry skipped on %s: strikes too close (CE %.2f%%, PE %.2f%% < %.2f%%)", entry_day, ce_far*100, pe_far*100, min_dist_pct*100)
+                return
 
         # If a leg has 0 LTP, nudge further OTM on that side (several steps)
         def _nudge_nonzero(strike: Optional[float], side: str, steps: int = 10):
@@ -1561,6 +1584,15 @@ class MonthlyStrangleWithWeeklyHedge:
             pe_strike, pe_p, f"{pe_delta:.3f}" if pe_delta is not None else "NA"
         )
 
+        # Combined credit limit
+        net_credit = (ce_p + pe_p) * qty
+        max_credit_pct = float(self.cfg.get("max_entry_credit_pct", 0.0))
+        if max_credit_pct > 0 and spot > 0:
+            credit_pct = net_credit / (spot * qty)
+            if credit_pct > max_credit_pct:
+                LOG.info("Entry skipped on %s: credit %.2f%% exceeds cap %.2f%%", entry_day, credit_pct*100, max_credit_pct*100)
+                return
+
         # Record entries
         qty = int(qty)
         self.trades.append(TradeAction(entry_day.isoformat(), "SELL_CE", float(ce_strike), expiry_str, float(ce_p), qty,
@@ -1569,7 +1601,6 @@ class MonthlyStrangleWithWeeklyHedge:
                                        {"why": "entry", "delta": pe_delta, "spot": spot}))
 
         key = f"{sell_expiry.year}-{sell_expiry.month:02d}"
-        net_credit = (ce_p + pe_p) * qty
         self.positions[key] = OpenPosition(
             month_key=key, entry_date=entry_day, expiry=sell_expiry,
             ce_strike=float(ce_strike), pe_strike=float(pe_strike),
@@ -1593,18 +1624,9 @@ class MonthlyStrangleWithWeeklyHedge:
         days_total = max(1, (pos.expiry - pos.entry_date).days)
         days_passed = max(0, (d - pos.entry_date).days)
 
-        local_chain = _get_local_chain(d, pos.expiry)
-
-        def _local_price(strike: float, side: str) -> Optional[float]:
-            leg = local_chain.get(str(strike), {}).get("ce" if side == "CE" else "pe") if local_chain else None
-            if isinstance(leg, dict):
-                price = _safe_ltp(leg)
-                return price if price and price > 0 else None
-            return None
-
         entry_credit_total = entry_credit_per_lot * pos.qty
-        ce_px = _local_price(pos.ce_strike, "CE")
-        pe_px = _local_price(pos.pe_strike, "PE")
+        ce_px = _local_leg_price(d, pos.expiry, pos.ce_strike, "CE")
+        pe_px = _local_leg_price(d, pos.expiry, pos.pe_strike, "PE")
         mtm_ready = ce_px is not None and pe_px is not None
         current_debit_total = (ce_px + pe_px) * pos.qty if mtm_ready else None
         pnl_cash = (entry_credit_total - current_debit_total) if current_debit_total is not None else None
@@ -1657,6 +1679,50 @@ class MonthlyStrangleWithWeeklyHedge:
                 pos.is_closed = True
                 LOG.info("Stopped out %s on %s (MTM debit %.2f)", pos.month_key, d, current_debit_total)
                 return
+            # Hedge refresh when combined delta breaches thresholds
+            ce_delta = _local_leg_delta(d, pos.expiry, pos.ce_strike, "CE") or 0.0
+            pe_delta = _local_leg_delta(d, pos.expiry, pos.pe_strike, "PE") or 0.0
+            net_delta = abs(ce_delta + pe_delta)
+            hedge_trigger = float(
+                self.cfg.get(
+                    "hedge_delta_max",
+                    self.cfg.get("batman_hedge_delta_max", 0.12),
+                )
+            )
+            hedge_price_max = float(
+                self.cfg.get(
+                    "hedge_price_max",
+                    self.cfg.get("batman_hedge_price_max", 35.0),
+                )
+            )
+            hedge_delta_max = float(
+                self.cfg.get(
+                    "hedge_delta_max",
+                    self.cfg.get("batman_hedge_delta_max", 0.12),
+                )
+            )
+            hedge_roll_distance = float(
+                self.cfg.get(
+                    "hedge_roll_distance",
+                    self.cfg.get("batman_roll_distance", 200.0),
+                )
+            )
+            if net_delta > hedge_trigger:
+                hedge_side = "PUT" if ce_delta > abs(pe_delta) else "CALL"
+                hedge_strike = (pos.pe_strike - hedge_roll_distance) if hedge_side == "PUT" else (pos.ce_strike + hedge_roll_distance)
+                hedge_price = _local_leg_price(d, pos.expiry, hedge_strike, "CE" if hedge_side == "CALL" else "PE")
+                hedge_delta = _local_leg_delta(d, pos.expiry, hedge_strike, "CE" if hedge_side == "CALL" else "PE")
+                if hedge_price is not None and hedge_price <= hedge_price_max and abs(hedge_delta or 0) <= hedge_delta_max:
+                    self.trades.append(TradeAction(
+                        d.isoformat(),
+                        "BUY_TO_CLOSE",
+                        hedge_strike,
+                        pos.expiry.isoformat(),
+                        hedge_price,
+                        pos.qty,
+                        {"leg": "hedge", "why": "auto_hedge", "spot": spot, "net_delta": net_delta}
+                    ))
+                    LOG.info("Auto hedge %s | strike=%s price=%.2f netΔ=%.2f", d, int(hedge_strike), hedge_price, net_delta)
         else:
             near_ce = spot > pos.ce_strike - (buffer_pts * 0.25)
             near_pe = spot < pos.pe_strike + (buffer_pts * 0.25)
@@ -1736,20 +1802,10 @@ class MonthlyStrangleWithWeeklyHedge:
                 if d == pos.expiry and not pos.is_closed:
                     # expiry close proxy (very coarse)
                     between = (spot is not None) and (pos.pe_strike < spot < pos.ce_strike)
-                    local_chain = _get_local_chain(d, pos.expiry)
-
-                    def _expiry_price(strike: float, side: str, default: float) -> float:
-                        leg = local_chain.get(str(strike), {}).get("ce" if side == "CE" else "pe") if local_chain else None
-                        if isinstance(leg, dict):
-                            price = _safe_ltp(leg)
-                            if price is not None and price >= 0:
-                                return float(price)
-                        return default
-
                     ce_default = 0.05 * pos.ce_prem if between else 1.5 * pos.ce_prem
                     pe_default = 0.05 * pos.pe_prem if between else 1.5 * pos.pe_prem
-                    ce_exit = _expiry_price(pos.ce_strike, "CE", ce_default)
-                    pe_exit = _expiry_price(pos.pe_strike, "PE", pe_default)
+                    ce_exit = _local_leg_price(d, pos.expiry, pos.ce_strike, "CE") or ce_default
+                    pe_exit = _local_leg_price(d, pos.expiry, pos.pe_strike, "PE") or pe_default
                     self.trades.append(TradeAction(d.isoformat(), "BUY_TO_CLOSE", pos.ce_strike, pos.expiry.isoformat(),
                                                    ce_exit, pos.qty, {"leg": "CE", "why": "expiry", "spot": spot}))
                     self.trades.append(TradeAction(d.isoformat(), "BUY_TO_CLOSE", pos.pe_strike, pos.expiry.isoformat(),
@@ -1799,7 +1855,7 @@ NIFTY_FNO_SEG = "NSE_FNO"
 
 
 @dataclass
-class BatmanConfig:
+class HedgeConfig:
     enabled: bool = True
     delta_breach: float = 0.30
     premium_hard_x: float = 2.0
@@ -1851,7 +1907,7 @@ class LiveConfig:
     trade_mode: str = "live"
     blotter_path: Optional[str] = None
     blotter_summary_path: Optional[str] = None
-    batman: BatmanConfig = field(default_factory=BatmanConfig)
+    hedge: HedgeConfig = field(default_factory=HedgeConfig)
     feature_log_path: Optional[str] = None
     equity_log_path: Optional[str] = None
     equity_snapshot_minutes: float = 10.0
@@ -2562,6 +2618,30 @@ def _get_local_chain(day: date, expiry: date) -> Dict[str, Dict[str, dict]]:
     return oc
 
 
+def _lookup_local_leg(day: date, expiry: date, strike: float, side: str) -> Optional[Dict[str, Any]]:
+    chain = _get_local_chain(day, expiry)
+    if not chain:
+        return None
+    legs = chain.get(str(strike)) or {}
+    leg = legs.get("ce" if side.upper() == "CE" else "pe")
+    return leg if isinstance(leg, dict) else None
+
+
+def _local_leg_price(day: date, expiry: date, strike: float, side: str) -> Optional[float]:
+    leg = _lookup_local_leg(day, expiry, strike, side)
+    if not leg:
+        return None
+    px = _safe_ltp(leg)
+    return px if px is not None and px >= 0 else None
+
+
+def _local_leg_delta(day: date, expiry: date, strike: float, side: str) -> Optional[float]:
+    leg = _lookup_local_leg(day, expiry, strike, side)
+    if not leg:
+        return None
+    return _safe_delta(leg)
+
+
 def _find_fno_option_by_price(
     oc_payload: Dict[str, Any],
     target_price_min: float,
@@ -2720,7 +2800,7 @@ def _identify_batman_structures(rows: List[Dict[str, Any]]) -> List[BatmanStruct
 def _ensure_batman_hedges(
     dw,
     cfg: LiveConfig,
-    bat_cfg: BatmanConfig,
+    hedge_cfg: HedgeConfig,
     structure: BatmanStructure,
     chain_df: pd.DataFrame,
     spot: Optional[float],
@@ -2728,7 +2808,7 @@ def _ensure_batman_hedges(
     if chain_df is None or chain_df.empty:
         return
 
-    target_delta = bat_cfg.hedge_delta_max
+    target_delta = hedge_cfg.hedge_delta_max
     short_call_qty = abs(_option_qty(structure.short_call))
     short_put_qty = abs(_option_qty(structure.short_put))
     long_call_qty = max(0, _option_qty(structure.long_call))
@@ -2750,7 +2830,7 @@ def _ensure_batman_hedges(
             row = subset.sort_values(by=["strike"]).iloc[0]
             row_dict = _series_to_dict(row)
             price = _safe_float(row_dict.get("ltp_ce"), None)
-            if price is None or price <= bat_cfg.hedge_price_max:
+            if price is None or price <= hedge_cfg.hedge_price_max:
                 qty_needed = short_call_qty - long_call_qty
                 _place_option_order(
                     dw,
@@ -2780,7 +2860,7 @@ def _ensure_batman_hedges(
             row = subset.sort_values(by=["strike"], ascending=False).iloc[0]
             row_dict = _series_to_dict(row)
             price = _safe_float(row_dict.get("ltp_pe"), None)
-            if price is None or price <= bat_cfg.hedge_price_max:
+            if price is None or price <= hedge_cfg.hedge_price_max:
                 qty_needed = short_put_qty - long_put_qty
                 _place_option_order(
                     dw,
@@ -2803,11 +2883,11 @@ def _ensure_batman_hedges(
 def monitor_batman_positions(
     dw,
     cfg: LiveConfig,
-    bat_cfg: BatmanConfig,
+    hedge_cfg: HedgeConfig,
     positions: List[Dict[str, Any]],
     ingestor: Optional[OptionChainIngestor],
 ) -> None:
-    if not bat_cfg.enabled or not positions:
+    if not hedge_cfg.enabled or not positions:
         return
     structures = _identify_batman_structures(positions)
     if not structures:
@@ -2847,21 +2927,21 @@ def monitor_batman_positions(
 
         if call_ltp is not None and cost_call > 0:
             ratio = call_ltp / cost_call
-            if ratio >= bat_cfg.premium_hard_x or (call_delta is not None and call_delta > bat_cfg.delta_breach):
-                target = structure.short_call_strike + bat_cfg.roll_distance
+            if ratio >= hedge_cfg.premium_hard_x or (call_delta is not None and call_delta > hedge_cfg.delta_breach):
+                target = structure.short_call_strike + hedge_cfg.roll_distance
                 replacement = _select_replacement(chain_df, target, "CALL", "UP")
                 if replacement:
                     _roll_short_leg(dw, cfg, structure.short_call, "CALL", replacement, "call_roll")
 
         if put_ltp is not None and cost_put > 0:
             ratio = put_ltp / cost_put
-            if ratio >= bat_cfg.premium_hard_x or (put_delta is not None and abs(put_delta) > bat_cfg.delta_breach):
-                target = structure.short_put_strike - bat_cfg.roll_distance
+            if ratio >= hedge_cfg.premium_hard_x or (put_delta is not None and abs(put_delta) > hedge_cfg.delta_breach):
+                target = structure.short_put_strike - hedge_cfg.roll_distance
                 replacement = _select_replacement(chain_df, target, "PUT", "DOWN")
                 if replacement:
                     _roll_short_leg(dw, cfg, structure.short_put, "PUT", replacement, "put_roll")
 
-        _ensure_batman_hedges(dw, cfg, bat_cfg, structure, chain_df, spot)
+        _ensure_batman_hedges(dw, cfg, hedge_cfg, structure, chain_df, spot)
 
         feature_row = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -3555,7 +3635,11 @@ def run_live(
         LOG.warning("[live] OptionChainIngestor unavailable: %s", exc)
         chain_ingestor = None
 
-    bat_cfg = getattr(cfg, "batman", BatmanConfig())
+    hedge_cfg = getattr(cfg, "hedge", None)
+    if hedge_cfg is None and hasattr(cfg, "batman"):
+        hedge_cfg = getattr(cfg, "batman")
+    if hedge_cfg is None:
+        hedge_cfg = HedgeConfig()
 
     if feature_history_path is None and cfg.feature_log_path:
         feature_history_path = Path(cfg.feature_log_path)
@@ -3705,8 +3789,8 @@ def run_live(
 
             has_live_strangle = bool(open_deriv_rows)
 
-            if open_deriv_rows and bat_cfg.enabled:
-                monitor_batman_positions(dw, cfg, bat_cfg, open_deriv_rows, chain_ingestor)
+            if open_deriv_rows and hedge_cfg.enabled:
+                monitor_batman_positions(dw, cfg, hedge_cfg, open_deriv_rows, chain_ingestor)
 
             if open_deriv_rows:
                 monitor_and_manage_positions(dw, cfg, open_deriv_rows, chain_ingestor)

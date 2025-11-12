@@ -1,2 +1,2 @@
 monthly_cycles,n_trades,underlying_id,entry_credit_value,exit_value,net_credit,note
-11,58,13,44432.5,209156.0,-164723.5,OTM + Δ≥target; next-month strangle; daily monitor with profit/SL/roll; snap-to-available; iterative force-distance; 0-LTP nudged.
+3,16,13,2065.0,45672.75,-43607.75,OTM + Δ≥target; next-month strangle; daily monitor with profit/SL/roll; snap-to-available; iterative force-distance; 0-LTP nudged.

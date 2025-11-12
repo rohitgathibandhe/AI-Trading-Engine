@@ -107,13 +107,13 @@ DEFAULT_SETTINGS = {
     "leg_sl_pct": 2.5,
     "profit_pct": 2.25,
     "warn_only": False,
-    "batman_enabled": True,
-    "batman_delta_breach": 0.30,
-    "batman_premium_hard_x": 2.0,
-    "batman_roll_distance": 150.0,
-    "batman_hedge_delta_max": 0.12,
-    "batman_hedge_price_max": 35.0,
-    "batman_salvage_wing_ltp": 5.0,
+    "hedge_enabled": True,
+    "hedge_delta_breach": 0.30,
+    "hedge_premium_hard_x": 2.0,
+    "hedge_roll_distance": 150.0,
+    "hedge_delta_max": 0.12,
+    "hedge_price_max": 35.0,
+    "hedge_salvage_wing_ltp": 5.0,
     "risk_max_portfolio_delta": 0.25,
     "risk_max_exposure_pct": 0.05,
     "risk_account_equity": 500000.0,
@@ -122,6 +122,16 @@ DEFAULT_SETTINGS = {
         "flatten_on_delta": False,
         "flatten_on_exposure": False,
     },
+}
+
+LEGACY_HEDGE_SETTING_ALIASES = {
+    "batman_enabled": "hedge_enabled",
+    "batman_delta_breach": "hedge_delta_breach",
+    "batman_premium_hard_x": "hedge_premium_hard_x",
+    "batman_roll_distance": "hedge_roll_distance",
+    "batman_hedge_delta_max": "hedge_delta_max",
+    "batman_hedge_price_max": "hedge_price_max",
+    "batman_salvage_wing_ltp": "hedge_salvage_wing_ltp",
 }
 
 BLOTTER_CSV = STATE_DIR / "trade_blotter.csv"
@@ -234,6 +244,9 @@ def _load_settings() -> Dict[str, Any]:
             raise TypeError("settings not a dict")
     except Exception:
         data = {}
+    for legacy, new in LEGACY_HEDGE_SETTING_ALIASES.items():
+        if legacy in data and new not in data:
+            data[new] = data[legacy]
     merged = {**DEFAULT_SETTINGS, **data}
     # ensure types
     merged["max_legs"] = int(merged.get("max_legs", DEFAULT_SETTINGS["max_legs"]))
@@ -241,13 +254,13 @@ def _load_settings() -> Dict[str, Any]:
     merged["leg_sl_pct"] = float(merged.get("leg_sl_pct", DEFAULT_SETTINGS["leg_sl_pct"]))
     merged["profit_pct"] = float(merged.get("profit_pct", DEFAULT_SETTINGS["profit_pct"]))
     merged["warn_only"] = bool(merged.get("warn_only", DEFAULT_SETTINGS["warn_only"]))
-    merged["batman_enabled"] = bool(merged.get("batman_enabled", DEFAULT_SETTINGS["batman_enabled"]))
-    merged["batman_delta_breach"] = float(merged.get("batman_delta_breach", DEFAULT_SETTINGS["batman_delta_breach"]))
-    merged["batman_premium_hard_x"] = float(merged.get("batman_premium_hard_x", DEFAULT_SETTINGS["batman_premium_hard_x"]))
-    merged["batman_roll_distance"] = float(merged.get("batman_roll_distance", DEFAULT_SETTINGS["batman_roll_distance"]))
-    merged["batman_hedge_delta_max"] = float(merged.get("batman_hedge_delta_max", DEFAULT_SETTINGS["batman_hedge_delta_max"]))
-    merged["batman_hedge_price_max"] = float(merged.get("batman_hedge_price_max", DEFAULT_SETTINGS["batman_hedge_price_max"]))
-    merged["batman_salvage_wing_ltp"] = float(merged.get("batman_salvage_wing_ltp", DEFAULT_SETTINGS["batman_salvage_wing_ltp"]))
+    merged["hedge_enabled"] = bool(merged.get("hedge_enabled", DEFAULT_SETTINGS["hedge_enabled"]))
+    merged["hedge_delta_breach"] = float(merged.get("hedge_delta_breach", DEFAULT_SETTINGS["hedge_delta_breach"]))
+    merged["hedge_premium_hard_x"] = float(merged.get("hedge_premium_hard_x", DEFAULT_SETTINGS["hedge_premium_hard_x"]))
+    merged["hedge_roll_distance"] = float(merged.get("hedge_roll_distance", DEFAULT_SETTINGS["hedge_roll_distance"]))
+    merged["hedge_delta_max"] = float(merged.get("hedge_delta_max", DEFAULT_SETTINGS["hedge_delta_max"]))
+    merged["hedge_price_max"] = float(merged.get("hedge_price_max", DEFAULT_SETTINGS["hedge_price_max"]))
+    merged["hedge_salvage_wing_ltp"] = float(merged.get("hedge_salvage_wing_ltp", DEFAULT_SETTINGS["hedge_salvage_wing_ltp"]))
     merged["risk_max_portfolio_delta"] = float(merged.get("risk_max_portfolio_delta", DEFAULT_SETTINGS["risk_max_portfolio_delta"]))
     merged["risk_max_exposure_pct"] = float(merged.get("risk_max_exposure_pct", DEFAULT_SETTINGS["risk_max_exposure_pct"]))
     merged["risk_account_equity"] = float(merged.get("risk_account_equity", DEFAULT_SETTINGS["risk_account_equity"]))
@@ -974,13 +987,22 @@ def _agent_env() -> dict:
     base["BLOTTER_PATH"] = str(STATE_DIR / "trade_blotter.csv")
     base["BLOTTER_SUMMARY_PATH"] = str(STATE_DIR / "trade_blotter_summary.json")
     base["FEATURE_LOG_PATH"] = str(STATE_DIR / "feature_history.csv")
-    base["BATMAN_ENABLED"] = "1" if settings.get("batman_enabled", True) else "0"
-    base["BATMAN_DELTA_BREACH"] = str(settings.get("batman_delta_breach", 0.30))
-    base["BATMAN_PREMIUM_HARD_X"] = str(settings.get("batman_premium_hard_x", 2.0))
-    base["BATMAN_ROLL_DISTANCE"] = str(settings.get("batman_roll_distance", 150.0))
-    base["BATMAN_HEDGE_DELTA_MAX"] = str(settings.get("batman_hedge_delta_max", 0.12))
-    base["BATMAN_HEDGE_PRICE_MAX"] = str(settings.get("batman_hedge_price_max", 35.0))
-    base["BATMAN_SALVAGE_WING_LTP"] = str(settings.get("batman_salvage_wing_ltp", 5.0))
+    hedge_enabled = bool(settings.get("hedge_enabled", True))
+    base["HEDGE_ENABLED"] = "1" if hedge_enabled else "0"
+    base["HEDGE_DELTA_BREACH"] = str(settings.get("hedge_delta_breach", 0.30))
+    base["HEDGE_PREMIUM_HARD_X"] = str(settings.get("hedge_premium_hard_x", 2.0))
+    base["HEDGE_ROLL_DISTANCE"] = str(settings.get("hedge_roll_distance", 150.0))
+    base["HEDGE_DELTA_MAX"] = str(settings.get("hedge_delta_max", 0.12))
+    base["HEDGE_PRICE_MAX"] = str(settings.get("hedge_price_max", 35.0))
+    base["HEDGE_SALVAGE_WING_LTP"] = str(settings.get("hedge_salvage_wing_ltp", 5.0))
+    # legacy exports to support older start_agent builds
+    base["BATMAN_ENABLED"] = base["HEDGE_ENABLED"]
+    base["BATMAN_DELTA_BREACH"] = base["HEDGE_DELTA_BREACH"]
+    base["BATMAN_PREMIUM_HARD_X"] = base["HEDGE_PREMIUM_HARD_X"]
+    base["BATMAN_ROLL_DISTANCE"] = base["HEDGE_ROLL_DISTANCE"]
+    base["BATMAN_HEDGE_DELTA_MAX"] = base["HEDGE_DELTA_MAX"]
+    base["BATMAN_HEDGE_PRICE_MAX"] = base["HEDGE_PRICE_MAX"]
+    base["BATMAN_SALVAGE_WING_LTP"] = base["HEDGE_SALVAGE_WING_LTP"]
     base["STRATEGY_MODEL_PATH"] = str(STATE_DIR / "strategy_selector_model.json")
     return base
 
@@ -2349,55 +2371,55 @@ def _settings_tab() -> None:
         profit_pct = st.number_input("Profit booking (%)", 0.5, 10.0, float(current.get("profit_pct", 2.25)))
     warn_only = st.checkbox("Warn-only mode (log orders, no execution)", value=bool(current.get("warn_only", False)))
 
-    with st.expander("Batman (short body) adjustments"):
-        batman_enabled = st.checkbox(
-            "Enable Batman monitoring",
-            value=bool(current.get("batman_enabled", True)),
-            help="Detects existing Batman structures, rolls stressed legs, and adds hedges automatically.",
+    with st.expander("Hedge monitor adjustments"):
+        hedge_enabled = st.checkbox(
+            "Enable hedge monitor",
+            value=bool(current.get("hedge_enabled", True)),
+            help="Detect existing short-body structures, roll stressed legs, and add hedges automatically.",
         )
         bc1, bc2 = st.columns(2)
         with bc1:
-            batman_delta_breach = st.number_input(
+            hedge_delta_breach = st.number_input(
                 "Delta breach threshold",
                 0.05,
                 0.9,
-                float(current.get("batman_delta_breach", 0.30)),
+                float(current.get("hedge_delta_breach", 0.30)),
                 help="Roll a side when |delta| exceeds this value.",
             )
-            batman_roll_distance = st.number_input(
+            hedge_roll_distance = st.number_input(
                 "Roll distance (pts)",
                 50.0,
                 500.0,
-                float(current.get("batman_roll_distance", 150.0)),
+                float(current.get("hedge_roll_distance", 150.0)),
                 help="How far to move the body when rolling.",
             )
-            batman_salvage = st.number_input(
+            hedge_salvage = st.number_input(
                 "Wing salvage LTP",
                 0.0,
                 20.0,
-                float(current.get("batman_salvage_wing_ltp", 5.0)),
+                float(current.get("hedge_salvage_wing_ltp", 5.0)),
                 help="Wings below this value can be considered for salvage/refresh (future use).",
             )
         with bc2:
-            batman_premium_hard_x = st.number_input(
+            hedge_premium_hard_x = st.number_input(
                 "Premium multiple trigger",
                 1.0,
                 4.0,
-                float(current.get("batman_premium_hard_x", 2.0)),
+                float(current.get("hedge_premium_hard_x", 2.0)),
                 help="Roll when current premium >= multiple × entry premium.",
             )
-            batman_hedge_delta_max = st.number_input(
+            hedge_delta_max = st.number_input(
                 "Hedge target delta",
                 0.01,
                 0.5,
-                float(current.get("batman_hedge_delta_max", 0.12)),
+                float(current.get("hedge_delta_max", 0.12)),
                 help="Select hedges with |delta| below this value.",
             )
-            batman_hedge_price_max = st.number_input(
+            hedge_price_max = st.number_input(
                 "Max hedge cost",
                 1.0,
                 200.0,
-                float(current.get("batman_hedge_price_max", 35.0)),
+                float(current.get("hedge_price_max", 35.0)),
                 help="Do not auto-buy hedges above this LTP.",
             )
 
@@ -2408,13 +2430,13 @@ def _settings_tab() -> None:
             "leg_sl_pct": float(leg_sl_pct),
             "profit_pct": float(profit_pct),
             "warn_only": bool(warn_only),
-            "batman_enabled": bool(batman_enabled),
-            "batman_delta_breach": float(batman_delta_breach),
-            "batman_premium_hard_x": float(batman_premium_hard_x),
-            "batman_roll_distance": float(batman_roll_distance),
-            "batman_hedge_delta_max": float(batman_hedge_delta_max),
-            "batman_hedge_price_max": float(batman_hedge_price_max),
-            "batman_salvage_wing_ltp": float(batman_salvage),
+            "hedge_enabled": bool(hedge_enabled),
+            "hedge_delta_breach": float(hedge_delta_breach),
+            "hedge_premium_hard_x": float(hedge_premium_hard_x),
+            "hedge_roll_distance": float(hedge_roll_distance),
+            "hedge_delta_max": float(hedge_delta_max),
+            "hedge_price_max": float(hedge_price_max),
+            "hedge_salvage_wing_ltp": float(hedge_salvage),
         }, indent=2))
         st.success("Settings saved.")
     with st.expander("Auto Playbook"):
