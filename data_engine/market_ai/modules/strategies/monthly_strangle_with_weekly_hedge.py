@@ -1403,6 +1403,8 @@ class MonthlyStrangleWithWeeklyHedge:
         target = float(self.cfg.get("delta_target", 0.15))
 
         ce_cands, pe_cands = [], []
+        min_credit = float(self.cfg.get("min_entry_credit", 0.0))
+        min_delta = float(self.cfg.get("min_delta_abs", 0.05))
         for k, legs in (oc or {}).items():
             K = _safe_float(k, None)
             if K is None:
@@ -1415,9 +1417,9 @@ class MonthlyStrangleWithWeeklyHedge:
             pe_p_tmp = _safe_ltp(pe_leg)
 
             # OTM filters
-            if K >= spot and ce_p_tmp > 0 and ce_d is not None:
+            if K >= spot and ce_p_tmp > 0 and ce_d is not None and abs(ce_d) >= min_delta and ce_p_tmp >= min_credit:
                 ce_cands.append((K, ce_leg, ce_d, ce_p_tmp))
-            if K <= spot and pe_p_tmp > 0 and pe_d is not None:
+            if K <= spot and pe_p_tmp > 0 and pe_d is not None and abs(pe_d) >= min_delta and pe_p_tmp >= min_credit:
                 pe_cands.append((K, pe_leg, pe_d, pe_p_tmp))
 
         def pick_ce(cands, thr):
@@ -2512,6 +2514,7 @@ def _load_local_rolling_option_chain(as_of: date, expiry: date) -> Dict[str, Any
     if "expiryDate" in df.columns:
         df = df[df["expiryDate"].fillna("").astype(str).isin([expiry_iso, ""])]
     oc: Dict[str, Dict[str, dict]] = {}
+    ttl_days = max(1, (expiry - as_of).days)
     for _, row in df.iterrows():
         strike_val = row.get("strikePrice") or row.get("strike")
         opt_type = (row.get("optionType") or "").upper()
@@ -2531,6 +2534,19 @@ def _load_local_rolling_option_chain(as_of: date, expiry: date) -> Dict[str, Any
             "oi": _safe_float(row.get("oi"), None),
         }
         delta_val = _safe_float(row.get("delta"), None)
+        if delta_val is not None and (isinstance(delta_val, float) and not math.isfinite(delta_val)):
+            delta_val = None
+        if delta_val is None and node.get("spot") and node.get("iv"):
+            iv_eff = float(node["iv"])
+            if iv_eff > 1.0:
+                iv_eff /= 100.0
+            delta_val = _bs_delta(
+                float(node["spot"]),
+                strike,
+                max(iv_eff, 1e-6),
+                ttl_days / 365.0,
+                call=(opt_type == "CE"),
+            )
         if delta_val is not None:
             node["greeks"] = {"delta": delta_val}
         oc.setdefault(str(strike), {})["ce" if opt_type == "CE" else "pe"] = {k: v for k, v in node.items() if v is not None}
@@ -3720,3 +3736,12 @@ def run_live(
             base_poll = max(base_poll, float(getattr(cfg, "poll_backoff_when_idle", base_poll)))
         time.sleep(base_poll)
         loop_iter += 1
+def _bs_delta(spot: float, strike: float, iv: float, t_years: float, call: bool) -> Optional[float]:
+    try:
+        if spot <= 0 or strike <= 0 or iv <= 0 or t_years <= 0:
+            return None
+        d1 = (math.log(spot / strike) + 0.5 * iv * iv * t_years) / (iv * math.sqrt(t_years))
+        cdf = 0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))
+        return cdf if call else (cdf - 1.0)
+    except Exception:
+        return None

@@ -2,7 +2,7 @@
 
 This job keeps the agent’s historical dataset and selector model fresh by:
 
-1. Pulling the latest rolling-option candles from Dhan (chunked to respect their 30‑day window limit).
+1. Pulling the latest rolling-option candles from Dhan (chunked to respect their 30‑day window limit) across a default ladder of `ATM`, `ATM±2`, `ATM±4`, `ATM±6`.
 2. Regenerating `state/feature_history.csv`, engineered feature parquet, targets, and dataset summaries.
 3. Retraining the selector (ridge regression per strategy) and writing metrics consumed by the dashboard.
 4. Surfacing coverage + training health in the Observability tab.
@@ -22,9 +22,6 @@ python3 data_engine/market_ai/scripts/run_data_pipeline.py \
   --security-id 13 \
   --seg NSE_FNO \
   --lookback-days 30 \
-  --strike-selector ATM \
-  --strike-selector ATM+2 \
-  --strike-selector ATM-2 \
   --option-type CALL \
   --option-type PUT
 ```
@@ -51,7 +48,6 @@ Run every weekday at 7:30 AM IST (convert to your server’s timezone):
   /usr/bin/env DHAN_CLIENT_ID=xxx DHAN_ACCESS_TOKEN=yyy \
   /usr/bin/python3 data_engine/market_ai/scripts/run_data_pipeline.py \
     NIFTY --security-id 13 --seg NSE_FNO --lookback-days 30 \
-    --strike-selector ATM --strike-selector ATM+2 --strike-selector ATM-2 \
     --option-type CALL --option-type PUT >> logs/data_pipeline.log 2>&1
 ```
 

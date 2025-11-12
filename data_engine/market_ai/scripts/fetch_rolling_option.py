@@ -13,11 +13,11 @@ from typing import Iterable, List
 
 SCRIPT_PATH = Path(__file__).resolve()
 ENGINE_DIR = SCRIPT_PATH.parents[1]
-REPO_ROOT = ENGINE_DIR.parents[1]
+PACKAGE_ROOT = ENGINE_DIR.parents[0]
 
 if __package__ is None:
     import sys
-    sys.path.insert(0, str(REPO_ROOT))
+    sys.path.insert(0, str(PACKAGE_ROOT))
 
 
 import pandas as pd
@@ -112,7 +112,7 @@ def run_rolling_option(args: argparse.Namespace, out_dir: Path) -> None:
     strike_selectors = _collect_list(getattr(args, "strike_selectors", None))
     option_types = _collect_list(getattr(args, "option_types", None))
     required_data = _collect_list(getattr(args, "required_data", None))
-    cfg = RollingOptionConfig(
+    cfg_kwargs = dict(
         underlying=args.underlying,
         segment=args.seg,
         security_id=args.security_id,
@@ -121,10 +121,14 @@ def run_rolling_option(args: argparse.Namespace, out_dir: Path) -> None:
         expiry=args.expiry,
         interval=args.interval,
         limit_per_page=args.page_limit,
-        strike_selectors=strike_selectors or None,
-        option_types=option_types or None,
-        required_data=required_data or None,
     )
+    if strike_selectors:
+        cfg_kwargs["strike_selectors"] = strike_selectors
+    if option_types:
+        cfg_kwargs["option_types"] = option_types
+    if required_data:
+        cfg_kwargs["required_data"] = required_data
+    cfg = RollingOptionConfig(**cfg_kwargs)
     parquet_paths = ingestor.fetch_range(cfg)
     if parquet_paths:
         print(f"[rollingoption] wrote {len(parquet_paths)} parquet files under {ingestor.out_dir}")

@@ -49,7 +49,17 @@ class RollingOptionConfig:
     interval: str = "1"
     expiry_flag: str = "MONTH"
     expiry_code: Optional[int] = None
-    strike_selectors: Sequence[str] = field(default_factory=lambda: ("ATM",))
+    strike_selectors: Sequence[str] = field(
+        default_factory=lambda: (
+            "ATM",
+            "ATM+2",
+            "ATM-2",
+            "ATM+4",
+            "ATM-4",
+            "ATM+6",
+            "ATM-6",
+        )
+    )
     option_types: Sequence[str] = field(default_factory=lambda: ("CALL", "PUT"))
     required_data: Sequence[str] = field(default_factory=lambda: DEFAULT_REQUIRED_DATA)
     limit_per_page: int = 500  # retained for backward compatibility (unused)
