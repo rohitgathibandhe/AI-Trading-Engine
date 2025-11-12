@@ -63,6 +63,7 @@ ORDER_AUDIT_LOG = STATE_DIR / "order_audit.jsonl"
 ORDER_INTENT_QUEUE = STATE_DIR / "order_intents.jsonl"
 MANAGED_LEG_STATE = STATE_DIR / "managed_legs.json"
 ROLLING_CACHE_DIR = MARKET_AI_DIR / "state" / "rolling_option"
+_LOCAL_CHAIN_CACHE: Dict[Tuple[str, str], Dict[str, Dict[str, dict]]] = {}
 
 BLOTTER_FIELDS = [
     "timestamp",
@@ -1385,7 +1386,11 @@ class MonthlyStrangleWithWeeklyHedge:
                             if s is not None:
                                 return s
             return None
-        spot = spot_hint if spot_hint is not None else _spot_from_chain(oc)
+        chain_spot = _spot_from_chain(oc)
+        spot = spot_hint if spot_hint is not None else chain_spot
+        if chain_spot is not None and spot is not None:
+            if abs(spot - chain_spot) / max(chain_spot, 1.0) > 0.02:
+                spot = chain_spot
         if spot is None:
             LOG.warning("No spot on %s; skip month to avoid ITM mishaps.", entry_day)
             return
@@ -1586,15 +1591,31 @@ class MonthlyStrangleWithWeeklyHedge:
         days_total = max(1, (pos.expiry - pos.entry_date).days)
         days_passed = max(0, (d - pos.entry_date).days)
 
+        local_chain = _get_local_chain(d, pos.expiry)
+
+        def _local_price(strike: float, side: str) -> Optional[float]:
+            leg = local_chain.get(str(strike), {}).get("ce" if side == "CE" else "pe") if local_chain else None
+            if isinstance(leg, dict):
+                price = _safe_ltp(leg)
+                return price if price and price > 0 else None
+            return None
+
+        entry_credit_total = entry_credit_per_lot * pos.qty
+        ce_px = _local_price(pos.ce_strike, "CE")
+        pe_px = _local_price(pos.pe_strike, "PE")
+        mtm_ready = ce_px is not None and pe_px is not None
+        current_debit_total = (ce_px + pe_px) * pos.qty if mtm_ready else None
+        pnl_cash = (entry_credit_total - current_debit_total) if current_debit_total is not None else None
+
         # Profit booking (only when spot is comfortably between wings and half the cycle is done)
         wide_ok = (spot < pos.ce_strike - buffer_pts) and (spot > pos.pe_strike + buffer_pts)
-        if wide_ok and days_passed >= days_total * 0.5:
+        if wide_ok and days_passed >= days_total * 0.5 and mtm_ready and pnl_cash is not None and pnl_cash >= pt * entry_credit_total:
             self.trades.append(TradeAction(d.isoformat(), "BUY_TO_CLOSE", pos.ce_strike, pos.expiry.isoformat(),
-                                           pos.ce_prem * (1 - pt), pos.qty, {"leg": "CE", "why": "PT", "spot": spot}))
+                                           ce_px, pos.qty, {"leg": "CE", "why": "PT", "spot": spot}))
             self.trades.append(TradeAction(d.isoformat(), "BUY_TO_CLOSE", pos.pe_strike, pos.expiry.isoformat(),
-                                           pos.pe_prem * (1 - pt), pos.qty, {"leg": "PE", "why": "PT", "spot": spot}))
+                                           pe_px, pos.qty, {"leg": "PE", "why": "PT", "spot": spot}))
             pos.is_closed = True
-            LOG.info("Booked profit for %s on %s ~%.0f%%", pos.month_key, d, pt * 100)
+            LOG.info("Booked profit for %s on %s using MTM prices", pos.month_key, d)
             return
 
         # Rolls (single per cycle)
@@ -1624,19 +1645,33 @@ class MonthlyStrangleWithWeeklyHedge:
                 pos.pe_strike = new_pe
                 LOG.info("Roll %s | PE: %s → %s | spot=%.2f", d, int(prev), int(new_pe), spot)
 
-        # Soft combined SL proxy (very approximate — improves with live Greeks)
-        near_ce = spot > pos.ce_strike - (buffer_pts * 0.25)
-        near_pe = spot < pos.pe_strike + (buffer_pts * 0.25)
-        est_combined = entry_credit_per_lot
-        if near_ce: est_combined *= 1.3
-        if near_pe: est_combined *= 1.3
-        if (est_combined / (entry_credit_per_lot + 1e-9)) >= sl:
-            self.trades.append(TradeAction(d.isoformat(), "BUY_TO_CLOSE", pos.ce_strike, pos.expiry.isoformat(),
-                                           pos.ce_prem * 1.5, pos.qty, {"leg": "CE", "why": "SL", "spot": spot}))
-            self.trades.append(TradeAction(d.isoformat(), "BUY_TO_CLOSE", pos.pe_strike, pos.expiry.isoformat(),
-                                           pos.pe_prem * 1.5, pos.qty, {"leg": "PE", "why": "SL", "spot": spot}))
-            pos.is_closed = True
-            LOG.info("Stopped out %s on %s (combined SL %.0f%%)", pos.month_key, d, sl * 100)
+        # Combined SL (uses MTM when available, otherwise heuristic)
+        if mtm_ready and current_debit_total is not None:
+            if current_debit_total >= entry_credit_total * (1 + sl):
+                self.trades.append(TradeAction(d.isoformat(), "BUY_TO_CLOSE", pos.ce_strike, pos.expiry.isoformat(),
+                                               ce_px, pos.qty, {"leg": "CE", "why": "SL", "spot": spot}))
+                self.trades.append(TradeAction(d.isoformat(), "BUY_TO_CLOSE", pos.pe_strike, pos.expiry.isoformat(),
+                                               pe_px, pos.qty, {"leg": "PE", "why": "SL", "spot": spot}))
+                pos.is_closed = True
+                LOG.info("Stopped out %s on %s (MTM debit %.2f)", pos.month_key, d, current_debit_total)
+                return
+        else:
+            near_ce = spot > pos.ce_strike - (buffer_pts * 0.25)
+            near_pe = spot < pos.pe_strike + (buffer_pts * 0.25)
+            est_combined = entry_credit_per_lot
+            if near_ce:
+                est_combined *= 1.3
+            if near_pe:
+                est_combined *= 1.3
+            if (est_combined / (entry_credit_per_lot + 1e-9)) >= sl:
+                ce_exit = ce_px if ce_px is not None else pos.ce_prem * 1.5
+                pe_exit = pe_px if pe_px is not None else pos.pe_prem * 1.5
+                self.trades.append(TradeAction(d.isoformat(), "BUY_TO_CLOSE", pos.ce_strike, pos.expiry.isoformat(),
+                                               ce_exit, pos.qty, {"leg": "CE", "why": "SL_h", "spot": spot}))
+                self.trades.append(TradeAction(d.isoformat(), "BUY_TO_CLOSE", pos.pe_strike, pos.expiry.isoformat(),
+                                               pe_exit, pos.qty, {"leg": "PE", "why": "SL_h", "spot": spot}))
+                pos.is_closed = True
+                LOG.info("Heuristic stop triggered %s on %s", pos.month_key, d)
 
     # ---------- main ----------
     def run(self, df: pd.DataFrame, cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
@@ -1699,8 +1734,20 @@ class MonthlyStrangleWithWeeklyHedge:
                 if d == pos.expiry and not pos.is_closed:
                     # expiry close proxy (very coarse)
                     between = (spot is not None) and (pos.pe_strike < spot < pos.ce_strike)
-                    ce_exit = 0.05 * pos.ce_prem if between else 1.5 * pos.ce_prem
-                    pe_exit = 0.05 * pos.pe_prem if between else 1.5 * pos.pe_prem
+                    local_chain = _get_local_chain(d, pos.expiry)
+
+                    def _expiry_price(strike: float, side: str, default: float) -> float:
+                        leg = local_chain.get(str(strike), {}).get("ce" if side == "CE" else "pe") if local_chain else None
+                        if isinstance(leg, dict):
+                            price = _safe_ltp(leg)
+                            if price is not None and price >= 0:
+                                return float(price)
+                        return default
+
+                    ce_default = 0.05 * pos.ce_prem if between else 1.5 * pos.ce_prem
+                    pe_default = 0.05 * pos.pe_prem if between else 1.5 * pos.pe_prem
+                    ce_exit = _expiry_price(pos.ce_strike, "CE", ce_default)
+                    pe_exit = _expiry_price(pos.pe_strike, "PE", pe_default)
                     self.trades.append(TradeAction(d.isoformat(), "BUY_TO_CLOSE", pos.ce_strike, pos.expiry.isoformat(),
                                                    ce_exit, pos.qty, {"leg": "CE", "why": "expiry", "spot": spot}))
                     self.trades.append(TradeAction(d.isoformat(), "BUY_TO_CLOSE", pos.pe_strike, pos.expiry.isoformat(),
@@ -2483,7 +2530,19 @@ def _load_local_rolling_option_chain(as_of: date, expiry: date) -> Dict[str, Any
             "iv": _safe_float(row.get("iv"), None),
             "oi": _safe_float(row.get("oi"), None),
         }
+        delta_val = _safe_float(row.get("delta"), None)
+        if delta_val is not None:
+            node["greeks"] = {"delta": delta_val}
         oc.setdefault(str(strike), {})["ce" if opt_type == "CE" else "pe"] = {k: v for k, v in node.items() if v is not None}
+    return oc
+
+
+def _get_local_chain(day: date, expiry: date) -> Dict[str, Dict[str, dict]]:
+    key = (day.isoformat(), expiry.isoformat())
+    if key in _LOCAL_CHAIN_CACHE:
+        return _LOCAL_CHAIN_CACHE[key]
+    oc = _load_local_rolling_option_chain(day, expiry)
+    _LOCAL_CHAIN_CACHE[key] = oc
     return oc
 
 

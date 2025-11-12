@@ -1,2 +1,2 @@
 monthly_cycles,n_trades,underlying_id,entry_credit_value,exit_value,net_credit,note
-0,0,13,0.0,0.0,0.0,No entries; check market adapter & rolling feed.
+9,50,13,112897.5,286954.0,-174056.5,OTM + Δ≥target; next-month strangle; daily monitor with profit/SL/roll; snap-to-available; iterative force-distance; 0-LTP nudged.
