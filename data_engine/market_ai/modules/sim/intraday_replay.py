@@ -73,13 +73,18 @@ class IntradayReplaySession:
         Returns a dict with 'events' and placeholder 'summary'.
         """
         events: List[Dict[str, Any]] = []
+        last_bar: Optional[Dict[str, Any]] = None
         for bar in self.iterate():
+            last_bar = bar
             ts = bar.get(self.cfg.time_col)
             if ts is None:
                 continue
             intents = strategy.on_new_bar(bar) or []
             for intent in intents:
                 events.append({"timestamp": ts, **intent})
+        if last_bar is not None and hasattr(strategy, "on_finish"):
+            finish_events = strategy.on_finish(last_bar) or []
+            events.extend(finish_events)
         summary = {
             "events": len(events),
             "flatten_time": self.cfg.flatten_time.isoformat(),
@@ -88,4 +93,3 @@ class IntradayReplaySession:
             "events": events,
             "summary": summary,
         }
-

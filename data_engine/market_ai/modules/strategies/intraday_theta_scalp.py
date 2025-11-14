@@ -73,10 +73,12 @@ class DailyTargetConfig:
 class EntryFilterConfig:
     min_iv_rank: float = 0.20
     max_iv_rank: float = 0.80
-    min_premium_pct: float = 0.03        # combined call+put / spot
+    min_premium_pct: float = 0.018       # combined call+put / spot
     trend_lookback_min: int = 15         # minutes for VWAP/EMA slope checks (reserved)
     spot_atm_band: float = 0.003         # +/- band to define “ATM” for straddle entries
     max_abs_delta: float = 0.80
+    max_trend_pct: float = 0.002         # reject entries if |spot - MA| / MA exceeds
+    max_trend_slope: float = 0.0005      # reject entries if MA slope (per bar) exceeds
     enable_directional_overrides: bool = True
 
 
@@ -99,6 +101,11 @@ class IntradayConfig:
     timezone: str = "Asia/Kolkata"
     max_entries_per_day: int = 2
     risk_stop_pct: float = 0.35          # exit if debit >= entry_credit * (1 + risk_stop_pct)
+    per_leg_stop_pct: float = 0.40       # exit if any leg loses 40% vs entry
+    max_hold_minutes: int = 90
+    hedge_spot_pct: float = 0.004        # add hedge when |spot-entry| >= this %
+    hedge_cost_fixed: float = 250.0
+    max_hedges_per_trade: int = 1
 
 
 @dataclass
@@ -108,6 +115,8 @@ class PositionState:
     entry_put: float
     qty: int
     lot_size: int
+    entry_spot: Optional[float]
+    hedges: int = 0
 
     def entry_credit(self) -> float:
         return (self.entry_call + self.entry_put) * self.qty * self.lot_size
@@ -148,6 +157,8 @@ class IntradayThetaScalp:
             "disabled": False,
             "events": [],
             "entries": 0,
+            "spot_window": [],
+            "equity_curve": [],
         }
 
     @staticmethod
@@ -190,6 +201,7 @@ class IntradayThetaScalp:
             entry_put=float(bar["atm_put_ltp"]),
             qty=qty,
             lot_size=self.cfg.lot_size,
+            entry_spot=self._safe_float(bar.get("spot")),
         )
         self.state["position"] = pos
         self.state["entries"] = self.state.get("entries", 0) + 1
@@ -250,6 +262,8 @@ class IntradayThetaScalp:
         position: Optional[PositionState] = self.state["position"]
         call_ltp = float(bar["atm_call_ltp"])
         put_ltp = float(bar["atm_put_ltp"])
+        spot_val = self._safe_float(bar.get("spot"))
+        self._append_spot_window(spot_val)
 
         if position is None:
             if self.state["entries"] >= self.cfg.max_entries_per_day:
@@ -264,6 +278,11 @@ class IntradayThetaScalp:
         unrealized = position.unrealized(call_ltp, put_ltp)
         equity = self._current_equity(unrealized)
         self.state["daily_peak_pnl"] = max(self.state["daily_peak_pnl"], equity)
+        self._record_equity(local_ts, equity)
+
+        hedge_event = self._maybe_add_hedge(local_ts, position, spot_val)
+        if hedge_event:
+            events.append(hedge_event)
 
         daily_cfg = self.cfg.daily_target
         trail_floor = self.state["daily_peak_pnl"] * (1 - daily_cfg.trail_pct)
@@ -282,6 +301,16 @@ class IntradayThetaScalp:
         stop_pct = max(0.0, float(self.cfg.risk_stop_pct))
         if stop_pct > 0 and position.current_debit(call_ltp, put_ltp) >= position.entry_credit() * (1 + stop_pct):
             reasons.append("risk_stop")
+        per_leg_stop = max(0.0, float(self.cfg.per_leg_stop_pct))
+        if per_leg_stop > 0 and (
+            call_ltp >= position.entry_call * (1 + per_leg_stop)
+            or put_ltp >= position.entry_put * (1 + per_leg_stop)
+        ):
+            reasons.append("leg_stop")
+        if self.cfg.max_hold_minutes > 0:
+            minutes_open = (local_ts - position.entry_time).total_seconds() / 60.0
+            if minutes_open >= self.cfg.max_hold_minutes:
+                reasons.append("max_hold")
 
         if reasons:
             event = self._close_position(local_ts, bar, reason="|".join(reasons))
@@ -303,7 +332,85 @@ class IntradayThetaScalp:
         put_delta = abs(self._safe_float(bar.get("atm_put_delta"), 0.0) or 0.0)
         if call_delta > filt.max_abs_delta or put_delta > filt.max_abs_delta:
             return False
+        if filt.max_trend_pct > 0:
+            spot = self._safe_float(bar.get("spot"))
+            trend = self._spot_trend()
+            if spot is not None and trend is not None and trend:
+                drift = abs((spot - trend) / trend)
+                if drift > filt.max_trend_pct:
+                    return False
+        slope = self._spot_slope()
+        if slope is not None and abs(slope) > filt.max_trend_slope:
+            return False
         return True
+
+    def _append_spot_window(self, spot: Optional[float]) -> None:
+        if spot is None:
+            return
+        window = self.state.get("spot_window", [])
+        window.append(spot)
+        max_len = max(1, int(self.cfg.entry_filter.trend_lookback_min))
+        if len(window) > max_len:
+            window = window[-max_len:]
+        self.state["spot_window"] = window
+
+    def _spot_trend(self) -> Optional[float]:
+        window = self.state.get("spot_window") or []
+        if not window:
+            return None
+        return sum(window) / len(window)
+
+    def _spot_slope(self) -> Optional[float]:
+        window = self.state.get("spot_window") or []
+        if len(window) < 2:
+            return None
+        first, last = window[0], window[-1]
+        if not first:
+            return None
+        steps = max(len(window) - 1, 1)
+        return (last - first) / abs(first) / steps
+
+    def _maybe_add_hedge(
+        self,
+        ts: datetime,
+        position: Optional[PositionState],
+        spot_val: Optional[float],
+    ) -> Optional[Dict[str, Any]]:
+        if position is None or spot_val is None:
+            return None
+        cfg = self.cfg
+        if cfg.max_hedges_per_trade <= 0 or position.hedges >= cfg.max_hedges_per_trade:
+            return None
+        entry_spot = position.entry_spot or spot_val
+        drift = abs(spot_val - entry_spot) / max(entry_spot, 1.0)
+        if drift < cfg.hedge_spot_pct:
+            return None
+        cost = cfg.hedge_cost_fixed * position.qty
+        position.hedges += 1
+        position.entry_spot = spot_val
+        self.state["daily_realized"] -= cost
+        hedge_event = {
+            "timestamp": ts,
+            "action": "HEDGE",
+            "cost": cost,
+            "spot": spot_val,
+            "reason": "spot_drift",
+        }
+        self.state["events"].append(hedge_event)
+        return hedge_event
+
+    def _record_equity(self, ts: datetime, equity: float) -> None:
+        self.state.setdefault("equity_curve", []).append({"timestamp": ts, "equity": equity})
+
+    def on_finish(self, final_bar: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        if self.state.get("position") is None or final_bar is None:
+            return events
+        ts = self._to_local(final_bar["timestamp"]) if final_bar.get("timestamp") is not None else datetime.now(self._tz)
+        event = self._close_position(ts, final_bar, reason="eod_flatten")
+        self.state["events"].append(event)
+        events.append(event)
+        return events
 
     def on_fill(self, fill: Dict[str, Any]) -> None:
         """
@@ -332,6 +439,32 @@ def _coerce_config(cfg: Dict[str, Any]) -> IntradayConfig:
     return IntradayConfig(**data)
 
 
+def _summarize_events(events_df: pd.DataFrame, strat) -> Dict[str, Any]:
+    entries = (events_df["action"] == "OPEN").sum() if "action" in events_df else 0
+    closes = (events_df["action"] == "CLOSE").sum() if "action" in events_df else 0
+    total_realized = float(events_df.loc[events_df["action"] == "CLOSE", "realized"].sum()) if "realized" in events_df else 0.0
+    equity_curve = strat.state.get("equity_curve", []) if hasattr(strat, "state") else []
+
+    def _drawdown(curve: List[Dict[str, Any]]) -> float:
+        peak = float("-inf")
+        max_dd = 0.0
+        for point in curve:
+            equity = float(point.get("equity", 0.0))
+            peak = max(peak, equity)
+            if peak > 0:
+                max_dd = min(max_dd, equity - peak)
+        return max_dd
+
+    summary = {
+        "entries": int(entries),
+        "closes": int(closes),
+        "total_realized": total_realized,
+        "max_drawdown": _drawdown(equity_curve),
+        "note": "Intraday simulator prototype – rules are placeholder sizing/entries.",
+    }
+    return summary
+
+
 def run_backtest(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     """
     Backtest harness placeholder. Once the intraday simulator exists, this
@@ -343,10 +476,7 @@ def run_backtest(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, p
     result = replay.run(strat)
     trades_df = pd.DataFrame(result["events"])
     metrics_df = pd.DataFrame([result["summary"]])
-    summary = {
-        "events": result["summary"]["events"],
-        "note": "Intraday simulator prototype – rules are placeholder sizing/entries.",
-    }
+    summary = _summarize_events(trades_df, strat)
     return trades_df, metrics_df, summary
 
 
