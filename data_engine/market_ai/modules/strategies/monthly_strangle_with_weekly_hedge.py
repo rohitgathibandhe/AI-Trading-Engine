@@ -1290,6 +1290,8 @@ class MonthlyStrangleWithWeeklyHedge:
         "min_distance_pct": 0.01,       # minimum |strike-spot| pct for entries
         "max_entry_credit_pct": 0.015,   # skip cycles with combined entry >1.5% of spot
         "delta_band": (0.20, 0.40),     # acceptable absolute delta range
+        "entry_relax_plan": None,       # optional custom relax plan for guardrails
+        "force_exit_dte": 15,           # close remaining legs when <= 15 days-to-expiry (avoid high gamma)
     }
 
     def __init__(self, cfg: Dict[str, Any], market):
@@ -1306,6 +1308,103 @@ class MonthlyStrangleWithWeeklyHedge:
         except Exception as exc:
             LOG.warning("OptionChainIngestor unavailable: %s", exc)
             self.chain_ingestor = None
+
+    @staticmethod
+    def _normalize_delta_band(band: Optional[Any]) -> Tuple[Optional[float], Optional[float]]:
+        if band is None:
+            return (None, None)
+        if isinstance(band, (list, tuple)) and len(band) >= 2:
+            try:
+                lo = float(band[0]) if band[0] is not None else None
+            except Exception:
+                lo = None
+            try:
+                hi = float(band[1]) if band[1] is not None else None
+            except Exception:
+                hi = None
+            return (lo, hi)
+        return (None, None)
+
+    @staticmethod
+    def _widen_delta_band(band: Tuple[Optional[float], Optional[float]], pad: float) -> Tuple[Optional[float], Optional[float]]:
+        lo, hi = band
+        if lo is None and hi is None:
+            return (None, None)
+        new_lo = lo - pad if lo is not None else None
+        new_hi = hi + pad if hi is not None else None
+        if new_lo is not None:
+            new_lo = max(0.0, new_lo)
+        return (new_lo, new_hi)
+
+    def _default_entry_relax_plan(
+        self,
+        base_distance: float,
+        base_credit: float,
+        base_band: Tuple[Optional[float], Optional[float]],
+    ) -> List[Dict[str, Any]]:
+        plan: List[Dict[str, Any]] = [{"label": "base"}]
+        # Mild relax: slightly closer strikes, slightly wider delta band, modest credit cap bump
+        plan.append(
+            {
+                "label": "relax_mild",
+                "min_distance_pct": max(0.0, base_distance * 0.85),
+                "max_entry_credit_pct": base_credit * 1.15 if base_credit > 0 else 0.0,
+                "delta_band": self._widen_delta_band(base_band, 0.02),
+            }
+        )
+        # Medium relax: allow tighter strikes and wider deltas / credit
+        plan.append(
+            {
+                "label": "relax_medium",
+                "min_distance_pct": max(0.0, base_distance * 0.70),
+                "max_entry_credit_pct": base_credit * 1.30 if base_credit > 0 else 0.0,
+                "delta_band": self._widen_delta_band(base_band, 0.05),
+            }
+        )
+        # Final attempt: allow tighter strikes and ~2% credit cap, but never infinite
+        relaxed_credit_cap = None
+        if base_credit > 0:
+            relaxed_credit_cap = min(0.0225, base_credit * 1.5)
+        else:
+            relaxed_credit_cap = 0.02
+        plan.append(
+            {
+                "label": "relax_last",
+                "min_distance_pct": max(0.0, base_distance * 0.50),
+                "max_entry_credit_pct": relaxed_credit_cap,
+                "delta_band": self._widen_delta_band(base_band, 0.07),
+            }
+        )
+        return plan
+
+    def _build_entry_relax_plan(self) -> List[Dict[str, Any]]:
+        base_distance = float(self.cfg.get("min_distance_pct", 0.0) or 0.0)
+        base_credit = float(self.cfg.get("max_entry_credit_pct", 0.0) or 0.0)
+        base_band = self._normalize_delta_band(self.cfg.get("delta_band"))
+        cfg_plan = self.cfg.get("entry_relax_plan")
+
+        plan_entries: List[Dict[str, Any]] = []
+        if isinstance(cfg_plan, list):
+            for step in cfg_plan:
+                if isinstance(step, dict):
+                    plan_entries.append(step)
+
+        if not plan_entries:
+            plan_entries = self._default_entry_relax_plan(base_distance, base_credit, base_band)
+
+        normalized: List[Dict[str, Any]] = []
+        for idx, step in enumerate(plan_entries):
+            label = step.get("label") if isinstance(step, dict) else None
+            label = label or ("base" if idx == 0 else f"relax_{idx}")
+            normalized.append(
+                {
+                    "label": label,
+                    "min_distance_pct": step.get("min_distance_pct"),
+                    "max_entry_credit_pct": step.get("max_entry_credit_pct"),
+                    "delta_band": self._normalize_delta_band(step.get("delta_band", base_band)),
+                }
+            )
+        return normalized or [{"label": "base"}]
 
     # ---------- entry helpers ----------
     def _enter_on_expiry_for_next_month(self, entry_day: date, sell_expiry: date, spot_hint: Optional[float]) -> None:
@@ -1402,96 +1501,15 @@ class MonthlyStrangleWithWeeklyHedge:
         all_strikes = [float(k) for k in (oc or {}).keys() if _safe_float(k) is not None]
         tick = _infer_tick(all_strikes, 50.0)
 
-        # ---------- OTM + delta-thresholded selection ----------
+        relax_plan = self._build_entry_relax_plan()
+        base_delta_band = self._normalize_delta_band(self.cfg.get("delta_band"))
+        base_min_distance = float(self.cfg.get("min_distance_pct", 0.0) or 0.0)
+        base_max_credit = float(self.cfg.get("max_entry_credit_pct", 0.0) or 0.0)
+        min_entry_credit = float(self.cfg.get("min_entry_credit", 0.0))
+        min_delta_abs = float(self.cfg.get("min_delta_abs", 0.05))
         target = float(self.cfg.get("delta_target", 0.15))
+        last_reason = "guards_exhausted"
 
-        ce_cands, pe_cands = [], []
-        min_credit = float(self.cfg.get("min_entry_credit", 0.0))
-        min_delta = float(self.cfg.get("min_delta_abs", 0.05))
-        delta_band = self.cfg.get("delta_band") or (None, None)
-        min_band, max_band = delta_band if isinstance(delta_band, (list, tuple)) else (None, None)
-
-        for k, legs in (oc or {}).items():
-            K = _safe_float(k, None)
-            if K is None:
-                continue
-            ce_leg = legs.get("ce") or {}
-            pe_leg = legs.get("pe") or {}
-            ce_d = _safe_delta(ce_leg)
-            pe_d = _safe_delta(pe_leg)
-            ce_p_tmp = _safe_ltp(ce_leg)
-            pe_p_tmp = _safe_ltp(pe_leg)
-
-            # OTM filters
-            if K >= spot and ce_p_tmp > 0 and ce_d is not None and abs(ce_d) >= min_delta and ce_p_tmp >= min_credit:
-                if min_band is not None and abs(ce_d) < min_band:
-                    continue
-                if max_band is not None and abs(ce_d) > max_band:
-                    continue
-                ce_cands.append((K, ce_leg, ce_d, ce_p_tmp))
-            if K <= spot and pe_p_tmp > 0 and pe_d is not None and abs(pe_d) >= min_delta and pe_p_tmp >= min_credit:
-                if min_band is not None and abs(pe_d) < min_band:
-                    continue
-                if max_band is not None and abs(pe_d) > max_band:
-                    continue
-                pe_cands.append((K, pe_leg, pe_d, pe_p_tmp))
-
-        def pick_ce(cands, thr):
-            if not cands:
-                return None, None
-            hard = [c for c in cands if c[2] >= thr]
-            if hard:
-                hard.sort(key=lambda x: (x[2], x[0]))  # smallest Δ above threshold
-                return (hard[0][0], hard[0][1])
-            # soft fallback: nearest |Δ - thr|
-            soft = sorted(cands, key=lambda x: (abs(x[2] - thr), x[0]))
-            return (soft[0][0], soft[0][1]) if soft else (None, None)
-
-        def pick_pe(cands, thr):
-            if not cands:
-                return None, None
-            hard = [c for c in cands if c[2] <= -thr]
-            if hard:
-                hard.sort(key=lambda x: (abs(abs(x[2]) - thr), -x[0]))  # |Δ| nearest to thr, further OTM preferred
-                return (hard[0][0], hard[0][1])
-            # soft fallback
-            soft = sorted(cands, key=lambda x: (abs(abs(x[2]) - thr), -x[0]))
-            return (soft[0][0], soft[0][1]) if soft else (None, None)
-
-        ce_strike, ce = pick_ce(ce_cands, target)
-        pe_strike, pe = pick_pe(pe_cands, target)
-
-        # If a side is missing, use ±2.5% distance and SNAP to available keys
-        if ce_strike is None or pe_strike is None:
-            otp = 0.025
-            raw_ce = math.ceil((spot * (1 + otp)) / tick) * tick
-            raw_pe = math.floor((spot * (1 - otp)) / tick) * tick
-            if ce_strike is None:
-                ce_strike, ce = _snap_available(oc, spot, raw_ce, "CE")
-            if pe_strike is None:
-                pe_strike, pe = _snap_available(oc, spot, raw_pe, "PE")
-
-        # Avoid accidental straddle
-        if ce_strike is not None and pe_strike is not None and ce_strike == pe_strike:
-            ce_strike += tick
-            ce = oc.get(str(ce_strike), {}).get("ce", {})
-
-        # Prices
-        ce_leg = ce if isinstance(ce, dict) else {}
-        pe_leg = pe if isinstance(pe, dict) else {}
-        ce_p = _safe_ltp(ce_leg)
-        pe_p = _safe_ltp(pe_leg)
-
-        # Distance filter (skip cycles too close to spot)
-        min_dist_pct = float(self.cfg.get("min_distance_pct", 0.0))
-        if min_dist_pct > 0 and ce_strike is not None and pe_strike is not None:
-            ce_far = abs(ce_strike - spot) / max(spot, 1.0)
-            pe_far = abs(spot - pe_strike) / max(spot, 1.0)
-            if ce_far < min_dist_pct or pe_far < min_dist_pct:
-                LOG.info("Entry skipped on %s: strikes too close (CE %.2f%%, PE %.2f%% < %.2f%%)", entry_day, ce_far*100, pe_far*100, min_dist_pct*100)
-                return
-
-        # If a leg has 0 LTP, nudge further OTM on that side (several steps)
         def _nudge_nonzero(strike: Optional[float], side: str, steps: int = 10):
             if strike is None:
                 return None, {}, 0.0
@@ -1513,102 +1531,259 @@ class MonthlyStrangleWithWeeklyHedge:
                     s -= tick
             return strike, oc.get(str(strike), {}).get("ce" if side == "CE" else "pe", {}), 0.0
 
-        if ce_p <= 0.0:
-            ce_strike, ce, ce_p = _nudge_nonzero(ce_strike, "CE")
+        for attempt_idx, relax in enumerate(relax_plan, 1):
+            label = relax.get("label") or ("base" if attempt_idx == 1 else f"relax_{attempt_idx}")
+            min_dist_pct = relax.get("min_distance_pct")
+            if min_dist_pct is None:
+                min_dist_pct = base_min_distance
+            max_credit_pct = relax.get("max_entry_credit_pct")
+            if max_credit_pct is None:
+                max_credit_pct = base_max_credit
+            band_source = relax.get("delta_band")
+            if band_source == (None, None):
+                min_band = max_band = None
+                eff_band = (None, None)
+            else:
+                if band_source is None:
+                    band_source = base_delta_band
+                eff_band = band_source
+                min_band, max_band = band_source if band_source else (None, None)
+
+            LOG.debug(
+                "[entry:%s attempt %d/%d] distance>=%.2f%%, credit<=%s, delta_band=%s",
+                label,
+                attempt_idx,
+                len(relax_plan),
+                min_dist_pct * 100.0,
+                f"{max_credit_pct * 100:.2f}%" if max_credit_pct > 0 else "∞",
+                eff_band,
+            )
+
+            ce_cands: List[Tuple[float, Dict[str, Any], float, float]] = []
+            pe_cands: List[Tuple[float, Dict[str, Any], float, float]] = []
+            for k, legs in (oc or {}).items():
+                K = _safe_float(k, None)
+                if K is None:
+                    continue
+                ce_leg = legs.get("ce") or {}
+                pe_leg = legs.get("pe") or {}
+                ce_d = _safe_delta(ce_leg)
+                pe_d = _safe_delta(pe_leg)
+                ce_p_tmp = _safe_ltp(ce_leg)
+                pe_p_tmp = _safe_ltp(pe_leg)
+
+                if (
+                    K >= spot
+                    and ce_p_tmp > 0
+                    and ce_d is not None
+                    and abs(ce_d) >= min_delta_abs
+                    and ce_p_tmp >= min_entry_credit
+                ):
+                    if min_band is not None and abs(ce_d) < min_band:
+                        pass
+                    elif max_band is not None and abs(ce_d) > max_band:
+                        pass
+                    else:
+                        ce_cands.append((K, ce_leg, ce_d, ce_p_tmp))
+                if (
+                    K <= spot
+                    and pe_p_tmp > 0
+                    and pe_d is not None
+                    and abs(pe_d) >= min_delta_abs
+                    and pe_p_tmp >= min_entry_credit
+                ):
+                    if min_band is not None and abs(pe_d) < min_band:
+                        pass
+                    elif max_band is not None and abs(pe_d) > max_band:
+                        pass
+                    else:
+                        pe_cands.append((K, pe_leg, pe_d, pe_p_tmp))
+
+            def pick_ce(cands, thr):
+                if not cands:
+                    return None, None
+                hard = [c for c in cands if c[2] >= thr]
+                if hard:
+                    hard.sort(key=lambda x: (x[2], x[0]))
+                    return (hard[0][0], hard[0][1])
+                soft = sorted(cands, key=lambda x: (abs(x[2] - thr), x[0]))
+                return (soft[0][0], soft[0][1]) if soft else (None, None)
+
+            def pick_pe(cands, thr):
+                if not cands:
+                    return None, None
+                hard = [c for c in cands if c[2] <= -thr]
+                if hard:
+                    hard.sort(key=lambda x: (abs(abs(x[2]) - thr), -x[0]))
+                    return (hard[0][0], hard[0][1])
+                soft = sorted(cands, key=lambda x: (abs(abs(x[2]) - thr), -x[0]))
+                return (soft[0][0], soft[0][1]) if soft else (None, None)
+
+            ce_strike, ce = pick_ce(ce_cands, target)
+            pe_strike, pe = pick_pe(pe_cands, target)
+
+            if ce_strike is None or pe_strike is None:
+                otp = 0.025
+                raw_ce = math.ceil((spot * (1 + otp)) / tick) * tick
+                raw_pe = math.floor((spot * (1 - otp)) / tick) * tick
+                if ce_strike is None:
+                    ce_strike, ce = _snap_available(oc, spot, raw_ce, "CE")
+                if pe_strike is None:
+                    pe_strike, pe = _snap_available(oc, spot, raw_pe, "PE")
+
+            if ce_strike is not None and pe_strike is not None and ce_strike == pe_strike:
+                ce_strike += tick
+                ce = oc.get(str(ce_strike), {}).get("ce", {})
+
             ce_leg = ce if isinstance(ce, dict) else {}
-        if pe_p <= 0.0:
-            pe_strike, pe, pe_p = _nudge_nonzero(pe_strike, "PE")
             pe_leg = pe if isinstance(pe, dict) else {}
+            ce_p = _safe_ltp(ce_leg)
+            pe_p = _safe_ltp(pe_leg)
 
-        # If still invalid after nudging, one-time refetch (adapter widens automatically), then snap again
-        if (ce_p <= 0.0 or pe_p <= 0.0) and hasattr(self.market, "get_option_chain"):
-            try:
-                oc_wide = self.market.get_option_chain(uid, expiry_str, as_of_date=entry_day.isoformat())
-                if ce_p <= 0.0 and ce_strike is not None:
-                    ce_strike, ce = _snap_available(oc_wide, spot, ce_strike, "CE")
-                    ce_leg = ce if isinstance(ce, dict) else {}
-                    ce_p = _safe_ltp(ce_leg)
-                if pe_p <= 0.0 and pe_strike is not None:
-                    pe_strike, pe = _snap_available(oc_wide, spot, pe_strike, "PE")
-                    pe_leg = pe if isinstance(pe, dict) else {}
-                    pe_p = _safe_ltp(pe_leg)
-            except Exception:
-                pass
+            if min_dist_pct > 0 and ce_strike is not None and pe_strike is not None:
+                ce_far = abs(ce_strike - spot) / max(spot, 1.0)
+                pe_far = abs(spot - pe_strike) / max(spot, 1.0)
+                if ce_far < min_dist_pct or pe_far < min_dist_pct:
+                    last_reason = f"distance_guard ce={ce_far:.2%} pe={pe_far:.2%} thr={min_dist_pct:.2%}"
+                    LOG.info("[entry:%s] distance guard tripped (CE %.2f%%, PE %.2f%% < %.2f%%) — trying next plan",
+                             label, ce_far * 100, pe_far * 100, min_dist_pct * 100)
+                    continue
 
-        # If still invalid, abort safely
-        if ce_p <= 0.0 or pe_p <= 0.0 or ce_strike is None or pe_strike is None:
-            LOG.warning("Invalid quotes on %s (spot=%.2f): CE %s @ %.2f | PE %s @ %.2f; skip.",
-                        entry_day, spot, ce_strike, ce_p, pe_strike, pe_p)
-            return
+            if ce_p <= 0.0:
+                ce_strike, ce, ce_p = _nudge_nonzero(ce_strike, "CE")
+                ce_leg = ce if isinstance(ce, dict) else {}
+            if pe_p <= 0.0:
+                pe_strike, pe, pe_p = _nudge_nonzero(pe_strike, "PE")
+                pe_leg = pe if isinstance(pe, dict) else {}
 
-        # Ensure downstream helpers see dict inputs
-        ce_leg: Dict[str, Any] = ce if isinstance(ce, dict) else {}
-        pe_leg: Dict[str, Any] = pe if isinstance(pe, dict) else {}
-
-        # Read back deltas
-        ce_delta = _safe_delta(ce_leg)
-        pe_delta = _safe_delta(pe_leg)
-
-        # If chosen deltas are still too high (near ATM), force distance iteratively and SNAP
-        def _forced_delta_cycle(target_otp_list: List[float]):
-            nonlocal ce_strike, ce, ce_p, ce_delta, pe_strike, pe, pe_p, pe_delta
-            for otp in target_otp_list:
-                changed = False
-                if ce_delta is None or ce_delta > 0.20:
-                    ce_target = math.ceil((spot * (1 + otp)) / tick) * tick
-                    sK, sLeg = _snap_available(oc, spot, ce_target, "CE")
-                    if sK is not None:
-                        ce_strike, ce = sK, sLeg
+            if (ce_p <= 0.0 or pe_p <= 0.0) and hasattr(self.market, "get_option_chain"):
+                try:
+                    oc_wide = self.market.get_option_chain(uid, expiry_str, as_of_date=entry_day.isoformat())
+                    if ce_p <= 0.0 and ce_strike is not None:
+                        ce_strike, ce = _snap_available(oc_wide, spot, ce_strike, "CE")
                         ce_leg = ce if isinstance(ce, dict) else {}
                         ce_p = _safe_ltp(ce_leg)
-                        ce_delta = _safe_delta(ce_leg)
-                        changed = True
-                if pe_delta is None or abs(pe_delta) > 0.20:
-                    pe_target = math.floor((spot * (1 - otp)) / tick) * tick
-                    sK, sLeg = _snap_available(oc, spot, pe_target, "PE")
-                    if sK is not None:
-                        pe_strike, pe = sK, sLeg
+                    if pe_p <= 0.0 and pe_strike is not None:
+                        pe_strike, pe = _snap_available(oc_wide, spot, pe_strike, "PE")
                         pe_leg = pe if isinstance(pe, dict) else {}
                         pe_p = _safe_ltp(pe_leg)
-                        pe_delta = _safe_delta(pe_leg)
-                        changed = True
-                if not changed:
-                    break  # nothing more to do
+                except Exception:
+                    pass
 
-        _forced_delta_cycle([0.025, 0.030, 0.035, 0.040])
-
-        LOG.info(
-            "Entry sell_expiry=%s | spot=%.2f | CE %.0f @ %.2f (Δ=%s) | PE %.0f @ %.2f (Δ=%s)",
-            expiry_str, spot,
-            ce_strike, ce_p, f"{ce_delta:.3f}" if ce_delta is not None else "NA",
-            pe_strike, pe_p, f"{pe_delta:.3f}" if pe_delta is not None else "NA"
-        )
-
-        # Combined credit limit
-        net_credit = (ce_p + pe_p) * qty
-        max_credit_pct = float(self.cfg.get("max_entry_credit_pct", 0.0))
-        if max_credit_pct > 0 and spot > 0:
-            credit_pct = net_credit / (spot * qty)
-            if credit_pct > max_credit_pct:
-                LOG.info("Entry skipped on %s: credit %.2f%% exceeds cap %.2f%%", entry_day, credit_pct*100, max_credit_pct*100)
+            if ce_p <= 0.0 or pe_p <= 0.0 or ce_strike is None or pe_strike is None:
+                LOG.warning(
+                    "Invalid quotes on %s (spot=%.2f): CE %s @ %.2f | PE %s @ %.2f; skip.",
+                    entry_day,
+                    spot,
+                    ce_strike,
+                    ce_p,
+                    pe_strike,
+                    pe_p,
+                )
                 return
 
-        # Record entries
-        qty = int(qty)
-        self.trades.append(TradeAction(entry_day.isoformat(), "SELL_CE", float(ce_strike), expiry_str, float(ce_p), qty,
-                                       {"why": "entry", "delta": ce_delta, "spot": spot}))
-        self.trades.append(TradeAction(entry_day.isoformat(), "SELL_PE", float(pe_strike), expiry_str, float(pe_p), qty,
-                                       {"why": "entry", "delta": pe_delta, "spot": spot}))
+            ce_leg = ce if isinstance(ce, dict) else {}
+            pe_leg = pe if isinstance(pe, dict) else {}
+            ce_delta = _safe_delta(ce_leg)
+            pe_delta = _safe_delta(pe_leg)
 
-        key = f"{sell_expiry.year}-{sell_expiry.month:02d}"
-        self.positions[key] = OpenPosition(
-            month_key=key, entry_date=entry_day, expiry=sell_expiry,
-            ce_strike=float(ce_strike), pe_strike=float(pe_strike),
-            ce_prem=float(ce_p), pe_prem=float(pe_p),
-            qty=qty, net_credit=float(net_credit)
-        )
-        LOG.info("Entered cycle (sell_expiry=%s) | CE %.0f @ %.2f, PE %.0f @ %.2f, net_credit=%.2f",
-                 expiry_str, ce_strike, ce_p, pe_strike, pe_p, net_credit)
+            def _forced_delta_cycle(target_otp_list: List[float]):
+                nonlocal ce_strike, ce, ce_p, ce_delta, pe_strike, pe, pe_p, pe_delta, ce_leg, pe_leg
+                for otp in target_otp_list:
+                    changed = False
+                    if ce_delta is None or ce_delta > 0.20:
+                        ce_target = math.ceil((spot * (1 + otp)) / tick) * tick
+                        sK, sLeg = _snap_available(oc, spot, ce_target, "CE")
+                        if sK is not None:
+                            ce_strike, ce = sK, sLeg
+                            ce_leg = ce if isinstance(ce, dict) else {}
+                            ce_p = _safe_ltp(ce_leg)
+                            ce_delta = _safe_delta(ce_leg)
+                            changed = True
+                    if pe_delta is None or abs(pe_delta) > 0.20:
+                        pe_target = math.floor((spot * (1 - otp)) / tick) * tick
+                        sK, sLeg = _snap_available(oc, spot, pe_target, "PE")
+                        if sK is not None:
+                            pe_strike, pe = sK, sLeg
+                            pe_leg = pe if isinstance(pe, dict) else {}
+                            pe_p = _safe_ltp(pe_leg)
+                            pe_delta = _safe_delta(pe_leg)
+                            changed = True
+                    if not changed:
+                        break
+
+            _forced_delta_cycle([0.025, 0.030, 0.035, 0.040])
+
+            LOG.info(
+                "Entry (%s) sell_expiry=%s | spot=%.2f | CE %.0f @ %.2f (Δ=%s) | PE %.0f @ %.2f (Δ=%s)",
+                label,
+                expiry_str,
+                spot,
+                ce_strike,
+                ce_p,
+                f"{ce_delta:.3f}" if ce_delta is not None else "NA",
+                pe_strike,
+                pe_p,
+                f"{pe_delta:.3f}" if pe_delta is not None else "NA",
+            )
+
+            net_credit = (ce_p + pe_p) * qty
+            if max_credit_pct > 0 and spot > 0:
+                credit_pct = net_credit / (spot * qty)
+                if credit_pct > max_credit_pct:
+                    last_reason = f"credit_guard credit={credit_pct:.2%} cap={max_credit_pct:.2%}"
+                    LOG.info(
+                        "[entry:%s] skipped: credit %.2f%% exceeds cap %.2f%% — trying next plan",
+                        label,
+                        credit_pct * 100,
+                        max_credit_pct * 100,
+                    )
+                    continue
+
+            qty_int = int(qty)
+            self.trades.append(
+                TradeAction(
+                    entry_day.isoformat(),
+                    "SELL_CE",
+                    float(ce_strike),
+                    expiry_str,
+                    float(ce_p),
+                    qty_int,
+                    {"why": "entry", "delta": ce_delta, "spot": spot, "relax": label},
+                )
+            )
+            self.trades.append(
+                TradeAction(
+                    entry_day.isoformat(),
+                    "SELL_PE",
+                    float(pe_strike),
+                    expiry_str,
+                    float(pe_p),
+                    qty_int,
+                    {"why": "entry", "delta": pe_delta, "spot": spot, "relax": label},
+                )
+            )
+
+            key = f"{sell_expiry.year}-{sell_expiry.month:02d}"
+            self.positions[key] = OpenPosition(
+                month_key=key,
+                entry_date=entry_day,
+                expiry=sell_expiry,
+                ce_strike=float(ce_strike),
+                pe_strike=float(pe_strike),
+                ce_prem=float(ce_p),
+                pe_prem=float(pe_p),
+                qty=qty_int,
+                net_credit=float(net_credit),
+            )
+            if attempt_idx > 1:
+                LOG.info("Entry succeeded after relax step '%s' (attempt %d/%d)", label, attempt_idx, len(relax_plan))
+            else:
+                LOG.info("Entered cycle (sell_expiry=%s) | CE %.0f @ %.2f, PE %.0f @ %.2f, net_credit=%.2f",
+                         expiry_str, ce_strike, ce_p, pe_strike, pe_p, net_credit)
+            return
+
+        LOG.info("Entry skipped on %s after %d attempts (reason=%s)", entry_day, len(relax_plan), last_reason)
 
     # ---------- monitoring / adjustments ----------
     def _monitor_and_adjust(self, d: date, spot: Optional[float], pos: OpenPosition) -> None:
@@ -1623,6 +1798,7 @@ class MonthlyStrangleWithWeeklyHedge:
         entry_credit_per_lot = pos.ce_prem + pos.pe_prem
         days_total = max(1, (pos.expiry - pos.entry_date).days)
         days_passed = max(0, (d - pos.entry_date).days)
+        days_to_expiry = max(0, (pos.expiry - d).days)
 
         entry_credit_total = entry_credit_per_lot * pos.qty
         ce_px = _local_leg_price(d, pos.expiry, pos.ce_strike, "CE")
@@ -1640,6 +1816,53 @@ class MonthlyStrangleWithWeeklyHedge:
                                            pe_px, pos.qty, {"leg": "PE", "why": "PT", "spot": spot}))
             pos.is_closed = True
             LOG.info("Booked profit for %s on %s using MTM prices", pos.month_key, d)
+            return
+
+        force_exit_dte = max(0, int(self.cfg.get("force_exit_dte", 0) or 0))
+        if force_exit_dte and days_to_expiry <= force_exit_dte:
+            def _time_exit_price(px, entry_prem, is_call: bool) -> float:
+                if px is not None:
+                    return px
+                if spot is None:
+                    return entry_prem
+                if is_call:
+                    near = spot >= pos.ce_strike - (buffer_pts * 0.25)
+                    return entry_prem * (1.35 if near else 0.65)
+                near = spot <= pos.pe_strike + (buffer_pts * 0.25)
+                return entry_prem * (1.35 if near else 0.65)
+
+            ce_exit = _time_exit_price(ce_px, pos.ce_prem, True)
+            pe_exit = _time_exit_price(pe_px, pos.pe_prem, False)
+            self.trades.append(
+                TradeAction(
+                    d.isoformat(),
+                    "BUY_TO_CLOSE",
+                    pos.ce_strike,
+                    pos.expiry.isoformat(),
+                    ce_exit,
+                    pos.qty,
+                    {"leg": "CE", "why": "time_exit", "spot": spot, "dte": days_to_expiry},
+                )
+            )
+            self.trades.append(
+                TradeAction(
+                    d.isoformat(),
+                    "BUY_TO_CLOSE",
+                    pos.pe_strike,
+                    pos.expiry.isoformat(),
+                    pe_exit,
+                    pos.qty,
+                    {"leg": "PE", "why": "time_exit", "spot": spot, "dte": days_to_expiry},
+                )
+            )
+            pos.is_closed = True
+            LOG.info(
+                "Time-based exit for %s on %s (DTE=%d <= %d)",
+                pos.month_key,
+                d,
+                days_to_expiry,
+                force_exit_dte,
+            )
             return
 
         # Rolls (single per cycle)
