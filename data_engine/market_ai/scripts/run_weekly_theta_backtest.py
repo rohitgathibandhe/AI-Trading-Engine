@@ -60,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-severities", default="high", help="Comma separated event severities to skip.")
     parser.add_argument("--expiry-offset-weeks", type=int, default=0, help="0 = front weekly, 1 = next weekly, etc.")
     parser.add_argument("--min-days-to-expiry", type=int, default=0, help="Require at least N days to target expiry.")
+    parser.add_argument("--directional-enabled", type=int, choices=[0, 1], default=1, help="Enable directional spreads (1=yes,0=no).")
     parser.add_argument("--ml-exit-model", type=Path, help="Optional ML exit model path.")
     parser.add_argument("--ml-exit-threshold", type=float, default=0.6, help="Probability cutoff for ML exit.")
     parser.add_argument("--emit-plan", type=Path, help="Optional JSON file to emit plan summary.")
@@ -98,6 +99,7 @@ def main() -> None:
         "trend_range_threshold": args.trend_threshold,
         "condor_range_threshold": args.condor_threshold,
         "oi_distance_pct": args.oi_distance,
+        "directional_enabled": bool(args.directional_enabled),
         "event_calendar_path": str(args.event_calendar) if args.event_calendar else None,
         "skip_event_severities": tuple(s.strip() for s in args.skip_severities.split(",") if s.strip()),
         "expiry_offset_weeks": args.expiry_offset_weeks,

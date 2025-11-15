@@ -62,6 +62,41 @@ def _auto_refresh() -> None:
             unsafe_allow_html=True,
         )
 
+
+def _load_weekly_settings() -> Dict[str, Any]:
+    defaults = {
+        "min_prev_range": 0.003,
+        "pnl_target": 6000.0,
+        "pnl_stop": 4000.0,
+        "max_gap_pct": 0.01,
+        "directional_enabled": True,
+    }
+    if WEEKLY_SETTINGS_FILE.exists():
+        try:
+            data = json.loads(WEEKLY_SETTINGS_FILE.read_text())
+            defaults.update(data or {})
+        except Exception:
+            pass
+    return defaults
+
+
+def _save_weekly_settings(data: Dict[str, Any]) -> None:
+    WEEKLY_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    WEEKLY_SETTINGS_FILE.write_text(json.dumps(data, indent=2))
+
+
+def _ensure_weekly_settings_state() -> None:
+    ss = st.session_state
+    if ss.get("_weekly_settings_loaded"):
+        return
+    data = _load_weekly_settings()
+    ss["weekly_min_prev_range"] = data.get("min_prev_range", 0.003)
+    ss["weekly_pnl_target"] = data.get("pnl_target", 6000.0)
+    ss["weekly_pnl_stop"] = data.get("pnl_stop", 4000.0)
+    ss["weekly_max_gap_pct"] = data.get("max_gap_pct", 0.01)
+    ss["weekly_directional_enabled"] = bool(data.get("directional_enabled", True))
+    ss["_weekly_settings_loaded"] = True
+
 # =============================================================================
 # Paths & constants
 # =============================================================================
@@ -89,6 +124,7 @@ BROADER_STATE_DIR = ROOT / "state"
 BROADER_STATE_DIR.mkdir(parents=True, exist_ok=True)
 WEEKLY_PLAN_FILE = BROADER_STATE_DIR / "weekly_plan.json"
 WEEKLY_PLAN_SCRIPT = ROOT / "scripts" / "weekly_plan_cron.sh"
+WEEKLY_SETTINGS_FILE = BROADER_STATE_DIR / "weekly_plan_settings.json"
 ORDER_INTENT_FILE = STATE_DIR / "order_intents.jsonl"
 
 AGENT_LOG = STATE_DIR / "agent.log"
@@ -410,7 +446,7 @@ def _render_rolling_data_quality(summary: Dict[str, Any]) -> None:
     if selectors:
         sel_df = pd.DataFrame(selectors, columns=["Selector", "Rows"])
         st.caption("Top selectors")
-        st.dataframe(sel_df.head(10), hide_index=True, use_container_width=True)
+        st.dataframe(sel_df.head(10), hide_index=True, width="stretch")
 
     if summary.get("missing_dates"):
         st.caption("Recent missing trading days")
@@ -436,7 +472,7 @@ def _render_selector_training_summary(summary: Dict[str, Any]) -> None:
         df = pd.DataFrame(metrics)
         display_cols = ["strategy", "samples", "train_rmse", "val_rmse", "val_r2"]
         df = df[display_cols]
-        st.dataframe(df.sort_values("val_rmse"), use_container_width=True)
+        st.dataframe(df.sort_values("val_rmse"), width="stretch")
 
 
 def _parse_context_blob(value: Any) -> Dict[str, Any]:
@@ -2520,6 +2556,7 @@ def _paper_pnl_tab() -> None:
 
 
 def _weekly_plan_tab() -> None:
+    _ensure_weekly_settings_state()
     st.markdown("## Weekly Plan & Intents")
     c1, c2 = st.columns([1, 1])
     script_path = globals().get("WEEKLY_PLAN_SCRIPT", Path("scripts/weekly_plan_cron.sh"))
@@ -2527,8 +2564,18 @@ def _weekly_plan_tab() -> None:
         if st.button("Run weekly plan script now"):
             if script_path.exists():
                 with st.spinner("Running weekly_plan_cron.sh ..."):
+                    dir_flag = "1" if st.session_state.get("weekly_directional_enabled", True) else "0"
+                    cmd = [
+                        "bash",
+                        str(script_path),
+                        str(st.session_state.get("weekly_min_prev_range", 0.003)),
+                        str(st.session_state.get("weekly_pnl_target", 6000.0)),
+                        str(st.session_state.get("weekly_pnl_stop", 4000.0)),
+                        dir_flag,
+                        str(st.session_state.get("weekly_max_gap_pct", 0.01)),
+                    ]
                     result = subprocess.run(
-                        ["bash", str(script_path)],
+                        cmd,
                         capture_output=True,
                         text=True,
                     )
@@ -2538,10 +2585,68 @@ def _weekly_plan_tab() -> None:
                     st.error("Script failed.")
                     st.code(result.stderr or result.stdout or "No output")
             else:
-                st.error(f"Script not found: {WEEKLY_PLAN_SCRIPT}")
+                st.error(f"Script not found: {script_path}")
     with c2:
         st.caption(f"Script path: `{script_path}`")
         st.caption("Cron entry already calls this every Monday 08:45 local.")
+
+    with st.expander("Weekly Plan Settings", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.number_input(
+                "Min prev-range pct",
+                min_value=0.001,
+                max_value=0.05,
+                value=float(st.session_state["weekly_min_prev_range"]),
+                step=0.001,
+                key="weekly_min_prev_range",
+            )
+            st.number_input(
+                "Profit target (₹)",
+                min_value=1000.0,
+                max_value=15000.0,
+                value=float(st.session_state["weekly_pnl_target"]),
+                step=500.0,
+                key="weekly_pnl_target",
+            )
+            st.number_input(
+                "Max gap % (skip if open > %)",
+                min_value=0.001,
+                max_value=0.05,
+                value=float(st.session_state["weekly_max_gap_pct"]),
+                step=0.001,
+                format="%.3f",
+                key="weekly_max_gap_pct",
+            )
+        with col2:
+            st.number_input(
+                "Stop loss (₹)",
+                min_value=1000.0,
+                max_value=10000.0,
+                value=float(st.session_state["weekly_pnl_stop"]),
+                step=500.0,
+                key="weekly_pnl_stop",
+            )
+            st.toggle(
+                "Directional spreads enabled",
+                value=bool(st.session_state["weekly_directional_enabled"]),
+                key="weekly_directional_enabled",
+                help="Allow bull put / bear call spreads when trend bias is strong.",
+            )
+        if st.button("💾 Save Weekly Settings"):
+            payload = {
+                "min_prev_range": float(st.session_state["weekly_min_prev_range"]),
+                "pnl_target": float(st.session_state["weekly_pnl_target"]),
+                "pnl_stop": float(st.session_state["weekly_pnl_stop"]),
+                "max_gap_pct": float(st.session_state["weekly_max_gap_pct"]),
+                "directional_enabled": bool(st.session_state["weekly_directional_enabled"]),
+            }
+            try:
+                _save_weekly_settings(payload)
+                st.success(f"Settings saved to {WEEKLY_SETTINGS_FILE}")
+            except Exception as exc:
+                st.error(f"Failed to save settings: {exc}")
+        st.caption(f"Settings file: `{WEEKLY_SETTINGS_FILE}`")
 
     fallback_plan_dir = Path(st.session_state.get("cwd_override") or ".") / "state"
     plan_path = globals().get("WEEKLY_PLAN_FILE", fallback_plan_dir / "weekly_plan.json")
@@ -2566,7 +2671,7 @@ def _weekly_plan_tab() -> None:
                 df = pd.DataFrame([latest])
                 if "expiry" in df.columns:
                     st.caption(f"Expiry: {df.loc[0, 'expiry']}")
-                st.dataframe(df, use_container_width=True)
+                st.dataframe(df, width="stretch")
     else:
         st.info(f"No plan file yet. Expected at `{plan_path}`.")
 
@@ -2574,7 +2679,7 @@ def _weekly_plan_tab() -> None:
     st.markdown("### Recent Weekly Intents")
     if intents:
         df = pd.DataFrame(intents)
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width="stretch")
     else:
         st.caption("No intents logged yet.")
 

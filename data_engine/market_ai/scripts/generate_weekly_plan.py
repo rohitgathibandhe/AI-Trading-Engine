@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--event-calendar", type=Path, default=Path("data_engine/market_ai/state/events.json"))
     parser.add_argument("--expiry-offset", type=int, default=0, help="0 = front weekly, 1 = next weekly, etc.")
     parser.add_argument("--min-days-to-expiry", type=int, default=0, help="Require at least N days to target expiry.")
+    parser.add_argument("--directional-enabled", type=int, choices=[0, 1], default=1)
     parser.add_argument("--ml-exit-model", type=Path, help="Optional path to trained ML exit model.")
     parser.add_argument("--ml-exit-threshold", type=float, default=0.6, help="Probability to trigger ML exit.")
     return parser.parse_args()
@@ -71,6 +72,7 @@ def main() -> None:
         "trend_range_threshold": args.trend_threshold,
         "condor_range_threshold": args.condor_threshold,
         "oi_distance_pct": args.oi_distance,
+        "directional_enabled": bool(args.directional_enabled),
         "event_calendar_path": str(args.event_calendar) if args.event_calendar else None,
         "expiry_offset_weeks": args.expiry_offset,
         "ml_exit_model_path": str(args.ml_exit_model) if args.ml_exit_model else None,
