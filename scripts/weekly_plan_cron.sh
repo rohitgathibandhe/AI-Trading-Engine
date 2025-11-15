@@ -30,9 +30,9 @@ python3 data_engine/market_ai/scripts/generate_weekly_plan.py \
     --intent-path "${INTENT_PATH}" \
     --qty 2 \
     --hybrid \
-    --min-prev-range 0.005 \
+    --min-prev-range 0.003 \
     --max-prev-range 0.05 \
-    --pnl-target 4000 \
+    --pnl-target 6000 \
     --pnl-stop 4000 \
     --structure STRANGLE \
     --wing-offset 4 \
@@ -40,6 +40,8 @@ python3 data_engine/market_ai/scripts/generate_weekly_plan.py \
     --condor-threshold 0.012 \
     --oi-distance 0.012 \
     --expiry-offset 1 \
-    --min-days-to-expiry 4
+    --min-days-to-expiry 4 \
+    --ml-exit-model "data_engine/market_ai/state/weekly_exit_model.pkl" \
+    --ml-exit-threshold 0.9
 
 echo "[weekly-plan] done – plan written to ${PLAN_PATH}"

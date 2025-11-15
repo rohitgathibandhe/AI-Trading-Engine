@@ -6,8 +6,8 @@ Example:
 python3 data_engine/market_ai/scripts/run_weekly_theta_backtest.py \
     --input reports/intraday_from_rolling_12m.csv \
     --qty 2 \
-    --min-prev-range 0.005 \
-    --pnl-target 4000 \
+    --min-prev-range 0.003 \
+    --pnl-target 6000 \
     --pnl-stop 4000 \
     --no-demand-prev-break
 """
@@ -42,9 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--entry-day", type=int, default=0, help="Entry weekday (0=Mon).")
     parser.add_argument("--exit-day", type=int, default=3, help="Preferred exit weekday (0=Mon).")
     parser.add_argument("--min-premium", type=float, default=0.016, help="Combined premium pct threshold.")
-    parser.add_argument("--min-prev-range", type=float, default=0.005, help="Minimum prior day range pct.")
+    parser.add_argument("--min-prev-range", type=float, default=0.003, help="Minimum prior day range pct.")
     parser.add_argument("--max-prev-range", type=float, default=0.05, help="Maximum prior day range pct.")
-    parser.add_argument("--pnl-target", type=float, default=4_000.0, help="Weekly profit target (INR).")
+    parser.add_argument("--pnl-target", type=float, default=6_000.0, help="Weekly profit target (INR).")
     parser.add_argument("--pnl-stop", type=float, default=4_000.0, help="Weekly loss stop (INR).")
     parser.add_argument("--trailing-lock", type=float, default=0.25, help="Trailing give-back percentage.")
     parser.add_argument("--hard-exit-day", type=int, default=3, help="Force exit on/after this weekday.")
@@ -60,6 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-severities", default="high", help="Comma separated event severities to skip.")
     parser.add_argument("--expiry-offset-weeks", type=int, default=0, help="0 = front weekly, 1 = next weekly, etc.")
     parser.add_argument("--min-days-to-expiry", type=int, default=0, help="Require at least N days to target expiry.")
+    parser.add_argument("--ml-exit-model", type=Path, help="Optional ML exit model path.")
+    parser.add_argument("--ml-exit-threshold", type=float, default=0.6, help="Probability cutoff for ML exit.")
     parser.add_argument("--emit-plan", type=Path, help="Optional JSON file to emit plan summary.")
     return parser.parse_args()
 
@@ -97,15 +99,22 @@ def main() -> None:
         "event_calendar_path": str(args.event_calendar) if args.event_calendar else None,
         "skip_event_severities": tuple(s.strip() for s in args.skip_severities.split(",") if s.strip()),
         "expiry_offset_weeks": args.expiry_offset_weeks,
+        "ml_exit_model_path": str(args.ml_exit_model) if args.ml_exit_model else None,
+        "ml_exit_min_prob": args.ml_exit_threshold,
     }
 
-    trades_df, summary = run_backtest(df, cfg)
+    trades_df, daily_df, summary = run_backtest(df, cfg)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     trades_path = args.output_dir / "weekly_theta_trades.csv"
     summary_path = args.output_dir / "weekly_theta_summary.json"
+    daily_log_path = args.output_dir / "weekly_theta_daily_log.csv"
     trades_df.to_csv(trades_path, index=False)
+    if isinstance(daily_df, pd.DataFrame):
+        daily_df.to_csv(daily_log_path, index=False)
     summary_path.write_text(json.dumps(summary, indent=2, default=str))
     print(f"Wrote trades to {trades_path}")
+    if isinstance(daily_df, pd.DataFrame):
+        print(f"Wrote daily log to {daily_log_path}")
     print(f"Summary: {json.dumps(summary, indent=2)}")
     if args.emit_plan:
         plan = {

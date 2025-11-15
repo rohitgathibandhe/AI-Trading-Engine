@@ -1,0 +1,35 @@
+{
+  "samples_total": 50,
+  "train_samples": 40,
+  "val_samples": 10,
+  "close_advantage": 819.2,
+  "prob_threshold": 0.9,
+  "roc_auc": NaN,
+  "classification_report": {
+    "0": {
+      "precision": 1.0,
+      "recall": 0.9,
+      "f1-score": 0.9473684210526315,
+      "support": 10.0
+    },
+    "1": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 0.0
+    },
+    "accuracy": 0.9,
+    "macro avg": {
+      "precision": 0.5,
+      "recall": 0.45,
+      "f1-score": 0.47368421052631576,
+      "support": 10.0
+    },
+    "weighted avg": {
+      "precision": 1.0,
+      "recall": 0.9,
+      "f1-score": 0.9473684210526315,
+      "support": 10.0
+    }
+  }
+}

@@ -32,9 +32,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan-path", type=Path, default=Path("state/weekly_plan.json"), help="Where to write the plan JSON.")
     parser.add_argument("--intent-path", type=Path, default=Path("data_engine/market_ai/state/order_intents.jsonl"), help="Intent JSONL file.")
     parser.add_argument("--qty", type=int, default=2)
-    parser.add_argument("--min-prev-range", type=float, default=0.005)
+    parser.add_argument("--min-prev-range", type=float, default=0.003)
     parser.add_argument("--max-prev-range", type=float, default=0.05)
-    parser.add_argument("--pnl-target", type=float, default=4_000.0)
+    parser.add_argument("--pnl-target", type=float, default=6_000.0)
     parser.add_argument("--pnl-stop", type=float, default=4_000.0)
     parser.add_argument("--hybrid", action="store_true", help="Enable hybrid strangle/condor mode.")
     parser.add_argument("--structure", default="STRANGLE")
@@ -45,6 +45,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--event-calendar", type=Path, default=Path("data_engine/market_ai/state/events.json"))
     parser.add_argument("--expiry-offset", type=int, default=0, help="0 = front weekly, 1 = next weekly, etc.")
     parser.add_argument("--min-days-to-expiry", type=int, default=0, help="Require at least N days to target expiry.")
+    parser.add_argument("--ml-exit-model", type=Path, help="Optional path to trained ML exit model.")
+    parser.add_argument("--ml-exit-threshold", type=float, default=0.6, help="Probability to trigger ML exit.")
     return parser.parse_args()
 
 
@@ -70,14 +72,19 @@ def main() -> None:
         "oi_distance_pct": args.oi_distance,
         "event_calendar_path": str(args.event_calendar) if args.event_calendar else None,
         "expiry_offset_weeks": args.expiry_offset,
+        "ml_exit_model_path": str(args.ml_exit_model) if args.ml_exit_model else None,
+        "ml_exit_min_prob": args.ml_exit_threshold,
     }
-    trades_df, summary = run_backtest(df, cfg)
+    trades_df, daily_df, summary = run_backtest(df, cfg)
     plan = {
         "generated_at": datetime.now().isoformat(),
         "dataset": str(args.input),
         "config": cfg,
         "summary": summary,
     }
+    if isinstance(daily_df, pd.DataFrame) and not daily_df.empty:
+        latest_daily = daily_df.iloc[-1].to_dict()
+        plan["latest_daily_snapshot"] = {k: (None if pd.isna(v) else v) for k, v in latest_daily.items()}
     openings = trades_df[trades_df["action"] == "OPEN"].copy()
     if not openings.empty:
         latest_open = openings.iloc[-1].to_dict()

@@ -17,7 +17,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import pickle
 import pandas as pd
+import json
+import logging
+import numpy as np
+
+LOG = logging.getLogger(__name__)
 
 __all__ = ["WeeklyConfig", "WeeklyTargets", "EntryRules", "run_backtest", "WeeklyThetaStrangle"]
 
@@ -28,15 +34,15 @@ class EntryRules:
     min_iv_rank: float = 0.05
     max_iv_rank: float = 1.0
     max_prev_range_pct: float = 0.035
-    min_prev_range_pct: float = 0.01
+    min_prev_range_pct: float = 0.003
     demand_prev_break: bool = True
     min_days_to_target_expiry: int = 0
 
 
 @dataclass
 class WeeklyTargets:
-    pnl_target: float = 5_000.0
-    pnl_stop: float = 5_000.0
+    pnl_target: float = 6_000.0
+    pnl_stop: float = 4_000.0
     trailing_lock_pct: float = 0.25
     hard_exit_day: int = 3  # Thursday (0=Mon)
     max_hold_days: int = 5
@@ -60,6 +66,8 @@ class WeeklyConfig:
     event_calendar_path: Optional[str] = "data_engine/market_ai/state/events.json"
     skip_event_severities: Tuple[str, ...] = ("high",)
     expiry_offset_weeks: int = 0
+    ml_exit_model_path: Optional[str] = None
+    ml_exit_min_prob: float = 0.6
 
 
 @dataclass
@@ -103,6 +111,21 @@ class WeeklyThetaStrangle:
         self.week_id: Optional[Tuple[int, int]] = None
         self.trades: List[Dict[str, Any]] = []
         self._event_calendar = _load_event_calendar(cfg.event_calendar_path)
+        self.daily_snapshots: List[Dict[str, Any]] = []
+        self._last_close_reason: Optional[str] = None
+        self._last_close_time: Optional[pd.Timestamp] = None
+        self._last_close_pnl: Optional[float] = None
+        self._last_closed_position: Optional[WeeklyPosition] = None
+        self._ml_exit_helper: Optional[MLExitHelper] = None
+        self._last_ml_prob: Optional[float] = None
+        self._last_ml_decision: Optional[str] = None
+        model_path = cfg.ml_exit_model_path
+        if model_path:
+            try:
+                self._ml_exit_helper = MLExitHelper(Path(model_path), cfg.ml_exit_min_prob)
+                LOG.info("Loaded ML exit model from %s (threshold=%.2f)", model_path, self._ml_exit_helper.threshold)
+            except Exception as exc:
+                LOG.warning("Could not load ML exit model %s: %s", model_path, exc)
 
     def on_new_day(self, day_rows: pd.DataFrame) -> None:
         if day_rows.empty:
@@ -112,12 +135,19 @@ class WeeklyThetaStrangle:
         current_date = pd.to_datetime(morning["timestamp"]).date()
         weekday = current_date.weekday()
         current_week = (current_date.isocalendar().year, current_date.isocalendar().week)
+        entry_attempted = False
+        entry_outcome = None
+        entry_block_reason = None
 
         if self.position is None and weekday <= self.cfg.exit_day:
-            if self._entry_allowed(day_rows):
+            entry_attempted = True
+            allowed, block_reason = self._entry_allowed(day_rows)
+            if allowed:
                 self.week_id = current_week
                 self._open_position(morning)
-                return
+                entry_outcome = "OPENED"
+            else:
+                entry_block_reason = block_reason or "blocked"
 
         if self.position:
             if current_week != self.week_id:
@@ -126,9 +156,10 @@ class WeeklyThetaStrangle:
                 return
             pnl = self.position.current_pnl(close["atm_call_ltp"], close["atm_put_ltp"])
             self.position.best_pnl = max(self.position.best_pnl, pnl)
-            exit_reason = self._check_exit(weekday, pnl)
+            exit_reason = self._check_exit(weekday, pnl, morning, close)
             if exit_reason:
                 self._close_position(close, reason=exit_reason)
+        self._log_daily_snapshot(morning, close, weekday, entry_attempted, entry_outcome, entry_block_reason)
 
     def _open_position(self, row: pd.Series) -> None:
         structure = self._determine_structure(row)
@@ -177,7 +208,8 @@ class WeeklyThetaStrangle:
     def _close_position(self, row: pd.Series, reason: str) -> None:
         if self.position is None:
             return
-        current_legs = self._resolve_close_legs(row, self.position.structure)
+        current_pos = self.position
+        current_legs = self._resolve_close_legs(row, current_pos.structure)
         pnl = self.position.current_pnl(
             current_legs["short_call"],
             current_legs["short_put"],
@@ -196,25 +228,29 @@ class WeeklyThetaStrangle:
                 "reason": reason,
             }
         )
+        self._last_close_reason = reason
+        self._last_close_time = pd.to_datetime(row["timestamp"])
+        self._last_close_pnl = pnl
+        self._last_closed_position = current_pos
         self.position = None
         self.week_id = None
 
-    def _entry_allowed(self, day_rows: pd.DataFrame) -> bool:
+    def _entry_allowed(self, day_rows: pd.DataFrame) -> Tuple[bool, Optional[str]]:
         rules = self.cfg.entry_rules
         day_rows = day_rows.sort_values("timestamp")
         row = day_rows.iloc[0]
         premium_pct = row.get("combined_premium_pct")
         if pd.isna(premium_pct) or premium_pct < rules.min_premium_pct:
-            return False
+            return False, "premium_lt_min"
         iv_rank = row.get("iv_rank")
         if not pd.isna(iv_rank) and not (rules.min_iv_rank <= iv_rank <= rules.max_iv_rank):
-            return False
+            return False, "iv_rank_band"
         prev_range = row.get("prev_day_range")
         spot = row.get("spot")
         if not pd.isna(prev_range) and spot:
             prev_range_pct = abs(prev_range) / max(spot, 1.0)
             if prev_range_pct < rules.min_prev_range_pct or prev_range_pct > rules.max_prev_range_pct:
-                return False
+                return False, "prev_range_band"
         if rules.demand_prev_break:
             prev_high = row.get("prev_day_high")
             prev_low = row.get("prev_day_low")
@@ -223,16 +259,16 @@ class WeeklyThetaStrangle:
                 day_high = day_rows["spot"].max()
                 day_low = day_rows["spot"].min()
                 if not ((day_high >= (prev_high + buffer)) or (day_low <= (prev_low - buffer))):
-                    return False
+                    return False, "no_prev_break"
         expiry, days_to = self._target_expiry_info(row)
         min_days = getattr(rules, "min_days_to_target_expiry", 0)
         if expiry is None:
-            return False
+            return False, "missing_expiry"
         if min_days and (days_to is None or days_to < min_days):
-            return False
+            return False, "days_to_expiry"
         if not self._event_allowed(pd.to_datetime(row["timestamp"]).date()):
-            return False
-        return True
+            return False, "event_block"
+        return True, None
 
     def _determine_structure(self, row: pd.Series) -> str:
         if not self.cfg.hybrid_enabled:
@@ -321,10 +357,13 @@ class WeeklyThetaStrangle:
             target_expiry = None
         return target_expiry, target_days
 
-    def _event_allowed(self, current_date: datetime.date) -> bool:
+    def _events_for(self, current_date: datetime.date) -> List[Dict[str, Any]]:
         if not self._event_calendar:
-            return True
-        entries = self._event_calendar.get(current_date.isoformat(), [])
+            return []
+        return self._event_calendar.get(current_date.isoformat(), [])
+
+    def _event_allowed(self, current_date: datetime.date) -> bool:
+        entries = self._events_for(current_date)
         skip_set = {s.lower() for s in self.cfg.skip_event_severities}
         for entry in entries:
             sev = str(entry.get("severity", "")).lower()
@@ -332,8 +371,95 @@ class WeeklyThetaStrangle:
                 return False
         return True
 
-    def _check_exit(self, weekday: int, pnl: float) -> Optional[str]:
+    def _log_daily_snapshot(
+        self,
+        morning: pd.Series,
+        close: pd.Series,
+        weekday: int,
+        entry_attempted: bool,
+        entry_outcome: Optional[str],
+        entry_block_reason: Optional[str],
+    ) -> None:
+        current_date = pd.to_datetime(morning["timestamp"]).date()
+        events = self._events_for(current_date)
+        events_json = json.dumps(events, default=str)
+        event_tags = ",".join(
+            sorted(
+                {
+                    str(evt.get("tag") or evt.get("event") or evt.get("title") or "").strip()
+                    for evt in events
+                    if evt
+                }
+            )
+        ).strip(",")
+        active_position = self.position
+        last_closed_applicable = (
+            self._last_closed_position if self._last_close_time and self._last_close_time.date() == current_date else None
+        )
+        pnl = None
+        best_pnl = None
+        target_expiry = None
+        target_days_remaining = None
+        entry_date = None
+        structure = None
+        if active_position:
+            pnl = active_position.current_pnl(close["atm_call_ltp"], close["atm_put_ltp"])
+            best_pnl = active_position.best_pnl
+            target_expiry = active_position.target_expiry
+            if target_expiry is not None and not pd.isna(target_expiry):
+                target_days_remaining = (target_expiry.date() - current_date).days
+            entry_date = active_position.entry_date
+            structure = active_position.structure
+        elif last_closed_applicable:
+            target_expiry = last_closed_applicable.target_expiry
+            if target_expiry is not None and not pd.isna(target_expiry):
+                target_days_remaining = (target_expiry.date() - current_date).days
+            entry_date = last_closed_applicable.entry_date
+            structure = last_closed_applicable.structure
+        snapshot = {
+            "date": current_date.isoformat(),
+            "weekday": weekday,
+            "entry_attempted": entry_attempted,
+            "entry_outcome": entry_outcome,
+            "entry_block_reason": entry_block_reason,
+            "spot_open": morning.get("spot"),
+            "spot_close": close.get("spot"),
+            "combined_premium_pct": morning.get("combined_premium_pct"),
+            "iv_rank": morning.get("iv_rank"),
+            "iv_skew": morning.get("iv_skew"),
+            "oi_skew": morning.get("oi_skew"),
+            "volume_skew": morning.get("volume_skew"),
+            "call_oi_max_strike": morning.get("call_oi_max_strike"),
+            "put_oi_max_strike": morning.get("put_oi_max_strike"),
+            "events": events_json,
+            "event_count": len(events),
+            "event_tags": event_tags,
+            "has_position": active_position is not None,
+            "structure": structure,
+            "entry_date": entry_date.isoformat() if entry_date is not None else None,
+            "target_expiry": target_expiry.isoformat() if target_expiry is not None and not pd.isna(target_expiry) else None,
+            "target_days_remaining": target_days_remaining,
+            "current_pnl": pnl,
+            "best_pnl": best_pnl,
+            "close_reason": self._last_close_reason if last_closed_applicable else None,
+            "close_pnl": self._last_close_pnl if last_closed_applicable else None,
+            "ml_exit_prob": self._last_ml_prob,
+            "ml_exit_decision": self._last_ml_decision,
+        }
+        self.daily_snapshots.append(snapshot)
+        if last_closed_applicable:
+            self._last_closed_position = None
+            self._last_close_reason = None
+            self._last_close_pnl = None
+            self._last_close_time = None
+        self._last_ml_prob = None
+        self._last_ml_decision = None
+
+    def _check_exit(self, weekday: int, pnl: float, morning_row: pd.Series, close_row: pd.Series) -> Optional[str]:
         targets = self.cfg.targets
+        ml_reason = self._ml_exit_decision(weekday, pnl, morning_row, close_row)
+        if ml_reason:
+            return ml_reason
         if pnl >= targets.pnl_target:
             return "target_hit"
         if pnl <= -targets.pnl_stop:
@@ -348,6 +474,55 @@ class WeeklyThetaStrangle:
         if weekday >= targets.hard_exit_day:
             return "hard_exit"
         return None
+
+    def _ml_exit_decision(self, weekday: int, pnl: float, morning_row: pd.Series, close_row: pd.Series) -> Optional[str]:
+        self._last_ml_prob = None
+        self._last_ml_decision = None
+        helper = self._ml_exit_helper
+        if not helper or self.position is None:
+            return None
+        features = self._ml_feature_vector(weekday, pnl, morning_row, close_row)
+        if features is None:
+            return None
+        prob = helper.predict_prob(features)
+        self._last_ml_prob = prob
+        if prob >= helper.threshold:
+            self._last_ml_decision = "EXIT"
+            return "ml_exit"
+        self._last_ml_decision = "HOLD"
+        return None
+
+    def _ml_feature_vector(self, weekday: int, pnl: float, morning_row: pd.Series, close_row: pd.Series) -> Optional[Dict[str, float]]:
+        if self.position is None:
+            return None
+        current_date = pd.to_datetime(close_row["timestamp"]).date()
+        entry_date = self.position.entry_date.date()
+        target_expiry = self.position.target_expiry.date() if self.position.target_expiry is not None else None
+        days_since_entry = (current_date - entry_date).days
+        target_days_remaining = (target_expiry - current_date).days if target_expiry else None
+        events = self._events_for(current_date)
+        event_count = len(events)
+        has_event_risk = 1 if event_count > 0 else 0
+        drawdown_from_best = (self.position.best_pnl - pnl) if self.position.best_pnl is not None else None
+        return {
+            "weekday": weekday,
+            "spot_open": float(morning_row.get("spot")) if not pd.isna(morning_row.get("spot")) else 0.0,
+            "spot_close": float(close_row.get("spot")) if not pd.isna(close_row.get("spot")) else 0.0,
+            "combined_premium_pct": float(morning_row.get("combined_premium_pct") or 0.0),
+            "iv_rank": float(morning_row.get("iv_rank") or 0.0),
+            "iv_skew": float(morning_row.get("iv_skew") or 0.0),
+            "oi_skew": float(close_row.get("oi_skew") or 0.0),
+            "volume_skew": float(close_row.get("volume_skew") or 0.0),
+            "call_oi_max_strike": float(close_row.get("call_oi_max_strike") or 0.0),
+            "put_oi_max_strike": float(close_row.get("put_oi_max_strike") or 0.0),
+            "event_count": float(event_count),
+            "has_event_risk": float(has_event_risk),
+            "days_since_entry": float(days_since_entry if days_since_entry is not None else 0.0),
+            "target_days_remaining": float(target_days_remaining if target_days_remaining is not None else 0.0),
+            "current_pnl": float(pnl),
+            "best_pnl": float(self.position.best_pnl or 0.0),
+            "drawdown_from_best": float(drawdown_from_best or 0.0),
+        }
 
 
 def _coerce_config(cfg_input: Optional[Any]) -> WeeklyConfig:
@@ -400,7 +575,7 @@ def _load_event_calendar(path_str: Optional[str]) -> Dict[str, List[Dict[str, An
     return events
 
 
-def run_backtest(df: pd.DataFrame, cfg_dict: Optional[Any] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def run_backtest(df: pd.DataFrame, cfg_dict: Optional[Any] = None) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     cfg = _coerce_config(cfg_dict)
     strat = WeeklyThetaStrangle(cfg)
     df = df.copy()
@@ -422,6 +597,7 @@ def run_backtest(df: pd.DataFrame, cfg_dict: Optional[Any] = None) -> Tuple[pd.D
     if strat.position and last_rows is not None:
         strat._close_position(last_rows.iloc[-1], reason="dataset_end")
     trades_df = pd.DataFrame(strat.trades)
+    daily_df = pd.DataFrame(strat.daily_snapshots)
     total_realized = float(trades_df.loc[trades_df["action"] == "CLOSE", "realized"].sum()) if not trades_df.empty else 0.0
     summary = {
         "entries": int((trades_df["action"] == "OPEN").sum()) if not trades_df.empty else 0,
@@ -429,4 +605,39 @@ def run_backtest(df: pd.DataFrame, cfg_dict: Optional[Any] = None) -> Tuple[pd.D
         "total_realized": total_realized,
         "avg_per_trade": float(total_realized / max(1, (trades_df["action"] == "CLOSE").sum())) if not trades_df.empty else 0.0,
     }
-    return trades_df, summary
+    return trades_df, daily_df, summary
+ML_FEATURES = [
+    "weekday",
+    "spot_open",
+    "spot_close",
+    "combined_premium_pct",
+    "iv_rank",
+    "iv_skew",
+    "oi_skew",
+    "volume_skew",
+    "call_oi_max_strike",
+    "put_oi_max_strike",
+    "event_count",
+    "has_event_risk",
+    "days_since_entry",
+    "target_days_remaining",
+    "current_pnl",
+    "best_pnl",
+    "drawdown_from_best",
+]
+
+
+class MLExitHelper:
+    def __init__(self, model_path: Path, fallback_threshold: float):
+        with Path(model_path).open("rb") as fh:
+            payload = pickle.load(fh)
+        self.model = payload.get("estimator")
+        self.feature_names = payload.get("feature_names", ML_FEATURES)
+        self.threshold = float(payload.get("prob_threshold", fallback_threshold))
+        if self.model is None:
+            raise RuntimeError(f"Invalid model payload at {model_path}")
+
+    def predict_prob(self, features: Dict[str, float]) -> float:
+        data = {name: [float(features.get(name, 0.0))] for name in self.feature_names}
+        X = pd.DataFrame(data)
+        return float(self.model.predict_proba(X)[0][1])
