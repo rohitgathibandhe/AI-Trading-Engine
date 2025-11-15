@@ -59,6 +59,7 @@ def main() -> None:
             "min_prev_range_pct": args.min_prev_range,
             "max_prev_range_pct": args.max_prev_range,
             "min_days_to_target_expiry": args.min_days_to_expiry,
+            "max_gap_pct": args.max_gap_pct,
         },
         "targets": {
             "pnl_target": args.pnl_target,
@@ -119,3 +120,4 @@ def append_intent(signal: Dict[str, Any], intent_path: Path, qty: int) -> None:
 
 if __name__ == "__main__":
     main()
+    parser.add_argument("--max-gap-pct", type=float, default=0.01)

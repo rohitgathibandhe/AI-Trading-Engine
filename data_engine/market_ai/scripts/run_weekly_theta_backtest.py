@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ml-exit-model", type=Path, help="Optional ML exit model path.")
     parser.add_argument("--ml-exit-threshold", type=float, default=0.6, help="Probability cutoff for ML exit.")
     parser.add_argument("--emit-plan", type=Path, help="Optional JSON file to emit plan summary.")
+    parser.add_argument("--max-gap-pct", type=float, default=0.01, help="Skip entry if Monday gap > pct.")
     return parser.parse_args()
 
 
@@ -75,6 +76,7 @@ def main() -> None:
         "max_prev_range_pct": args.max_prev_range,
         "demand_prev_break": args.demand_prev_break,
         "min_days_to_target_expiry": args.min_days_to_expiry,
+        "max_gap_pct": args.max_gap_pct,
     }
     targets: Dict[str, Any] = {
         "pnl_target": args.pnl_target,

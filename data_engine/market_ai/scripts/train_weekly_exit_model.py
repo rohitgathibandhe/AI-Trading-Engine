@@ -27,6 +27,16 @@ FEATURES: List[str] = [
     "volume_skew",
     "call_oi_max_strike",
     "put_oi_max_strike",
+    "spot_return_1",
+    "spot_return_3",
+    "spot_return_5",
+    "spot_trend_20",
+    "spot_trend_50",
+    "spot_trend_100",
+    "spot_volatility",
+    "spot_intraday_range_pct",
+    "call_oi_change",
+    "put_oi_change",
     "event_count",
     "has_event_risk",
     "days_since_entry",
@@ -106,6 +116,11 @@ def main() -> None:
         "roc_auc": roc,
         "classification_report": report,
     }
+    if hasattr(clf, "feature_importances_"):
+        metrics["feature_importances"] = {
+            name: float(val)
+            for name, val in zip(FEATURES, clf.feature_importances_)
+        }
     args.report_out.parent.mkdir(parents=True, exist_ok=True)
     args.report_out.write_text(json.dumps(metrics, indent=2))
     print(f"[weekly-exit] model saved to {args.model_out}")

@@ -1,35 +1,64 @@
 {
-  "samples_total": 50,
-  "train_samples": 40,
-  "val_samples": 10,
-  "close_advantage": 819.2,
+  "samples_total": 63,
+  "train_samples": 50,
+  "val_samples": 13,
+  "close_advantage": 1200.0,
   "prob_threshold": 0.9,
-  "roc_auc": NaN,
+  "roc_auc": 0.5,
   "classification_report": {
     "0": {
-      "precision": 1.0,
-      "recall": 0.9,
-      "f1-score": 0.9473684210526315,
-      "support": 10.0
+      "precision": 0.9230769230769231,
+      "recall": 1.0,
+      "f1-score": 0.96,
+      "support": 12.0
     },
     "1": {
       "precision": 0.0,
       "recall": 0.0,
       "f1-score": 0.0,
-      "support": 0.0
+      "support": 1.0
     },
-    "accuracy": 0.9,
+    "accuracy": 0.9230769230769231,
     "macro avg": {
-      "precision": 0.5,
-      "recall": 0.45,
-      "f1-score": 0.47368421052631576,
-      "support": 10.0
+      "precision": 0.46153846153846156,
+      "recall": 0.5,
+      "f1-score": 0.48,
+      "support": 13.0
     },
     "weighted avg": {
-      "precision": 1.0,
-      "recall": 0.9,
-      "f1-score": 0.9473684210526315,
-      "support": 10.0
+      "precision": 0.8520710059171598,
+      "recall": 0.9230769230769231,
+      "f1-score": 0.8861538461538461,
+      "support": 13.0
     }
+  },
+  "feature_importances": {
+    "weekday": 0.0,
+    "spot_open": 0.04744733288493191,
+    "spot_close": 0.022194561457533582,
+    "combined_premium_pct": 0.5303638941398866,
+    "iv_rank": 0.018369592092190946,
+    "iv_skew": 0.0,
+    "oi_skew": 0.0,
+    "volume_skew": 0.15639543588124225,
+    "call_oi_max_strike": 0.038578363606962825,
+    "put_oi_max_strike": 0.014940359538048278,
+    "spot_return_1": 0.0,
+    "spot_return_3": 0.0,
+    "spot_return_5": 0.0,
+    "spot_trend_20": 0.04154955733273801,
+    "spot_trend_50": 0.0,
+    "spot_trend_100": 0.020724580913681408,
+    "spot_volatility": 0.10943632215278426,
+    "spot_intraday_range_pct": 0.0,
+    "call_oi_change": 0.0,
+    "put_oi_change": 0.0,
+    "event_count": 0.0,
+    "has_event_risk": 0.0,
+    "days_since_entry": 0.0,
+    "target_days_remaining": 0.0,
+    "current_pnl": 0.0,
+    "best_pnl": 0.0,
+    "drawdown_from_best": 0.0
   }
 }

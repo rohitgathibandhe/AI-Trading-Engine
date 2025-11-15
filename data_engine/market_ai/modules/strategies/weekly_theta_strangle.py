@@ -37,6 +37,7 @@ class EntryRules:
     min_prev_range_pct: float = 0.003
     demand_prev_break: bool = True
     min_days_to_target_expiry: int = 0
+    max_gap_pct: float = 0.01  # 1% gap guard
 
 
 @dataclass
@@ -68,6 +69,8 @@ class WeeklyConfig:
     expiry_offset_weeks: int = 0
     ml_exit_model_path: Optional[str] = None
     ml_exit_min_prob: float = 0.6
+    directional_enabled: bool = True
+    directional_bias_threshold: float = 0.02
 
 
 @dataclass
@@ -260,6 +263,11 @@ class WeeklyThetaStrangle:
                 day_low = day_rows["spot"].min()
                 if not ((day_high >= (prev_high + buffer)) or (day_low <= (prev_low - buffer))):
                     return False, "no_prev_break"
+        prev_close = row.get("prev_day_close")
+        if not pd.isna(prev_close) and spot:
+            gap_pct = abs(spot - prev_close) / max(prev_close, 1.0)
+            if gap_pct > getattr(rules, "max_gap_pct", 0.01):
+                return False, "gap_guard"
         expiry, days_to = self._target_expiry_info(row)
         min_days = getattr(rules, "min_days_to_target_expiry", 0)
         if expiry is None:
@@ -276,6 +284,11 @@ class WeeklyThetaStrangle:
         spot = row.get("spot")
         prev_range = row.get("prev_day_range")
         prev_range_pct = abs(prev_range) / max(spot, 1.0) if spot and prev_range else 0.0
+        bias = row.get("spot_trend_20") or 0.0
+        if self.cfg.directional_enabled and prev_range_pct >= self.cfg.directional_bias_threshold and bias:
+            if bias >= 0:
+                return "BULL_PUT_SPREAD"
+            return "BEAR_CALL_SPREAD"
         if prev_range_pct >= self.cfg.trend_range_threshold:
             return "STRANGLE"
         if prev_range_pct <= self.cfg.condor_range_threshold and self._condor_viable(row):
@@ -306,6 +319,30 @@ class WeeklyThetaStrangle:
             "short_put_strike": float(row.get("atm_put_strike", 0.0)) if not pd.isna(row.get("atm_put_strike")) else None,
             "structure": structure,
         }
+        if structure == "BULL_PUT_SPREAD":
+            legs["short_call"] = 0.0
+            legs["short_call_strike"] = None
+            long_put = row.get(_selector_field("put", -2, "ltp"))
+            long_put_strike = row.get(_selector_field("put", -2, "strike"))
+            if pd.isna(long_put) or pd.isna(long_put_strike):
+                legs["structure"] = "STRANGLE"
+                return legs
+            legs["long_put"] = float(long_put)
+            legs["long_put_strike"] = float(long_put_strike)
+            legs["structure"] = "BULL_PUT_SPREAD"
+            return legs
+        if structure == "BEAR_CALL_SPREAD":
+            legs["short_put"] = 0.0
+            legs["short_put_strike"] = None
+            long_call = row.get(_selector_field("call", 2, "ltp"))
+            long_call_strike = row.get(_selector_field("call", 2, "strike"))
+            if pd.isna(long_call) or pd.isna(long_call_strike):
+                legs["structure"] = "STRANGLE"
+                return legs
+            legs["long_call"] = float(long_call)
+            legs["long_call_strike"] = float(long_call_strike)
+            legs["structure"] = "BEAR_CALL_SPREAD"
+            return legs
         if structure != "IRON_CONDOR":
             legs["structure"] = "STRANGLE"
             return legs
@@ -326,6 +363,14 @@ class WeeklyThetaStrangle:
             "short_call": float(row.get("atm_call_ltp", 0.0)),
             "short_put": float(row.get("atm_put_ltp", 0.0)),
         }
+        if structure == "BULL_PUT_SPREAD":
+            long_put = row.get(_selector_field("put", -2, "ltp"))
+            legs["long_put"] = float(long_put) if not pd.isna(long_put) else 0.0
+            return legs
+        if structure == "BEAR_CALL_SPREAD":
+            long_call = row.get(_selector_field("call", 2, "ltp"))
+            legs["long_call"] = float(long_call) if not pd.isna(long_call) else 0.0
+            return legs
         if structure != "IRON_CONDOR":
             return legs
         offset = max(1, int(self.cfg.wing_offset))
@@ -431,6 +476,16 @@ class WeeklyThetaStrangle:
             "volume_skew": morning.get("volume_skew"),
             "call_oi_max_strike": morning.get("call_oi_max_strike"),
             "put_oi_max_strike": morning.get("put_oi_max_strike"),
+            "spot_return_1": close.get("spot_return_1"),
+            "spot_return_3": close.get("spot_return_3"),
+            "spot_return_5": close.get("spot_return_5"),
+            "spot_trend_20": close.get("spot_trend_20"),
+            "spot_trend_50": close.get("spot_trend_50"),
+            "spot_trend_100": close.get("spot_trend_100"),
+            "spot_volatility": close.get("spot_volatility"),
+            "spot_intraday_range_pct": close.get("spot_intraday_range_pct"),
+            "call_oi_change": close.get("call_oi_change"),
+            "put_oi_change": close.get("put_oi_change"),
             "events": events_json,
             "event_count": len(events),
             "event_tags": event_tags,
@@ -515,6 +570,16 @@ class WeeklyThetaStrangle:
             "volume_skew": float(close_row.get("volume_skew") or 0.0),
             "call_oi_max_strike": float(close_row.get("call_oi_max_strike") or 0.0),
             "put_oi_max_strike": float(close_row.get("put_oi_max_strike") or 0.0),
+            "spot_return_1": float(close_row.get("spot_return_1") or 0.0),
+            "spot_return_3": float(close_row.get("spot_return_3") or 0.0),
+            "spot_return_5": float(close_row.get("spot_return_5") or 0.0),
+            "spot_trend_20": float(close_row.get("spot_trend_20") or 0.0),
+            "spot_trend_50": float(close_row.get("spot_trend_50") or 0.0),
+            "spot_trend_100": float(close_row.get("spot_trend_100") or 0.0),
+            "spot_volatility": float(close_row.get("spot_volatility") or 0.0),
+            "spot_intraday_range_pct": float(close_row.get("spot_intraday_range_pct") or 0.0),
+            "call_oi_change": float(close_row.get("call_oi_change") or 0.0),
+            "put_oi_change": float(close_row.get("put_oi_change") or 0.0),
             "event_count": float(event_count),
             "has_event_risk": float(has_event_risk),
             "days_since_entry": float(days_since_entry if days_since_entry is not None else 0.0),
@@ -617,6 +682,16 @@ ML_FEATURES = [
     "volume_skew",
     "call_oi_max_strike",
     "put_oi_max_strike",
+    "spot_return_1",
+    "spot_return_3",
+    "spot_return_5",
+    "spot_trend_20",
+    "spot_trend_50",
+    "spot_trend_100",
+    "spot_volatility",
+    "spot_intraday_range_pct",
+    "call_oi_change",
+    "put_oi_change",
     "event_count",
     "has_event_risk",
     "days_since_entry",

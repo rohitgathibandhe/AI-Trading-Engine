@@ -213,7 +213,28 @@ def process_day(day_dir: Path, selectors: List[str], tz: str) -> Optional[pd.Dat
         merged["atm_put_volume"].replace(0, np.nan),
     )
     merged["source_date"] = day_dir.name
+
+    merged = _augment_spot_features(merged)
     return merged
+
+
+def _augment_spot_features(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    grouped = df.groupby("source_date")
+    for periods in (1, 3, 5):
+        df[f"spot_return_{periods}"] = grouped["spot"].transform(lambda s: s.pct_change(periods=periods))
+    for span in (20, 50, 100):
+        df[f"spot_ema_{span}"] = grouped["spot"].transform(lambda s: s.ewm(span=span, adjust=False).mean())
+        df[f"spot_trend_{span}"] = (df["spot"] - df[f"spot_ema_{span}"]) / df[f"spot_ema_{span}"]
+    df["spot_volatility"] = grouped["spot"].transform(lambda s: s.pct_change().rolling(20, min_periods=5).std())
+    df["spot_intraday_range_pct"] = grouped["spot"].transform(lambda s: (s.cummax() - s.cummin()) / s.cummax().replace(0, np.nan))
+    df["call_oi_change"] = grouped["atm_call_oi"].transform(lambda s: s.diff())
+    df["put_oi_change"] = grouped["atm_put_oi"].transform(lambda s: s.diff())
+    df["call_iv_change"] = grouped["atm_call_iv"].transform(lambda s: s.diff())
+    df["put_iv_change"] = grouped["atm_put_iv"].transform(lambda s: s.diff())
+    return df
 
 
 def main() -> None:
