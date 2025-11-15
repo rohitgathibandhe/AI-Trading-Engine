@@ -132,6 +132,7 @@ class WeeklyThetaStrangle:
         legs = self._resolve_entry_legs(row, structure)
         if legs is None:
             return
+        expiry = row.get("expiryDate") or row.get("expiry_date")
         pos = WeeklyPosition(
             entry_date=pd.to_datetime(row["timestamp"]),
             entry_call=legs["short_call"],
@@ -159,6 +160,7 @@ class WeeklyThetaStrangle:
                 "put_strike": pos.short_put_strike,
                 "long_call_strike": pos.long_call_strike,
                 "long_put_strike": pos.long_put_strike,
+                "expiry": expiry.isoformat() if hasattr(expiry, "isoformat") else expiry,
                 "structure": pos.structure,
                 "notes": "weekly_entry",
             }

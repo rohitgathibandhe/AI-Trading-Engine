@@ -68,7 +68,7 @@ def _auto_refresh() -> None:
 _UI_FILE = Path(__file__).resolve()            # .../data_engine/market_ai/ui/app.py
 ENGINE_DIR = _UI_FILE.parents[1]               # .../data_engine/market_ai
 # Repo root = parent of the top-level "data_engine" package (works for AI-Trading-Engine and older layouts)
-ROOT = (ENGINE_DIR.parents[2])
+ROOT = ENGINE_DIR.parents[1]
 PYTHON = sys.executable
 
 # Ensure repo root is on sys.path
@@ -85,6 +85,11 @@ ACTION_STATUS_FILE = STATE_DIR / "manual_action_status.json"
 PLAYBOOK_HISTORY_FILE = STATE_DIR / "playbook_history.jsonl"
 ROLLING_SUMMARY_FILE = STATE_DIR / "rolling_option_summary.json"
 SELECTOR_SUMMARY_FILE = STATE_DIR / "strategy_selector_training_summary.json"
+BROADER_STATE_DIR = ROOT / "state"
+BROADER_STATE_DIR.mkdir(parents=True, exist_ok=True)
+WEEKLY_PLAN_FILE = BROADER_STATE_DIR / "weekly_plan.json"
+WEEKLY_PLAN_SCRIPT = ROOT / "scripts" / "weekly_plan_cron.sh"
+ORDER_INTENT_FILE = STATE_DIR / "order_intents.jsonl"
 
 AGENT_LOG = STATE_DIR / "agent.log"
 SETTINGS_JSON = STATE_DIR / "agent_settings.json"
@@ -2507,11 +2512,71 @@ def _paper_pnl_tab() -> None:
                 name="Net Credit",
             ))
             fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=40))
-            st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, width="stretch")
 
     if summary:
         st.markdown("#### Latest Summary")
         st.json(summary)
+
+
+def _weekly_plan_tab() -> None:
+    st.markdown("## Weekly Plan & Intents")
+    c1, c2 = st.columns([1, 1])
+    script_path = globals().get("WEEKLY_PLAN_SCRIPT", Path("scripts/weekly_plan_cron.sh"))
+    with c1:
+        if st.button("Run weekly plan script now"):
+            if script_path.exists():
+                with st.spinner("Running weekly_plan_cron.sh ..."):
+                    result = subprocess.run(
+                        ["bash", str(script_path)],
+                        capture_output=True,
+                        text=True,
+                    )
+                if result.returncode == 0:
+                    st.success("Plan regenerated successfully.")
+                else:
+                    st.error("Script failed.")
+                    st.code(result.stderr or result.stdout or "No output")
+            else:
+                st.error(f"Script not found: {WEEKLY_PLAN_SCRIPT}")
+    with c2:
+        st.caption(f"Script path: `{script_path}`")
+        st.caption("Cron entry already calls this every Monday 08:45 local.")
+
+    fallback_plan_dir = Path(st.session_state.get("cwd_override") or ".") / "state"
+    plan_path = globals().get("WEEKLY_PLAN_FILE", fallback_plan_dir / "weekly_plan.json")
+    if plan_path.exists():
+        try:
+            plan = json.loads(plan_path.read_text())
+        except Exception as exc:
+            st.error(f"Failed to load plan: {exc}")
+            plan = None
+        if plan:
+            st.markdown("### Plan Summary")
+            summary = plan.get("summary") or {}
+            cols = st.columns(3)
+            cols[0].metric("Entries", summary.get("entries", 0))
+            cols[1].metric("Closures", summary.get("closes", 0))
+            cols[2].metric("Total Realized", f"₹{summary.get('total_realized', 0):,.0f}")
+            st.markdown("#### Config Snapshot")
+            st.json(plan.get("config", {}))
+            latest = plan.get("latest_signal")
+            if latest:
+                st.markdown("#### Latest Signal")
+                df = pd.DataFrame([latest])
+                if "expiry" in df.columns:
+                    st.caption(f"Expiry: {df.loc[0, 'expiry']}")
+                st.dataframe(df, use_container_width=True)
+    else:
+        st.info(f"No plan file yet. Expected at `{plan_path}`.")
+
+    intents = _load_recent_intents(limit=10)
+    st.markdown("### Recent Weekly Intents")
+    if intents:
+        df = pd.DataFrame(intents)
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.caption("No intents logged yet.")
 
 # =============================================================================
 # Sidebar
@@ -2595,7 +2660,7 @@ def main() -> None:
 
     _rehydrate_dw_if_needed()
 
-    tab_labels = ["Trade", "Positions", "Strategy Monitor", "Observability"]
+    tab_labels = ["Trade", "Positions", "Strategy Monitor", "Observability", "Weekly Plan"]
     show_paper = ss.get("trade_mode") == "paper"
     if show_paper:
         tab_labels.append("Paper P&L")
@@ -2623,6 +2688,10 @@ def main() -> None:
         _observability_tab()
     idx += 1
 
+    with tabs[idx]:
+        _weekly_plan_tab()
+    idx += 1
+
     if show_paper:
         with tabs[idx]:
             _paper_pnl_tab()
@@ -2637,6 +2706,26 @@ def main() -> None:
 
     # gentle pause so the UI cadence feels steady with refresh slider
     time.sleep(max(0.1, float(st.session_state.get("refresh_sec", 5))))
+
+def _load_recent_intents(limit: int = 10) -> List[Dict[str, Any]]:
+    if not ORDER_INTENT_FILE.exists():
+        return []
+    try:
+        lines = ORDER_INTENT_FILE.read_text().strip().splitlines()
+    except Exception:
+        return []
+    entries: List[Dict[str, Any]] = []
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        entries.append(payload)
+        if len(entries) >= limit:
+            break
+    return entries
 
 if __name__ == "__main__":
     main()
