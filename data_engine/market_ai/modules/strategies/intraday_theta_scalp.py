@@ -314,6 +314,8 @@ class IntradayThetaScalp:
             "inside_day": False,
             "context_state": "unknown",
             "breakout_flags": {},
+            "pattern_lock": {15: False, 30: False},
+            "prev_day_breakout": False,
         }
         if directive == "skip":
             self.state["disabled"] = True
@@ -494,7 +496,7 @@ class IntradayThetaScalp:
 
         position: Optional[PositionState] = self.state["position"]
         spot_val = self._safe_float(bar.get("spot"))
-        self._update_spot_stats(bar)
+        self._update_spot_stats(bar, local_ts, spot_val)
         self.state["_last_iv_skew"] = self._safe_float(bar.get("iv_skew"))
         self.state["_last_oi_skew"] = self._safe_float(bar.get("oi_skew"))
 
@@ -599,6 +601,12 @@ class IntradayThetaScalp:
         if sizing_loss_pause and self.state.get("daily_realized", 0.0) <= min(0.0, sizing_loss_pause):
             return False
         self.state["structure_hint"] = None
+        context = self.state.get("context_state")
+        if context in {"inside", "chop"}:
+            return False
+        pattern_lock = self.state.get("pattern_lock", {})
+        if any(pattern_lock.get(duration) for duration in (15, 30)):
+            return False
         filt = self.cfg.entry_filter
         premium_pct = self._safe_float(bar.get("combined_premium_pct"))
         if premium_pct is None or premium_pct < filt.min_premium_pct:
@@ -673,6 +681,8 @@ class IntradayThetaScalp:
         iv_skew_val = self._safe_float(bar.get("iv_skew"))
         if iv_skew_val is not None and abs(iv_skew_val) > max(0.5, filt.range_skew_max * 5):
             return False
+        if not self.state.get("prev_day_breakout", True):
+            return False
         vwap = self.state.get("spot_vwap")
         context = self.state.get("context_state", "unknown")
         if vwap and spot is not None and filt.vwap_band_pct > 0:
@@ -688,8 +698,8 @@ class IntradayThetaScalp:
             return False
         return True
 
-    def _update_spot_stats(self, bar: Dict[str, Any]) -> None:
-        spot = self._safe_float(bar.get("spot"))
+    def _update_spot_stats(self, bar: Dict[str, Any], local_ts: datetime, spot_override: Optional[float]) -> None:
+        spot = spot_override if spot_override is not None else self._safe_float(bar.get("spot"))
         if spot is None:
             return
         short_len = max(1, int(self.cfg.entry_filter.trend_lookback_min))
@@ -705,10 +715,6 @@ class IntradayThetaScalp:
 
         _append("spot_window", short_len)
         _append("spot_window_long", long_len)
-        _append("hi_window_short", max(1, ema_cfg.breakout_short_period))
-        _append("hi_window_long", max(1, ema_cfg.breakout_long_period))
-        _append("lo_window_short", max(1, ema_cfg.breakout_short_period))
-        _append("lo_window_long", max(1, ema_cfg.breakout_long_period))
 
         prev = self.state.get("_prev_spot")
         if prev is not None:
@@ -724,20 +730,118 @@ class IntradayThetaScalp:
         lo = self.state.get("intraday_low")
         self.state["intraday_high"] = max(spot, hi or spot)
         self.state["intraday_low"] = min(spot, lo or spot)
+        _append("hi_window_short", max(1, ema_cfg.breakout_short_period))
+        _append("hi_window_long", max(1, ema_cfg.breakout_long_period))
+        _append("lo_window_short", max(1, ema_cfg.breakout_short_period))
+        _append("lo_window_long", max(1, ema_cfg.breakout_long_period))
+        self._update_mtf_context(local_ts, spot)
         self._update_ema_values(spot)
+        self._update_swing_points(spot)
         prev_high = self._safe_float(bar.get("prev_day_high"))
         prev_low = self._safe_float(bar.get("prev_day_low"))
         prev_range = self._safe_float(bar.get("prev_day_range"))
+        if prev_high is None or prev_low is None:
+            self.state["prev_day_breakout"] = True
+        else:
+            buffer = spot * max(0.0, self.cfg.entry_filter.breakout_prevday_buffer_pct)
+            breakout = False
+            if spot >= prev_high + buffer or spot <= prev_low - buffer:
+                breakout = True
+            self.state["prev_day_breakout"] = self.state.get("prev_day_breakout", False) or breakout
         self.state["inside_day"] = self._compute_inside_day(prev_high, prev_low, prev_range)
         self.state["breakout_flags"] = self._compute_breakout_flags(spot, prev_high, prev_low)
         self._update_vwap(bar, spot)
         self.state["context_state"] = self._derive_context()
+        self._update_oi_snapshot(bar)
 
     def _update_ema_values(self, spot: float) -> None:
         ema_cfg = self.cfg.ema
         self.state["ema_fast"] = self._ema_next(self.state.get("ema_fast"), spot, ema_cfg.fast_period)
         self.state["ema_mid"] = self._ema_next(self.state.get("ema_mid"), spot, ema_cfg.mid_period)
         self.state["ema_slow"] = self._ema_next(self.state.get("ema_slow"), spot, ema_cfg.slow_period)
+
+    def _update_mtf_context(self, local_ts: datetime, spot: float) -> None:
+        durations = (15, 30)
+        trackers = self.state.setdefault("mtf_trackers", {})
+        pattern_flags = self.state.setdefault("pattern_flags", {})
+        lock_state = self.state.setdefault("pattern_lock", {15: False, 30: False})
+        for duration in durations:
+            tracker = trackers.get(duration, {"current": None, "history": []})
+            block_start = local_ts.replace(minute=(local_ts.minute // duration) * duration, second=0, microsecond=0)
+            current = tracker.get("current")
+            if current is None or current.get("start") != block_start:
+                if current:
+                    history = tracker.get("history", [])
+                    history.append(current)
+                    history = history[-2:]
+                    tracker["history"] = history
+                    if len(history) >= 2:
+                        prev = history[-1]
+                        prev_prev = history[-2]
+                        inside = prev["high"] <= prev_prev["high"] and prev["low"] >= prev_prev["low"]
+                        outside = prev["high"] >= prev_prev["high"] and prev["low"] <= prev_prev["low"]
+                        break_up = prev["high"] > prev_prev["high"]
+                        break_down = prev["low"] < prev_prev["low"]
+                        pattern_info = {
+                            "inside": inside,
+                            "outside": outside,
+                            "break_up": break_up,
+                            "break_down": break_down,
+                        }
+                        pattern_flags[duration] = pattern_info
+                        if inside:
+                            lock_state[duration] = True
+                        elif break_up or break_down or outside:
+                            lock_state[duration] = False
+                tracker["current"] = {"start": block_start, "high": spot, "low": spot}
+            else:
+                current["high"] = max(current["high"], spot)
+                current["low"] = min(current["low"], spot)
+            trackers[duration] = tracker
+
+    def _update_swing_points(self, spot: float) -> None:
+        window = self.state.get("swing_window", [])
+        window.append(spot)
+        if len(window) > 7:
+            window = window[-7:]
+        self.state["swing_window"] = window
+        if len(window) < 5:
+            return
+        values = window[-5:]
+        mid = values[2]
+        left = values[:2]
+        right = values[3:]
+        if mid >= max(left + right):
+            self.state["last_swing"] = {"type": "high", "value": mid}
+        elif mid <= min(left + right):
+            self.state["last_swing"] = {"type": "low", "value": mid}
+
+    def _update_oi_snapshot(self, bar: Dict[str, Any]) -> None:
+        call_strike = self._safe_float(bar.get("call_oi_max_strike"))
+        put_strike = self._safe_float(bar.get("put_oi_max_strike"))
+        call_oi = self._safe_float(bar.get("call_oi_max"))
+        put_oi = self._safe_float(bar.get("put_oi_max"))
+        prev_call = self.state.get("_prev_call_oi")
+        prev_put = self.state.get("_prev_put_oi")
+        call_delta = (call_oi - prev_call) if (call_oi is not None and prev_call is not None) else 0.0
+        put_delta = (put_oi - prev_put) if (put_oi is not None and prev_put is not None) else 0.0
+        bias = None
+        threshold = 2000.0
+        if call_delta > threshold and put_delta < threshold / 2:
+            bias = "call_build"
+        elif put_delta > threshold and call_delta < threshold / 2:
+            bias = "put_build"
+        elif call_delta > threshold and put_delta > threshold:
+            bias = "range_build"
+        self.state["_prev_call_oi"] = call_oi
+        self.state["_prev_put_oi"] = put_oi
+        self.state["oi_bias"] = bias
+        self.state["last_oi_snapshot"] = {
+            "call_strike": call_strike,
+            "put_strike": put_strike,
+            "call_oi": call_oi,
+            "put_oi": put_oi,
+        }
 
     def _update_vwap(self, bar: Dict[str, Any], spot: float) -> None:
         call_vol = self._safe_float(bar.get("atm_call_volume"), 0.0) or 0.0
@@ -834,6 +938,21 @@ class IntradayThetaScalp:
         if atr_norm <= filt.atr_vol_threshold * 0.7:
             return "range"
         return "chop"
+
+    def _oi_range_ready(self) -> bool:
+        info = self.state.get("last_oi_snapshot") or {}
+        spot = self.state.get("_prev_spot")
+        call_strike = info.get("call_strike")
+        put_strike = info.get("put_strike")
+        bias = self.state.get("oi_bias")
+        if bias != "range_build":
+            return False
+        if spot is None or call_strike is None or put_strike is None:
+            return False
+        distance_call = abs(call_strike - spot) / max(spot, 1.0)
+        distance_put = abs(spot - put_strike) / max(spot, 1.0)
+        band = max(0.0075, self.cfg.entry_filter.spot_atm_band * 2.5)
+        return distance_call >= band and distance_put >= band
 
     def _spot_trend(self, window_name: str = "spot_window") -> Optional[float]:
         window = self.state.get(window_name) or []
@@ -949,6 +1068,10 @@ class IntradayThetaScalp:
         if atr_norm > filt.atr_vol_threshold:
             return False
 
+        pattern_ok = self._pattern_confirm("up" if regime == "trend_up" else "down")
+        if not pattern_ok:
+            return False
+
         if regime == "trend_up":
             return (
                 slope_short >= trigger
@@ -969,16 +1092,69 @@ class IntradayThetaScalp:
             )
         return False
 
+    def _pattern_confirm(self, direction: str) -> bool:
+        flags_map = self.state.get("pattern_flags", {})
+        if direction == "up":
+            desired_break_key = "break_up"
+        elif direction == "down":
+            desired_break_key = "break_down"
+        else:
+            desired_break_key = None
+        durations = (15, 30)
+        for duration in durations:
+            flags = flags_map.get(duration) or {}
+            if direction == "range":
+                if flags.get("inside") is False and flags.get("outside"):
+                    return True
+                continue
+            if flags.get(desired_break_key) or flags.get("outside"):
+                return True
+        last_swing = self.state.get("last_swing")
+        spot = self.state.get("_prev_spot")
+        if last_swing and spot is not None:
+            if direction == "up" and last_swing.get("type") == "high" and spot >= last_swing.get("value", spot):
+                return True
+            if direction == "down" and last_swing.get("type") == "low" and spot <= last_swing.get("value", spot):
+                return True
+            if direction == "range" and last_swing.get("type") in {"high", "low"}:
+                tolerance = 0.0008 * max(spot, 1.0)
+                if abs(spot - last_swing.get("value", spot)) <= tolerance:
+                    return True
+        return False
+
     def _determine_structure(self) -> Optional[str]:
         if self.state.get("event_directive") == "reduce":
             return "STRANGLE"
         if self.state.get("inside_day"):
-            return "STRANGLE"
+            return None
+        context = self.state.get("context_state")
+        if context == "trend_up":
+            if self._directional_confirm("trend_up"):
+                return "BULL_PUT_SPREAD"
+            return "STRANGLE" if self._pattern_confirm("up") else None
+        if context == "trend_down":
+            if self._directional_confirm("trend_down"):
+                return "BEAR_CALL_SPREAD"
+            return "STRANGLE" if self._pattern_confirm("down") else None
+        if context == "range":
+            if self._oi_range_ready():
+                return "IRON_CONDOR"
+            return "STRANGLE" if self._pattern_confirm("range") else None
+        if context == "chop":
+            return None
         hint = self.state.get("structure_hint")
+        oi_pressure = self.state.get("oi_bias")
+        if not hint:
+            if oi_pressure == "call_build":
+                hint = "resistance"
+            elif oi_pressure == "put_build":
+                hint = "support"
         if hint == "resistance":
             return "BEAR_CALL_SPREAD" if self._directional_confirm("trend_down") else "STRANGLE"
         if hint == "support":
             return "BULL_PUT_SPREAD" if self._directional_confirm("trend_up") else "STRANGLE"
+        if oi_pressure == "range_build" and self._oi_range_ready():
+            return "IRON_CONDOR"
         regime = self._infer_regime()
         if regime == "trend_up":
             return "BULL_PUT_SPREAD" if self._directional_confirm(regime) else "STRANGLE"

@@ -1,0 +1,37 @@
+{
+  "config": {
+    "lot_size": 50,
+    "qty": 2,
+    "entry_day": 0,
+    "exit_day": 3,
+    "entry_rules": {
+      "min_premium_pct": 0.016,
+      "min_prev_range_pct": 0.005,
+      "max_prev_range_pct": 0.05,
+      "demand_prev_break": false
+    },
+    "targets": {
+      "pnl_target": 4000.0,
+      "pnl_stop": 4000.0,
+      "trailing_lock_pct": 0.25,
+      "hard_exit_day": 3,
+      "max_hold_days": 5
+    },
+    "structure": "STRANGLE",
+    "wing_offset": 5,
+    "hybrid_enabled": true,
+    "trend_range_threshold": 0.02,
+    "condor_range_threshold": 0.015,
+    "oi_distance_pct": 0.015,
+    "event_calendar_path": "data_engine/market_ai/state/events.json",
+    "skip_event_severities": [
+      "high"
+    ]
+  },
+  "summary": {
+    "entries": 59,
+    "closes": 59,
+    "total_realized": 328015.0,
+    "avg_per_trade": 5559.576271186441
+  }
+}
