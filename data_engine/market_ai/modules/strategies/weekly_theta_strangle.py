@@ -30,6 +30,7 @@ class EntryRules:
     max_prev_range_pct: float = 0.035
     min_prev_range_pct: float = 0.01
     demand_prev_break: bool = True
+    min_days_to_target_expiry: int = 0
 
 
 @dataclass
@@ -58,6 +59,7 @@ class WeeklyConfig:
     oi_distance_pct: float = 0.01
     event_calendar_path: Optional[str] = "data_engine/market_ai/state/events.json"
     skip_event_severities: Tuple[str, ...] = ("high",)
+    expiry_offset_weeks: int = 0
 
 
 @dataclass
@@ -75,6 +77,7 @@ class WeeklyPosition:
     long_call_strike: Optional[float] = None
     long_put_strike: Optional[float] = None
     best_pnl: float = 0.0
+    target_expiry: Optional[pd.Timestamp] = None
 
     def entry_credit(self) -> float:
         credit = (self.entry_call + self.entry_put) - (self.long_call_entry + self.long_put_entry)
@@ -132,7 +135,9 @@ class WeeklyThetaStrangle:
         legs = self._resolve_entry_legs(row, structure)
         if legs is None:
             return
-        expiry = row.get("expiryDate") or row.get("expiry_date")
+        expiry, days_to = self._target_expiry_info(row)
+        if expiry is None:
+            return
         pos = WeeklyPosition(
             entry_date=pd.to_datetime(row["timestamp"]),
             entry_call=legs["short_call"],
@@ -146,6 +151,7 @@ class WeeklyThetaStrangle:
             short_put_strike=legs.get("short_put_strike"),
             long_call_strike=legs.get("long_call_strike"),
             long_put_strike=legs.get("long_put_strike"),
+            target_expiry=pd.to_datetime(expiry),
         )
         self.position = pos
         self.trades.append(
@@ -161,6 +167,8 @@ class WeeklyThetaStrangle:
                 "long_call_strike": pos.long_call_strike,
                 "long_put_strike": pos.long_put_strike,
                 "expiry": expiry.isoformat() if hasattr(expiry, "isoformat") else expiry,
+                "target_days": days_to,
+                "expiry_mode": "NEXT_WEEK" if self.cfg.expiry_offset_weeks else "FRONT_WEEK",
                 "structure": pos.structure,
                 "notes": "weekly_entry",
             }
@@ -216,6 +224,12 @@ class WeeklyThetaStrangle:
                 day_low = day_rows["spot"].min()
                 if not ((day_high >= (prev_high + buffer)) or (day_low <= (prev_low - buffer))):
                     return False
+        expiry, days_to = self._target_expiry_info(row)
+        min_days = getattr(rules, "min_days_to_target_expiry", 0)
+        if expiry is None:
+            return False
+        if min_days and (days_to is None or days_to < min_days):
+            return False
         if not self._event_allowed(pd.to_datetime(row["timestamp"]).date()):
             return False
         return True
@@ -284,6 +298,28 @@ class WeeklyThetaStrangle:
         legs["long_call"] = float(long_call) if not pd.isna(long_call) else 0.0
         legs["long_put"] = float(long_put) if not pd.isna(long_put) else 0.0
         return legs
+
+    def _target_expiry_info(self, row: pd.Series) -> Tuple[Optional[pd.Timestamp], Optional[float]]:
+        base_expiry = pd.to_datetime(row.get("expiryDate"), errors="coerce") if "expiryDate" in row else None
+        base_days = row.get("days_to_expiry")
+        offset = max(0, int(self.cfg.expiry_offset_weeks))
+        target_expiry = base_expiry
+        target_days = float(base_days) if base_days is not None and not pd.isna(base_days) else None
+        if offset > 0:
+            if offset == 1 and "next_week_expiry" in row:
+                next_expiry = pd.to_datetime(row.get("next_week_expiry"), errors="coerce")
+                if next_expiry is not None and not pd.isna(next_expiry):
+                    target_expiry = next_expiry
+                next_days = row.get("days_to_next_expiry")
+                if next_days is not None and not pd.isna(next_days):
+                    target_days = float(next_days)
+            if (target_expiry is None or pd.isna(target_expiry)) and base_expiry is not None and not pd.isna(base_expiry):
+                target_expiry = base_expiry + pd.to_timedelta(7 * offset, unit="D")
+            if (target_days is None) and base_days is not None and not pd.isna(base_days):
+                target_days = float(base_days) + 7 * offset
+        if target_expiry is not None and pd.isna(target_expiry):
+            target_expiry = None
+        return target_expiry, target_days
 
     def _event_allowed(self, current_date: datetime.date) -> bool:
         if not self._event_calendar:
@@ -369,6 +405,12 @@ def run_backtest(df: pd.DataFrame, cfg_dict: Optional[Any] = None) -> Tuple[pd.D
     strat = WeeklyThetaStrangle(cfg)
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"])
+    for col in ("expiryDate", "next_week_expiry"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    for col in ("days_to_expiry", "days_to_next_expiry"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     if "source_date" in df.columns:
         df["trade_date"] = pd.to_datetime(df["source_date"]).dt.date
     else:

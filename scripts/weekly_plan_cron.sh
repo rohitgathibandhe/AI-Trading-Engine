@@ -38,6 +38,8 @@ python3 data_engine/market_ai/scripts/generate_weekly_plan.py \
     --wing-offset 4 \
     --trend-threshold 0.02 \
     --condor-threshold 0.012 \
-    --oi-distance 0.012
+    --oi-distance 0.012 \
+    --expiry-offset 1 \
+    --min-days-to-expiry 4
 
 echo "[weekly-plan] done – plan written to ${PLAN_PATH}"

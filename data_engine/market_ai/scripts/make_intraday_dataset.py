@@ -13,13 +13,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
 import pandas as pd
+import os
 
 TIMEZONE = "Asia/Kolkata"
+WEEKLY_EXPIRY_WEEKDAY = int(os.environ.get("MARKET_AI_WEEKLY_EXPIRY_WEEKDAY", "1"))  # 0=Mon
 CALL_ALIASES = {"CALL", "CE"}
 PUT_ALIASES = {"PUT", "PE"}
 
@@ -41,6 +44,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=Path("reports/intraday_from_rolling.csv"))
     parser.add_argument("--tz", default=TIMEZONE, help="Timezone for timestamps.")
     return parser.parse_args()
+
+
+def _weekly_expiry_for(trade_day: datetime, target_weekday: int = WEEKLY_EXPIRY_WEEKDAY) -> datetime:
+    """Return the first target_weekday on/after trade_day."""
+    date_only = trade_day.date()
+    weekday = date_only.weekday()
+    delta = (target_weekday - weekday) % 7
+    return datetime.combine(date_only + timedelta(days=delta), datetime.min.time())
 
 
 def _clean_option_type(value: str) -> Optional[str]:
@@ -164,6 +175,35 @@ def process_day(day_dir: Path, selectors: List[str], tz: str) -> Optional[pd.Dat
     merged = pd.merge(merged, call_top, on="timestamp", how="left")
     merged = pd.merge(merged, put_top, on="timestamp", how="left")
     merged = merged.sort_values("timestamp")
+
+    expiry_map = (
+        df[["timestamp", "expiryDate"]]
+        .dropna(subset=["expiryDate"])
+        .drop_duplicates("timestamp", keep="last")
+    )
+    if expiry_map.empty:
+        expiry_hint = df["expiryDate"].dropna().head(1)
+        if not expiry_hint.empty:
+            expiry_map = pd.DataFrame(
+                {"timestamp": merged["timestamp"], "expiryDate": expiry_hint.iloc[0]}
+            )
+    if not expiry_map.empty:
+        expiry_map["expiryDate"] = pd.to_datetime(expiry_map["expiryDate"], errors="coerce")
+        merged = pd.merge(merged, expiry_map, on="timestamp", how="left")
+    else:
+        merged["expiryDate"] = pd.NaT
+    merged["expiryDate"] = pd.to_datetime(merged["expiryDate"], errors="coerce")
+    if merged["expiryDate"].isna().all():
+        trade_day = datetime.strptime(day_dir.name, "%Y-%m-%d")
+        inferred = _weekly_expiry_for(trade_day)
+        merged["expiryDate"] = pd.Timestamp(inferred)
+    ts_naive = merged["timestamp"].dt.tz_localize(None)
+    expiry_naive = merged["expiryDate"]
+    merged["days_to_expiry"] = (expiry_naive.dt.normalize() - ts_naive.dt.normalize()).dt.days
+    merged["next_week_expiry"] = merged["expiryDate"] + pd.Timedelta(days=7)
+    merged["days_to_next_expiry"] = (
+        (merged["next_week_expiry"].dt.normalize() - ts_naive.dt.normalize()).dt.days
+    )
     merged["combined_premium_pct"] = (merged["atm_call_ltp"] + merged["atm_put_ltp"]) / merged["spot"].replace(0, np.nan)
     merged["iv_rank"] = _iv_rank(merged["atm_call_iv"])
     merged["iv_skew"] = _skew(merged["atm_call_iv"], merged["atm_put_iv"])

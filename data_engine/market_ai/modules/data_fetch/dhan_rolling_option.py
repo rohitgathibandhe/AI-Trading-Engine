@@ -34,6 +34,7 @@ DEFAULT_REQUIRED_DATA: tuple[str, ...] = (
     "spot",
     "strike",
     "timestamp",
+    "expiryDate",
 )
 
 

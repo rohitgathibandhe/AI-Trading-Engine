@@ -43,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--condor-threshold", type=float, default=0.012)
     parser.add_argument("--oi-distance", type=float, default=0.012)
     parser.add_argument("--event-calendar", type=Path, default=Path("data_engine/market_ai/state/events.json"))
+    parser.add_argument("--expiry-offset", type=int, default=0, help="0 = front weekly, 1 = next weekly, etc.")
+    parser.add_argument("--min-days-to-expiry", type=int, default=0, help="Require at least N days to target expiry.")
     return parser.parse_args()
 
 
@@ -54,6 +56,7 @@ def main() -> None:
         "entry_rules": {
             "min_prev_range_pct": args.min_prev_range,
             "max_prev_range_pct": args.max_prev_range,
+            "min_days_to_target_expiry": args.min_days_to_expiry,
         },
         "targets": {
             "pnl_target": args.pnl_target,
@@ -66,6 +69,7 @@ def main() -> None:
         "condor_range_threshold": args.condor_threshold,
         "oi_distance_pct": args.oi_distance,
         "event_calendar_path": str(args.event_calendar) if args.event_calendar else None,
+        "expiry_offset_weeks": args.expiry_offset,
     }
     trades_df, summary = run_backtest(df, cfg)
     plan = {

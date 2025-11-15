@@ -58,6 +58,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--oi-distance", type=float, default=0.01, help="Min distance (pct) from spot to OI walls for condor.")
     parser.add_argument("--event-calendar", type=Path, default=Path("data_engine/market_ai/state/events.json"), help="Event calendar JSON.")
     parser.add_argument("--skip-severities", default="high", help="Comma separated event severities to skip.")
+    parser.add_argument("--expiry-offset-weeks", type=int, default=0, help="0 = front weekly, 1 = next weekly, etc.")
+    parser.add_argument("--min-days-to-expiry", type=int, default=0, help="Require at least N days to target expiry.")
     parser.add_argument("--emit-plan", type=Path, help="Optional JSON file to emit plan summary.")
     return parser.parse_args()
 
@@ -70,6 +72,7 @@ def main() -> None:
         "min_prev_range_pct": args.min_prev_range,
         "max_prev_range_pct": args.max_prev_range,
         "demand_prev_break": args.demand_prev_break,
+        "min_days_to_target_expiry": args.min_days_to_expiry,
     }
     targets: Dict[str, Any] = {
         "pnl_target": args.pnl_target,
@@ -93,6 +96,7 @@ def main() -> None:
         "oi_distance_pct": args.oi_distance,
         "event_calendar_path": str(args.event_calendar) if args.event_calendar else None,
         "skip_event_severities": tuple(s.strip() for s in args.skip_severities.split(",") if s.strip()),
+        "expiry_offset_weeks": args.expiry_offset_weeks,
     }
 
     trades_df, summary = run_backtest(df, cfg)
