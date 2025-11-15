@@ -58,6 +58,11 @@ def _iv_rank(series: pd.Series) -> pd.Series:
     return (clean - min_val) / (max_val - min_val)
 
 
+def _skew(a: pd.Series, b: pd.Series) -> pd.Series:
+    denom = (a.abs() + b.abs()).replace(0, np.nan)
+    return (a - b) / denom
+
+
 def process_day(day_dir: Path, selector: str, tz: str) -> pd.DataFrame:
     parquet_path = day_dir / "rolling_option.parquet"
     if not parquet_path.exists():
@@ -76,12 +81,16 @@ def process_day(day_dir: Path, selector: str, tz: str) -> pd.DataFrame:
         "ltp": "atm_call_ltp",
         "delta": "atm_call_delta",
         "iv": "atm_call_iv",
+        "oi": "atm_call_oi",
+        "volume": "atm_call_volume",
     }
     put_cols = {
         "strikePrice": "atm_put_strike",
         "ltp": "atm_put_ltp",
         "delta": "atm_put_delta",
         "iv": "atm_put_iv",
+        "oi": "atm_put_oi",
+        "volume": "atm_put_volume",
     }
 
     calls = df.loc[df["optionTypeNorm"] == "CALL", ["timestamp", "spot", *call_cols.keys()]].rename(columns=call_cols)
@@ -91,6 +100,12 @@ def process_day(day_dir: Path, selector: str, tz: str) -> pd.DataFrame:
     merged = merged.sort_values("timestamp")
     merged["combined_premium_pct"] = (merged["atm_call_ltp"] + merged["atm_put_ltp"]) / merged["spot"].replace(0, np.nan)
     merged["iv_rank"] = _iv_rank(merged["atm_call_iv"])
+    merged["iv_skew"] = _skew(merged["atm_call_iv"], merged["atm_put_iv"])
+    merged["oi_skew"] = _skew(merged["atm_call_oi"], merged["atm_put_oi"])
+    merged["volume_skew"] = _skew(
+        merged["atm_call_volume"].replace(0, np.nan),
+        merged["atm_put_volume"].replace(0, np.nan),
+    )
     merged["source_date"] = day_dir.name
     return merged
 
@@ -124,4 +139,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

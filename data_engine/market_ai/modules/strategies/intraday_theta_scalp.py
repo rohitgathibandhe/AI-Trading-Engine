@@ -67,18 +67,28 @@ class DailyTargetConfig:
     trail_pct: float = 0.25              # give-back allowed once target hit (25% of peak)
     hard_loss_per_day: float = 5_000.0   # flatten + disable after this loss
     flatten_time: time = time(15, 10)    # final exit command, done by 15:15
+    second_target_mult: float = 1.5      # second target = min_profit * mult
+    lock_in_pct: float = 0.15            # once second target hit, keep at least 15%
 
 
 @dataclass
 class EntryFilterConfig:
     min_iv_rank: float = 0.20
     max_iv_rank: float = 0.80
-    min_premium_pct: float = 0.018       # combined call+put / spot
-    trend_lookback_min: int = 15         # minutes for VWAP/EMA slope checks (reserved)
-    spot_atm_band: float = 0.003         # +/- band to define “ATM” for straddle entries
+    min_premium_pct: float = 0.016       # combined call+put / spot
+    trend_lookback_min: int = 15         # minutes for VWAP/EMA slope checks
+    trend_long_lookback_min: int = 45
+    spot_atm_band: float = 0.003
     max_abs_delta: float = 0.80
-    max_trend_pct: float = 0.002         # reject entries if |spot - MA| / MA exceeds
-    max_trend_slope: float = 0.0005      # reject entries if MA slope (per bar) exceeds
+    max_trend_pct: float = 0.002
+    max_trend_slope: float = 0.0005
+    directional_slope_trigger: float = 0.0007
+    range_slope_threshold: float = 0.00015
+    atr_vol_threshold: float = 0.0025
+    iv_skew_trend: float = 0.08
+    oi_skew_trend: float = 0.08
+    range_skew_max: float = 0.04
+    support_res_pct: float = 0.001
     enable_directional_overrides: bool = True
 
 
@@ -99,11 +109,11 @@ class IntradayConfig:
     warn_only: bool = False
     notes: Optional[str] = None
     timezone: str = "Asia/Kolkata"
-    max_entries_per_day: int = 2
+    max_entries_per_day: int = 3
     risk_stop_pct: float = 0.35          # exit if debit >= entry_credit * (1 + risk_stop_pct)
-    per_leg_stop_pct: float = 0.40       # exit if any leg loses 40% vs entry
+    per_leg_stop_pct: float = 0.30       # exit if any leg loses 30% vs entry
     max_hold_minutes: int = 90
-    hedge_spot_pct: float = 0.004        # add hedge when |spot-entry| >= this %
+    hedge_spot_pct: float = 0.0035        # add hedge when |spot-entry| >= this %
     hedge_cost_fixed: float = 250.0
     max_hedges_per_trade: int = 1
 
@@ -117,12 +127,28 @@ class PositionState:
     lot_size: int
     entry_spot: Optional[float]
     hedges: int = 0
+    call_active: bool = True
+    put_active: bool = True
+    structure: str = "STRANGLE"
+    best_equity: float = 0.0
+    hit_first_target: bool = False
+    hit_second_target: bool = False
 
     def entry_credit(self) -> float:
-        return (self.entry_call + self.entry_put) * self.qty * self.lot_size
+        credit = 0.0
+        if self.call_active:
+            credit += self.entry_call
+        if self.put_active:
+            credit += self.entry_put
+        return credit * self.qty * self.lot_size
 
     def current_debit(self, call_ltp: float, put_ltp: float) -> float:
-        return (call_ltp + put_ltp) * self.qty * self.lot_size
+        debit = 0.0
+        if self.call_active:
+            debit += call_ltp
+        if self.put_active:
+            debit += put_ltp
+        return debit * self.qty * self.lot_size
 
     def unrealized(self, call_ltp: float, put_ltp: float) -> float:
         return self.entry_credit() - self.current_debit(call_ltp, put_ltp)
@@ -158,7 +184,13 @@ class IntradayThetaScalp:
             "events": [],
             "entries": 0,
             "spot_window": [],
+            "spot_window_long": [],
+            "atr_window": [],
+            "intraday_high": None,
+            "intraday_low": None,
             "equity_curve": [],
+            "_prev_spot": None,
+            "last_regime": "unknown",
         }
 
     @staticmethod
@@ -193,27 +225,34 @@ class IntradayThetaScalp:
                 return True
         return False
 
-    def _open_position(self, ts: datetime, bar: Dict[str, Any]) -> Dict[str, Any]:
+    def _open_position(self, ts: datetime, bar: Dict[str, Any], structure: str) -> Dict[str, Any]:
         qty = 1  # TODO: sizing logic
+        call_active = structure != "SHORT_PUT"
+        put_active = structure != "SHORT_CALL"
+        call_entry = float(bar["atm_call_ltp"]) if call_active else 0.0
+        put_entry = float(bar["atm_put_ltp"]) if put_active else 0.0
         pos = PositionState(
             entry_time=ts,
-            entry_call=float(bar["atm_call_ltp"]),
-            entry_put=float(bar["atm_put_ltp"]),
+            entry_call=call_entry,
+            entry_put=put_entry,
             qty=qty,
             lot_size=self.cfg.lot_size,
             entry_spot=self._safe_float(bar.get("spot")),
+            call_active=call_active,
+            put_active=put_active,
+            structure=structure,
         )
         self.state["position"] = pos
         self.state["entries"] = self.state.get("entries", 0) + 1
         event = {
             "action": "OPEN",
-            "side": "SHORT_STRADDLE",
+            "side": structure,
             "timestamp": ts,
             "call_strike": bar.get("atm_call_strike"),
             "put_strike": bar.get("atm_put_strike"),
             "call_ltp": pos.entry_call,
             "put_ltp": pos.entry_put,
-            "notes": "auto-entry",
+            "notes": f"auto-entry|regime={self.state.get('last_regime')}",
         }
         return event
 
@@ -232,6 +271,7 @@ class IntradayThetaScalp:
             "call_ltp": call,
             "put_ltp": put,
             "realized": realized,
+            "structure": pos.structure,
         }
         return event
 
@@ -263,14 +303,19 @@ class IntradayThetaScalp:
         call_ltp = float(bar["atm_call_ltp"])
         put_ltp = float(bar["atm_put_ltp"])
         spot_val = self._safe_float(bar.get("spot"))
-        self._append_spot_window(spot_val)
+        self._update_spot_stats(spot_val)
+        self.state["_last_iv_skew"] = self._safe_float(bar.get("iv_skew"))
+        self.state["_last_oi_skew"] = self._safe_float(bar.get("oi_skew"))
 
         if position is None:
             if self.state["entries"] >= self.cfg.max_entries_per_day:
                 return events
             if not self._entry_allowed(bar):
                 return events
-            event = self._open_position(local_ts, bar)
+            structure = self._determine_structure()
+            if not structure:
+                return events
+            event = self._open_position(local_ts, bar, structure)
             self.state["events"].append(event)
             events.append(event)
             return events
@@ -280,18 +325,31 @@ class IntradayThetaScalp:
         self.state["daily_peak_pnl"] = max(self.state["daily_peak_pnl"], equity)
         self._record_equity(local_ts, equity)
 
+        position.best_equity = max(position.best_equity, equity)
+        daily_cfg = self.cfg.daily_target
+        first_target = daily_cfg.min_profit
+        second_target = first_target * max(1.0, daily_cfg.second_target_mult)
+        if equity >= first_target:
+            position.hit_first_target = True
+        if equity >= second_target:
+            position.hit_second_target = True
+
         hedge_event = self._maybe_add_hedge(local_ts, position, spot_val)
         if hedge_event:
             events.append(hedge_event)
 
         daily_cfg = self.cfg.daily_target
-        trail_floor = self.state["daily_peak_pnl"] * (1 - daily_cfg.trail_pct)
         flatten_time = daily_cfg.flatten_time
         reasons: List[str] = []
 
-        if equity >= daily_cfg.min_profit:
-            self.state["target_triggered"] = True
-        if self.state["target_triggered"] and equity <= trail_floor:
+        self.state["target_triggered"] = position.hit_first_target
+        dynamic_floor: Optional[float] = None
+        if position.hit_first_target:
+            dynamic_floor = position.best_equity * (1 - daily_cfg.trail_pct)
+        if position.hit_second_target:
+            lock_floor = position.best_equity * (1 - daily_cfg.lock_in_pct)
+            dynamic_floor = max(dynamic_floor or lock_floor, lock_floor)
+        if dynamic_floor is not None and equity <= dynamic_floor:
             reasons.append("trail")
         if equity <= -daily_cfg.hard_loss_per_day:
             reasons.append("daily_loss")
@@ -302,10 +360,15 @@ class IntradayThetaScalp:
         if stop_pct > 0 and position.current_debit(call_ltp, put_ltp) >= position.entry_credit() * (1 + stop_pct):
             reasons.append("risk_stop")
         per_leg_stop = max(0.0, float(self.cfg.per_leg_stop_pct))
-        if per_leg_stop > 0 and (
-            call_ltp >= position.entry_call * (1 + per_leg_stop)
-            or put_ltp >= position.entry_put * (1 + per_leg_stop)
-        ):
+        leg_stop_hit = False
+        if per_leg_stop > 0:
+            if position.call_active and position.entry_call > 0:
+                if call_ltp >= position.entry_call * (1 + per_leg_stop):
+                    leg_stop_hit = True
+            if position.put_active and position.entry_put > 0:
+                if put_ltp >= position.entry_put * (1 + per_leg_stop):
+                    leg_stop_hit = True
+        if leg_stop_hit:
             reasons.append("leg_stop")
         if self.cfg.max_hold_minutes > 0:
             minutes_open = (local_ts - position.entry_time).total_seconds() / 60.0
@@ -313,10 +376,14 @@ class IntradayThetaScalp:
                 reasons.append("max_hold")
 
         if reasons:
-            event = self._close_position(local_ts, bar, reason="|".join(reasons))
+            reason_str = "|".join(reasons)
+            event = self._close_position(local_ts, bar, reason=reason_str)
             self.state["events"].append(event)
             events.append(event)
-            self.state["disabled"] = True
+            if "daily_loss" in reasons or local_ts.time() >= flatten_time:
+                self.state["disabled"] = True
+            elif self.state.get("entries", 0) >= self.cfg.max_entries_per_day:
+                self.state["disabled"] = True
 
         return events
 
@@ -342,26 +409,60 @@ class IntradayThetaScalp:
         slope = self._spot_slope()
         if slope is not None and abs(slope) > filt.max_trend_slope:
             return False
+        atr_norm = self._spot_atr()
+        if atr_norm is not None and atr_norm > filt.atr_vol_threshold:
+            return False
+        hi = self.state.get("intraday_high")
+        lo = self.state.get("intraday_low")
+        spot = self._safe_float(bar.get("spot"))
+        if spot is not None and hi is not None and lo is not None and hi != lo:
+            buffer = filt.support_res_pct * spot
+            if abs(spot - hi) <= buffer or abs(spot - lo) <= buffer:
+                return False
+        iv_skew_val = self._safe_float(bar.get("iv_skew"))
+        if iv_skew_val is not None and abs(iv_skew_val) > max(0.5, filt.range_skew_max * 5):
+            return False
         return True
 
-    def _append_spot_window(self, spot: Optional[float]) -> None:
+    def _update_spot_stats(self, spot: Optional[float]) -> None:
         if spot is None:
             return
-        window = self.state.get("spot_window", [])
-        window.append(spot)
-        max_len = max(1, int(self.cfg.entry_filter.trend_lookback_min))
-        if len(window) > max_len:
-            window = window[-max_len:]
-        self.state["spot_window"] = window
+        short_len = max(1, int(self.cfg.entry_filter.trend_lookback_min))
+        long_len = max(short_len, int(self.cfg.entry_filter.trend_long_lookback_min))
 
-    def _spot_trend(self) -> Optional[float]:
-        window = self.state.get("spot_window") or []
+        def _append(name: str, length: int) -> None:
+            buf = self.state.get(name, [])
+            buf.append(spot)
+            if len(buf) > length:
+                buf = buf[-length:]
+            self.state[name] = buf
+
+        _append("spot_window", short_len)
+        _append("spot_window_long", long_len)
+
+        prev = self.state.get("_prev_spot")
+        if prev is not None:
+            tr = abs(spot - prev)
+            atr_window = self.state.get("atr_window", [])
+            atr_window.append(tr)
+            if len(atr_window) > short_len:
+                atr_window = atr_window[-short_len:]
+            self.state["atr_window"] = atr_window
+        self.state["_prev_spot"] = spot
+
+        hi = self.state.get("intraday_high")
+        lo = self.state.get("intraday_low")
+        self.state["intraday_high"] = max(spot, hi or spot)
+        self.state["intraday_low"] = min(spot, lo or spot)
+
+    def _spot_trend(self, window_name: str = "spot_window") -> Optional[float]:
+        window = self.state.get(window_name) or []
         if not window:
             return None
         return sum(window) / len(window)
 
-    def _spot_slope(self) -> Optional[float]:
-        window = self.state.get("spot_window") or []
+    def _spot_slope(self, window_name: str = "spot_window") -> Optional[float]:
+        window = self.state.get(window_name) or []
         if len(window) < 2:
             return None
         first, last = window[0], window[-1]
@@ -369,6 +470,16 @@ class IntradayThetaScalp:
             return None
         steps = max(len(window) - 1, 1)
         return (last - first) / abs(first) / steps
+
+    def _spot_atr(self) -> Optional[float]:
+        atr_window = self.state.get("atr_window") or []
+        if not atr_window:
+            return None
+        spot_window = self.state.get("spot_window") or []
+        spot = spot_window[-1] if spot_window else None
+        if spot in (None, 0):
+            return None
+        return (sum(atr_window) / len(atr_window)) / abs(spot)
 
     def _maybe_add_hedge(
         self,
@@ -398,6 +509,54 @@ class IntradayThetaScalp:
         }
         self.state["events"].append(hedge_event)
         return hedge_event
+
+    def _infer_regime(self) -> str:
+        filt = self.cfg.entry_filter
+        slope_short = self._spot_slope("spot_window") or 0.0
+        slope_long = self._spot_slope("spot_window_long") or 0.0
+        atr_norm = self._spot_atr() or 0.0
+        iv_skew = self._safe_float(self.state.get("_last_iv_skew"), 0.0) or 0.0
+        oi_skew = self._safe_float(self.state.get("_last_oi_skew"), 0.0) or 0.0
+
+        if atr_norm > filt.atr_vol_threshold * 1.5:
+            regime = "volatile"
+            self.state["last_regime"] = regime
+            return regime
+
+        trigger = filt.directional_slope_trigger
+        skew_trigger_iv = filt.iv_skew_trend
+        skew_trigger_oi = filt.oi_skew_trend
+
+        if slope_short >= trigger or slope_long >= trigger or iv_skew >= skew_trigger_iv or oi_skew >= skew_trigger_oi:
+            regime = "trend_up"
+            self.state["last_regime"] = regime
+            return regime
+        if slope_short <= -trigger or slope_long <= -trigger or iv_skew <= -skew_trigger_iv or oi_skew <= -skew_trigger_oi:
+            regime = "trend_down"
+            self.state["last_regime"] = regime
+            return regime
+
+        if atr_norm > filt.atr_vol_threshold:
+            regime = "volatile"
+            self.state["last_regime"] = regime
+            return regime
+
+        if abs(slope_short) <= filt.range_slope_threshold and abs(iv_skew) <= filt.range_skew_max:
+            regime = "range"
+        else:
+            regime = "neutral"
+        self.state["last_regime"] = regime
+        return regime
+
+    def _determine_structure(self) -> Optional[str]:
+        regime = self._infer_regime()
+        if regime == "trend_up":
+            return "SHORT_PUT"
+        if regime == "trend_down":
+            return "SHORT_CALL"
+        if regime == "volatile":
+            return None
+        return "STRANGLE"
 
     def _record_equity(self, ts: datetime, equity: float) -> None:
         self.state.setdefault("equity_curve", []).append({"timestamp": ts, "equity": equity})

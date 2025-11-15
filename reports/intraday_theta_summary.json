@@ -1,7 +1,7 @@
 {
-  "entries": 16,
-  "closes": 16,
-  "total_realized": 2122.5000000000073,
-  "max_drawdown": -762.5,
+  "entries": 83,
+  "closes": 83,
+  "total_realized": 7380.000000000006,
+  "max_drawdown": -607.5,
   "note": "Intraday simulator prototype \u2013 rules are placeholder sizing/entries."
 }

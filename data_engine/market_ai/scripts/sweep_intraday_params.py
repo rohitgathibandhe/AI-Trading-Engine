@@ -38,6 +38,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trail-pcts", help="Comma separated trailing give-back percents.")
     parser.add_argument("--risk-stop-pcts", help="Comma separated risk stop percentages.")
     parser.add_argument("--per-leg-stop-pcts", help="Comma separated per-leg stop percentages.")
+    parser.add_argument("--iv-skew-trends", help="Comma separated IV skew triggers for trends.")
+    parser.add_argument("--oi-skew-trends", help="Comma separated OI skew triggers for trends.")
+    parser.add_argument("--range-skew-maxes", help="Comma separated max skew for range regime.")
+    parser.add_argument("--atr-thresholds", help="Comma separated ATR volatility thresholds.")
     parser.add_argument("--min-profit", type=float, default=2_000.0, help="Daily profit target.")
     parser.add_argument("--hard-loss", type=float, default=5_000.0, help="Daily hard loss.")
     return parser.parse_args()
@@ -50,12 +54,43 @@ def main() -> None:
     trail_values = _parse_float_list(args.trail_pcts or "", [0.2, 0.3])
     risk_stop_values = _parse_float_list(args.risk_stop_pcts or "", [0.3, 0.4])
     per_leg_values = _parse_float_list(args.per_leg_stop_pcts or "", [0.35, 0.45])
+    iv_skew_values = _parse_float_list(args.iv_skew_trends or "", [0.05, 0.08])
+    oi_skew_values = _parse_float_list(args.oi_skew_trends or "", [0.05, 0.08])
+    range_skew_values = _parse_float_list(args.range_skew_maxes or "", [0.03, 0.05])
+    atr_values = _parse_float_list(args.atr_thresholds or "", [0.0025, 0.0030])
 
-    combos = list(itertools.product(min_prem_values, trail_values, risk_stop_values, per_leg_values))
+    combos = list(
+        itertools.product(
+            min_prem_values,
+            trail_values,
+            risk_stop_values,
+            per_leg_values,
+            iv_skew_values,
+            oi_skew_values,
+            range_skew_values,
+            atr_values,
+        )
+    )
     results: List[Dict[str, Any]] = []
-    for idx, (min_prem, trail_pct, risk_stop, per_leg_stop) in enumerate(combos, 1):
+    for idx, (
+        min_prem,
+        trail_pct,
+        risk_stop,
+        per_leg_stop,
+        iv_skew_trend,
+        oi_skew_trend,
+        range_skew_max,
+        atr_threshold,
+    ) in enumerate(combos, 1):
+        entry_filter_cfg = {
+            "min_premium_pct": min_prem,
+            "iv_skew_trend": iv_skew_trend,
+            "oi_skew_trend": oi_skew_trend,
+            "range_skew_max": range_skew_max,
+            "atr_vol_threshold": atr_threshold,
+        }
         cfg = {
-            "entry_filter": {"min_premium_pct": min_prem},
+            "entry_filter": entry_filter_cfg,
             "daily_target": {"min_profit": args.min_profit, "trail_pct": trail_pct, "hard_loss_per_day": args.hard_loss},
             "risk_stop_pct": risk_stop,
             "per_leg_stop_pct": per_leg_stop,
@@ -67,6 +102,10 @@ def main() -> None:
                 "trail_pct": trail_pct,
                 "risk_stop_pct": risk_stop,
                 "per_leg_stop_pct": per_leg_stop,
+                "iv_skew_trend": iv_skew_trend,
+                "oi_skew_trend": oi_skew_trend,
+                "range_skew_max": range_skew_max,
+                "atr_threshold": atr_threshold,
                 "entries": summary.get("entries", len(trades_df)),
                 "closes": summary.get("closes", len(trades_df)),
             }
@@ -84,4 +123,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

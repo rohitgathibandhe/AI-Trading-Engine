@@ -41,6 +41,15 @@ def _safe_float(val: Any, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
+def _skew_value(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is None or b is None:
+        return None
+    denom = abs(a) + abs(b)
+    if denom == 0:
+        return None
+    return (a - b) / denom
+
+
 def _iv_rank(value: Optional[float], series: pd.Series) -> Optional[float]:
     clean = series.dropna()
     if value is None or clean.empty:
@@ -82,6 +91,10 @@ def compute_snapshot(df: pd.DataFrame, now: datetime) -> Optional[Dict[str, Any]
     call_iv = _safe_float(row.get("IV_CE"))
     call_delta = _safe_float(row.get("delta_ce"))
     put_delta = _safe_float(row.get("delta_pe"))
+    call_oi = _safe_float(row.get("oi_ce"))
+    put_oi = _safe_float(row.get("oi_pe"))
+    call_vol = _safe_float(row.get("volume_ce"))
+    put_vol = _safe_float(row.get("volume_pe"))
 
     iv_rank = _iv_rank(call_iv, df["IV_CE"])
     combined_premium_pct = None
@@ -98,6 +111,14 @@ def compute_snapshot(df: pd.DataFrame, now: datetime) -> Optional[Dict[str, Any]
         "atm_call_delta": call_delta,
         "atm_put_delta": put_delta,
         "atm_call_iv": call_iv,
+        "atm_put_iv": _safe_float(row.get("IV_PE")),
+        "atm_call_oi": call_oi,
+        "atm_put_oi": put_oi,
+        "atm_call_volume": call_vol,
+        "atm_put_volume": put_vol,
+        "iv_skew": _skew_value(_safe_float(row.get("IV_CE")), _safe_float(row.get("IV_PE"))),
+        "oi_skew": _skew_value(call_oi, put_oi),
+        "volume_skew": _skew_value(call_vol, put_vol),
         "iv_rank": iv_rank,
         "combined_premium_pct": combined_premium_pct,
         "raw_call": json.dumps(row.get("raw_call", {}), default=str),
@@ -152,4 +173,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
