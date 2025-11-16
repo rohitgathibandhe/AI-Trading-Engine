@@ -23,6 +23,7 @@ import json
 import logging
 import numpy as np
 import uuid
+import os
 
 LOG = logging.getLogger(__name__)
 
@@ -265,18 +266,18 @@ def run_live(dw, cfg: LiveConfig) -> None:
             ltps_for_limits = _fetch_ltps(dw, cfg.underlying_seg, [ce_sec, pe_sec])
             ce_price = ltps_for_limits.get(ce_sec)
             pe_price = ltps_for_limits.get(pe_sec)
-        order_type = cfg.order_type or "MARKET"
-        ce_limit = pe_limit = None
-        if order_type.upper() == "LIMIT":
-            if ce_price:
-                ce_limit = ce_price * (1.0 - cfg.slippage_pct)
-            if pe_price:
-                pe_limit = pe_price * (1.0 - cfg.slippage_pct)
-        ce_order_id = _place_with_retries(dw, cfg, ce_sec, ce_qty, order_type, ce_limit)
-        pe_order_id = _place_with_retries(dw, cfg, pe_sec, pe_qty, order_type, pe_limit)
-        ltps_entry = _fetch_ltps(dw, cfg.underlying_seg, [ce_sec, pe_sec], retries=3)
-        entry_ce = ltps_entry.get(ce_sec)
-        entry_pe = ltps_entry.get(pe_sec)
+            order_type = cfg.order_type or "MARKET"
+            ce_limit = pe_limit = None
+            if order_type.upper() == "LIMIT":
+                if ce_price:
+                    ce_limit = ce_price * (1.0 - cfg.slippage_pct)
+                if pe_price:
+                    pe_limit = pe_price * (1.0 - cfg.slippage_pct)
+            ce_order_id = _place_with_retries(dw, cfg, ce_sec, ce_qty, order_type, ce_limit)
+            pe_order_id = _place_with_retries(dw, cfg, pe_sec, pe_qty, order_type, pe_limit)
+            ltps_entry = _fetch_ltps(dw, cfg.underlying_seg, [ce_sec, pe_sec], retries=3)
+            entry_ce = ltps_entry.get(ce_sec)
+            entry_pe = ltps_entry.get(pe_sec)
             open_position = {
                 "expiry": expiry,
                 "atm": atm,

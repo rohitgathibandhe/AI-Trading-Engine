@@ -7,8 +7,10 @@ No Streamlit dependencies.
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import requests
+from pathlib import Path
 from dataclasses import dataclass
 from decimal import Decimal
 from datetime import datetime, time as dtime
@@ -52,6 +54,14 @@ __all__ = [
 # ---------------------------
 # Import Dhan SDK safely
 # ---------------------------
+# Ensure local checkout is on sys.path so the vendored dhan_sdk works even when
+# PYTHONPATH was not exported (common when launching via Streamlit/UI).
+HERE = Path(__file__).resolve()
+ROOT = HERE.parents[2]  # repo root
+PKG_DIR = HERE.parents[1]  # data_engine/market_ai
+for p in (str(ROOT), str(PKG_DIR)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 def _import_from_dhan_sdk():
     last_err = None

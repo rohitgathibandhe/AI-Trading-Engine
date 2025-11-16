@@ -7,6 +7,7 @@ import logging
 import importlib.util
 from pathlib import Path
 from dataclasses import dataclass
+import inspect
 from typing import Tuple, Any, Dict
 import json
 from logging.handlers import RotatingFileHandler
@@ -366,7 +367,7 @@ def _maybe_run_adaptive() -> bool:
     for d in (state_dir, control_dir, logs_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    cfg = AgentConfig(
+    cfg = AgentConfig(  # type: ignore[arg-type]
         state_path=str(state_dir / "trade_state.json"),
         control_dir=str(control_dir),
     )
@@ -431,20 +432,9 @@ def main() -> None:
     equity_path = Path(equity_log)
     _ensure_csv_file(equity_path, EQUITY_FIELDS)
 
-    cfg = LiveConfig(
-        max_strangles=pick("MAX_STRANGLES", "max_legs", 1, _as_int),
-        lot_size=pick("NIFTY_LOT", "lot_size", 75, _as_int),
-        sl_pct=pick("SL_PCT", "leg_sl_pct", 0.025, _as_float),
-        tp_pct=pick("TP_PCT", "profit_pct", 0.0225, _as_float),
-        hedge_enable=pick_bool("HEDGE_ENABLE", "hedge_enabled", True),
-        hedge_price_min=pick("HEDGE_PRICE_MIN", "hedge_price_min", 2.5, _as_float),
-        hedge_price_max=pick("HEDGE_PRICE_MAX", "hedge_price_max", 3.5, _as_float),
-        poll_sec=pick("POLL_SEC", "poll_sec", 5.0, _as_float),
-        warn_only=pick_bool("WARN_ONLY", "warn_only", False),
-        trade_mode=trade_mode,
-        blotter_path=blotter_path,
-        blotter_summary_path=summary_path,
-        hedge=HedgeConfig(
+    hedge_cfg_obj = None
+    if callable(HedgeConfig):
+        hedge_cfg_obj = HedgeConfig(
             enabled=pick_bool("HEDGE_ENABLED", "hedge_enabled", True),
             delta_breach=pick("HEDGE_DELTA_BREACH", "hedge_delta_breach", 0.30, _as_float),
             premium_hard_x=pick("HEDGE_PREMIUM_HARD_X", "hedge_premium_hard_x", 2.0, _as_float),
@@ -452,30 +442,55 @@ def main() -> None:
             hedge_delta_max=pick("HEDGE_DELTA_MAX", "hedge_delta_max", 0.12, _as_float),
             hedge_price_max=pick("HEDGE_PRICE_MAX", "hedge_price_max", 35.0, _as_float),
             salvage_wing_ltp=pick("HEDGE_SALVAGE_WING_LTP", "hedge_salvage_wing_ltp", 5.0, _as_float),
-        ),
-        feature_log_path=feature_log,
-        equity_log_path=equity_log,
-        equity_snapshot_minutes=pick(
-            "EQUITY_SNAPSHOT_MINUTES",
-            "equity_snapshot_minutes",
-            getattr(LiveConfig, "equity_snapshot_minutes", 10.0),
+        )
+    elif HedgeConfig is not None:
+        log.warning("HedgeConfig is present but not callable; skipping hedge config build")
+
+    params = inspect.signature(LiveConfig).parameters
+    cfg_kwargs: dict = {}
+    def set_if(name: str, val):
+        if name in params:
+            cfg_kwargs[name] = val
+
+    set_if("max_strangles", pick("MAX_STRANGLES", "max_legs", 1, _as_int))
+    set_if("lot_size", pick("NIFTY_LOT", "lot_size", 75, _as_int))
+    set_if("sl_pct", pick("SL_PCT", "leg_sl_pct", 0.025, _as_float))
+    set_if("tp_pct", pick("TP_PCT", "profit_pct", 0.0225, _as_float))
+    set_if("hedge_enable", pick_bool("HEDGE_ENABLE", "hedge_enabled", True))
+    set_if("hedge_price_min", pick("HEDGE_PRICE_MIN", "hedge_price_min", 2.5, _as_float))
+    set_if("hedge_price_max", pick("HEDGE_PRICE_MAX", "hedge_price_max", 3.5, _as_float))
+    set_if("poll_sec", pick("POLL_SEC", "poll_sec", 5.0, _as_float))
+    set_if("warn_only", pick_bool("WARN_ONLY", "warn_only", False))
+    set_if("trade_mode", trade_mode)
+    set_if("blotter_path", blotter_path)
+    set_if("blotter_summary_path", summary_path)
+    set_if("hedge", hedge_cfg_obj)
+    set_if("feature_log_path", feature_log)
+    set_if("equity_log_path", equity_log)
+    set_if("equity_snapshot_minutes", pick("EQUITY_SNAPSHOT_MINUTES", "equity_snapshot_minutes", getattr(LiveConfig, "equity_snapshot_minutes", 10.0), _as_float))
+    set_if("risk_max_daily_loss", pick("RISK_MAX_DAILY_LOSS", "risk_max_daily_loss", getattr(LiveConfig, "risk_max_daily_loss", 75000.0), _as_float))
+    set_if("risk_max_exposure_pct", pick("RISK_MAX_EXPOSURE_PCT", "risk_max_exposure_pct", getattr(LiveConfig, "risk_max_exposure_pct", 0.05), _as_float))
+    set_if("risk_account_equity", pick("RISK_ACCOUNT_EQUITY", "risk_account_equity", getattr(LiveConfig, "risk_account_equity", 500000.0), _as_float))
+    set_if("risk_max_rolls_per_day", pick("RISK_MAX_ROLLS_PER_DAY", "risk_max_rolls_per_day", getattr(LiveConfig, "risk_max_rolls_per_day", 6), _as_int))
+    set_if("risk_overall_sl_pct", pick("RISK_OVERALL_SL_PCT", "risk_overall_sl_pct", getattr(LiveConfig, "risk_overall_sl_pct", 2.5), _as_float))
+    set_if("risk_max_portfolio_delta", pick("RISK_MAX_PORTFOLIO_DELTA", "risk_max_portfolio_delta", getattr(LiveConfig, "risk_max_portfolio_delta", 0.25), _as_float))
+    set_if("risk_per_leg_sl_mult", pick("RISK_PER_LEG_SL_MULT", "risk_per_leg_sl_mult", getattr(LiveConfig, "risk_per_leg_sl_mult", 2.0), _as_float))
+    if "auto_playbook" in params:
+        set_if("auto_playbook", settings.get("auto_playbook", getattr(LiveConfig, "auto_playbook", {})))
+    cfg = LiveConfig(**{k: v for k, v in cfg_kwargs.items() if v is not None})
+    if hasattr(cfg, "regime_refresh_minutes"):
+        cfg.regime_refresh_minutes = pick(
+            "REGIME_REFRESH_MINUTES",
+            "regime_refresh_minutes",
+            cfg.regime_refresh_minutes,
             _as_float,
-        ),
-        risk_max_daily_loss=pick("RISK_MAX_DAILY_LOSS", "risk_max_daily_loss", getattr(LiveConfig, "risk_max_daily_loss", 75000.0), _as_float),
-        risk_max_exposure_pct=pick("RISK_MAX_EXPOSURE_PCT", "risk_max_exposure_pct", getattr(LiveConfig, "risk_max_exposure_pct", 0.05), _as_float),
-        risk_account_equity=pick("RISK_ACCOUNT_EQUITY", "risk_account_equity", getattr(LiveConfig, "risk_account_equity", 500000.0), _as_float),
-        risk_max_rolls_per_day=pick("RISK_MAX_ROLLS_PER_DAY", "risk_max_rolls_per_day", getattr(LiveConfig, "risk_max_rolls_per_day", 6), _as_int),
-        risk_overall_sl_pct=pick("RISK_OVERALL_SL_PCT", "risk_overall_sl_pct", getattr(LiveConfig, "risk_overall_sl_pct", 2.5), _as_float),
-        risk_max_portfolio_delta=pick("RISK_MAX_PORTFOLIO_DELTA", "risk_max_portfolio_delta", getattr(LiveConfig, "risk_max_portfolio_delta", 0.25), _as_float),
-        risk_per_leg_sl_mult=pick("RISK_PER_LEG_SL_MULT", "risk_per_leg_sl_mult", getattr(LiveConfig, "risk_per_leg_sl_mult", 2.0), _as_float),
-        auto_playbook=settings.get("auto_playbook", getattr(LiveConfig, "auto_playbook", {})),
-    )
-    cfg.regime_refresh_minutes = pick("REGIME_REFRESH_MINUTES", "regime_refresh_minutes", cfg.regime_refresh_minutes, _as_float)
-    cfg.auto_disable_strangle_when_unfavored = pick_bool(
-        "AUTO_DISABLE_STRANGLE",
-        "auto_disable_strangle",
-        cfg.auto_disable_strangle_when_unfavored,
-    )
+        )
+    if hasattr(cfg, "auto_disable_strangle_when_unfavored"):
+        cfg.auto_disable_strangle_when_unfavored = pick_bool(
+            "AUTO_DISABLE_STRANGLE",
+            "auto_disable_strangle",
+            cfg.auto_disable_strangle_when_unfavored,
+        )
 
     selector_model_path = Path(
         os.getenv(
@@ -531,39 +546,33 @@ def main() -> None:
                 top.name,
                 top.score,
             )
-            if cfg.auto_disable_strangle_when_unfavored:
+            if hasattr(cfg, "auto_disable_strangle_when_unfavored") and cfg.auto_disable_strangle_when_unfavored:
                 cfg.enable_strangle_entry = top.name == "monthly_strangle_with_weekly_hedge"
     else:
         if selector_model_path.exists():
             recommendation = select_preferred_strategy(selector_model_path, feature_path)
         else:
             recommendation = None
-        if recommendation:
-            log.info(
-                "Selector recommendation: %s (expected_credit=%.2f, samples=%d, confidence=%.2f)",
-                recommendation.name,
-                recommendation.expected_credit,
-                recommendation.samples,
-                recommendation.confidence,
-            )
-            if recommendation.name.lower() == "strangle":
-                cfg.enable_strangle_entry = True
-            elif recommendation.name.lower() == "batman" and cfg.auto_disable_strangle_when_unfavored:
-                cfg.enable_strangle_entry = False
-                if not cfg.hedge.enabled:
-                    log.warning("Selector favours Batman but it is disabled via settings")
-        else:
-            log.info("Strategy selector model unavailable; using configured defaults")
+            if recommendation:
+                log.info(
+                    "Selector recommendation: %s (expected_credit=%.2f, samples=%d, confidence=%.2f)",
+                    recommendation.name,
+                    recommendation.expected_credit,
+                    recommendation.samples,
+                    recommendation.confidence,
+                )
+                if recommendation.name.lower() == "strangle":
+                    cfg.enable_strangle_entry = True
+                elif recommendation.name.lower() == "batman" and hasattr(cfg, "auto_disable_strangle_when_unfavored") and cfg.auto_disable_strangle_when_unfavored:
+                    cfg.enable_strangle_entry = False
+                    if getattr(cfg, "hedge", None) is not None and not cfg.hedge.enabled:
+                        log.warning("Selector favours Batman but it is disabled via settings")
+            else:
+                log.info("Strategy selector model unavailable; using configured defaults")
 
     _debug_positions_once(dw)
     log.info("Starting strategy run_live with cfg=%s", cfg)
-    run_live(
-        dw,
-        cfg,
-        regime_analyzer=regime_analyzer,
-        recommender=recommender,
-        feature_history_path=feature_path,
-    )
+    run_live(dw, cfg)
 
 
 def _debug_positions_once(dw) -> None:

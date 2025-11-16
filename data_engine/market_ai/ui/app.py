@@ -25,6 +25,12 @@ from typing import Iterable
 from typing import Optional, Dict, Any, Tuple, List
 from queue import Queue, Empty
 
+# --- Bootstrap PYTHONPATH for VS Code/Streamlit launches ---
+_ROOT = Path(__file__).resolve().parents[3]  # repo root
+_DATA_ENGINE = _ROOT / "data_engine"
+for _p in (str(_ROOT), str(_DATA_ENGINE)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import streamlit as st
 import pandas as pd
