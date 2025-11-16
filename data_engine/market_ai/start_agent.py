@@ -211,53 +211,44 @@ def _import_dhan_wrapper():
 DhanWrapper = _import_dhan_wrapper()
 
 # ───────────────────────── Strategy import (robust) ─────────────────────────
-STRAT_FILENAME = "monthly_strangle_with_weekly_hedge.py"
+STRAT_FILENAME = os.environ.get("STRATEGY_FILE", "monthly_strangle_with_weekly_hedge.py")
 
 def _import_strategy() -> Tuple[Any, Any, Any]:
     """
     Returns (run_live, LiveConfig, HedgeConfig).
     Prefers package imports; falls back to loading the .py file from known dirs.
     """
-    # 1) package-style, preferred: modules/strategies
-    try:
-        from data_engine.market_ai.modules.strategies.monthly_strangle_with_weekly_hedge import (  # type: ignore
-            run_live, LiveConfig, HedgeConfig
-        )
-        log.info("Strategy import: data_engine.market_ai.modules.strategies")
-        return run_live, LiveConfig, HedgeConfig
-    except Exception:
-        pass
-
-    # 2) older package paths
-    try:
-        from data_engine.market_ai.strategies.monthly_strangle_with_weekly_hedge import (  # type: ignore
-            run_live, LiveConfig, HedgeConfig
-        )
-        log.info("Strategy import: data_engine.market_ai.strategies")
-        return run_live, LiveConfig, HedgeConfig
-    except Exception:
-        pass
-    try:
-        from strategies.monthly_strangle_with_weekly_hedge import run_live, LiveConfig, HedgeConfig  # type: ignore
-        log.info("Strategy import: 'strategies' on sys.path")
-        return run_live, LiveConfig, HedgeConfig
-    except Exception:
-        pass
-
-    # 3) file fallbacks
+    module_name = STRAT_FILENAME.replace(".py", "")
+    candidates = [
+        f"data_engine.market_ai.modules.strategies.{module_name}",
+        f"market_ai.modules.strategies.{module_name}",
+        f"strategies.{module_name}",
+    ]
+    for mod in candidates:
+        try:
+            imported = __import__(mod, fromlist=["run_live", "LiveConfig"])
+            run_live = getattr(imported, "run_live")
+            LiveConfig = getattr(imported, "LiveConfig")
+            HedgeConfig = getattr(imported, "HedgeConfig", None)
+            log.info("Strategy import: %s", mod)
+            return run_live, LiveConfig, HedgeConfig
+        except Exception:
+            continue
+    # file fallback
     search_dirs = [PREFERRED_STRAT_DIR, *ALT_STRAT_DIRS]
     for d in search_dirs:
         path = (Path(d) / STRAT_FILENAME).resolve()
         if path.exists():
             mod = _load_module_from_path("dyn_strategy", path)
             log.info("Strategy import: file '%s'", path)
-            return mod.run_live, mod.LiveConfig, mod.HedgeConfig  # type: ignore[attr-defined]
-
-    # 4) nothing found -> informative error
+            run_live = getattr(mod, "run_live")
+            LiveConfig = getattr(mod, "LiveConfig")
+            HedgeConfig = getattr(mod, "HedgeConfig", None)
+            return run_live, LiveConfig, HedgeConfig
     lines = "\n".join(f" - {(Path(d)/STRAT_FILENAME).resolve()}" for d in search_dirs)
     raise FileNotFoundError(
         f"Could not locate {STRAT_FILENAME}. Place it at one of:\n{lines}\n"
-        "Or set STRATEGIES_DIR to the folder that contains it."
+        "Or set STRATEGY_FILE to the filename (e.g., weekly_theta_strangle.py)."
     )
 
 # Try now so any error appears in the log immediately

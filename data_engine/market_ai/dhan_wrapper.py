@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import threading
+import requests
 from dataclasses import dataclass
 from decimal import Decimal
 from datetime import datetime, time as dtime
@@ -129,6 +130,74 @@ class DhanWrapper:
       - Live positions with multiple fallbacks
       - Simple background LTP poller
     """
+    def _order_headers(self) -> Dict[str, str]:
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "access-token": self.access_token,
+            "client-id": self.client_id,
+        }
+
+    def place_order(
+        self,
+        *,
+        side: str,
+        exchange_seg: str,
+        security_id: int,
+        quantity: int,
+        product_type: str = "MIS",
+        order_type: str = "MARKET",
+        validity: str = "DAY",
+        price: Optional[float] = None,
+        client_order_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Minimal order placement by security_id. Uses /v2/orders directly.
+        Side: BUY/SELL. exchange_seg: e.g., NSE_FNO.
+        """
+        url = f"{os.getenv('DHAN_API_BASE', 'https://api.dhan.co').rstrip('/')}/v2/orders"
+        payload: Dict[str, Any] = {
+            "transactionType": side.upper(),
+            "exchangeSegment": exchange_seg,
+            "productType": product_type,
+            "orderType": order_type,
+            "validity": validity,
+            "securityId": int(security_id),
+            "quantity": int(quantity),
+            "price": float(price) if price is not None else 0,
+            "afterMarketOrder": False,
+            "amoTime": None,
+        }
+        if client_order_id:
+            payload["clientOrderId"] = str(client_order_id)
+        resp = requests.post(url, headers=self._order_headers(), json=payload, timeout=10)
+        try:
+            js = resp.json()
+        except Exception:
+            self.log.error("[order] non-JSON response %s", resp.text[:400])
+            resp.raise_for_status()
+            raise
+        if resp.status_code >= 400 or (isinstance(js, dict) and js.get("status") == "failed"):
+            self.log.error("[order] failed %s: %s", resp.status_code, str(js)[:400])
+            resp.raise_for_status()
+        return js
+
+    def order_status(self, order_id: str) -> Dict[str, Any]:
+        """
+        Fetch order status from /v2/orders/{order_id}.
+        """
+        url = f"{os.getenv('DHAN_API_BASE', 'https://api.dhan.co').rstrip('/')}/v2/orders/{order_id}"
+        resp = requests.get(url, headers=self._order_headers(), timeout=10)
+        try:
+            js = resp.json()
+        except Exception:
+            self.log.error("[order_status] non-JSON response %s", resp.text[:400])
+            resp.raise_for_status()
+            raise
+        if resp.status_code >= 400 or (isinstance(js, dict) and js.get("status") == "failed"):
+            self.log.error("[order_status] failed %s: %s", resp.status_code, str(js)[:400])
+            resp.raise_for_status()
+        return js
 
     # --- Compatibility shims -------------------------------------------------
     def get_ltp_many(self, exchange_seg: str, security_ids: list[int]) -> Dict[tuple[str, int], Optional[float]]:

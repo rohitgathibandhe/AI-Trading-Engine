@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dates",
         required=True,
-        help="Comma separated list of trade dates (YYYY-MM-DD) to include.",
+        help="Comma separated list of trade dates (YYYY-MM-DD) to include, or 'ALL' to include all subdirs.",
     )
     parser.add_argument("--selector", default=None, help="(Deprecated) single selector tag to filter on.")
     parser.add_argument(
@@ -247,7 +247,10 @@ def main() -> None:
         selectors = ["ATM"]
     if not selectors:
         selectors = ["ATM"]
-    dates = [d.strip() for d in args.dates.split(",") if d.strip()]
+    if args.dates.strip().upper() == "ALL":
+        dates = sorted([p.name for p in args.root.iterdir() if p.is_dir()])
+    else:
+        dates = [d.strip() for d in args.dates.split(",") if d.strip()]
     all_rows: List[pd.DataFrame] = []
     for day in dates:
         day_dir = args.root / day

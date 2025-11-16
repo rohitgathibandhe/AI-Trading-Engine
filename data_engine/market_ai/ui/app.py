@@ -1054,6 +1054,20 @@ def _agent_env() -> dict:
     base["BATMAN_HEDGE_PRICE_MAX"] = base["HEDGE_PRICE_MAX"]
     base["BATMAN_SALVAGE_WING_LTP"] = base["HEDGE_SALVAGE_WING_LTP"]
     base["STRATEGY_MODEL_PATH"] = str(STATE_DIR / "strategy_selector_model.json")
+    base["STRATEGY_FILE"] = st.session_state.get("strategy_file", "monthly_strangle_with_weekly_hedge.py")
+    if base["STRATEGY_FILE"] == "weekly_theta_strangle.py" and st.session_state.get("weekly_warn_only", True):
+        base["WEEKLY_WARN_ONLY"] = "1"
+    # Weekly order params
+    if base["STRATEGY_FILE"] == "weekly_theta_strangle.py":
+        base["WEEKLY_ORDER_TYPE"] = st.session_state.get("weekly_order_type", "MARKET")
+        try:
+            slip = float(st.session_state.get("weekly_slip_pct", 0.2))
+        except Exception:
+            slip = 0.2
+        base["WEEKLY_SLIPPAGE_PCT"] = str(slip / 100.0)
+        if st.session_state.get("weekly_hedge_enabled"):
+            base["WEEKLY_HEDGE_ENABLED"] = "1"
+    return base
     return base
 
 def start_agent() -> None:
@@ -2015,6 +2029,23 @@ def _render_live_monitor_snapshot() -> None:
         cols = [c for c in ["timestamp", "source", "event_type", "headline", "importance"] if c in df_e.columns]
         st.dataframe(df_e[cols].sort_values("timestamp"), height=200, hide_index=True)
 
+    status_path = STATE_DIR / "weekly_live_status.json"
+    if status_path.exists():
+        st.markdown("#### Weekly Live Status")
+        try:
+            status = json.loads(status_path.read_text())
+            if status:
+                cols = st.columns(3)
+                cols[0].metric("Expiry", str(status.get("expiry", "—")))
+                cols[1].metric("MTM", _fmt_optional(status.get("mtm")))
+                cols[2].metric("MTM %", _fmt_optional(status.get("mtm_pct")))
+                st.caption(f"Updated: {status.get('timestamp')}")
+                st.json(status)
+            else:
+                st.caption("No weekly status yet.")
+        except Exception:
+            st.caption("Weekly status unreadable.")
+
 
 def _render_capital_telemetry(
     equity_df: Optional[pd.DataFrame] = None,
@@ -2827,6 +2858,46 @@ def _sidebar() -> None:
         disabled=agent_running,
         help="Stop the agent before switching modes." if agent_running else None,
     )
+    st.sidebar.selectbox(
+        "Strategy",
+        options=[
+            ("Monthly Strangle w/ Hedge", "monthly_strangle_with_weekly_hedge.py"),
+            ("Weekly Theta Strangle (alpha live)", "weekly_theta_strangle.py"),
+        ],
+        format_func=lambda x: x[0],
+        key="strategy_choice",
+        disabled=agent_running,
+        help="Pick strategy before starting agent.",
+    )
+    # store selected file in session for env export
+    choice = st.session_state.get("strategy_choice")
+    if choice:
+        st.session_state["strategy_file"] = choice[1]
+    if st.session_state.get("strategy_file") == "weekly_theta_strangle.py":
+        st.sidebar.checkbox("Weekly: warn only (paper)", value=True, key="weekly_warn_only", disabled=agent_running)
+        st.sidebar.selectbox(
+            "Weekly order type",
+            options=["MARKET", "LIMIT"],
+            key="weekly_order_type",
+            disabled=agent_running,
+        )
+        st.sidebar.slider(
+            "Weekly slippage (LIMIT, %)",
+            min_value=0.1,
+            max_value=1.0,
+            step=0.05,
+            value=0.2,
+            key="weekly_slip_pct",
+            help="Limit orders are placed at LTP*(1 - slip%).",
+            disabled=agent_running or st.session_state.get("weekly_order_type", "MARKET") != "LIMIT",
+        )
+        st.sidebar.checkbox(
+            "Weekly: enable hedge on drawdown",
+            value=False,
+            key="weekly_hedge_enabled",
+            disabled=agent_running,
+            help="Buys cheap wings when drawdown crosses the configured trigger.",
+        )
 
     c1, c2 = st.sidebar.columns(2)
     if c1.button("▶️ Start Agent"):

@@ -22,10 +22,19 @@ import pandas as pd
 import json
 import logging
 import numpy as np
+import uuid
 
 LOG = logging.getLogger(__name__)
 
-__all__ = ["WeeklyConfig", "WeeklyTargets", "EntryRules", "run_backtest", "WeeklyThetaStrangle"]
+__all__ = [
+    "WeeklyConfig",
+    "WeeklyTargets",
+    "EntryRules",
+    "run_backtest",
+    "WeeklyThetaStrangle",
+    "LiveConfig",
+    "run_live",
+]
 
 
 @dataclass
@@ -71,6 +80,528 @@ class WeeklyConfig:
     ml_exit_min_prob: float = 0.6
     directional_enabled: bool = True
     directional_bias_threshold: float = 0.02
+
+
+# ---------------------- Live (placeholder, conservative) ----------------------
+@dataclass
+class LiveConfig:
+    lot_size: int = 50
+    qty: int = 2
+    entry_day: int = 0  # Monday
+    entry_hour: int = 9
+    entry_minute: int = 30
+    warn_only: bool = True  # paper by default; set False to send live orders
+    underlying_symbol: str = "NIFTY"
+    underlying_seg: str = "NSE_FNO"
+    underlying_id: int = 13  # NIFTY security id in Dhan
+    product_type: str = "MIS"
+    sl_pct: float = 0.02
+    tp_pct: float = 0.025
+    max_hold_days: int = 5
+    hard_exit_hour: int = 15
+    hard_exit_minute: int = 1
+    notes: str = "Weekly live alpha."
+    poll_seconds: int = 30
+    event_block_hours: int = 6  # block entry if high-importance event within +/- window
+    order_type: str = os.environ.get("WEEKLY_ORDER_TYPE", "MARKET")  # MARKET or LIMIT
+    slippage_pct: float = float(os.environ.get("WEEKLY_SLIPPAGE_PCT") or 0.002)  # used if order_type=LIMIT
+    fill_wait_seconds: int = 10
+    fill_poll_seconds: int = 1
+    max_requote: int = 2  # attempts to re-place remaining qty if fill not met
+    hedge_enabled: bool = bool(int(os.environ.get("WEEKLY_HEDGE_ENABLED", "0")))
+    hedge_trigger_pct: float = 0.01  # hedge when MTM drawdown beyond this
+    hedge_distance: int = 200  # points away from ATM for hedge wings
+    hedge_cost_cap: float = 500.0  # max premium spend per hedge leg
+
+
+def run_live(dw, cfg: LiveConfig) -> None:
+    """
+    Alpha live loop: when flat and entry window opens on entry_day, enters ATM short strangle for nearest Tuesday expiry,
+    sets MTM TP/SL, and exits on targets or max_hold/hard exit. Uses Dhan scrip master to resolve security IDs.
+    """
+    LOG.info("[weekly_live] starting with cfg=%s", cfg)
+    import time
+    from market_ai.modules.data_fetch.dhan_scrip_cache import resolve_option_security_id, refresh_scrip_master
+
+    intents_path = Path(__file__).resolve().parents[2] / "state" / "weekly_order_intents.jsonl"
+    intents_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path = Path(__file__).resolve().parents[2] / "state" / "weekly_live_status.json"
+    status_path = Path(__file__).resolve().parents[2] / "state" / "weekly_live_status.json"
+
+    def _append_intent(payload: dict) -> None:
+        try:
+            with intents_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, default=str) + "\n")
+        except Exception as exc:
+            LOG.warning("[weekly_live] failed to log intent: %s", exc)
+
+    open_position: Optional[Dict[str, Any]] = None
+
+    while True:
+        now = datetime.now()
+        weekday = now.weekday()
+
+        try:
+            positions = dw.get_positions_live() if hasattr(dw, "get_positions_live") else []
+        except Exception as exc:
+            LOG.warning("[weekly_live] positions fetch failed: %s", exc)
+            positions = []
+        open_deriv = [
+            p for p in positions if isinstance(p, dict) and str(p.get("exchangeSegment", "")).upper().startswith("NSE_FNO") and float(p.get("netQty", 0)) != 0
+        ]
+
+        if open_position:
+            # monitor MTM TP/SL and exit conditions
+            ce_ltp = pe_ltp = None
+            ltps = _fetch_ltps(dw, cfg.underlying_seg, [open_position["ce_sec_id"], open_position["pe_sec_id"]])
+            ce_ltp = ltps.get(open_position["ce_sec_id"])
+            pe_ltp = ltps.get(open_position["pe_sec_id"])
+            pnl, pnl_pct = _compute_mtm(open_position, ce_ltp, pe_ltp)
+            open_position["mtm"] = pnl
+            open_position["mtm_pct"] = pnl_pct
+            if pnl_pct is not None:
+                LOG.debug("[weekly_live] MTM pnl=%.2f pnl%%=%.2f", pnl or 0.0, pnl_pct * 100)
+            age_days = (now.date() - open_position["entry_date"].date()).days
+            # exit at/after expiry date end-of-day
+            expiry_date = open_position.get("expiry_date")
+            if expiry_date and now.date() >= expiry_date and now.hour >= cfg.hard_exit_hour:
+                LOG.info("[weekly_live] Expiry reached, closing")
+                _close_weekly(dw, open_position, cfg)
+                open_position = None
+            if pnl_pct is not None and pnl_pct >= cfg.tp_pct:
+                LOG.info("[weekly_live] TP hit %.2f%%, closing", pnl_pct * 100)
+                _close_weekly(dw, open_position, cfg)
+                open_position = None
+            elif pnl_pct is not None and pnl_pct <= -cfg.sl_pct:
+                LOG.info("[weekly_live] SL hit %.2f%%, closing", pnl_pct * 100)
+                _close_weekly(dw, open_position, cfg)
+                open_position = None
+            elif age_days >= cfg.max_hold_days or (now.hour >= cfg.hard_exit_hour and now.minute >= cfg.hard_exit_minute):
+                LOG.info("[weekly_live] Time exit (age=%s days), closing", age_days)
+                _close_weekly(dw, open_position, cfg)
+                open_position = None
+            elif cfg.hedge_enabled and (pnl_pct or 0) <= -cfg.hedge_trigger_pct and not (open_position.get("hedged")):
+                if _maybe_hedge(dw, cfg, open_position):
+                    open_position["hedged"] = True
+                    _write_status(status_path, open_position)
+            _write_status(status_path, open_position)
+            time.sleep(cfg.poll_seconds)
+            continue
+
+        # skip entry if any other FNO positions exist
+        if open_deriv:
+            LOG.debug("[weekly_live] other positions open (%d), skipping entry", len(open_deriv))
+            time.sleep(cfg.poll_seconds * 2)
+            continue
+        if weekday != cfg.entry_day:
+            time.sleep(cfg.poll_seconds * 4)
+            continue
+        if now.hour < cfg.entry_hour or (now.hour == cfg.entry_hour and now.minute < cfg.entry_minute):
+            time.sleep(cfg.poll_seconds)
+            continue
+        # block entry if high importance event within window
+        if _events_block(cfg.event_block_hours):
+            LOG.info("[weekly_live] High-importance event within %sh, skipping entry", cfg.event_block_hours)
+            time.sleep(cfg.poll_seconds * 4)
+            continue
+
+        # Entry: fetch spot via option chain ATM
+        try:
+            expiry = _next_tuesday_expiry(now)
+            oc = dw.get_option_chain(cfg.underlying_id, cfg.underlying_seg, expiry)
+            spot = _extract_spot_from_oc(oc)
+        except Exception:
+            spot = None
+        if spot is None:
+            LOG.warning("[weekly_live] no spot from option chain; skipping entry this cycle")
+            time.sleep(cfg.poll_seconds * 2)
+            continue
+        # skip if holiday on expiry or trade day based on events
+        if _holiday_block(now, expiry):
+            LOG.info("[weekly_live] Holiday block for trade/expiry date; skipping entry")
+            time.sleep(cfg.poll_seconds * 4)
+            continue
+        atm = _round_to_int(spot, 50)
+        strikes = {"CE": atm, "PE": atm}
+
+        def _resolve(sec_type: str) -> Optional[int]:
+            try:
+                refresh_scrip_master(force=False)
+                return resolve_option_security_id(cfg.underlying_symbol, expiry, strikes[sec_type], sec_type)
+            except Exception:
+                return None
+
+        ce_sec = _resolve("CE")
+        pe_sec = _resolve("PE")
+        if not ce_sec or not pe_sec:
+            LOG.warning("[weekly_live] could not resolve sec ids for strikes %s", strikes)
+            time.sleep(cfg.poll_seconds * 2)
+            continue
+
+        intent = {
+            "timestamp": now.isoformat(timespec="seconds"),
+            "action": "ENTER_WEEKLY_STRANGLE",
+            "expiry": expiry,
+            "spot": spot,
+            "atm": atm,
+            "ce_sec_id": ce_sec,
+            "pe_sec_id": pe_sec,
+            "lot_size": cfg.lot_size,
+            "qty": cfg.qty,
+            "warn_only": cfg.warn_only,
+            "note": cfg.notes,
+        }
+        _append_intent(intent)
+        if cfg.warn_only:
+            LOG.info("[weekly_live] (warn_only) logged intent: %s", intent)
+            _write_status(status_path, {"intent": intent})
+            time.sleep(cfg.poll_seconds * 10)
+            continue
+
+        # place orders
+        try:
+            ce_qty = cfg.qty * cfg.lot_size
+            pe_qty = cfg.qty * cfg.lot_size
+            ltps_for_limits = _fetch_ltps(dw, cfg.underlying_seg, [ce_sec, pe_sec])
+            ce_price = ltps_for_limits.get(ce_sec)
+            pe_price = ltps_for_limits.get(pe_sec)
+        order_type = cfg.order_type or "MARKET"
+        ce_limit = pe_limit = None
+        if order_type.upper() == "LIMIT":
+            if ce_price:
+                ce_limit = ce_price * (1.0 - cfg.slippage_pct)
+            if pe_price:
+                pe_limit = pe_price * (1.0 - cfg.slippage_pct)
+        ce_order_id = _place_with_retries(dw, cfg, ce_sec, ce_qty, order_type, ce_limit)
+        pe_order_id = _place_with_retries(dw, cfg, pe_sec, pe_qty, order_type, pe_limit)
+        ltps_entry = _fetch_ltps(dw, cfg.underlying_seg, [ce_sec, pe_sec], retries=3)
+        entry_ce = ltps_entry.get(ce_sec)
+        entry_pe = ltps_entry.get(pe_sec)
+            open_position = {
+                "expiry": expiry,
+                "atm": atm,
+                "ce_sec_id": ce_sec,
+                "pe_sec_id": pe_sec,
+                "underlying_symbol": cfg.underlying_symbol,
+                "qty": cfg.qty,
+                "lot_size": cfg.lot_size,
+                "ce_strike": strikes["CE"],
+                "pe_strike": strikes["PE"],
+                "entry_ce": float(entry_ce) if entry_ce is not None else None,
+                "entry_pe": float(entry_pe) if entry_pe is not None else None,
+                "entry_date": now,
+                "underlying_id": cfg.underlying_id,
+                "expiry_date": datetime.fromisoformat(expiry).date(),
+                "order_type": order_type,
+                "ce_limit": ce_limit,
+                "pe_limit": pe_limit,
+                "ce_order_id": ce_order_id,
+                "pe_order_id": pe_order_id,
+                "hedged": False,
+            }
+            LOG.info("[weekly_live] Entered weekly strangle CE %s PE %s", ce_sec, pe_sec)
+            _write_status(status_path, open_position)
+        except Exception as exc:
+            LOG.warning("[weekly_live] order placement failed: %s", exc)
+            open_position = None
+        time.sleep(cfg.poll_seconds * 10)
+
+
+def _round_to_int(x: float, step: int = 50) -> int:
+    return int(round(x / step) * step)
+
+
+def _next_tuesday_expiry(now: datetime) -> str:
+    from datetime import timedelta
+    d = now.date()
+    holidays = _holiday_dates()
+    max_ahead = 10
+    ahead = 0
+    while True:
+        if d.weekday() == 1 and d not in holidays:
+            return d.isoformat()
+        d += timedelta(days=1)
+        ahead += 1
+        if ahead > max_ahead:
+            return d.isoformat()
+
+
+def _extract_spot_from_oc(oc: Dict[str, Any]) -> Optional[float]:
+    if isinstance(oc, dict):
+        data = oc.get("data") or oc
+        spot = data.get("last_price") or data.get("spot") or data.get("underlyingValue")
+        if spot:
+            try:
+                return float(spot)
+            except Exception:
+                return None
+    return None
+
+
+def _close_weekly(dw, pos: Dict[str, Any], cfg: LiveConfig) -> None:
+    for key, side in (("ce_sec_id", "BUY"), ("pe_sec_id", "BUY")):
+        sec = pos.get(key)
+        if not sec:
+            continue
+        try:
+            qty = pos.get("qty", 0) * pos.get("lot_size", 0)
+            if qty <= 0:
+                continue
+            dw.place_order(
+                side=side,
+                exchange_seg=cfg.underlying_seg,
+                security_id=sec,
+                quantity=qty,
+                product_type=cfg.product_type,
+                order_type="MARKET",
+            )
+        except Exception as exc:
+            LOG.warning("[weekly_live] close leg failed %s: %s", key, exc)
+
+
+def _compute_mtm(pos: Dict[str, Any], ce_ltp: Optional[float], pe_ltp: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+    entry_ce = pos.get("entry_ce")
+    entry_pe = pos.get("entry_pe")
+    if entry_ce is None or entry_pe is None or ce_ltp is None or pe_ltp is None:
+        # if entry missing but current LTPs exist, set entry to current as fallback
+        if entry_ce is None and ce_ltp is not None:
+            pos["entry_ce"] = ce_ltp
+            entry_ce = ce_ltp
+        if entry_pe is None and pe_ltp is not None:
+            pos["entry_pe"] = pe_ltp
+            entry_pe = pe_ltp
+        if entry_ce is None or entry_pe is None or ce_ltp is None or pe_ltp is None:
+            return pos.get("mtm"), pos.get("mtm_pct")
+    qty = pos.get("qty", 0) * pos.get("lot_size", 0)
+    entry_credit = (entry_ce + entry_pe) * qty
+    current_debit = (ce_ltp + pe_ltp) * qty
+    pnl = entry_credit - current_debit
+    pnl_pct = pnl / entry_credit if entry_credit else None
+    return pnl, pnl_pct
+
+
+def _events_block(window_hours: int) -> bool:
+    """
+    Look at events.jsonl and block entry if any importance>=3 event within +/- window_hours.
+    """
+    path = Path(__file__).resolve().parents[2] / "state" / "events.jsonl"
+    if not path.exists():
+        return False
+    try:
+        now = datetime.now()
+        window = timedelta(hours=window_hours)
+        for line in path.read_text().splitlines():
+            try:
+                ev = json.loads(line)
+                ts = ev.get("timestamp")
+                if not ts:
+                    continue
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if abs((dt - now).total_seconds()) <= window.total_seconds() and int(ev.get("importance", 1)) >= 3:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
+def _holiday_block(now: datetime, expiry_str: str) -> bool:
+    """Block if a holiday event matches trade day or expiry day."""
+    target_dates = {now.date(), datetime.fromisoformat(expiry_str).date()}
+    dates = _holiday_dates()
+    return bool(target_dates & dates)
+
+
+def _holiday_dates() -> set:
+    dates = set()
+    path = Path(__file__).resolve().parents[2] / "state" / "events.jsonl"
+    if not path.exists():
+        return dates
+    try:
+        for line in path.read_text().splitlines():
+            try:
+                ev = json.loads(line)
+                if ev.get("event_type") != "holiday":
+                    continue
+                ts = ev.get("timestamp")
+                if not ts:
+                    continue
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+                dates.add(dt)
+            except Exception:
+                continue
+    except Exception:
+        return dates
+    return dates
+
+
+def _write_status(path: Path, pos: Optional[Dict[str, Any]]) -> None:
+    try:
+        payload = pos or {}
+        payload["timestamp"] = datetime.now().isoformat(timespec="seconds")
+        path.write_text(json.dumps(payload, default=str, indent=2))
+    except Exception:
+        LOG.debug("[weekly_live] failed to write status")
+
+
+def _fetch_ltps(dw, exchange_seg: str, sec_ids: list[int], retries: int = 2, delay: float = 1.0) -> Dict[int, Optional[float]]:
+    out: Dict[int, Optional[float]] = {}
+    for attempt in range(retries):
+        try:
+            pairs = [(exchange_seg, sid) for sid in sec_ids]
+            ltps = dw.get_ltp_bulk(pairs) if hasattr(dw, "get_ltp_bulk") else {}
+            for sid in sec_ids:
+                out[sid] = ltps.get((exchange_seg, sid))
+            if all(v is not None for v in out.values()):
+                return out
+        except Exception:
+            pass
+        time.sleep(delay)
+    return out
+
+
+def _ensure_fill(dw, cfg: LiveConfig, sec_id: int, target_qty: int, order_id: Optional[str] = None) -> bool:
+    """
+    Poll positions to confirm net qty for sec_id reaches target within the fill window.
+    """
+    deadline = datetime.now().timestamp() + cfg.fill_wait_seconds
+    # First try order status if available
+    if order_id and hasattr(dw, "order_status"):
+        try:
+            status = dw.order_status(order_id)
+            if _order_filled(status):
+                return True
+        except Exception:
+            pass
+    while datetime.now().timestamp() < deadline:
+        try:
+            rows = dw.get_positions_live()
+        except Exception:
+            time.sleep(cfg.fill_poll_seconds)
+            continue
+        net = 0
+        for r in rows:
+            try:
+                if int(r.get("security_id") or r.get("securityId") or 0) == int(sec_id):
+                    net = int(float(r.get("netQty") or r.get("netqty") or 0))
+                    break
+            except Exception:
+                continue
+        if net == target_qty:
+            return True
+        time.sleep(cfg.fill_poll_seconds)
+    LOG.warning("[weekly_live] Fill not confirmed for %s target %s", sec_id, target_qty)
+    return False
+
+
+def _order_filled(status_resp: Dict[str, Any]) -> bool:
+    st = str(status_resp.get("orderStatus") or status_resp.get("status") or "").lower()
+    if st in {"completed", "executed", "filled", "traded", "complete"}:
+        return True
+    filled = status_resp.get("filledQuantity") or status_resp.get("filledQty")
+    remaining = status_resp.get("pendingQuantity") or status_resp.get("remainingQuantity")
+    try:
+        filled = int(float(filled or 0))
+        remaining = int(float(remaining or 0))
+        if filled > 0 and remaining == 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _maybe_hedge(dw, cfg: LiveConfig, pos: Dict[str, Any]) -> bool:
+    """
+    Buy cheap wings to limit risk if drawdown crosses threshold.
+    """
+    expiry = pos.get("expiry")
+    if not expiry:
+        return False
+    hedges = []
+    for opt_type, strike in (("CALL", pos.get("ce_strike", pos.get("atm", 0)) + cfg.hedge_distance), ("PUT", pos.get("pe_strike", pos.get("atm", 0)) - cfg.hedge_distance)):
+        try:
+            if strike is None or strike <= 0:
+                continue
+            sec_id = resolve_option_security_id(pos.get("underlying_symbol", "NIFTY") or cfg.underlying_symbol, expiry, strike, opt_type)
+        except Exception:
+            sec_id = None
+        if not sec_id:
+            continue
+        try:
+            ltp = dw.get_ltp_once(cfg.underlying_seg, sec_id) if hasattr(dw, "get_ltp_once") else None
+        except Exception:
+            ltp = None
+        if ltp is None or ltp * cfg.lot_size > cfg.hedge_cost_cap:
+            continue
+        hedges.append((sec_id, ltp))
+    placed = False
+    for sec_id, ltp in hedges:
+        try:
+            price = ltp * (1.0 + cfg.slippage_pct)
+            dw.place_order(
+                side="BUY",
+                exchange_seg=cfg.underlying_seg,
+                security_id=sec_id,
+                quantity=cfg.lot_size,
+                product_type=cfg.product_type,
+                order_type="LIMIT",
+                price=price,
+                client_order_id=f"HEDGE-{uuid.uuid4().hex[:6]}",
+            )
+            placed = True
+        except Exception as exc:
+            LOG.warning("[weekly_live] hedge placement failed for %s: %s", sec_id, exc)
+    return placed
+
+
+def _place_with_retries(dw, cfg: LiveConfig, sec_id: int, qty: int, order_type: str, limit_price: Optional[float]) -> Optional[str]:
+    """Place order and, if fill not reached, retry a limited number of times with adjusted limit."""
+    side = "SELL"
+    remaining = qty
+    client_id = f"WEEKLY-{uuid.uuid4().hex[:8]}"
+    last_order_id: Optional[str] = None
+    for attempt in range(cfg.max_requote + 1):
+        try:
+            resp = dw.place_order(
+                side=side,
+                exchange_seg=cfg.underlying_seg,
+                security_id=sec_id,
+                quantity=remaining,
+                product_type=cfg.product_type,
+                order_type=order_type,
+                price=limit_price if order_type.upper() == "LIMIT" else None,
+                client_order_id=client_id,
+            )
+            if isinstance(resp, dict):
+                last_order_id = resp.get("orderId") or resp.get("order_id") or last_order_id
+        except Exception as exc:
+            LOG.warning("[weekly_live] order placement failed (attempt %d) sec=%s: %s", attempt + 1, sec_id, exc)
+        time.sleep(2)
+        if _ensure_fill(dw, cfg, sec_id, -remaining, last_order_id):
+            return last_order_id
+        # fetch positions to see if filled
+        try:
+            rows = dw.get_positions_live()
+            net = 0
+            for r in rows:
+                if int(r.get("security_id") or r.get("securityId") or 0) == int(sec_id):
+                    net = int(float(r.get("netQty") or 0))
+                    break
+            if net == -qty:
+                return
+            # calculate remaining based on filled qty
+            filled = max(net + qty, 0)  # net is negative for sells
+            remaining = max(qty - filled, 0)
+            if remaining <= 0:
+                return
+        except Exception:
+            pass
+        # adjust limit slightly if not filled
+        if order_type.upper() == "LIMIT" and limit_price:
+            limit_price = limit_price * (1.0 + cfg.slippage_pct * 0.5)
+    LOG.warning("[weekly_live] Could not confirm fill for %s after retries", sec_id)
+    return last_order_id
 
 
 @dataclass
