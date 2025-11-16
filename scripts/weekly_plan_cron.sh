@@ -41,6 +41,19 @@ PNL_STOP=${PNL_STOP_ARG:-${JSON_PNL_STOP:-4000}}
 DIRECTIONAL_ENABLED=${DIRECTIONAL_ENABLED_ARG:-${JSON_DIRECTIONAL_ENABLED:-1}}
 MAX_GAP_PCT=${MAX_GAP_PCT_ARG:-${JSON_MAX_GAP_PCT:-0.01}}
 
+collect_option_chain() {
+    local cid="$1"
+    local token="$2"
+    if [ -z "$cid" ] || [ -z "$token" ]; then
+        echo "[weekly-plan] skipping option-chain snapshot (missing creds)"
+        return
+    fi
+    echo "[weekly-plan] collecting live option chain snapshot"
+    DHAN_CLIENT_ID="$cid" DHAN_ACCESS_TOKEN="$token" PYTHONPATH="data_engine" \
+        python3 data_engine/market_ai/scripts/collect_live_option_chain.py >> logs/option_chain.log 2>&1 || \
+        echo "[weekly-plan] option-chain collector failed"
+}
+
 echo "[weekly-plan] collecting last 260 trade dates from ${ROLLING_DIR}"
 DATES=$(python3 - <<'PY'
 from pathlib import Path
@@ -81,3 +94,4 @@ python3 data_engine/market_ai/scripts/generate_weekly_plan.py \
     --ml-exit-threshold 0.9
 
 echo "[weekly-plan] done – plan written to ${PLAN_PATH}"
+collect_option_chain "${DHAN_CLIENT_ID:-}" "${DHAN_ACCESS_TOKEN:-}"

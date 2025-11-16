@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "Streamlit UI (workspace = repo root)",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
       "python": "/Users/Rohit/.venvs/data_engine_py310/bin/python",
       "module": "streamlit",
@@ -21,7 +21,7 @@
     },
     {
       "name": "Streamlit UI (workspace = data_engine)",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
       "python": "/Users/Rohit/.venvs/data_engine_py310/bin/python",
       "module": "streamlit",
@@ -43,7 +43,7 @@
     },
     {
       "name": "Streamlit UI (absolute path)",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
       "python": "/Users/Rohit/.venvs/data_engine_py310/bin/python",
       "module": "streamlit",

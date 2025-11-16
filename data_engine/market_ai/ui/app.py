@@ -124,6 +124,7 @@ BROADER_STATE_DIR = ROOT / "state"
 BROADER_STATE_DIR.mkdir(parents=True, exist_ok=True)
 WEEKLY_PLAN_FILE = BROADER_STATE_DIR / "weekly_plan.json"
 WEEKLY_PLAN_SCRIPT = ROOT / "scripts" / "weekly_plan_cron.sh"
+OPTION_CHAIN_SCRIPT = ROOT / "data_engine/market_ai/scripts/collect_live_option_chain.py"
 WEEKLY_SETTINGS_FILE = BROADER_STATE_DIR / "weekly_plan_settings.json"
 ORDER_INTENT_FILE = STATE_DIR / "order_intents.jsonl"
 
@@ -2592,12 +2593,17 @@ def _weekly_plan_tab() -> None:
 
     with st.expander("Weekly Plan Settings", expanded=False):
         col1, col2 = st.columns(2)
+        min_prev = float(st.session_state.get("weekly_min_prev_range", 0.003))
+        pnl_target = float(st.session_state.get("weekly_pnl_target", 6000.0))
+        pnl_stop = float(st.session_state.get("weekly_pnl_stop", 4000.0))
+        max_gap = float(st.session_state.get("weekly_max_gap_pct", 0.01))
+        directional_enabled = bool(st.session_state.get("weekly_directional_enabled", True))
         with col1:
             st.number_input(
                 "Min prev-range pct",
                 min_value=0.001,
                 max_value=0.05,
-                value=float(st.session_state["weekly_min_prev_range"]),
+                value=min_prev,
                 step=0.001,
                 key="weekly_min_prev_range",
             )
@@ -2605,7 +2611,7 @@ def _weekly_plan_tab() -> None:
                 "Profit target (₹)",
                 min_value=1000.0,
                 max_value=15000.0,
-                value=float(st.session_state["weekly_pnl_target"]),
+                value=pnl_target,
                 step=500.0,
                 key="weekly_pnl_target",
             )
@@ -2613,7 +2619,7 @@ def _weekly_plan_tab() -> None:
                 "Max gap % (skip if open > %)",
                 min_value=0.001,
                 max_value=0.05,
-                value=float(st.session_state["weekly_max_gap_pct"]),
+                value=max_gap,
                 step=0.001,
                 format="%.3f",
                 key="weekly_max_gap_pct",
@@ -2623,13 +2629,13 @@ def _weekly_plan_tab() -> None:
                 "Stop loss (₹)",
                 min_value=1000.0,
                 max_value=10000.0,
-                value=float(st.session_state["weekly_pnl_stop"]),
+                value=pnl_stop,
                 step=500.0,
                 key="weekly_pnl_stop",
             )
             st.toggle(
                 "Directional spreads enabled",
-                value=bool(st.session_state["weekly_directional_enabled"]),
+                value=directional_enabled,
                 key="weekly_directional_enabled",
                 help="Allow bull put / bear call spreads when trend bias is strong.",
             )
@@ -2647,6 +2653,38 @@ def _weekly_plan_tab() -> None:
             except Exception as exc:
                 st.error(f"Failed to save settings: {exc}")
         st.caption(f"Settings file: `{WEEKLY_SETTINGS_FILE}`")
+
+    st.markdown("### Option Chain Snapshots")
+    option_script = globals().get("OPTION_CHAIN_SCRIPT")
+    if option_script and option_script.exists():
+        if st.button("Fetch live option chain snapshot", key="option_chain_snapshot"):
+            ss = st.session_state
+            if not ss.get("creds_verified") and not _verify_and_remember_creds():
+                st.error("Please verify DHAN credentials first.")
+            else:
+                env = os.environ.copy()
+                env["DHAN_CLIENT_ID"] = str(ss.get("client_id", env.get("DHAN_CLIENT_ID", "")))
+                env["DHAN_ACCESS_TOKEN"] = str(ss.get("access_token", env.get("DHAN_ACCESS_TOKEN", "")))
+                if not env["DHAN_CLIENT_ID"] or not env["DHAN_ACCESS_TOKEN"]:
+                    st.error("Missing DHAN credentials.")
+                else:
+                    with st.spinner("Collecting option chain snapshot..."):
+                        result = subprocess.run(
+                            ["python3", str(option_script)],
+                            capture_output=True,
+                            text=True,
+                            env=env,
+                        )
+                    if result.returncode == 0:
+                        st.success("Snapshot saved under state/option_chain_history.")
+                        if result.stdout:
+                            st.code(result.stdout.strip()[-1000:])
+                    else:
+                        st.error("Option-chain collector failed.")
+                        if result.stderr:
+                            st.code(result.stderr.strip()[-2000:])
+    else:
+        st.info("Option-chain collector script not found.")
 
     fallback_plan_dir = Path(st.session_state.get("cwd_override") or ".") / "state"
     plan_path = globals().get("WEEKLY_PLAN_FILE", fallback_plan_dir / "weekly_plan.json")

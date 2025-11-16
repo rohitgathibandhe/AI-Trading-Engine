@@ -144,7 +144,7 @@ class RollingExpiredOptionsMarket:
     # ---------- core fetch ----------
     def _pull(self, security_id: int, selector: str, opt_type: str,
               from_date: str, to_date: str, expiry_code: int,
-              want: List[str], target_day: date) -> Optional[Tuple[str, float, Dict[str, Any]]]:
+              want: List[str], target_day: date) -> List[Tuple[str, float, Dict[str, Any]]]:
         payload = {
             "exchangeSegment": self.exchange_segment,
             "interval": self.interval,
@@ -162,43 +162,94 @@ class RollingExpiredOptionsMarket:
         node = (data.get("data") or {}).get("ce" if opt_type == "CALL" else "pe") or {}
         ts = node.get("timestamp") or []
         idx = _choose_last_idx_for_day(ts, target_day)
+        results: List[Tuple[str, float, Dict[str, Any]]] = []
         if idx is None:
-            time.sleep(self.throttle_s); return None
+            time.sleep(self.throttle_s)
+            return results
+        strikes = node.get("strike") or []
+        closes = node.get("close") or []
+        ivs = node.get("iv") or []
+        spots = node.get("spot") or []
+        ois = node.get("oi") or []
+
+        def _safe_get(seq, i):
+            try:
+                return seq[i]
+            except Exception:
+                return None
+
+        # Support ranged selectors ("ATM±10~10") returning many strikes.
+        if isinstance(strikes, list) and len(strikes) > 1 and selector.startswith("ATM±"):
+            for i, K in enumerate(strikes):
+                if K in (None, [], {}):
+                    continue
+                try:
+                    strike_val = float(K)
+                except Exception:
+                    continue
+                close_val = _safe_get(closes, i) or _safe_get(closes, idx)
+                iv_val = _safe_get(ivs, i) or _safe_get(ivs, idx)
+                spot_val = _safe_get(spots, i) or _safe_get(spots, idx)
+                oi_val = _safe_get(ois, i) or 0.0
+                leg = {
+                    "last_price": float(close_val or 0.0),
+                    "iv": float(iv_val) if iv_val not in (None, []) else None,
+                    "oi": float(oi_val or 0.0),
+                    "spot": float(spot_val) if spot_val not in (None, []) else None,
+                    "strike": strike_val,
+                }
+                iv_eff = (leg["iv"] / 100.0) if (leg["iv"] and leg["iv"] > 1.0) else (leg["iv"] or self.iv_fallback)
+                spot_eff = leg["spot"]
+                if spot_eff and strike_val and iv_eff:
+                    d = bs_delta(float(spot_eff), strike_val, 1.0 / 12.0, float(iv_eff), self.r, call=(opt_type == "CALL"))
+                else:
+                    d = None
+                leg.setdefault("greeks", {})["delta"] = d
+                results.append((selector, strike_val, leg))
+            time.sleep(self.throttle_s)
+            return results
+
         try:
-            K = float(node["strike"][idx])
-            close = float(node["close"][idx])
-            iv = node.get("iv", [None])[idx]; iv = float(iv) if iv is not None else None
-            spot = node.get("spot", [None])[idx]; spot = float(spot) if spot is not None else None
-            oi = node.get("oi", [0.0])[idx] or 0.0
+            K = float(strikes[idx])
+            close = float(closes[idx])
+            iv = _safe_get(ivs, idx); iv = float(iv) if iv is not None else None
+            spot = _safe_get(spots, idx); spot = float(spot) if spot is not None else None
+            oi = _safe_get(ois, idx) or 0.0
         except Exception:
-            time.sleep(self.throttle_s); return None
+            time.sleep(self.throttle_s)
+            return results
 
         leg = {"last_price": close, "iv": iv, "oi": float(oi), "spot": spot, "strike": K}
         iv_eff = (iv / 100.0) if (iv is not None and iv > 1.0) else (iv if iv is not None else self.iv_fallback)
         if spot and K and iv_eff:
-            d = bs_delta(float(spot), float(K), 1.0/12.0, float(iv_eff), self.r, call=(opt_type=="CALL"))
+            d = bs_delta(float(spot), float(K), 1.0 / 12.0, float(iv_eff), self.r, call=(opt_type == "CALL"))
         else:
             d = None
         leg.setdefault("greeks", {})["delta"] = d
+        results.append((selector, K, leg))
         time.sleep(self.throttle_s)
-        return selector, K, leg
+        return results
 
     def _ladder(self, spot: Optional[float]) -> List[int]:
         # assume 50pt spacing; seed ~3.5% OTM
         tick = 50.0
         k0 = 6 if spot is None else max(2, int((spot * self.seed_otm_pct) // tick))
-        return [k0, k0 + 2, k0 + 4, k0 + 6]
+        ladder = [k0, k0 + 2, k0 + 4, k0 + 6]
+        # extend ladder for farther strikes (Batman needs ±600)
+        ladder.extend([k0 + 8, k0 + 10, k0 + 12])
+        return sorted(set(ladder))
 
     def _build_side(self, security_id: int, as_of_date: str, expiry_code: int, opt_type: str) -> List[Tuple[float, Dict[str, Any]]]:
         want = ["open","high","low","close","iv","volume","strike","oi","spot","timestamp"]
         day = _parse_iso(as_of_date); to_date = (day + timedelta(days=1)).isoformat()
 
         # 1) ATM to get spot
-        at = self._pull(security_id, "ATM", opt_type, as_of_date, to_date, expiry_code, want, day)
+        atm_rows = self._pull(security_id, "ATM", opt_type, as_of_date, to_date, expiry_code, want, day)
+        at = atm_rows[0] if atm_rows else None
         reqs = 1 if at else 0
         rows_by_selector: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         if at:
-            rows_by_selector["ATM"] = (at[1], at[2])
+            rows_by_selector[str(at[1])] = (at[1], at[2])
         spot = at[2].get("spot") if at else None
 
         # 2) fixed small ladder
@@ -207,15 +258,18 @@ class RollingExpiredOptionsMarket:
             if reqs >= self.max_requests: break
             sel = f"ATM+{k}" if opt_type=="CALL" else f"ATM-{k}"
             if sel in rows_by_selector: continue
-            got = self._pull(security_id, sel, opt_type, as_of_date, to_date, expiry_code, want, day)
+            got_rows = self._pull(security_id, sel, opt_type, as_of_date, to_date, expiry_code, want, day)
             reqs += 1
-            if not got: continue
-            _, K, leg = got
-            price = float(leg["last_price"]); s = float(leg.get("spot") or 0.0)
-            rows_by_selector[sel] = (K, leg)
-            # early guards
-            if price <= self.min_premium: break
-            if s>0 and abs(K - s)/s >= self.max_otm_pct: break
+            if not got_rows:
+                continue
+            for _, K, leg in got_rows:
+                price = float(leg["last_price"])
+                s = float(leg.get("spot") or 0.0)
+                rows_by_selector[str(K)] = (K, leg)
+                if price <= self.min_premium:
+                    break
+                if s > 0 and abs(K - s) / s >= self.max_otm_pct:
+                    break
 
         # ensure uniqueness by strike (server sometimes maps different selectors → same K)
         out_rows: List[Tuple[float, Dict[str, Any]]] = []

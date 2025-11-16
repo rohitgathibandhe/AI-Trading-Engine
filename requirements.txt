@@ -3,3 +3,4 @@ pandas
 numpy
 requests
 scikit-learn
+feedparser>=6.0
