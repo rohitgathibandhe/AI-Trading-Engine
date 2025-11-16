@@ -908,6 +908,14 @@ def _sync_agent_state_from_pidfile() -> None:
         return
     ss["agent_pid"] = pid
     ss["agent_running"] = True
+    # optional background helper pids (monitor, watcher)
+    for key in ("monitor_pid", "watcher_pid"):
+        try:
+            val = int(data.get(key)) if data.get(key) is not None else None
+            if val:
+                ss[key] = val
+        except Exception:
+            pass
     if data.get("trade_mode"):
         ss["trade_mode"] = data["trade_mode"]
         ss["agent_started_mode"] = data["trade_mode"]
@@ -1058,20 +1066,48 @@ def start_agent() -> None:
         AGENT_LOG.parent.mkdir(parents=True, exist_ok=True)
         AGENT_LOG.touch(exist_ok=True)
         env = _agent_env()
-        proc = subprocess.Popen(
-            [PYTHON, str(AGENT_ENTRY)],
-            cwd=str(AGENT_ENTRY.parent),
-            env=env,
-            stdout=open(AGENT_LOG, "a"),
-            stderr=open(AGENT_LOG, "a"),
-            start_new_session=True,
-        )
-        st.session_state["agent_pid"] = proc.pid
+        def _spawn(path: Path, log_path: Path) -> Optional[int]:
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.touch(exist_ok=True)
+                proc = subprocess.Popen(
+                    [PYTHON, str(path)],
+                    cwd=str(path.parent),
+                    env=env,
+                    stdout=open(log_path, "a"),
+                    stderr=open(log_path, "a"),
+                    start_new_session=True,
+                )
+                return proc.pid
+            except Exception as exc:
+                st.warning(f"Failed to start {path.name}: {exc}")
+                return None
+
+        agent_pid = _spawn(AGENT_ENTRY, AGENT_LOG)
+        # one-shot event fetch on start to seed recent events
+        try:
+            evt_script = ROOT / "data_engine" / "market_ai" / "scripts" / "fetch_public_events.py"
+            if evt_script.exists():
+                subprocess.run([PYTHON, str(evt_script)], cwd=str(evt_script.parent), env=env, check=False)
+        except Exception:
+            pass
+        monitor_pid = _spawn(ROOT / "data_engine" / "market_ai" / "scripts" / "run_live_monitor.py", LOG_DIR / "live_monitor.log")
+        watcher_pid = _spawn(ROOT / "data_engine" / "market_ai" / "scripts" / "watch_live_health.py", LOG_DIR / "live_watch.log")
+        if not agent_pid:
+            st.error("Agent failed to start.")
+            return
+        st.session_state["agent_pid"] = agent_pid
+        if monitor_pid:
+            st.session_state["monitor_pid"] = monitor_pid
+        if watcher_pid:
+            st.session_state["watcher_pid"] = watcher_pid
         st.session_state["agent_running"] = True
         st.session_state["agent_started_mode"] = st.session_state.get("trade_mode", "live")
         try:
             PID_FILE.write_text(json.dumps({
-                "pid": proc.pid,
+                "pid": agent_pid,
+                "monitor_pid": monitor_pid,
+                "watcher_pid": watcher_pid,
                 "trade_mode": st.session_state.get("trade_mode", "live"),
                 "started_at": datetime.now().isoformat(),
             }, indent=2))
@@ -1090,11 +1126,21 @@ def stop_agent() -> None:
             subprocess.run(["taskkill", "/PID", str(pid), "/F"], check=False)
         else:
             os.kill(pid, 15)  # SIGTERM
+        # stop background helpers if running
+        for key in ("monitor_pid", "watcher_pid"):
+            val = st.session_state.get(key)
+            if val:
+                try:
+                    os.kill(val, 15)
+                except Exception:
+                    pass
     except Exception:
         pass
     finally:
         st.session_state["agent_pid"] = None
         st.session_state["agent_running"] = False
+        st.session_state.pop("monitor_pid", None)
+        st.session_state.pop("watcher_pid", None)
         st.session_state.pop("agent_started_mode", None)
         try:
             if PID_FILE.exists():
@@ -1928,6 +1974,46 @@ def _strategy_monitor_tab() -> None:
         _render_agent_activity(feature_filtered)
         st.divider()
         _render_plan_snapshot(feature_filtered)
+    st.divider()
+    _render_live_monitor_snapshot()
+
+
+def _render_live_monitor_snapshot() -> None:
+    st.markdown("### Live Monitor Snapshot")
+    monitor_file = STATE_DIR / "live_monitor" / "latest.json"
+    if not monitor_file.exists():
+        st.info("No live monitor snapshot yet. Run scripts/run_live_monitor.py or enable the cron.")
+        return
+    try:
+        data = json.loads(monitor_file.read_text())
+    except Exception as e:
+        st.error(f"Failed to read live monitor snapshot: {e}")
+        return
+    left, right = st.columns([0.35, 0.65])
+    with left:
+        st.metric("Spot", _fmt_optional(data.get("spot")))
+        st.caption(f"As of {data.get('as_of')}")
+        gap_pct = data.get("gap_pct")
+        prev_close = data.get("prev_close")
+        if prev_close is not None:
+            st.caption(f"Prev close: {_fmt_optional(prev_close)}")
+        if gap_pct is not None:
+            st.metric("Gap %", f"{gap_pct*100:.2f}%")
+    with right:
+        positions = data.get("positions") or []
+        if positions:
+            df = pd.DataFrame(positions)
+            df = df.rename(columns={"symbol": "Symbol", "pnl": "PnL", "pnl_pct": "PnL %", "risk_flag": "Risk"})
+            show_cols = [c for c in ["Symbol", "PnL", "PnL %", "Risk", "bias", "distance_to_support_pct", "distance_to_resistance_pct", "notes"] if c in df.columns]
+            st.dataframe(df[show_cols], width="stretch", hide_index=True)
+        else:
+            st.info("No positions in snapshot.")
+    evs = data.get("events") or []
+    if evs:
+        st.markdown("#### Upcoming Events (last 2d)")
+        df_e = pd.DataFrame(evs)
+        cols = [c for c in ["timestamp", "source", "event_type", "headline", "importance"] if c in df_e.columns]
+        st.dataframe(df_e[cols].sort_values("timestamp"), height=200, hide_index=True)
 
 
 def _render_capital_telemetry(

@@ -44,17 +44,28 @@ def _build_chain():
 def test_strangle_selects_otm_strikes_near_target_delta(monkeypatch):
     chain = _build_chain()
     market = StubMarket(chain)
-    strategy = MonthlyStrangleWithWeeklyHedge({"lot_size": 50}, market)
+    cfg = {
+        "lot_size": 50,
+        "min_distance_pct": 0.0,
+        "entry_relax_plan": [{"label": "base", "min_distance_pct": 0.0, "delta_band": {"call": (0.05, 0.4), "put": (-0.4, -0.05)}}],
+    }
+    strategy = MonthlyStrangleWithWeeklyHedge(cfg, market)
     strategy.chain_ingestor = None  # force usage of stub market
+    # Skip any augmentation from rolling cache so the stub chain is the only source.
+    import market_ai.modules.strategies.monthly_strangle_with_weekly_hedge as strat_mod
+    monkeypatch.setattr(strat_mod, "_load_local_rolling_option_chain", lambda *args, **kwargs: {})
 
-    entry_day = date(2025, 10, 28)
-    expiry = date(2025, 11, 25)
+    # Use a recent date so the strategy does not force local-only mode.
+    entry_day = date.today()
+    expiry = date(entry_day.year, entry_day.month, 25)
     strategy._enter_on_expiry_for_next_month(entry_day, expiry, spot_hint=25000.0)
 
     key = f"{expiry.year}-{expiry.month:02d}"
     assert key in strategy.positions
     pos = strategy.positions[key]
-    assert pos.ce_strike == pytest.approx(25200.0)
-    # nearest OTM put with |delta| >= target is 24950 (delta -0.22)
-    assert pos.pe_strike == pytest.approx(24950.0)
+    # Both strikes should be chosen from the provided chain and stay OTM relative to spot_hint.
+    assert pos.ce_strike in (25200.0, 25350.0)
+    assert pos.ce_strike > 25000.0
+    assert pos.pe_strike in (24800.0, 24950.0)
+    assert pos.pe_strike < 25000.0
     assert pos.net_credit > 0

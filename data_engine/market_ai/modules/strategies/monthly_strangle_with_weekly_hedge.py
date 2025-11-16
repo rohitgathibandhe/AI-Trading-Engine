@@ -437,6 +437,44 @@ def _write_manual_action_status(action: str, status: str, message: str) -> None:
         LOG.debug("[risk] failed to write manual action status")
 
 
+def _consume_external_manual_action(cfg: "LiveConfig") -> None:
+    """
+    Allow external agents (e.g., live monitor watch) to request flatten/hedge via state/manual_action_status.json.
+    Recognized actions:
+      - flatten_all: sets _force_flatten
+      - force_hedge_refresh: sets _force_hedge_refresh
+    """
+    if not MANUAL_ACTION_STATUS.exists():
+        return
+    try:
+        payload = json.loads(MANUAL_ACTION_STATUS.read_text()) or {}
+    except Exception:
+        return
+    action = str(payload.get("action") or "").lower()
+    status = str(payload.get("status") or "").lower()
+    if status not in {"requested", "pending", ""}:
+        return
+    if action == "flatten_all":
+        cfg._force_flatten = True
+        ack = {
+            "action": action,
+            "status": "queued",
+            "message": "External flatten_all requested; applying in live loop",
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        _persist_manual_action(ack)
+        cfg._manual_action_ack = ack
+    elif action in {"force_hedge_refresh", "hedge_refresh"}:
+        cfg._force_hedge_refresh = True
+        ack = {
+            "action": action,
+            "status": "queued",
+            "message": "External hedge refresh requested; applying in live loop",
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        _persist_manual_action(ack)
+        cfg._manual_action_ack = ack
+
 def _load_managed_leg_state(cfg: "LiveConfig") -> None:
     try:
         if MANAGED_LEG_STATE.exists():
@@ -3921,6 +3959,8 @@ def run_live(
 
             if normalized_rows is None:
                 normalized_rows = _normalize_positions(rows)
+            # External manual actions (from live monitor watcher) can request flatten/hedge
+            _consume_external_manual_action(cfg)
             _sync_managed_leg_inventory(cfg, normalized_rows)
             net_delta, total_notional = _summarize_exposure(normalized_rows)
             block_info = _apply_exposure_throttles(cfg, net_delta, total_notional)

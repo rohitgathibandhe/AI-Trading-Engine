@@ -1,8 +1,23 @@
 from __future__ import annotations
 
 import json
+import sys
+import importlib
 from pathlib import Path
 from typing import Dict, Tuple
+
+# Normalize sys.path before any project imports so we always take this checkout.
+sys.path = [p for p in sys.path if "Algotrade_ai" not in p]
+REPO_ROOT = Path(__file__).resolve().parents[1]
+MARKET_AI_SRC = REPO_ROOT / "data_engine"
+if str(MARKET_AI_SRC) not in sys.path:
+    sys.path.insert(0, str(MARKET_AI_SRC))
+if "market_ai" in sys.modules:
+    loaded = Path(getattr(sys.modules["market_ai"], "__file__", "") or "")
+    if loaded and MARKET_AI_SRC not in loaded.parents:
+        sys.modules.pop("market_ai")
+importlib.invalidate_caches()
+importlib.import_module("market_ai")
 
 import pandas as pd
 import pytest
