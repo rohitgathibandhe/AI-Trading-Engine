@@ -51,20 +51,34 @@ class OptionChain:
         self.default_seg = default_seg
         self._expiry_cache: Dict[str, List[str]] = {}
 
-    def get_option_chain(self, underlying_id: int, expiry_or_tag: str, underlying_seg: Optional[str] = None) -> Dict[str, Any]:
+    def get_option_chain(self, underlying_id: int, expiry_or_tag: Optional[str], underlying_seg: Optional[str] = None) -> Dict[str, Any]:
         seg = (underlying_seg or self.default_seg) or "IDX_I"
+        tag = expiry_or_tag or ""
 
-        # 1) If explicit ISO date, call exactly that expiry once. Do NOT remap to "next".
-        if _is_iso_date(expiry_or_tag):
+        # 0) No tag/expiry provided → default to first future expiry (front)
+        if not tag:
+            exps = self._expiries(underlying_id, seg)
+            pick = _pick_first_future(exps)
+            if not pick:
+                return {}
             try:
-                oc_raw = get_option_chain_for(self.client, underlying_id, expiry=expiry_or_tag, underlying_seg=seg)
+                oc_raw = get_option_chain_for(self.client, underlying_id, expiry=pick, underlying_seg=seg)
                 return _normalize(oc_raw)
             except DhanError as e:
-                LOG.warning("DHAN could not serve explicit expiry %s on %s: %s", expiry_or_tag, seg, e)
+                LOG.warning("DHAN front expiry %s failed: %s", pick, e)
+                return {}
+
+        # 1) If explicit ISO date, call exactly that expiry once. Do NOT remap to "next".
+        if _is_iso_date(tag):
+            try:
+                oc_raw = get_option_chain_for(self.client, underlying_id, expiry=tag, underlying_seg=seg)
+                return _normalize(oc_raw)
+            except DhanError as e:
+                LOG.warning("DHAN could not serve explicit expiry %s on %s: %s", tag, seg, e)
                 return {}
 
         # 2) If tag 'weekly', resolve the next weekly from DHAN expiry list (live only).
-        if expiry_or_tag.lower() == "weekly":
+        if tag.lower() == "weekly":
             exps = self._expiries(underlying_id, seg)
             pick = _pick_first_future(exps)
             if not pick:

@@ -572,6 +572,19 @@ def main() -> None:
 
     _debug_positions_once(dw)
     log.info("Starting strategy run_live with cfg=%s", cfg)
+    # Persist pid so the UI can detect manually started agents.
+    try:
+        pid_file = ENGINE_DIR / "state" / "agent.pid"
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text(json.dumps({
+            "pid": os.getpid(),
+            "monitor_pid": None,
+            "watcher_pid": None,
+            "trade_mode": getattr(cfg, "trade_mode", trade_mode),
+            "started_at": datetime.now().isoformat(),
+        }, indent=2))
+    except Exception as exc:
+        log.debug("Failed to write agent.pid: %s", exc)
     run_live(dw, cfg)
 
 
