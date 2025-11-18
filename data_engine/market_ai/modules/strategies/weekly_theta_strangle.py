@@ -129,6 +129,17 @@ class LiveConfig:
     entry_hedge_enabled: bool = True  # buy cheap OTM wings on entry for margin benefit
     entry_hedge_price_cap: float = 3.5  # do not pay above this per entry hedge leg
     min_days_to_expiry: int = 2  # skip front expiry if fewer days remain
+    adopt_legs: list = field(default_factory=lambda: [
+        {"side": "SELL", "strike": 26200, "type": "CALL", "qty": 75, "entry": 104.65, "expiry": "2025-11-25"},
+        {"side": "SELL", "strike": 26400, "type": "CALL", "qty": 75, "entry": 46.45, "expiry": "2025-11-25"},
+        {"side": "SELL", "strike": 25600, "type": "PUT",  "qty": 150, "entry": 47.10, "expiry": "2025-11-25"},
+        {"side": "BUY",  "strike": 23800, "type": "PUT",  "qty": 150, "entry": 3.05,  "expiry": "2025-11-25"},
+        {"side": "BUY",  "strike": 26900, "type": "CALL", "qty": 75,  "entry": 5.10,  "expiry": "2025-11-25"},
+        {"side": "BUY",  "strike": 27200, "type": "CALL", "qty": 150, "entry": 3.20,  "expiry": "2025-11-25"},
+    ])  # optional pre-existing legs to manage
+    basket_tp_abs: float = 4000.0
+    basket_sl_abs: float = -3000.0
+    basket_hedge_dd: float = -2000.0
 
 
 def run_live(dw, cfg: LiveConfig) -> None:
@@ -154,9 +165,48 @@ def run_live(dw, cfg: LiveConfig) -> None:
 
     open_position: Optional[Dict[str, Any]] = None
 
+    def _adopt_if_needed() -> bool:
+        nonlocal open_position
+        if open_position or not cfg.adopt_legs:
+            return False
+        legs = []
+        expiry = None
+        for leg in cfg.adopt_legs:
+            side = leg.get("side") or leg.get("direction") or "SELL"
+            strike = float(leg.get("strike"))
+            opt_type = leg.get("type") or ("CALL" if "CE" in str(leg.get("name","")).upper() else "PUT")
+            qty = int(leg.get("qty") or leg.get("quantity") or 0)
+            entry = float(leg.get("avg") or leg.get("entry") or 0.0)
+            expiry_str = leg.get("expiry")
+            expiry = expiry or expiry_str
+            sec_id = leg.get("securityId") or leg.get("security_id")
+            if not sec_id:
+                try:
+                    sec_id = resolve_option_security_id(cfg.underlying_symbol, expiry_str, strike, opt_type)
+                except Exception:
+                    sec_id = None
+            legs.append({"side": side, "strike": strike, "type": opt_type, "qty": qty, "entry": entry, "sec_id": sec_id})
+        if not legs or not expiry:
+            return False
+        open_position = {
+            "expiry": expiry,
+            "legs": legs,
+            "entry_date": now,
+            "adopted": True,
+            "underlying_symbol": cfg.underlying_symbol,
+            "qty": 0,
+            "lot_size": cfg.lot_size,
+        }
+        LOG.info("[weekly_live] adopted %d legs for management", len(legs))
+        return True
+
     while True:
         now = datetime.now()
         weekday = now.weekday()
+
+        # adopt existing legs once if provided
+        if _adopt_if_needed():
+            pass
 
         try:
             positions = dw.get_positions_live() if hasattr(dw, "get_positions_live") else []
@@ -169,39 +219,42 @@ def run_live(dw, cfg: LiveConfig) -> None:
 
         if open_position:
             # monitor MTM TP/SL and exit conditions
-            ce_ltp = pe_ltp = None
-            ltps = _fetch_ltps(dw, cfg.underlying_seg, [open_position["ce_sec_id"], open_position["pe_sec_id"]])
-            ce_ltp = ltps.get(open_position["ce_sec_id"])
-            pe_ltp = ltps.get(open_position["pe_sec_id"])
-            pnl, pnl_pct = _compute_mtm(open_position, ce_ltp, pe_ltp)
-            open_position["mtm"] = pnl
-            open_position["mtm_pct"] = pnl_pct
-            if pnl_pct is not None:
-                LOG.debug("[weekly_live] MTM pnl=%.2f pnl%%=%.2f", pnl or 0.0, pnl_pct * 100)
-            age_days = (now.date() - open_position["entry_date"].date()).days
-            # exit at/after expiry date end-of-day
-            expiry_date = open_position.get("expiry_date")
-            if expiry_date and now.date() >= expiry_date and now.hour >= cfg.hard_exit_hour:
-                LOG.info("[weekly_live] Expiry reached, closing")
-                _close_weekly(dw, open_position, cfg)
-                open_position = None
-            if pnl_pct is not None and pnl_pct >= cfg.tp_pct:
-                LOG.info("[weekly_live] TP hit %.2f%%, closing", pnl_pct * 100)
-                _close_weekly(dw, open_position, cfg)
-                open_position = None
-            elif pnl_pct is not None and pnl_pct <= -cfg.sl_pct:
-                LOG.info("[weekly_live] SL hit %.2f%%, closing", pnl_pct * 100)
-                _close_weekly(dw, open_position, cfg)
-                open_position = None
-            elif age_days >= cfg.max_hold_days or (now.hour >= cfg.hard_exit_hour and now.minute >= cfg.hard_exit_minute):
-                LOG.info("[weekly_live] Time exit (age=%s days), closing", age_days)
-                _close_weekly(dw, open_position, cfg)
-                open_position = None
-            elif cfg.hedge_enabled and (pnl_pct or 0) <= -cfg.hedge_trigger_pct and not (open_position.get("hedged")):
-                if _maybe_hedge(dw, cfg, open_position):
-                    open_position["hedged"] = True
-                    _write_status(status_path, open_position)
-            _write_status(status_path, open_position)
+            if open_position.get("adopted"):
+                _manage_adopted(dw, cfg, open_position, now)
+            else:
+                ce_ltp = pe_ltp = None
+                ltps = _fetch_ltps(dw, cfg.underlying_seg, [open_position["ce_sec_id"], open_position["pe_sec_id"]])
+                ce_ltp = ltps.get(open_position["ce_sec_id"])
+                pe_ltp = ltps.get(open_position["pe_sec_id"])
+                pnl, pnl_pct = _compute_mtm(open_position, ce_ltp, pe_ltp)
+                open_position["mtm"] = pnl
+                open_position["mtm_pct"] = pnl_pct
+                if pnl_pct is not None:
+                    LOG.debug("[weekly_live] MTM pnl=%.2f pnl%%=%.2f", pnl or 0.0, pnl_pct * 100)
+                age_days = (now.date() - open_position["entry_date"].date()).days
+                # exit at/after expiry date end-of-day
+                expiry_date = open_position.get("expiry_date")
+                if expiry_date and now.date() >= expiry_date and now.hour >= cfg.hard_exit_hour:
+                    LOG.info("[weekly_live] Expiry reached, closing")
+                    _close_weekly(dw, open_position, cfg)
+                    open_position = None
+                if pnl_pct is not None and pnl_pct >= cfg.tp_pct:
+                    LOG.info("[weekly_live] TP hit %.2f%%, closing", pnl_pct * 100)
+                    _close_weekly(dw, open_position, cfg)
+                    open_position = None
+                elif pnl_pct is not None and pnl_pct <= -cfg.sl_pct:
+                    LOG.info("[weekly_live] SL hit %.2f%%, closing", pnl_pct * 100)
+                    _close_weekly(dw, open_position, cfg)
+                    open_position = None
+                elif age_days >= cfg.max_hold_days or (now.hour >= cfg.hard_exit_hour and now.minute >= cfg.hard_exit_minute):
+                    LOG.info("[weekly_live] Time exit (age=%s days), closing", age_days)
+                    _close_weekly(dw, open_position, cfg)
+                    open_position = None
+                elif cfg.hedge_enabled and (pnl_pct or 0) <= -cfg.hedge_trigger_pct and not (open_position.get("hedged")):
+                    if _maybe_hedge(dw, cfg, open_position):
+                        open_position["hedged"] = True
+                        _write_status(status_path, open_position)
+                _write_status(status_path, open_position)
             time.sleep(cfg.poll_seconds)
             continue
 
@@ -401,24 +454,48 @@ def _extract_spot_from_oc(oc: Dict[str, Any]) -> Optional[float]:
 
 
 def _close_weekly(dw, pos: Dict[str, Any], cfg: LiveConfig) -> None:
-    for key, side in (("ce_sec_id", "BUY"), ("pe_sec_id", "BUY")):
-        sec = pos.get(key)
-        if not sec:
-            continue
-        try:
-            qty = pos.get("qty", 0) * pos.get("lot_size", 0)
-            if qty <= 0:
+    if pos.get("adopted"):
+        for leg in pos.get("legs", []):
+            sec = leg.get("sec_id")
+            if not sec:
+                try:
+                    sec = resolve_option_security_id(cfg.underlying_symbol, pos.get("expiry"), leg.get("strike"), leg.get("type"))
+                except Exception:
+                    sec = None
+            if not sec:
                 continue
-            dw.place_order(
-                side=side,
-                exchange_seg=cfg.underlying_seg,
-                security_id=sec,
-                quantity=qty,
-                product_type=cfg.product_type,
-                order_type="MARKET",
-            )
-        except Exception as exc:
-            LOG.warning("[weekly_live] close leg failed %s: %s", key, exc)
+            try:
+                qty = abs(int(leg.get("qty", 0)))
+                side = "BUY" if str(leg.get("side","SELL")).upper().startswith("SELL") else "SELL"
+                dw.place_order(
+                    side=side,
+                    exchange_seg=cfg.underlying_seg,
+                    security_id=sec,
+                    quantity=qty,
+                    product_type=cfg.product_type,
+                    order_type="MARKET",
+                )
+            except Exception as exc:
+                LOG.warning("[weekly_live] close leg failed %s: %s", leg, exc)
+    else:
+        for key, side in (("ce_sec_id", "BUY"), ("pe_sec_id", "BUY")):
+            sec = pos.get(key)
+            if not sec:
+                continue
+            try:
+                qty = pos.get("qty", 0) * pos.get("lot_size", 0)
+                if qty <= 0:
+                    continue
+                dw.place_order(
+                    side=side,
+                    exchange_seg=cfg.underlying_seg,
+                    security_id=sec,
+                    quantity=qty,
+                    product_type=cfg.product_type,
+                    order_type="MARKET",
+                )
+            except Exception as exc:
+                LOG.warning("[weekly_live] close leg failed %s: %s", key, exc)
 
 
 def _compute_mtm(pos: Dict[str, Any], ce_ltp: Optional[float], pe_ltp: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
@@ -440,6 +517,70 @@ def _compute_mtm(pos: Dict[str, Any], ce_ltp: Optional[float], pe_ltp: Optional[
     pnl = entry_credit - current_debit
     pnl_pct = pnl / entry_credit if entry_credit else None
     return pnl, pnl_pct
+
+
+def _manage_adopted(dw, cfg: LiveConfig, pos: Dict[str, Any], now: datetime) -> None:
+    pnl, pnl_pct, ltps = _compute_adopted_mtm(dw, cfg, pos)
+    pos["mtm"] = pnl
+    pos["mtm_pct"] = pnl_pct
+    # basket TP/SL
+    if pnl >= cfg.basket_tp_abs:
+        LOG.info("[weekly_live] Adopted basket TP hit %.0f; closing all", pnl)
+        _close_weekly(dw, pos, cfg)
+        pos.clear()
+        return
+    if pnl <= cfg.basket_sl_abs:
+        LOG.info("[weekly_live] Adopted basket SL hit %.0f; closing all", pnl)
+        _close_weekly(dw, pos, cfg)
+        pos.clear()
+        return
+    # additional wings on drawdown
+    if pnl <= cfg.basket_hedge_dd:
+        _add_extra_wings(dw, cfg, pos, ltps)
+    # per-leg actions
+    for leg in list(pos.get("legs", [])):
+        if str(leg.get("side","SELL")).upper().startswith("SELL"):
+            entry = float(leg.get("entry", 0.0))
+            ltp = ltps.get(str(leg.get("strike")) + leg.get("type",""))
+            if ltp is None or entry <= 0:
+                continue
+            if ltp <= entry * 0.40:
+                LOG.info("[weekly_live] TP leg %s strike=%s entry=%.2f ltp=%.2f", leg.get("type"), leg.get("strike"), entry, ltp)
+                _close_leg(dw, cfg, leg, pos)
+            elif ltp >= entry * 1.50 or _leg_delta(dw, cfg, leg) > 0.30:
+                LOG.info("[weekly_live] Roll trigger leg %s strike=%s entry=%.2f ltp=%.2f", leg.get("type"), leg.get("strike"), entry, ltp)
+                _roll_leg(dw, cfg, leg, pos)
+    _write_status(Path(__file__).resolve().parents[2] / "state" / "weekly_live_status.json", pos)
+
+
+def _compute_adopted_mtm(dw, cfg: LiveConfig, pos: Dict[str, Any]) -> Tuple[float, float, Dict[str, float]]:
+    ltps: Dict[str, float] = {}
+    pnl = 0.0
+    credit = 0.0
+    for leg in pos.get("legs", []):
+        sec = leg.get("sec_id")
+        if not sec:
+            try:
+                sec = resolve_option_security_id(cfg.underlying_symbol, pos.get("expiry"), leg.get("strike"), leg.get("type"))
+            except Exception:
+                sec = None
+        ltp = None
+        if sec:
+            try:
+                ltp = dw.get_ltp_once(cfg.underlying_seg, sec) if hasattr(dw, "get_ltp_once") else None
+            except Exception:
+                ltp = None
+        if ltp is None:
+            continue
+        ltps[str(leg.get("strike")) + leg.get("type","")] = ltp
+        entry = float(leg.get("entry", 0.0))
+        qty = abs(int(leg.get("qty", 0)))
+        direction = -1 if str(leg.get("side","SELL")).upper().startswith("SELL") else 1
+        pnl += direction * qty * cfg.lot_size * (entry - ltp)
+        if direction < 0:
+            credit += entry * qty * cfg.lot_size
+    pnl_pct = (pnl / credit) if credit else 0.0
+    return pnl, pnl_pct, ltps
 
 
 def _events_block(window_hours: int) -> bool:
@@ -571,6 +712,157 @@ def _order_filled(status_resp: Dict[str, Any]) -> bool:
     except Exception:
         pass
     return False
+
+
+def _close_leg(dw, cfg: LiveConfig, leg: Dict[str, Any], pos: Dict[str, Any]) -> None:
+    sec = leg.get("sec_id")
+    if not sec:
+        try:
+            sec = resolve_option_security_id(cfg.underlying_symbol, pos.get("expiry"), leg.get("strike"), leg.get("type"))
+        except Exception:
+            sec = None
+    if not sec:
+        return
+    try:
+        qty = abs(int(leg.get("qty", 0)))
+        side = "BUY" if str(leg.get("side","SELL")).upper().startswith("SELL") else "SELL"
+        dw.place_order(
+            side=side,
+            exchange_seg=cfg.underlying_seg,
+            security_id=sec,
+            quantity=qty,
+            product_type=cfg.product_type,
+            order_type="MARKET",
+        )
+        try:
+            pos["legs"].remove(leg)
+        except ValueError:
+            pass
+    except Exception as exc:
+        LOG.warning("[weekly_live] close leg failed %s: %s", leg, exc)
+
+
+def _leg_delta(dw, cfg: LiveConfig, leg: Dict[str, Any]) -> float:
+    try:
+        sec = leg.get("sec_id")
+        if not sec:
+            sec = resolve_option_security_id(cfg.underlying_symbol, leg.get("expiry") or "", leg.get("strike"), leg.get("type"))
+        if not sec:
+            return 0.0
+        quote = dw.get_ltp_quote(cfg.underlying_seg, sec) if hasattr(dw, "get_ltp_quote") else None
+        delta = quote.get("delta") if isinstance(quote, dict) else None
+        return float(delta) if delta is not None else 0.0
+    except Exception:
+        return 0.0
+
+
+def _roll_leg(dw, cfg: LiveConfig, leg: Dict[str, Any], pos: Dict[str, Any]) -> None:
+    if datetime.now().hour > 14 or (datetime.now().hour == 14 and datetime.now().minute >= 45):
+        LOG.info("[weekly_live] Post 14:45, roll skipped for %s", leg)
+        return
+    # close existing leg
+    _close_leg(dw, cfg, leg, pos)
+    # determine new strike ~100 away same side
+    spot = None
+    try:
+        spot = dw.get_ltp_once("IDX_I", cfg.underlying_id)
+    except Exception:
+        spot = None
+    if spot is None:
+        return
+    move = 100
+    new_strike = leg.get("strike", 0.0)
+    if str(leg.get("type","CALL")).upper() == "CALL":
+        new_strike = _round_to_int(spot + move, 50)
+    else:
+        new_strike = _round_to_int(spot - move, 50)
+    try:
+        expiry = pos.get("expiry")
+        sec_new = resolve_option_security_id(cfg.underlying_symbol, expiry, new_strike, leg.get("type"))
+    except Exception:
+        sec_new = None
+    if not sec_new:
+        return
+    # place new short with small additional credit target
+    try:
+        ltp = dw.get_ltp_once(cfg.underlying_seg, sec_new) if hasattr(dw, "get_ltp_once") else None
+    except Exception:
+        ltp = None
+    if ltp is None or ltp < 5:
+        return
+    try:
+        qty = abs(int(leg.get("qty", 0)))
+        resp = dw.place_order(
+            side="SELL",
+            exchange_seg=cfg.underlying_seg,
+            security_id=sec_new,
+            quantity=qty,
+            product_type=cfg.product_type,
+            order_type="MARKET",
+        )
+        new_leg = {
+            "side": "SELL",
+            "strike": new_strike,
+            "type": leg.get("type"),
+            "qty": qty,
+            "entry": ltp,
+            "sec_id": sec_new,
+        }
+        pos.setdefault("legs", []).append(new_leg)
+    except Exception as exc:
+        LOG.warning("[weekly_live] roll placement failed %s: %s", leg, exc)
+
+
+def _add_extra_wings(dw, cfg: LiveConfig, pos: Dict[str, Any], ltps: Dict[str, float]) -> None:
+    # buy far wings ~300 away, cost <= 30% of net credit
+    net_credit = 0.0
+    for leg in pos.get("legs", []):
+        if str(leg.get("side","SELL")).upper().startswith("SELL"):
+            net_credit += float(leg.get("entry", 0.0)) * abs(int(leg.get("qty", 0))) * cfg.lot_size
+    budget = net_credit * 0.30 if net_credit > 0 else 0.0
+    if budget <= 0:
+        return
+    spot = None
+    try:
+        spot = dw.get_ltp_once("IDX_I", cfg.underlying_id)
+    except Exception:
+        spot = None
+    if spot is None:
+        return
+    wings = [
+        ("CALL", _round_to_int(spot + 300, 50)),
+        ("PUT", _round_to_int(spot - 300, 50)),
+    ]
+    spend = 0.0
+    for opt_type, strike in wings:
+        sec_id = None
+        try:
+            sec_id = resolve_option_security_id(cfg.underlying_symbol, pos.get("expiry"), strike, opt_type)
+        except Exception:
+            sec_id = None
+        if not sec_id:
+            continue
+        ltp = None
+        try:
+            ltp = dw.get_ltp_once(cfg.underlying_seg, sec_id) if hasattr(dw, "get_ltp_once") else None
+        except Exception:
+            ltp = None
+        if ltp is None:
+            continue
+        if spend + ltp * cfg.lot_size > budget:
+            continue
+        try:
+            dw.place_order(
+                side="BUY",
+                exchange_seg=cfg.underlying_seg,
+                security_id=sec_id,
+                quantity=cfg.lot_size,
+                product_type=cfg.product_type,
+                order_type="MARKET",
+            )
+            spend += ltp * cfg.lot_size
+        except Exception as exc:
+            LOG.warning("[weekly_live] extra wing buy failed %s: %s", strike, exc)
 
 
 def _maybe_hedge(dw, cfg: LiveConfig, pos: Dict[str, Any]) -> bool:
