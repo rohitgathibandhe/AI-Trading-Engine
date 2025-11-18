@@ -81,10 +81,10 @@ class RollingExpiredOptionsMarket:
         risk_free_rate: float = 0.06,
         throttle_s: float = 0.35,
         max_retries: int = 4,
-        seed_otm_pct: float = 0.035,
-        max_otm_pct: float = 0.060,
-        min_premium: float = 10.0,
-        max_requests: int = 8,
+        seed_otm_pct: float = 0.025,
+        max_otm_pct: float = 0.120,   # allow wider ladder to capture strikes
+        min_premium: float = 3.0,     # allow cheaper strikes to pass through
+        max_requests: int = 14,       # pull a few more rungs if available
         iv_fallback: float = 0.20,
         neighborhood_span: int = 2,   # accepted for compatibility (not used by laddered plan)
         **_ignored                     # accept extra kwargs safely

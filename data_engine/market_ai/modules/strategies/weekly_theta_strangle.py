@@ -25,6 +25,19 @@ import numpy as np
 import uuid
 import os
 
+try:
+    from market_ai.modules.data_fetch.dhan_scrip_cache import resolve_option_security_id
+except Exception:
+    # Fallback for direct module execution when PYTHONPATH missing
+    import sys
+    from pathlib import Path as _Path
+    ROOT = _Path(__file__).resolve().parents[3]
+    for _p in (ROOT, ROOT / "data_engine"):
+        _p = str(_p)
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+    from market_ai.modules.data_fetch.dhan_scrip_cache import resolve_option_security_id
+
 LOG = logging.getLogger(__name__)
 
 __all__ = [
@@ -113,6 +126,9 @@ class LiveConfig:
     hedge_trigger_pct: float = 0.01  # hedge when MTM drawdown beyond this
     hedge_distance: int = 200  # points away from ATM for hedge wings
     hedge_cost_cap: float = 500.0  # max premium spend per hedge leg
+    entry_hedge_enabled: bool = True  # buy cheap OTM wings on entry for margin benefit
+    entry_hedge_price_cap: float = 3.5  # do not pay above this per entry hedge leg
+    min_days_to_expiry: int = 2  # skip front expiry if fewer days remain
 
 
 def run_live(dw, cfg: LiveConfig) -> None:
@@ -208,7 +224,11 @@ def run_live(dw, cfg: LiveConfig) -> None:
 
         # Entry: fetch spot via option chain ATM
         try:
-            expiry = _next_tuesday_expiry(now)
+            expiry = _next_valid_expiry(now, cfg)
+            if not expiry:
+                LOG.info("[weekly_live] No valid expiry found beyond min_days_to_expiry=%s; skipping", cfg.min_days_to_expiry)
+                time.sleep(cfg.poll_seconds * 4)
+                continue
             oc = dw.get_option_chain(cfg.underlying_id, cfg.underlying_seg, expiry)
             spot = _extract_spot_from_oc(oc)
         except Exception:
@@ -302,6 +322,16 @@ def run_live(dw, cfg: LiveConfig) -> None:
             }
             LOG.info("[weekly_live] Entered weekly strangle CE %s PE %s", ce_sec, pe_sec)
             _write_status(status_path, open_position)
+            # Entry hedges (cheap OTM wings for margin benefit)
+            if cfg.entry_hedge_enabled:
+                try:
+                    hedge_orders = _place_entry_wings(dw, cfg, expiry, atm, cfg.qty * cfg.lot_size)
+                    if hedge_orders:
+                        open_position["entry_hedge_orders"] = hedge_orders
+                        LOG.info("[weekly_live] Placed entry hedges count=%d", len(hedge_orders))
+                        _write_status(status_path, open_position)
+                except Exception as exc:
+                    LOG.warning("[weekly_live] entry hedge placement failed: %s", exc)
         except Exception as exc:
             LOG.warning("[weekly_live] order placement failed: %s", exc)
             open_position = None
@@ -325,6 +355,37 @@ def _next_tuesday_expiry(now: datetime) -> str:
         ahead += 1
         if ahead > max_ahead:
             return d.isoformat()
+
+
+def _next_valid_expiry(now: datetime, cfg: LiveConfig) -> Optional[str]:
+    """
+    Pick the next Tuesday expiry with at least cfg.min_days_to_expiry days remaining.
+    Falls back to the nearest Tuesday if none meet the threshold.
+    """
+    from datetime import timedelta
+    candidate = _next_tuesday_expiry(now)
+    if not candidate:
+        return None
+    try:
+        cand_date = datetime.fromisoformat(candidate).date()
+        delta_days = (cand_date - now.date()).days
+        if delta_days >= cfg.min_days_to_expiry:
+            return candidate
+    except Exception:
+        pass
+    # fallback: pick the following Tuesday (closest beyond min_days)
+    d = now.date()
+    holidays = _holiday_dates()
+    max_ahead = 20
+    ahead = 0
+    while ahead <= max_ahead:
+        if d.weekday() == 1 and d not in holidays:
+            delta = (d - now.date()).days
+            if delta >= cfg.min_days_to_expiry:
+                return d.isoformat()
+        d += timedelta(days=1)
+        ahead += 1
+    return candidate
 
 
 def _extract_spot_from_oc(oc: Dict[str, Any]) -> Optional[float]:
@@ -554,6 +615,51 @@ def _maybe_hedge(dw, cfg: LiveConfig, pos: Dict[str, Any]) -> bool:
         except Exception as exc:
             LOG.warning("[weekly_live] hedge placement failed for %s: %s", sec_id, exc)
     return placed
+
+
+def _place_entry_wings(dw, cfg: LiveConfig, expiry: str, atm: float, qty: int) -> List[str]:
+    """
+    Buy cheap far OTM wings at entry to gain margin benefit.
+    Uses hedge_distance for strikes and entry_hedge_price_cap to bound cost.
+    """
+    orders: List[str] = []
+    strikes = [
+        ("CALL", atm + cfg.hedge_distance),
+        ("PUT", atm - cfg.hedge_distance),
+    ]
+    for opt_type, strike in strikes:
+        sec_id = None
+        try:
+            sec_id = resolve_option_security_id(cfg.underlying_symbol, expiry, strike, opt_type)
+        except Exception:
+            sec_id = None
+        if not sec_id:
+            continue
+        ltp = None
+        try:
+            ltp = dw.get_ltp_once(cfg.underlying_seg, sec_id) if hasattr(dw, "get_ltp_once") else None
+        except Exception:
+            ltp = None
+        if ltp is not None and ltp > cfg.entry_hedge_price_cap:
+            continue
+        try:
+            resp = dw.place_order(
+                side="BUY",
+                exchange_seg=cfg.underlying_seg,
+                security_id=sec_id,
+                quantity=qty,
+                product_type=cfg.product_type,
+                order_type="LIMIT",
+                price=cfg.entry_hedge_price_cap,
+                client_order_id=f"ENTRYH-{uuid.uuid4().hex[:6]}",
+            )
+            if isinstance(resp, dict):
+                oid = resp.get("orderId") or resp.get("order_id")
+                if oid:
+                    orders.append(oid)
+        except Exception as exc:
+            LOG.warning("[weekly_live] entry wing place failed %s@%s: %s", opt_type, strike, exc)
+    return orders
 
 
 def _place_with_retries(dw, cfg: LiveConfig, sec_id: int, qty: int, order_type: str, limit_price: Optional[float]) -> Optional[str]:

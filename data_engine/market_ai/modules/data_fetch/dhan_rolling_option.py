@@ -50,15 +50,12 @@ class RollingOptionConfig:
     interval: str = "1"
     expiry_flag: str = "MONTH"
     expiry_code: Optional[int] = None
+    # Default to the maximum supported range for index options: ATM±10.
     strike_selectors: Sequence[str] = field(
-        default_factory=lambda: (
-            "ATM",
-            "ATM+2",
-            "ATM-2",
-            "ATM+4",
-            "ATM-4",
-            "ATM+6",
-            "ATM-6",
+        default_factory=lambda: tuple(
+            ["ATM"]
+            + [f"ATM+{k}" for k in range(1, 11)]
+            + [f"ATM-{k}" for k in range(1, 11)]
         )
     )
     option_types: Sequence[str] = field(default_factory=lambda: ("CALL", "PUT"))
@@ -92,6 +89,21 @@ class RollingOptionIngestor:
 
         records: List[Dict[str, Any]] = []
         strikes = cfg.strike_selectors or ("ATM",)
+        # Enforce Dhan limits: index options ATM±10, others ATM±3
+        def _within_limit(selector: str) -> bool:
+            if selector.upper() == "ATM":
+                return True
+            if not selector.upper().startswith("ATM"):
+                return False
+            try:
+                off = selector.upper().replace("ATM", "")
+                sign = 1 if "+" in off else -1
+                mag = int(off.replace("+", "").replace("-", "")) * sign
+            except Exception:
+                return False
+            limit = 10 if cfg.instrument.upper() == "OPTIDX" else 3
+            return abs(mag) <= limit
+        strikes = tuple(s for s in strikes if _within_limit(s))
         option_types = cfg.option_types or ("CALL", "PUT")
         required = list(cfg.required_data or DEFAULT_REQUIRED_DATA)
 
