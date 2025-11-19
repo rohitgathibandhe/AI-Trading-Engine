@@ -1,5 +1,4 @@
 {
-  "python.testing.pytestEnabled": true,
-  "python.testing.pytestArgs": ["-m", "unit or integration"],
-  "python.defaultInterpreterPath": "/Users/Rohit/.venvs/data_engine_py310/bin/python"
+  "python.envFile": "${workspaceFolder}/.env",
+  "python.pythonPath": "/Users/Rohit/.venv/data_engine_py310/bin/python"
 }

@@ -2,66 +2,20 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Streamlit UI (workspace = repo root)",
-      "type": "debugpy",
+      "name": "Streamlit UI",
+      "type": "python",
       "request": "launch",
-      "python": "/Users/Rohit/.venvs/data_engine_py310/bin/python",
       "module": "streamlit",
       "args": [
         "run",
-        "data_engine/market_ai/ui/app.py",
-        "--server.address", "localhost",
-        "--server.port", "8501"
+        "${workspaceFolder}/data_engine/market_ai/ui/app.py"
       ],
       "cwd": "${workspaceFolder}",
-      "envFile": "${workspaceFolder}/.env",
-      "env": { "PYTHONPATH": "${workspaceFolder}" },
       "console": "integratedTerminal",
-      "justMyCode": true
-    },
-    {
-      "name": "Streamlit UI (workspace = data_engine)",
-      "type": "debugpy",
-      "request": "launch",
-      "python": "/Users/Rohit/.venvs/data_engine_py310/bin/python",
-      "module": "streamlit",
-      "args": [
-        "run",
-        "market_ai/ui/app.py",
-        "--server.address",
-        "localhost",
-        "--server.port",
-        "8504"
-      ],
-      "cwd": "${workspaceFolder}/data_engine",
       "envFile": "${workspaceFolder}/.env",
       "env": {
-        "PYTHONPATH": "${workspaceFolder}"
-      },
-      "console": "integratedTerminal",
-      "justMyCode": true
-    },
-    {
-      "name": "Streamlit UI (absolute path)",
-      "type": "debugpy",
-      "request": "launch",
-      "python": "/Users/Rohit/.venvs/data_engine_py310/bin/python",
-      "module": "streamlit",
-      "args": [
-        "run",
-        "/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/ui/app.py",
-        "--server.address",
-        "localhost",
-        "--server.port",
-        "8505"
-      ],
-      "cwd": "/Users/Rohit/AI-Trading-Engine",
-      "envFile": "/Users/Rohit/AI-Trading-Engine/.env",
-      "env": {
-        "PYTHONPATH": "/Users/Rohit/AI-Trading-Engine"
-      },
-      "console": "integratedTerminal",
-      "justMyCode": true
+        "PYTHONPATH": "${workspaceFolder}/data_engine"
+      }
     }
   ]
 }

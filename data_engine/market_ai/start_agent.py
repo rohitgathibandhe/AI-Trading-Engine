@@ -1,610 +1,213 @@
-# start_agent.py — unified entry
+#!/usr/bin/env python3
+"""
+Refactored agent entrypoint.
+
+Uses the new StrategySelector framework (regime-aware) instead of the legacy
+weekly_theta_strangle loop. Warn-only by default; flip WARN_ONLY=false to allow
+order placement once verified.
+"""
 from __future__ import annotations
 
+import json
+import logging
 import os
 import sys
-import logging
-import importlib.util
+import time
+from datetime import datetime, time as dtime
 from pathlib import Path
-from dataclasses import dataclass
-import inspect
-from typing import Tuple, Any, Dict
-import json
+from typing import List, Optional
+
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, timedelta
-import csv
 
-import pandas as pd
-
-# ───────────────────────── Path resolver (must be first) ─────────────────────
-THIS_FILE = Path(__file__).resolve()                   # .../data_engine/market_ai/start_agent.py
-ENGINE_DIR = THIS_FILE.parent                          # .../data_engine/market_ai
-DATA_ENGINE_DIR = ENGINE_DIR.parent                    # .../data_engine
-PROJECT_ROOT = DATA_ENGINE_DIR.parent                  # .../Algotrade_ai
+# ── Path/setup ────────────────────────────────────────────────────────────────
+THIS_FILE = Path(__file__).resolve()
+ENGINE_DIR = THIS_FILE.parent
+DATA_ENGINE_DIR = ENGINE_DIR.parent
+PROJECT_ROOT = DATA_ENGINE_DIR.parent
 STATE_DIR = ENGINE_DIR / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
-AGENT_LOG_PATH = STATE_DIR / "agent.log"
+AGENT_LOG = STATE_DIR / "agent.log"
 
-# Your correct strategies location
-PREFERRED_STRAT_DIR = ENGINE_DIR / "modules" / "strategies"
-
-# Other places we may accept as fallback (lower priority)
-ALT_STRAT_DIRS = [
-    ENGINE_DIR / "strategies",
-    PROJECT_ROOT / "strategies",
-    PROJECT_ROOT,
-]
-
-# Optional override via env
-env_dir = os.getenv("STRATEGIES_DIR")
-if env_dir:
-    ALT_STRAT_DIRS.insert(0, Path(env_dir).expanduser().resolve())
-
-# Ensure our code and strategies are importable
-for p in (ENGINE_DIR, DATA_ENGINE_DIR, PROJECT_ROOT, PREFERRED_STRAT_DIR, *ALT_STRAT_DIRS):
+for p in (ENGINE_DIR, DATA_ENGINE_DIR, PROJECT_ROOT, ENGINE_DIR / "strategies"):
     ps = str(p)
     if ps not in sys.path:
         sys.path.insert(0, ps)
 
-# ───────────────────────── Logging config (timestamps) ───────────────────────
-LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
-LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
-LOG_MAX_BYTES = int(os.getenv("AGENT_LOG_MAX_BYTES", 5 * 1024 * 1024))
-LOG_BACKUP_COUNT = int(os.getenv("AGENT_LOG_BACKUP_COUNT", 5))
-
-formatter = logging.Formatter(fmt=LOG_FORMAT, datefmt=LOG_DATEFMT)
-file_handler = RotatingFileHandler(
-    AGENT_LOG_PATH,
-    maxBytes=LOG_MAX_BYTES,
-    backupCount=LOG_BACKUP_COUNT,
-    encoding="utf-8",
+from market_ai.dhan_wrapper import DhanWrapper  # noqa: E402
+from market_ai.strategies import (  # noqa: E402
+    StrategySelector,
+    MarketSnapshot,
+    OptionLeg,
+    RiskConfig,
+    StrategyType,
 )
-file_handler.setFormatter(formatter)
 
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(formatter)
-
-root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
-root_logger.handlers = [file_handler, console_handler]
-
+# ── Logging ──────────────────────────────────────────────────────────────────
+formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
+handler = RotatingFileHandler(AGENT_LOG, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+handler.setFormatter(formatter)
+console = logging.StreamHandler(sys.stdout)
+console.setFormatter(formatter)
+root = logging.getLogger()
+root.setLevel(logging.INFO)
+root.handlers = [handler, console]
 log = logging.getLogger("start_agent")
 
-# ───────────────────────── Helpers ──────────────────────────────────────────
-def _load_module_from_path(mod_name: str, file_path: Path):
-    """Import a module from an explicit file path."""
-    spec = importlib.util.spec_from_file_location(mod_name, str(file_path))
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load module {mod_name} from {file_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    spec.loader.exec_module(module)  # type: ignore[attr-defined]
-    return module
-
-def _lazy_symbol(file_path: Path, symbol: str):
-    """Load one symbol from a file path."""
-    mod = _load_module_from_path(f"dyn_{file_path.stem}", file_path)
-    return getattr(mod, symbol)
-
-
-def _load_agent_settings() -> dict:
-    path = os.getenv("AGENT_SETTINGS_JSON")
-    if not path:
-        return {}
-    try:
-        settings_path = Path(path)
-        if not settings_path.exists():
-            return {}
-        data = json.loads(settings_path.read_text())
-        if isinstance(data, dict):
-            return data
-    except Exception as exc:
-        log.warning("Failed to read agent settings (%s): %s", path, exc)
-    return {}
-
-
-LEGACY_HEDGE_ENV_ALIASES = {
-    "BATMAN_ENABLED": "HEDGE_ENABLE",
-    "BATMAN_DELTA_BREACH": "HEDGE_DELTA_BREACH",
-    "BATMAN_PREMIUM_HARD_X": "HEDGE_PREMIUM_HARD_X",
-    "BATMAN_ROLL_DISTANCE": "HEDGE_ROLL_DISTANCE",
-    "BATMAN_HEDGE_DELTA_MAX": "HEDGE_DELTA_MAX",
-    "BATMAN_HEDGE_PRICE_MAX": "HEDGE_PRICE_MAX",
-    "BATMAN_SALVAGE_WING_LTP": "HEDGE_SALVAGE_WING_LTP",
-}
-
-LEGACY_HEDGE_SETTING_ALIASES = {
-    "batman_enabled": "hedge_enabled",
-    "batman_delta_breach": "hedge_delta_breach",
-    "batman_premium_hard_x": "hedge_premium_hard_x",
-    "batman_roll_distance": "hedge_roll_distance",
-    "batman_hedge_delta_max": "hedge_delta_max",
-    "batman_hedge_price_max": "hedge_price_max",
-    "batman_salvage_wing_ltp": "hedge_salvage_wing_ltp",
-}
-
-
-def _apply_legacy_env_aliases() -> None:
-    for legacy, new in LEGACY_HEDGE_ENV_ALIASES.items():
-        if legacy in os.environ and new not in os.environ:
-            os.environ[new] = os.environ[legacy]
-
-
-def _migrate_legacy_hedge_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
-    for legacy, new in LEGACY_HEDGE_SETTING_ALIASES.items():
-        if legacy in settings and new not in settings:
-            settings[new] = settings[legacy]
-    return settings
-
-
-def _as_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
+# ── Helpers ─────────────────────────────────────────────────────────────────
+def _as_bool(val: Optional[str], default: bool) -> bool:
+    if val is None:
         return default
-    try:
-        return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
-    except Exception:
-        return default
+    return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _as_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return float(default)
-
-
-def _as_int(value: Any, default: int) -> int:
-    try:
-        return int(round(float(value)))
-    except Exception:
-        return int(default)
-
-
-def _pick_json(env_name: str, setting_name: str, default: Any, settings: Dict[str, Any]) -> Any:
-    if env_name in os.environ:
+def _map_positions(rows: list) -> List[OptionLeg]:
+    legs: List[OptionLeg] = []
+    for r in rows or []:
         try:
-            return json.loads(os.environ[env_name])
-        except Exception as exc:
-            log.warning("Failed to parse %s: %s", env_name, exc)
-    if setting_name in settings:
-        return settings[setting_name]
-    return default
-# ───────────────────────── DhanWrapper import (robust) ───────────────────────
-def _import_dhan_wrapper():
-    """
-    Import the DhanWrapper class even if Python packages are not installed
-    properly (e.g. when start_agent.py is launched from a copied folder).
-    """
-    try:
-        from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
-        log.info("DhanWrapper import: data_engine.market_ai.dhan_wrapper")
-        return DhanWrapper
-    except (ModuleNotFoundError, ImportError) as exc:
-        candidates = [
-            ENGINE_DIR / "dhan_wrapper.py",
-            PROJECT_ROOT / "data_engine" / "market_ai" / "dhan_wrapper.py",
-            PROJECT_ROOT / "market_ai" / "dhan_wrapper.py",
-        ]
-        for path in candidates:
-            if path.exists():
-                DhanWrapper = _lazy_symbol(path, "DhanWrapper")  # type: ignore
-                log.info("DhanWrapper import: file %s", path)
-                return DhanWrapper
-
-        # as a last resort search the repo to help misconfigured deployments
-        hits = sorted(PROJECT_ROOT.rglob("dhan_wrapper.py"))
-        for path in hits:
-            try:
-                DhanWrapper = _lazy_symbol(path, "DhanWrapper")  # type: ignore
-                log.info("DhanWrapper import: discovered %s", path)
-                return DhanWrapper
-            except Exception:
+            exch = str(r.get("exchangeSegment") or r.get("exchange_seg") or "").upper()
+            if not exch.startswith("NSE_FNO"):
                 continue
-
-        raise ModuleNotFoundError(
-            "Unable to import DhanWrapper. Ensure data_engine/market_ai is on PYTHONPATH "
-            "or keep dhan_wrapper.py under the project root."
-        ) from exc
-
-
-DhanWrapper = _import_dhan_wrapper()
-
-# ───────────────────────── Strategy import (robust) ─────────────────────────
-STRAT_FILENAME = os.environ.get("STRATEGY_FILE", "monthly_strangle_with_weekly_hedge.py")
-
-def _import_strategy() -> Tuple[Any, Any, Any]:
-    """
-    Returns (run_live, LiveConfig, HedgeConfig).
-    Prefers package imports; falls back to loading the .py file from known dirs.
-    """
-    module_name = STRAT_FILENAME.replace(".py", "")
-    candidates = [
-        f"data_engine.market_ai.modules.strategies.{module_name}",
-        f"market_ai.modules.strategies.{module_name}",
-        f"strategies.{module_name}",
-    ]
-    for mod in candidates:
-        try:
-            imported = __import__(mod, fromlist=["run_live", "LiveConfig"])
-            run_live = getattr(imported, "run_live")
-            LiveConfig = getattr(imported, "LiveConfig")
-            HedgeConfig = getattr(imported, "HedgeConfig", None)
-            log.info("Strategy import: %s", mod)
-            return run_live, LiveConfig, HedgeConfig
+            symbol = r.get("tradingSymbol") or r.get("symbol") or ""
+            if "NIFTY" not in symbol.upper():
+                continue
+            net = float(r.get("netQty") or r.get("netqty") or 0)
+            if net == 0:
+                continue
+            qty = abs(int(net))
+            side = "SELL" if net < 0 else "BUY"
+            expiry = r.get("expiryDate") or r.get("expiry")
+            expiry_date = datetime.fromisoformat(str(expiry)).date() if expiry else datetime.now().date()
+            legs.append(
+                OptionLeg(
+                    symbol="NIFTY",
+                    expiry=expiry_date,
+                    strike=float(r.get("strikePrice") or r.get("strike") or 0),
+                    option_type="CALL" if "C" in str(r.get("optionType") or r.get("option_type") or "C").upper() else "PUT",
+                    side=side,
+                    quantity=qty,
+                    entry_price=float(r.get("avgPrice") or r.get("avg_price") or 0.0),
+                    security_id=str(r.get("securityId") or r.get("security_id") or ""),
+                )
+            )
         except Exception:
             continue
-    # file fallback
-    search_dirs = [PREFERRED_STRAT_DIR, *ALT_STRAT_DIRS]
-    for d in search_dirs:
-        path = (Path(d) / STRAT_FILENAME).resolve()
-        if path.exists():
-            mod = _load_module_from_path("dyn_strategy", path)
-            log.info("Strategy import: file '%s'", path)
-            run_live = getattr(mod, "run_live")
-            LiveConfig = getattr(mod, "LiveConfig")
-            HedgeConfig = getattr(mod, "HedgeConfig", None)
-            return run_live, LiveConfig, HedgeConfig
-    lines = "\n".join(f" - {(Path(d)/STRAT_FILENAME).resolve()}" for d in search_dirs)
-    raise FileNotFoundError(
-        f"Could not locate {STRAT_FILENAME}. Place it at one of:\n{lines}\n"
-        "Or set STRATEGY_FILE to the filename (e.g., weekly_theta_strangle.py)."
-    )
-
-# Try now so any error appears in the log immediately
-from market_ai.modules.strategies.strategy_selector import select_preferred_strategy
-from market_ai.modules.analytics import MarketRegimeAnalyzer
-from market_ai.modules.agents.strategy_recommender import StrategyRecommender
-
-run_live, LiveConfig, HedgeConfig = _import_strategy()
-strategy_module = sys.modules.get(run_live.__module__)
-if strategy_module is None or not hasattr(strategy_module, "FEATURE_FIELDS"):
-    FEATURE_FIELDS = [
-        "timestamp",
-        "strategy",
-        "expiry",
-        "exchange_seg",
-        "spot",
-        "ce_strike",
-        "pe_strike",
-        "ce_ltp",
-        "pe_ltp",
-        "ce_delta",
-        "pe_delta",
-        "ce_entry",
-        "pe_entry",
-        "net_credit",
-        "warn_only",
-        "trade_mode",
-        "context",
-    ]
-else:
-    FEATURE_FIELDS = list(getattr(strategy_module, "FEATURE_FIELDS"))
-
-if strategy_module is None or not hasattr(strategy_module, "BLOTTER_FIELDS"):
-    BLOTTER_FIELDS = [
-        "timestamp",
-        "trade_mode",
-        "warn_only",
-        "executed",
-        "side",
-        "order_type",
-        "exchange_seg",
-        "product_type",
-        "security_id",
-        "quantity",
-        "price",
-        "strike",
-        "tag",
-        "notes",
-    ]
-else:
-    BLOTTER_FIELDS = list(getattr(strategy_module, "BLOTTER_FIELDS"))
-
-if strategy_module is None or not hasattr(strategy_module, "EQUITY_FIELDS"):
-    EQUITY_FIELDS = [
-        "timestamp",
-        "available",
-        "collateral",
-        "utilized",
-        "withdrawable",
-        "gross_exposure",
-        "net_exposure",
-        "unrealized",
-        "realized",
-        "equity_estimate",
-    ]
-else:
-    EQUITY_FIELDS = list(getattr(strategy_module, "EQUITY_FIELDS"))
+    return legs
 
 
-def _ensure_csv_file(path: Path, headers: list[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.stat().st_size > 0:
-        return
-    with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=headers)
-        writer.writeheader()
-
-# ───────────────────────── Optional adaptive agent support ───────────────────
-def _maybe_run_adaptive() -> bool:
-    """
-    If AGENT_MODE=adaptive, attempt to load agents/adaptive_agent.py and run it.
-    Returns True if adaptive was started, else False.
-    """
-    if os.getenv("AGENT_MODE", "strategy").lower() != "adaptive":
-        return False
-
-    # Locate file
-    cand1 = ENGINE_DIR / "agents" / "adaptive_agent.py"
-    cand2 = ENGINE_DIR / "agent" / "adaptive_agent.py"
-    agent_file = cand1 if cand1.exists() else (cand2 if cand2.exists() else None)
-    if agent_file is None:
-        hits = list(PROJECT_ROOT.rglob("adaptive_agent.py"))
-        if hits:
-            # prefer a file under market_ai if present
-            agent_file = next((h for h in hits if "market_ai" in str(h)), hits[0])
-    if agent_file is None:
-        raise FileNotFoundError("AGENT_MODE=adaptive but 'adaptive_agent.py' not found.")
-
-    log.info("Loading adaptive agent from: %s", agent_file)
-    mod = _load_module_from_path("adaptive_agent_mod", agent_file)
-    AdaptiveAgent = getattr(mod, "AdaptiveAgent")
-    AgentConfig = getattr(mod, "AgentConfig", None)
-
-    if AgentConfig is None:
-        log.warning("adaptive_agent.py missing AgentConfig; using fallback dataclass")
-
-        @dataclass
-        class AgentConfig:  # type: ignore[redefinition]
-            state_path: str
-            control_dir: str
-
-    state_dir = ENGINE_DIR / "state"
-    control_dir = ENGINE_DIR / "control"
-    logs_dir = ENGINE_DIR / "logs"
-    for d in (state_dir, control_dir, logs_dir):
-        d.mkdir(parents=True, exist_ok=True)
-
-    cfg = AgentConfig(  # type: ignore[arg-type]
-        state_path=str(state_dir / "trade_state.json"),
-        control_dir=str(control_dir),
-    )
-    risk_cfg = {
-        "max_loss_pct_trade": 0.015,
-        "max_loss_pct_day": 0.025,
-        "ivpct_min": 10,
-        "ivpct_max": 85,
-        "vix_min": 10.0,
-        "vix_max": 25.0,
-        "gap_thr_pct": 0.5,
-        "default_account_equity": 500000.0,
-    }
-    AdaptiveAgent(cfg, risk_cfg).start()
-    return True
-
-# ───────────────────────── Main (strategy mode by default) ───────────────────
-def main() -> None:
-    if _maybe_run_adaptive():
-        return
-
-    # Strategy mode (default)
-    # DhanWrapper gets DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN from environment
-    dw = DhanWrapper()
-
-    settings = _migrate_legacy_hedge_settings(_load_agent_settings())
-    _apply_legacy_env_aliases()
-
-    def pick(env_name: str, setting_name: str, default: Any, caster) -> Any:
-        if env_name in os.environ:
-            return caster(os.environ[env_name], default)
-        if setting_name in settings:
-            return caster(settings[setting_name], default)
-        return default
-
-    def pick_bool(env_name: str, setting_name: str, default: bool) -> bool:
-        if env_name in os.environ:
-            return _as_bool(os.environ[env_name], default)
-        if setting_name in settings:
-            return _as_bool(settings[setting_name], default)
-        return default
-
-    strategy_bias_cfg = _pick_json("STRATEGY_BIAS", "strategy_bias", {}, settings)
-    if not isinstance(strategy_bias_cfg, dict):
-        strategy_bias_cfg = {}
-    strategy_whitelist_cfg = _pick_json("STRATEGY_WHITELIST", "strategy_whitelist", [], settings)
-    if isinstance(strategy_whitelist_cfg, str):
-        strategy_whitelist = [x.strip() for x in strategy_whitelist_cfg.split(",") if x.strip()]
-    elif isinstance(strategy_whitelist_cfg, list):
-        strategy_whitelist = [str(x) for x in strategy_whitelist_cfg]
-    else:
-        strategy_whitelist = []
-
-    blotter_path = os.getenv("BLOTTER_PATH", str(ENGINE_DIR / "state" / "trade_blotter.csv"))
-    summary_path = os.getenv("BLOTTER_SUMMARY_PATH", str(ENGINE_DIR / "state" / "trade_blotter_summary.json"))
-    trade_mode = os.getenv("TRADE_MODE", settings.get("trade_mode", "live"))
-    feature_log = os.getenv("FEATURE_LOG_PATH", settings.get("feature_log_path", str(ENGINE_DIR / "state" / "feature_history.csv")))
-    equity_log = os.getenv("EQUITY_LOG_PATH", settings.get("equity_log_path", str(ENGINE_DIR / "state" / "equity_history.csv")))
-
-    blotter_path_obj = Path(blotter_path)
-    _ensure_csv_file(blotter_path_obj, BLOTTER_FIELDS)
-    equity_path = Path(equity_log)
-    _ensure_csv_file(equity_path, EQUITY_FIELDS)
-
-    hedge_cfg_obj = None
-    if callable(HedgeConfig):
-        hedge_cfg_obj = HedgeConfig(
-            enabled=pick_bool("HEDGE_ENABLED", "hedge_enabled", True),
-            delta_breach=pick("HEDGE_DELTA_BREACH", "hedge_delta_breach", 0.30, _as_float),
-            premium_hard_x=pick("HEDGE_PREMIUM_HARD_X", "hedge_premium_hard_x", 2.0, _as_float),
-            roll_distance=pick("HEDGE_ROLL_DISTANCE", "hedge_roll_distance", 150.0, _as_float),
-            hedge_delta_max=pick("HEDGE_DELTA_MAX", "hedge_delta_max", 0.12, _as_float),
-            hedge_price_max=pick("HEDGE_PRICE_MAX", "hedge_price_max", 35.0, _as_float),
-            salvage_wing_ltp=pick("HEDGE_SALVAGE_WING_LTP", "hedge_salvage_wing_ltp", 5.0, _as_float),
-        )
-    elif HedgeConfig is not None:
-        log.warning("HedgeConfig is present but not callable; skipping hedge config build")
-
-    params = inspect.signature(LiveConfig).parameters
-    cfg_kwargs: dict = {}
-    def set_if(name: str, val):
-        if name in params:
-            cfg_kwargs[name] = val
-
-    set_if("max_strangles", pick("MAX_STRANGLES", "max_legs", 1, _as_int))
-    set_if("lot_size", pick("NIFTY_LOT", "lot_size", 75, _as_int))
-    set_if("sl_pct", pick("SL_PCT", "leg_sl_pct", 0.025, _as_float))
-    set_if("tp_pct", pick("TP_PCT", "profit_pct", 0.0225, _as_float))
-    set_if("hedge_enable", pick_bool("HEDGE_ENABLE", "hedge_enabled", True))
-    set_if("hedge_price_min", pick("HEDGE_PRICE_MIN", "hedge_price_min", 2.5, _as_float))
-    set_if("hedge_price_max", pick("HEDGE_PRICE_MAX", "hedge_price_max", 3.5, _as_float))
-    set_if("poll_sec", pick("POLL_SEC", "poll_sec", 5.0, _as_float))
-    set_if("warn_only", pick_bool("WARN_ONLY", "warn_only", False))
-    set_if("trade_mode", trade_mode)
-    set_if("blotter_path", blotter_path)
-    set_if("blotter_summary_path", summary_path)
-    set_if("hedge", hedge_cfg_obj)
-    set_if("feature_log_path", feature_log)
-    set_if("equity_log_path", equity_log)
-    set_if("equity_snapshot_minutes", pick("EQUITY_SNAPSHOT_MINUTES", "equity_snapshot_minutes", getattr(LiveConfig, "equity_snapshot_minutes", 10.0), _as_float))
-    set_if("risk_max_daily_loss", pick("RISK_MAX_DAILY_LOSS", "risk_max_daily_loss", getattr(LiveConfig, "risk_max_daily_loss", 75000.0), _as_float))
-    set_if("risk_max_exposure_pct", pick("RISK_MAX_EXPOSURE_PCT", "risk_max_exposure_pct", getattr(LiveConfig, "risk_max_exposure_pct", 0.05), _as_float))
-    set_if("risk_account_equity", pick("RISK_ACCOUNT_EQUITY", "risk_account_equity", getattr(LiveConfig, "risk_account_equity", 500000.0), _as_float))
-    set_if("risk_max_rolls_per_day", pick("RISK_MAX_ROLLS_PER_DAY", "risk_max_rolls_per_day", getattr(LiveConfig, "risk_max_rolls_per_day", 6), _as_int))
-    set_if("risk_overall_sl_pct", pick("RISK_OVERALL_SL_PCT", "risk_overall_sl_pct", getattr(LiveConfig, "risk_overall_sl_pct", 2.5), _as_float))
-    set_if("risk_max_portfolio_delta", pick("RISK_MAX_PORTFOLIO_DELTA", "risk_max_portfolio_delta", getattr(LiveConfig, "risk_max_portfolio_delta", 0.25), _as_float))
-    set_if("risk_per_leg_sl_mult", pick("RISK_PER_LEG_SL_MULT", "risk_per_leg_sl_mult", getattr(LiveConfig, "risk_per_leg_sl_mult", 2.0), _as_float))
-    if "auto_playbook" in params:
-        set_if("auto_playbook", settings.get("auto_playbook", getattr(LiveConfig, "auto_playbook", {})))
-    cfg = LiveConfig(**{k: v for k, v in cfg_kwargs.items() if v is not None})
-    if hasattr(cfg, "regime_refresh_minutes"):
-        cfg.regime_refresh_minutes = pick(
-            "REGIME_REFRESH_MINUTES",
-            "regime_refresh_minutes",
-            cfg.regime_refresh_minutes,
-            _as_float,
-        )
-    if hasattr(cfg, "auto_disable_strangle_when_unfavored"):
-        cfg.auto_disable_strangle_when_unfavored = pick_bool(
-            "AUTO_DISABLE_STRANGLE",
-            "auto_disable_strangle",
-            cfg.auto_disable_strangle_when_unfavored,
-        )
-
-    selector_model_path = Path(
-        os.getenv(
-            "STRATEGY_MODEL_PATH",
-            settings.get("strategy_model_path", str(ENGINE_DIR / "state" / "strategy_selector_model.json")),
-        )
-    )
-    feature_path = Path(feature_log)
-    feature_path.parent.mkdir(parents=True, exist_ok=True)
-    if not feature_path.exists():
-        header = ",".join(FEATURE_FIELDS) + "\n"
-        feature_path.write_text(header)
-
-    lookback_minutes = pick("REGIME_LOOKBACK_MINUTES", "regime_lookback_minutes", 180.0, _as_float)
-    regime_analyzer = MarketRegimeAnalyzer(lookback=timedelta(minutes=float(lookback_minutes)))
-    recommender = StrategyRecommender(
-        selector_model_path if selector_model_path.exists() else None,
-        feature_path,
-        bias=strategy_bias_cfg,
-        whitelist=strategy_whitelist,
-    )
-
-    initial_state = None
-    if feature_path.exists() and feature_path.stat().st_size > 0:
-        try:
-            history_df = pd.read_csv(feature_path).tail(600)
-            initial_state = regime_analyzer.analyze_feature_history(history_df)
-        except Exception as exc:
-            log.debug("Failed to compute initial market state: %s", exc)
-
-    if initial_state is None and feature_path.exists() and feature_path.stat().st_size == 0:
-        spot_val = _as_float(dw.get_ltp_once("IDX_I", 13), 0.0)
-        spot = spot_val if spot_val > 0 else None
-        if spot is not None:
-            history_df = pd.DataFrame([
+def _map_chain(chain_raw: dict, expiry) -> List[dict]:
+    rows: List[dict] = []
+    for strike, legs in (chain_raw or {}).items():
+        for opt_name, opt_data in (legs or {}).items():
+            if not isinstance(opt_data, dict):
+                continue
+            rows.append(
                 {
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "spot": spot,
+                    "expiry": expiry,
+                    "option_type": "CE" if opt_name.lower().startswith("ce") else "PE",
+                    "strike": float(strike),
+                    "ltp": opt_data.get("last_price") or opt_data.get("ltp") or opt_data.get("close"),
+                    "delta": opt_data.get("delta"),
+                    "security_id": opt_data.get("securityId") or opt_data.get("security_id"),
                 }
-            ])
-            initial_state = regime_analyzer.analyze_feature_history(history_df, min_required=1)
-
-    if initial_state:
-        setattr(cfg, "_last_market_state", initial_state)
-        candidates = recommender.recommend(initial_state)
-        setattr(cfg, "_last_strategy_candidates", candidates)
-        if candidates:
-            top = candidates[0]
-            log.info(
-                "Initial environment trend=%s vol=%s -> top strategy=%s score=%.2f",
-                initial_state.trend,
-                initial_state.volatility,
-                top.name,
-                top.score,
             )
-            if hasattr(cfg, "auto_disable_strangle_when_unfavored") and cfg.auto_disable_strangle_when_unfavored:
-                cfg.enable_strangle_entry = top.name == "monthly_strangle_with_weekly_hedge"
-    else:
-        if selector_model_path.exists():
-            recommendation = select_preferred_strategy(selector_model_path, feature_path)
-        else:
-            recommendation = None
-            if recommendation:
-                log.info(
-                    "Selector recommendation: %s (expected_credit=%.2f, samples=%d, confidence=%.2f)",
-                    recommendation.name,
-                    recommendation.expected_credit,
-                    recommendation.samples,
-                    recommendation.confidence,
-                )
-                if recommendation.name.lower() == "strangle":
-                    cfg.enable_strangle_entry = True
-                elif recommendation.name.lower() == "batman" and hasattr(cfg, "auto_disable_strangle_when_unfavored") and cfg.auto_disable_strangle_when_unfavored:
-                    cfg.enable_strangle_entry = False
-                    if getattr(cfg, "hedge", None) is not None and not cfg.hedge.enabled:
-                        log.warning("Selector favours Batman but it is disabled via settings")
-            else:
-                log.info("Strategy selector model unavailable; using configured defaults")
+    return rows
 
-    _debug_positions_once(dw)
-    log.info("Starting strategy run_live with cfg=%s", cfg)
-    # Persist pid so the UI can detect manually started agents.
+
+def _compute_mtm(legs: List[OptionLeg]) -> float:
+    mtm = 0.0
+    for leg in legs:
+        if leg.current_ltp is None:
+            continue
+        pnl = (leg.entry_price - leg.current_ltp) if leg.side == "SELL" else (leg.current_ltp - leg.entry_price)
+        mtm += pnl * leg.quantity
+    return mtm
+
+
+def _fetch_expiry(dw: DhanWrapper):
     try:
-        pid_file = ENGINE_DIR / "state" / "agent.pid"
-        pid_file.parent.mkdir(parents=True, exist_ok=True)
-        pid_file.write_text(json.dumps({
-            "pid": os.getpid(),
-            "monitor_pid": None,
-            "watcher_pid": None,
-            "trade_mode": getattr(cfg, "trade_mode", trade_mode),
-            "started_at": datetime.now().isoformat(),
-        }, indent=2))
-    except Exception as exc:
-        log.debug("Failed to write agent.pid: %s", exc)
-    run_live(dw, cfg)
-
-
-def _debug_positions_once(dw) -> None:
-    """Log the raw type/shape of broker positions once on startup for diagnostics."""
-    try:
-        raw = dw.get_positions_live()
-        t = type(raw).__name__
-        log.info("[start_agent] dw.get_positions_live() -> %s", t)
-        if isinstance(raw, list) and raw and not isinstance(raw[0], dict):
-            log.warning("[start_agent] first row type is %s ; sample=%r", type(raw[0]).__name__, raw[0])
-        if isinstance(raw, str):
-            snippet = raw[:300] + ("..." if len(raw) > 300 else "")
-            log.warning("[start_agent] got string response: %r", snippet)
+        expiries = dw.get_optionchain_expirylist("IDX_I", 13)
+        return expiries[0] if expiries else datetime.now().date()
     except Exception:
-        log.exception("[start_agent] probe positions failed")
+        return datetime.now().date()
+
+
+def build_market_snapshot(dw: DhanWrapper) -> MarketSnapshot:
+    spot = float(dw.get_ltp_once("IDX_I", 13) or 0.0)
+    now = datetime.now()
+    return MarketSnapshot(
+        symbol="NIFTY",
+        spot=spot,
+        candles_15m=[],  # TODO: wire real candle data
+        yesterday_high=spot,
+        yesterday_low=spot,
+        india_vix=0.0,
+        now=now,
+    )
+
+
+def main() -> None:
+    warn_only = _as_bool(os.getenv("WARN_ONLY"), True)
+    poll_sec = float(os.getenv("POLL_SEC", "10"))
+    dw = DhanWrapper()
+    selector = StrategySelector(symbol="NIFTY", lot_size=75)
+    risk = RiskConfig(
+        max_intraday_loss=-3000,
+        intraday_target=4000,
+        allow_carry_forward=False,
+        max_carry_days=0,
+        vix_carry_threshold=12.0,
+        last_entry_time=dtime(14, 45),
+        force_exit_time=dtime(15, 15),
+    )
+    log.info("Regime-aware agent started (warn_only=%s)", warn_only)
+
+    while True:
+        try:
+            market = build_market_snapshot(dw)
+            expiry = _fetch_expiry(dw)
+            positions_raw = dw.get_positions_live()
+            legs = _map_positions(positions_raw)
+            chain_raw = dw.get_option_chain(13, "IDX_I", expiry)
+            chain = _map_chain(chain_raw, expiry)
+            basket_mtm = _compute_mtm(legs)
+
+            decision = selector.decide(
+                market=market,
+                option_chain=chain,
+                expiry=expiry,
+                risk=risk,
+                current_positions=legs,
+                basket_mtm=basket_mtm,
+            )
+            log.info("Decision=%s strategy=%s reason=%s", decision.action_type, decision.strategy_type.value, decision.reason)
+            if not warn_only and decision.action_type.startswith("OPEN"):
+                for leg in decision.legs_to_open:
+                    side = "BUY" if leg.side == "BUY" else "SELL"
+                    resp = dw.place_order(
+                        side=side,
+                        exchange_seg="NSE_FNO",
+                        security_id=leg.security_id or 0,
+                        quantity=leg.quantity,
+                        product_type="MIS",
+                        order_type="MARKET",
+                    )
+                    log.info("order placed resp=%s", resp)
+            if not warn_only and decision.action_type.startswith("CLOSE"):
+                for leg in decision.legs_to_close:
+                    side = "BUY" if leg.side == "SELL" else "SELL"
+                    resp = dw.place_order(
+                        side=side,
+                        exchange_seg="NSE_FNO",
+                        security_id=leg.security_id or 0,
+                        quantity=leg.quantity,
+                        product_type="MIS",
+                        order_type="MARKET",
+                    )
+                    log.info("close order resp=%s", resp)
+        except Exception as exc:
+            log.exception("Agent loop error: %s", exc)
+        time.sleep(poll_sec)
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        logging.exception("Agent crashed with an unhandled exception")
-        raise
+    main()

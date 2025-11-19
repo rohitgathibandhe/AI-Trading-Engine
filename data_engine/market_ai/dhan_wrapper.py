@@ -78,8 +78,7 @@ def _import_from_dhan_sdk():
     ]
     mods: Dict[str, Any] = {}
     for mod_name, symbol in candidates:
-        try:
-            mod = __import__(mod_name, fromlist=["*"])
+        try:            mod = __import__(mod_name, fromlist=["*"])
             mods[symbol] = getattr(mod, symbol)
         except Exception as e:
             last_err = e
@@ -124,11 +123,17 @@ def _is_india_market_open(now: Optional[datetime] = None) -> bool:
 
 
 class _DefaultLogger:
-    def info(self, msg: str) -> None:
+    def info(self, *args, **kwargs) -> None:
+        msg = args[0] if args else ""
         print(msg)
-    def warning(self, msg: str) -> None:
+    def warning(self, *args, **kwargs) -> None:
+        msg = args[0] if args else ""
         print(msg)
-    def exception(self, msg: str) -> None:
+    def error(self, *args, **kwargs) -> None:
+        msg = args[0] if args else ""
+        print(msg)
+    def exception(self, *args, **kwargs) -> None:
+        msg = args[0] if args else ""
         print(msg)
 
 

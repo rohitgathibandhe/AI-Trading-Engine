@@ -140,6 +140,8 @@ class LiveConfig:
     basket_tp_abs: float = 4000.0
     basket_sl_abs: float = -3000.0
     basket_hedge_dd: float = -2000.0
+    auto_adopt_open_positions: bool = True  # adopt live F&O legs automatically
+    auto_adopt_underlying: str = "NIFTY"    # only adopt if symbol matches
 
 
 def run_live(dw, cfg: LiveConfig) -> None:
@@ -165,48 +167,60 @@ def run_live(dw, cfg: LiveConfig) -> None:
 
     open_position: Optional[Dict[str, Any]] = None
 
-    def _adopt_if_needed() -> bool:
+    def _adopt_if_needed(live_positions: list) -> bool:
         nonlocal open_position
-        if open_position or not cfg.adopt_legs:
+        if open_position:
             return False
-        legs = []
-        expiry = None
-        for leg in cfg.adopt_legs:
-            side = leg.get("side") or leg.get("direction") or "SELL"
-            strike = float(leg.get("strike"))
-            opt_type = leg.get("type") or ("CALL" if "CE" in str(leg.get("name","")).upper() else "PUT")
-            qty = int(leg.get("qty") or leg.get("quantity") or 0)
-            entry = float(leg.get("avg") or leg.get("entry") or 0.0)
-            expiry_str = leg.get("expiry")
-            expiry = expiry or expiry_str
-            sec_id = leg.get("securityId") or leg.get("security_id")
-            if not sec_id:
-                try:
-                    sec_id = resolve_option_security_id(cfg.underlying_symbol, expiry_str, strike, opt_type)
-                except Exception:
-                    sec_id = None
-            legs.append({"side": side, "strike": strike, "type": opt_type, "qty": qty, "entry": entry, "sec_id": sec_id})
-        if not legs or not expiry:
+        if not cfg.adopt_legs and not cfg.auto_adopt_open_positions:
             return False
-        open_position = {
-            "expiry": expiry,
-            "legs": legs,
-            "entry_date": now,
-            "adopted": True,
-            "underlying_symbol": cfg.underlying_symbol,
-            "qty": 0,
-            "lot_size": cfg.lot_size,
-        }
-        LOG.info("[weekly_live] adopted %d legs for management", len(legs))
-        return True
+        def _build_legs(src: list) -> Optional[Dict[str, Any]]:
+            legs_local = []
+            expiry_local = None
+            for leg in src:
+                side = leg.get("side") or leg.get("direction") or "SELL"
+                strike = float(leg.get("strike"))
+                opt_type = leg.get("type") or ("CALL" if "CE" in str(leg.get("name","")).upper() else "PUT")
+                qty = int(leg.get("qty") or leg.get("quantity") or 0)
+                entry = float(leg.get("avg") or leg.get("entry") or 0.0)
+                expiry_str = leg.get("expiry")
+                expiry_local = expiry_local or expiry_str
+                sec_id = leg.get("securityId") or leg.get("security_id")
+                if not sec_id:
+                    try:
+                        sec_id = resolve_option_security_id(cfg.underlying_symbol, expiry_str, strike, opt_type)
+                    except Exception:
+                        sec_id = None
+                legs_local.append({"side": side, "strike": strike, "type": opt_type, "qty": qty, "entry": entry, "sec_id": sec_id})
+            if not legs_local or not expiry_local:
+                return None
+            return {
+                "expiry": expiry_local,
+                "legs": legs_local,
+                "entry_date": now,
+                "adopted": True,
+                "underlying_symbol": cfg.underlying_symbol,
+                "qty": 0,
+                "lot_size": cfg.lot_size,
+            }
+
+        basket = _build_legs(cfg.adopt_legs)
+        if basket:
+            open_position = basket
+            LOG.info("[weekly_live] adopted %d legs from config", len(basket["legs"]))
+            return True
+        if not cfg.auto_adopt_open_positions:
+            return False
+        auto_legs = _extract_auto_adopt_legs(live_positions, cfg)
+        basket = _build_legs(auto_legs) if auto_legs else None
+        if basket:
+            open_position = basket
+            LOG.info("[weekly_live] auto-adopted %d legs from live positions", len(basket["legs"]))
+            return True
+        return False
 
     while True:
         now = datetime.now()
         weekday = now.weekday()
-
-        # adopt existing legs once if provided
-        if _adopt_if_needed():
-            pass
 
         try:
             positions = dw.get_positions_live() if hasattr(dw, "get_positions_live") else []
@@ -216,6 +230,10 @@ def run_live(dw, cfg: LiveConfig) -> None:
         open_deriv = [
             p for p in positions if isinstance(p, dict) and str(p.get("exchangeSegment", "")).upper().startswith("NSE_FNO") and float(p.get("netQty", 0)) != 0
         ]
+
+        # adopt existing legs once if provided or auto-adopt enabled
+        if _adopt_if_needed(positions):
+            pass
 
         if open_position:
             # monitor MTM TP/SL and exit conditions
@@ -576,9 +594,9 @@ def _compute_adopted_mtm(dw, cfg: LiveConfig, pos: Dict[str, Any]) -> Tuple[floa
         entry = float(leg.get("entry", 0.0))
         qty = abs(int(leg.get("qty", 0)))
         direction = -1 if str(leg.get("side","SELL")).upper().startswith("SELL") else 1
-        pnl += direction * qty * cfg.lot_size * (entry - ltp)
+        pnl += direction * qty * (entry - ltp)
         if direction < 0:
-            credit += entry * qty * cfg.lot_size
+            credit += entry * qty
     pnl_pct = (pnl / credit) if credit else 0.0
     return pnl, pnl_pct, ltps
 
@@ -714,6 +732,39 @@ def _order_filled(status_resp: Dict[str, Any]) -> bool:
     return False
 
 
+def _extract_auto_adopt_legs(live_positions: list, cfg: LiveConfig) -> list:
+    legs = []
+    for p in live_positions or []:
+        try:
+            exch = str(p.get("exchangeSegment") or p.get("exchange_seg") or "").upper()
+            if not exch.startswith("NSE_FNO"):
+                continue
+            symbol = str(p.get("tradingSymbol") or p.get("symbol") or "")
+            if cfg.auto_adopt_underlying and cfg.auto_adopt_underlying.upper() not in symbol.upper():
+                continue
+            net = float(p.get("netQty") or p.get("netqty") or 0)
+            if net == 0:
+                continue
+            qty = abs(int(net))
+            side = "SELL" if net < 0 else "BUY"
+            strike = p.get("strikePrice") or p.get("strike_price") or p.get("strike") or 0
+            opt_type = p.get("optionType") or p.get("option_type") or ("CALL" if "CE" in symbol.upper() else "PUT")
+            expiry = p.get("expiryDate") or p.get("expiry") or ""
+            entry = p.get("avgPrice") or p.get("avg_price") or p.get("sellAvg") or p.get("buyAvg") or 0.0
+            legs.append({
+                "side": side,
+                "strike": float(strike),
+                "type": "CALL" if str(opt_type).upper().startswith("C") else "PUT",
+                "qty": qty,
+                "entry": float(entry),
+                "expiry": str(expiry),
+                "securityId": p.get("securityId") or p.get("security_id"),
+            })
+        except Exception:
+            continue
+    return legs
+
+
 def _close_leg(dw, cfg: LiveConfig, leg: Dict[str, Any], pos: Dict[str, Any]) -> None:
     sec = leg.get("sec_id")
     if not sec:
@@ -818,7 +869,7 @@ def _add_extra_wings(dw, cfg: LiveConfig, pos: Dict[str, Any], ltps: Dict[str, f
     net_credit = 0.0
     for leg in pos.get("legs", []):
         if str(leg.get("side","SELL")).upper().startswith("SELL"):
-            net_credit += float(leg.get("entry", 0.0)) * abs(int(leg.get("qty", 0))) * cfg.lot_size
+            net_credit += float(leg.get("entry", 0.0)) * abs(int(leg.get("qty", 0)))
     budget = net_credit * 0.30 if net_credit > 0 else 0.0
     if budget <= 0:
         return
@@ -849,18 +900,18 @@ def _add_extra_wings(dw, cfg: LiveConfig, pos: Dict[str, Any], ltps: Dict[str, f
             ltp = None
         if ltp is None:
             continue
-        if spend + ltp * cfg.lot_size > budget:
+        if spend + ltp > budget:
             continue
         try:
             dw.place_order(
                 side="BUY",
                 exchange_seg=cfg.underlying_seg,
                 security_id=sec_id,
-                quantity=cfg.lot_size,
+                quantity=1,
                 product_type=cfg.product_type,
                 order_type="MARKET",
             )
-            spend += ltp * cfg.lot_size
+            spend += ltp
         except Exception as exc:
             LOG.warning("[weekly_live] extra wing buy failed %s: %s", strike, exc)
 
