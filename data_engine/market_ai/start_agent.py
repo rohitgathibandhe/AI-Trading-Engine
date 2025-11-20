@@ -34,6 +34,9 @@ STATE_DIR = ENGINE_DIR / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 AGENT_LOG = STATE_DIR / "agent.log"
 PID_FILE = STATE_DIR / "agent.pid"
+DEFAULT_SETTINGS: Dict[str, Any] = {
+    "lot_size": 75,
+}
 CREDS_FILE = STATE_DIR / "creds.json"
 
 for p in (ENGINE_DIR, DATA_ENGINE_DIR, PROJECT_ROOT, ENGINE_DIR / "strategies"):
@@ -52,6 +55,8 @@ from market_ai.strategies import (  # noqa: E402
     OptionLeg,
     RiskConfig,
     StrategyType,
+    OptionType,
+    LegSide,
 )
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -97,6 +102,22 @@ def _ensure_dhan_credentials() -> None:
         log.warning("DHAN credentials not found in env or %s; agent will fail to authenticate.", CREDS_FILE)
     elif not updated:
         log.info("DHAN credentials already present in environment.")
+
+
+def _load_agent_settings() -> Dict[str, Any]:
+    path = os.getenv("AGENT_SETTINGS_JSON")
+    if not path:
+        return dict(DEFAULT_SETTINGS)
+    try:
+        data = json.loads(Path(path).read_text())
+        if not isinstance(data, dict):
+            raise TypeError("settings json is not a dict")
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update(data)
+        return merged
+    except Exception as exc:
+        log.warning("Failed to load agent settings from %s (%s); falling back to defaults", path, exc)
+        return dict(DEFAULT_SETTINGS)
 
 
 def _write_pid_file() -> None:
@@ -301,7 +322,7 @@ def _map_positions(rows: list) -> List[OptionLeg]:
             if net == 0:
                 continue
             qty = abs(int(net))
-            side = "SELL" if net < 0 else "BUY"
+            side = LegSide.SELL if net < 0 else LegSide.BUY
             expiry = r.get("expiryDate") or r.get("expiry")
             expiry_date = datetime.fromisoformat(str(expiry)).date() if expiry else datetime.now().date()
             legs.append(
@@ -309,7 +330,7 @@ def _map_positions(rows: list) -> List[OptionLeg]:
                     symbol="NIFTY",
                     expiry=expiry_date,
                     strike=float(r.get("strikePrice") or r.get("strike") or 0),
-                    option_type="CALL" if "C" in str(r.get("optionType") or r.get("option_type") or "C").upper() else "PUT",
+                    option_type=OptionType.CALL if "C" in str(r.get("optionType") or r.get("option_type") or "C").upper() else OptionType.PUT,
                     side=side,
                     quantity=qty,
                     entry_price=float(r.get("avgPrice") or r.get("avg_price") or 0.0),
@@ -427,9 +448,11 @@ def main() -> None:
     poll_sec = float(os.getenv("POLL_SEC", "10"))
     _warm_scrip_master(force=False)
     _ensure_dhan_credentials()
+    settings = _load_agent_settings()
     dw = DhanWrapper(logger=logging.getLogger("dhan_wrapper"))
     _write_pid_file()
-    selector = StrategySelector(symbol="NIFTY", lot_size=75)
+    lot_size = int(settings.get("lot_size", DEFAULT_SETTINGS["lot_size"]))
+    selector = StrategySelector(symbol="NIFTY", lot_size=lot_size)
     risk = RiskConfig(
         max_intraday_loss=-3000,
         intraday_target=4000,
@@ -466,7 +489,9 @@ def main() -> None:
                     log.warning("Market closed; skipping OPEN action (%s)", decision.action_type)
                     continue
                 for leg in decision.legs_to_open:
-                    side = "BUY" if leg.side == "BUY" else "SELL"
+                    side = leg.side
+                    if isinstance(side, str):
+                        side = LegSide.BUY if side.upper().startswith("B") else LegSide.SELL
                     if not leg.security_id:
                         log.error(
                             "Skipping %s leg due to missing security_id: strike=%s opt=%s qty=%s expiry=%s",
@@ -490,7 +515,7 @@ def main() -> None:
                         continue
                     log.info(
                         "Placing %s order sec_id=%s strike=%s opt=%s qty=%s expiry=%s",
-                        side,
+                        side.value if hasattr(side, "value") else str(side),
                         sec_id,
                         leg.strike,
                         leg.option_type.value,
@@ -511,7 +536,11 @@ def main() -> None:
                     log.warning("Market closed; skipping CLOSE action (%s)", decision.action_type)
                     continue
                 for leg in decision.legs_to_close:
-                    side = "BUY" if leg.side == "SELL" else "SELL"
+                    side = leg.side
+                    if isinstance(side, str):
+                        side = LegSide.SELL if side.upper().startswith("B") else LegSide.BUY
+                    else:
+                        side = LegSide.BUY if side == LegSide.SELL else LegSide.SELL
                     if not leg.security_id:
                         log.error(
                             "Skipping close leg due to missing security_id: strike=%s opt=%s qty=%s expiry=%s",
@@ -533,7 +562,7 @@ def main() -> None:
                         continue
                     log.info(
                         "Placing close order side=%s sec_id=%s strike=%s opt=%s qty=%s expiry=%s",
-                        side,
+                        side.value if hasattr(side, "value") else str(side),
                         sec_id,
                         leg.strike,
                         leg.option_type.value,
