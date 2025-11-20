@@ -13,9 +13,10 @@ import requests
 from pathlib import Path
 from dataclasses import dataclass
 from decimal import Decimal
-from datetime import datetime, time as dtime
+from datetime import datetime, date as dt_date, time as dtime
 from enum import Enum
 import re
+import importlib.util
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 try:
@@ -78,10 +79,23 @@ def _import_from_dhan_sdk():
     ]
     mods: Dict[str, Any] = {}
     for mod_name, symbol in candidates:
-        try:            mod = __import__(mod_name, fromlist=["*"])
+        try:
+            mod = __import__(mod_name, fromlist=["*"])
             mods[symbol] = getattr(mod, symbol)
         except Exception as e:
             last_err = e
+            # attempt to load from vendored source immediately
+            fallback = HERE.parents[1] / "dhan_sdk" / f"{mod_name.split('.')[-1]}.py"
+            if fallback.exists():
+                try:
+                    spec = importlib.util.spec_from_file_location(f"dhan_sdk_local_{symbol}", str(fallback))
+                    module = importlib.util.module_from_spec(spec)
+                    assert spec.loader is not None
+                    spec.loader.exec_module(module)
+                    mods[symbol] = getattr(module, symbol)
+                    continue
+                except Exception as exc:
+                    last_err = exc
             continue
     needed = {"DhanHTTP", "MarketFeed", "OptionChain", "Portfolio"}
     if not needed.issubset(mods):
@@ -145,6 +159,72 @@ class DhanWrapper:
       - Live positions with multiple fallbacks
       - Simple background LTP poller
     """
+
+    @staticmethod
+    def _normalize_expiry_value(expiry: Any) -> Optional[str]:
+        """
+        Accept str/date/datetime/number and return YYYY-MM-DD string if possible.
+        """
+        if expiry is None:
+            return None
+        if hasattr(expiry, "isoformat"):
+            try:
+                return expiry.isoformat()
+            except Exception:
+                pass
+        if isinstance(expiry, (int, float)):
+            return str(expiry)
+        text = str(expiry).strip()
+        if not text:
+            return None
+        # Trim any timestamp portion
+        if "T" in text:
+            text = text.split("T", 1)[0]
+        if " " in text:
+            text = text.split(" ", 1)[0]
+        return text
+
+    @staticmethod
+    def _coerce_expiry_list(payload: Any) -> List[str]:
+        """
+        Flatten various DHAN expiry list payloads into a sorted list of ISO date strings.
+        """
+        stack: List[Any] = [payload]
+        collected: List[str] = []
+        seen: set[int] = set()
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, list):
+                for item in cur:
+                    if isinstance(item, (list, dict)):
+                        stack.append(item)
+                    else:
+                        norm = DhanWrapper._normalize_expiry_value(item)
+                        if norm:
+                            collected.append(norm)
+                continue
+            if isinstance(cur, dict):
+                oid = id(cur)
+                if oid in seen:
+                    continue
+                seen.add(oid)
+                for key in ("expiryList", "ExpiryList", "Expiry", "expiry", "expiries", "data", "Data"):
+                    if key in cur:
+                        stack.append(cur[key])
+                continue
+            norm = DhanWrapper._normalize_expiry_value(cur)
+            if norm:
+                collected.append(norm)
+        unique: List[str] = []
+        for raw in collected:
+            try:
+                # Validate format (allow YYYY-MM-DD only)
+                dt_date.fromisoformat(raw)
+                if raw not in unique:
+                    unique.append(raw)
+            except Exception:
+                continue
+        return sorted(unique)
     def _order_headers(self) -> Dict[str, str]:
         return {
             "Accept": "application/json",
@@ -160,7 +240,7 @@ class DhanWrapper:
         exchange_seg: str,
         security_id: int,
         quantity: int,
-        product_type: str = "MIS",
+        product_type: str = "MARGIN",
         order_type: str = "MARKET",
         validity: str = "DAY",
         price: Optional[float] = None,
@@ -174,7 +254,7 @@ class DhanWrapper:
         payload: Dict[str, Any] = {
             "transactionType": side.upper(),
             "exchangeSegment": exchange_seg,
-            "productType": product_type,
+            "productType": (product_type or "MARGIN").upper(),
             "orderType": order_type,
             "validity": validity,
             "securityId": int(security_id),
@@ -182,6 +262,7 @@ class DhanWrapper:
             "price": float(price) if price is not None else 0,
             "afterMarketOrder": False,
             "amoTime": None,
+            "dhanClientId": self.client_id,
         }
         if client_order_id:
             payload["clientOrderId"] = str(client_order_id)
@@ -193,7 +274,23 @@ class DhanWrapper:
             resp.raise_for_status()
             raise
         if resp.status_code >= 400 or (isinstance(js, dict) and js.get("status") == "failed"):
-            self.log.error("[order] failed %s: %s", resp.status_code, str(js)[:400])
+            error_info = js if isinstance(js, dict) else resp.text[:400]
+            payload_snapshot = {
+                "transactionType": payload.get("transactionType"),
+                "exchangeSegment": payload.get("exchangeSegment"),
+                "productType": payload.get("productType"),
+                "orderType": payload.get("orderType"),
+                "validity": payload.get("validity"),
+                "securityId": payload.get("securityId"),
+                "quantity": payload.get("quantity"),
+                "price": payload.get("price"),
+            }
+            self.log.error(
+                "[order] failed status=%s info=%s payload=%s",
+                resp.status_code,
+                error_info,
+                payload_snapshot,
+            )
             resp.raise_for_status()
         return js
 
@@ -392,10 +489,24 @@ class DhanWrapper:
         oc = OptionChain(ctx)
         return oc.expiry_list(underlying_security_id, underlying_seg)
 
-    def get_option_chain(self, underlying_security_id: int, underlying_seg: str, expiry: str) -> Dict[str, Any]:
+    def get_optionchain_expirylist(self, underlying_seg: str, underlying_security_id: int) -> List[str]:
+        """
+        Compatibility helper used by some agents/tests to fetch expiry list.
+        Returns a sorted list of ISO date strings when possible.
+        """
+        try:
+            raw = self.get_expiry_list(underlying_security_id, underlying_seg)
+        except Exception:
+            return []
+        return self._coerce_expiry_list(raw)
+
+    def get_option_chain(self, underlying_security_id: int, underlying_seg: str, expiry: Any) -> Dict[str, Any]:
         ctx = type("Ctx", (object,), {"get_dhan_http": lambda _: self.http})()
         oc = OptionChain(ctx)
-        return oc.option_chain(underlying_security_id, underlying_seg, expiry)
+        expiry_str = self._normalize_expiry_value(expiry)
+        if not expiry_str:
+            raise ValueError("expiry is required for get_option_chain")
+        return oc.option_chain(underlying_security_id, underlying_seg, expiry_str)
 
     # -------- LTP (single + bulk) --------
 

@@ -11,6 +11,8 @@
 import logging
 import os
 import time
+from datetime import date, datetime, time as dtime
+from decimal import Decimal
 from enum import Enum
 from json import dumps as json_dumps, loads as json_loads
 
@@ -54,10 +56,44 @@ class DhanHTTP:
             reqadapter = requests.adapters.HTTPAdapter(**pool)
             self.session.mount("https://", reqadapter)
 
+    @staticmethod
+    def _sanitize_payload(payload):
+        """
+        Recursively convert unsupported types (date/time/Decimal, etc.) into JSON-friendly values.
+        """
+        def convert(value):
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            if isinstance(value, (datetime, date)):
+                return value.isoformat()
+            if isinstance(value, dtime):
+                return value.isoformat()
+            if isinstance(value, Decimal):
+                return float(value)
+            if isinstance(value, dict):
+                return {str(k): convert(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple, set)):
+                return [convert(v) for v in value]
+            if hasattr(value, "isoformat"):
+                try:
+                    return value.isoformat()
+                except Exception:
+                    pass
+            return str(value)
+
+        return convert(payload)
+
     def _send_request(self, method, endpoint, payload=None):
         url = self.base_url + endpoint
         if payload:
-            payload["dhanClientId"] = self.client_id
+            payload = self._sanitize_payload(payload)
+            if isinstance(payload, dict):
+                payload["dhanClientId"] = self.client_id
+            else:
+                payload = {
+                    "dhanClientId": self.client_id,
+                    "data": payload,
+                }
             payload = json_dumps(payload)
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
