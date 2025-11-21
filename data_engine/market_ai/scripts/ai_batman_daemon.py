@@ -95,6 +95,9 @@ def _place_leg(dw: DhanWrapper, expiry_str: str, lot: int, leg: Any, trade_mode:
     if not sec_id:
         raise RuntimeError(f"Missing security id for {expiry_str} {leg.strike} {opt_type}")
     LOG.info("Placing %s %s %s @%s qty=%s seg=%s", side, opt_type, leg.strike, expiry_str, lot * leg.qty, seg)
+    if trade_mode == "paper":
+        LOG.info("[PAPER] Skipping live order for %s %s %s", side, opt_type, leg.strike)
+        return
     dw.place_order(
         side=side,
         product="I",

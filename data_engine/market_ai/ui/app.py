@@ -135,6 +135,7 @@ WEEKLY_SETTINGS_FILE = BROADER_STATE_DIR / "weekly_plan_settings.json"
 ORDER_INTENT_FILE = STATE_DIR / "order_intents.jsonl"
 
 AGENT_LOG = STATE_DIR / "agent.log"
+BATMAN_LOG = STATE_DIR / "batman_daemon.log"
 SETTINGS_JSON = STATE_DIR / "agent_settings.json"
 PID_FILE = STATE_DIR / "agent.pid"
 CREDS_FILE = STATE_DIR / "creds.json"
@@ -1135,7 +1136,7 @@ def start_agent() -> None:
 
         strategy_file = st.session_state.get("strategy_file")
         if strategy_file == "batman":
-            agent_pid = _spawn(ROOT / "data_engine" / "market_ai" / "scripts" / "ai_batman_daemon.py", LOG_DIR / "batman_daemon.log")
+            agent_pid = _spawn(ROOT / "data_engine" / "market_ai" / "scripts" / "ai_batman_daemon.py", BATMAN_LOG)
             monitor_pid = None
             watcher_pid = None
         else:
