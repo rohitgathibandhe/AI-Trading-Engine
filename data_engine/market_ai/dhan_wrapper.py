@@ -71,11 +71,13 @@ def _import_from_dhan_sdk():
         ("dhan_sdk._market_feed", "MarketFeed"),
         ("dhan_sdk._option_chain", "OptionChain"),
         ("dhan_sdk._portfolio", "Portfolio"),
+        ("dhan_sdk._historical_data", "HistoricalData"),
         # project-local fallbacks
         ("market_ai.dhan_sdk.dhan_http", "DhanHTTP"),
         ("market_ai.dhan_sdk._market_feed", "MarketFeed"),
         ("market_ai.dhan_sdk._option_chain", "OptionChain"),
         ("market_ai.dhan_sdk._portfolio", "Portfolio"),
+        ("market_ai.dhan_sdk._historical_data", "HistoricalData"),
     ]
     mods: Dict[str, Any] = {}
     for mod_name, symbol in candidates:
@@ -97,16 +99,22 @@ def _import_from_dhan_sdk():
                 except Exception as exc:
                     last_err = exc
             continue
-    needed = {"DhanHTTP", "MarketFeed", "OptionChain", "Portfolio"}
+    needed = {"DhanHTTP", "MarketFeed", "OptionChain", "Portfolio", "HistoricalData"}
     if not needed.issubset(mods):
         raise ModuleNotFoundError(
             "Could not import dhan_sdk modules. Ensure 'dhan_sdk' is on PYTHONPATH. "
             f"Missing={needed - set(mods)}, last_error={last_err}"
         )
-    return mods["DhanHTTP"], mods["MarketFeed"], mods["OptionChain"], mods["Portfolio"]
+    return (
+        mods["DhanHTTP"],
+        mods["MarketFeed"],
+        mods["OptionChain"],
+        mods["Portfolio"],
+        mods["HistoricalData"],
+    )
 
 
-DhanHTTP, MarketFeed, OptionChain, Portfolio = _import_from_dhan_sdk()
+DhanHTTP, MarketFeed, OptionChain, Portfolio, HistoricalData = _import_from_dhan_sdk()
 
 
 @dataclass(frozen=True)
@@ -149,6 +157,14 @@ class _DefaultLogger:
     def exception(self, *args, **kwargs) -> None:
         msg = args[0] if args else ""
         print(msg)
+
+
+class _SDKContext:
+    def __init__(self, http):
+        self._http = http
+
+    def get_dhan_http(self):
+        return self._http
 
 
 class DhanWrapper:
@@ -366,6 +382,8 @@ class DhanWrapper:
             pool=http_pool,
         )
         self.endpoints: DhanEndpoints = DhanEndpoints()
+        self._sdk_context = _SDKContext(self.http)
+        self._historical = HistoricalData(self._sdk_context)
 
         # poller state
         self._stop: threading.Event = threading.Event()
@@ -383,6 +401,25 @@ class DhanWrapper:
 
     # keep older name as alias, some call sites may still reference it
     _to_float = _as_float
+
+    @staticmethod
+    def _parse_timestamp(value: Any) -> Optional[datetime]:
+        if value in (None, "", [], {}):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        text = text.replace("T", " ").replace("/", "-")
+        try:
+            return datetime.fromisoformat(text)
+        except Exception:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d-%m-%Y %H:%M:%S"):
+            try:
+                return datetime.strptime(text, fmt)
+            except Exception:
+                continue
+        return None
 
     @staticmethod
     def _pick(d: Dict[str, Any], *keys: str) -> Any:
@@ -507,6 +544,84 @@ class DhanWrapper:
         if not expiry_str:
             raise ValueError("expiry is required for get_option_chain")
         return oc.option_chain(underlying_security_id, underlying_seg, expiry_str)
+
+    def get_intraday_candles(
+        self,
+        security_id: int,
+        exchange_segment: str,
+        instrument_type: str = "INDEX",
+        *,
+        interval: int = 5,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch intraday OHLCV from /charts/intraday via the HistoricalData helper.
+        Returns a list of dicts sorted by timestamp with keys: timestamp, open, high, low, close, volume.
+        """
+        from_str = (from_date or dt_date.today().isoformat()).strip()
+        to_str = (to_date or from_str).strip()
+        try:
+            resp = self._historical.intraday_minute_data(
+                security_id=security_id,
+                exchange_segment=exchange_segment,
+                instrument_type=instrument_type,
+                from_date=from_str,
+                to_date=to_str,
+                interval=interval,
+            )
+        except Exception as exc:
+            self.log.exception("[historical] intraday fetch failed: %s", exc)
+            return []
+
+        data: Any = resp
+        if isinstance(data, dict):
+            for key in ("data", "Data", "candles", "CANDLES"):
+                if key in data:
+                    data = data[key]
+                    break
+        if isinstance(data, dict):
+            for key in ("data", "candles"):
+                if key in data:
+                    data = data[key]
+                    break
+        if not isinstance(data, list):
+            return []
+
+        candles: List[Dict[str, Any]] = []
+
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            o = self._as_float(self._pick(row, "open", "openPrice", "Open", "o"))
+            h = self._as_float(self._pick(row, "high", "highPrice", "High", "h"))
+            l = self._as_float(self._pick(row, "low", "lowPrice", "Low", "l"))
+            c = self._as_float(self._pick(row, "close", "closePrice", "Close", "c", "ltp"))
+            v = self._as_float(self._pick(row, "volume", "volumeTraded", "Volume", "v"))
+            ts = self._parse_timestamp(
+                self._pick(
+                    row,
+                    "startTime",
+                    "start_time",
+                    "time",
+                    "timestamp",
+                    "tradeTime",
+                    "dateTime",
+                )
+            )
+            if o is None and h is None and l is None and c is None:
+                continue
+            candle = {
+                "timestamp": ts,
+                "open": o if o is not None else (h or l or c or 0.0),
+                "high": h if h is not None else (o or l or c or 0.0),
+                "low": l if l is not None else (o or h or c or 0.0),
+                "close": c if c is not None else (o or h or l or 0.0),
+                "volume": v if v is not None else 0.0,
+            }
+            candles.append(candle)
+        candles.sort(key=lambda item: item.get("timestamp") or datetime.min)
+        return candles
 
     # -------- LTP (single + bulk) --------
 

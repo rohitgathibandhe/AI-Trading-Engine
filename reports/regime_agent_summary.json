@@ -1,6 +1,20 @@
 {
-  "trades": 1379,
-  "realized_pnl": 203433.75,
-  "open_positions": 21,
-  "final_equity": 220800.0
+  "trades": 51,
+  "realized_pnl": 4937.517145944731,
+  "open_positions": 1,
+  "final_equity": 4928.369670294466,
+  "breakdown": [
+    {
+      "regime": "BEAR",
+      "strategy_type": "BEAR_CALL_SPREAD",
+      "trades": 12,
+      "realized_pnl": -11191.25
+    },
+    {
+      "regime": "BULL",
+      "strategy_type": "BULL_PUT_SPREAD",
+      "trades": 13,
+      "realized_pnl": 16128.767145944734
+    }
+  ]
 }

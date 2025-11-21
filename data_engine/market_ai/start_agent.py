@@ -3,20 +3,21 @@
 Refactored agent entrypoint.
 
 Uses the new StrategySelector framework (regime-aware) instead of the legacy
-weekly_theta_strangle loop. Warn-only by default; flip WARN_ONLY=false to allow
-order placement once verified.
+weekly_theta_strangle loop. Placement always goes to whichever mode (live vs paper)
+is selected via credentials; there is no warn-only mode.
 """
 from __future__ import annotations
 
 import atexit
 import json
+import csv
 import logging
 import os
 import sys
 import time
-from datetime import datetime, date as dt_date, time as dtime
+from datetime import datetime, date as dt_date, time as dtime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:  # Python 3.9+
     from zoneinfo import ZoneInfo  # type: ignore
@@ -34,10 +35,74 @@ STATE_DIR = ENGINE_DIR / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 AGENT_LOG = STATE_DIR / "agent.log"
 PID_FILE = STATE_DIR / "agent.pid"
+FEATURE_LOG_PATH = STATE_DIR / "feature_history.csv"
+INTEL_LOG_PATH = STATE_DIR / "intel_log.csv"
+TRADE_BLOTTER_PATH = STATE_DIR / "trade_blotter.csv"
+TRADE_BLOTTER_SUMMARY = STATE_DIR / "trade_blotter_summary.json"
+BLOTTER_FIELDS = [
+    "timestamp",
+    "trade_mode",
+    "warn_only",
+    "executed",
+    "side",
+    "order_type",
+    "exchange_seg",
+    "product_type",
+    "security_id",
+    "quantity",
+    "price",
+    "strike",
+    "tag",
+    "notes",
+]
+FEATURE_FIELDS = [
+    "timestamp",
+    "strategy",
+    "expiry",
+    "exchange_seg",
+    "spot",
+    "ce_strike",
+    "pe_strike",
+    "ce_ltp",
+    "pe_ltp",
+    "ce_delta",
+    "pe_delta",
+    "ce_entry",
+    "pe_entry",
+    "net_credit",
+    "warn_only",
+    "trade_mode",
+    "context",
+    "block_reason",
+    "net_delta",
+    "total_notional",
+    "positions_summary",
+]
+_LAST_ENV_LOG: Optional[datetime] = None
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "lot_size": 75,
+    "smart_selector_enabled": True,
+    "max_daily_trades": 5,
+    "max_daily_loss_pct": 0.03,
+    "partial_target_pct": 0.65,
+    "per_leg_sl_mult": 1.6,
+    "per_leg_tp_mult": 0.5,
+    "vix_adaptive_low": 12.0,
+    "vix_adaptive_high": 20.0,
+    "strangle_delta_low": 0.15,
+    "strangle_delta_high": 0.15,
+    "strangle_offset_low": 150.0,
+    "strangle_offset_high": 150.0,
+    "spread_short_delta_low": 0.25,
+    "spread_short_delta_high": 0.25,
 }
 CREDS_FILE = STATE_DIR / "creds.json"
+INDEX_SECURITY_ID = int(os.getenv("MARKET_AI_INDEX_SECURITY_ID", "13"))
+INDEX_EXCHANGE_SEG = os.getenv("MARKET_AI_INDEX_SEGMENT", "IDX_I")
+INDEX_INSTRUMENT = os.getenv("MARKET_AI_INDEX_INSTRUMENT", "INDEX")
+INTRADAY_INTERVAL_MIN = int(os.getenv("MARKET_AI_INTRADAY_INTERVAL", "5"))
+
+_INTRADAY_CACHE: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
 for p in (ENGINE_DIR, DATA_ENGINE_DIR, PROJECT_ROOT, ENGINE_DIR / "strategies"):
     ps = str(p)
@@ -57,7 +122,18 @@ from market_ai.strategies import (  # noqa: E402
     StrategyType,
     OptionType,
     LegSide,
+    TrendContext,
+    TrendSide,
+    ORBState,
+    TradeAction,
 )
+from market_ai.strategies.trend_detector import detect_trend_from_open
+from market_ai.strategies.orb_detector import ORBConfig, compute_orb_levels, detect_orb_breakout
+from market_ai.strategies.sr_levels import compute_sr_levels
+from market_ai.engine.feature_extractor import FeatureExtractor
+from market_ai.engine.regime_scorer import RegimeScorer
+from market_ai.engine.policy_engine import PolicyEngine
+from market_ai.engine.learning_manager import LearningManager
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -120,6 +196,68 @@ def _load_agent_settings() -> Dict[str, Any]:
         return dict(DEFAULT_SETTINGS)
 
 
+def _build_risk_config(settings: Dict[str, Any]) -> RiskConfig:
+    partial = float(settings.get("partial_target_pct", DEFAULT_SETTINGS["partial_target_pct"]))
+    partial = max(0.0, min(0.95, partial))
+    per_leg_sl = float(settings.get("per_leg_sl_mult", DEFAULT_SETTINGS["per_leg_sl_mult"]))
+    per_leg_tp = float(settings.get("per_leg_tp_mult", DEFAULT_SETTINGS["per_leg_tp_mult"]))
+    per_leg_sl = max(0.0, per_leg_sl)
+    per_leg_tp = max(0.0, per_leg_tp)
+    vix_low = float(settings.get("vix_adaptive_low", DEFAULT_SETTINGS["vix_adaptive_low"]))
+    vix_high = float(settings.get("vix_adaptive_high", DEFAULT_SETTINGS["vix_adaptive_high"]))
+    strangle_delta_low = float(settings.get("strangle_delta_low", DEFAULT_SETTINGS["strangle_delta_low"]))
+    strangle_delta_high = float(settings.get("strangle_delta_high", DEFAULT_SETTINGS["strangle_delta_high"]))
+    strangle_offset_low = float(settings.get("strangle_offset_low", DEFAULT_SETTINGS["strangle_offset_low"]))
+    strangle_offset_high = float(settings.get("strangle_offset_high", DEFAULT_SETTINGS["strangle_offset_high"]))
+    spread_delta_low = float(settings.get("spread_short_delta_low", DEFAULT_SETTINGS["spread_short_delta_low"]))
+    spread_delta_high = float(settings.get("spread_short_delta_high", DEFAULT_SETTINGS["spread_short_delta_high"]))
+    return RiskConfig(
+        max_intraday_loss=float(settings.get("max_intraday_loss", -3000)),
+        intraday_target=float(settings.get("intraday_target", 4000)),
+        allow_carry_forward=bool(settings.get("allow_carry_forward", False)),
+        max_carry_days=int(settings.get("max_carry_days", 0)),
+        vix_carry_threshold=float(settings.get("vix_carry_threshold", 12.0)),
+        last_entry_time=dtime(14, 45),
+        force_exit_time=dtime(15, 15),
+        max_daily_loss_pct=float(settings.get("max_daily_loss_pct", DEFAULT_SETTINGS["max_daily_loss_pct"])),
+        max_daily_trades=int(settings.get("max_daily_trades", DEFAULT_SETTINGS["max_daily_trades"])),
+        per_leg_sl_mult=per_leg_sl,
+        per_leg_tp_mult=per_leg_tp,
+        partial_target_pct=partial,
+        vix_adaptive_low=vix_low,
+        vix_adaptive_high=vix_high,
+        strangle_delta_low=strangle_delta_low,
+        strangle_delta_high=strangle_delta_high,
+        strangle_offset_low=strangle_offset_low,
+        strangle_offset_high=strangle_offset_high,
+        spread_short_delta_low=spread_delta_low,
+        spread_short_delta_high=spread_delta_high,
+    )
+
+
+def _normalize_leg_side(side) -> LegSide:
+    if isinstance(side, LegSide):
+        return side
+    if isinstance(side, str):
+        return LegSide.BUY if side.upper().startswith("B") else LegSide.SELL
+    return LegSide.BUY
+
+
+def _ensure_leg_security_id(leg: OptionLeg, symbol: str, expiry) -> Optional[int]:
+    if leg.security_id:
+        try:
+            return int(float(leg.security_id))
+        except Exception:
+            return None
+    resolved = _resolve_security_id_cached(symbol, expiry.isoformat(), leg.strike, leg.option_type.value)
+    if resolved:
+        try:
+            return int(float(resolved))
+        except Exception:
+            return None
+    return None
+
+
 def _write_pid_file() -> None:
     data: Dict[str, Any] = {}
     if PID_FILE.exists():
@@ -151,6 +289,154 @@ def _cleanup_pid_file() -> None:
 
 
 atexit.register(_cleanup_pid_file)
+
+
+def _ensure_csv_headers(path: Path, headers: List[str]) -> None:
+    if path.exists():
+        return
+    try:
+        with path.open("w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=headers)
+            writer.writeheader()
+    except Exception as exc:
+        log.warning("Failed to initialize CSV %s: %s", path, exc)
+
+
+def _append_csv_row(path: Path, headers: List[str], row: Dict[str, Any]) -> None:
+    _ensure_csv_headers(path, headers)
+    try:
+        with path.open("a", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=headers)
+            writer.writerow(row)
+    except Exception as exc:
+        log.warning("Failed to append row to %s: %s", path, exc)
+
+
+def _update_blotter_summary(entry: Dict[str, Any]) -> None:
+    summary: Dict[str, Any] = {"warn_only_orders": 0, "executed_orders": 0}
+    if TRADE_BLOTTER_SUMMARY.exists():
+        try:
+            summary = json.loads(TRADE_BLOTTER_SUMMARY.read_text()) or summary
+        except Exception:
+            summary = {"warn_only_orders": 0, "executed_orders": 0}
+    summary["executed_orders"] = int(summary.get("executed_orders", 0)) + int(entry.get("executed", 0))
+    summary["warn_only_orders"] = 0
+    summary["last_order_ts"] = entry.get("timestamp")
+    try:
+        TRADE_BLOTTER_SUMMARY.write_text(json.dumps(summary, indent=2))
+    except Exception as exc:
+        log.warning("Failed to update blotter summary: %s", exc)
+
+
+def _log_trade_event(*, trade_mode: str, side: str, leg: OptionLeg, order_type: str, notes: str = "") -> None:
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "trade_mode": trade_mode,
+        "warn_only": 0,
+        "executed": 1,
+        "side": side,
+        "order_type": order_type,
+        "exchange_seg": "NSE_FNO",
+        "product_type": "MARGIN",
+        "security_id": _ensure_leg_security_id(leg, leg.symbol, leg.expiry) or "",
+        "quantity": leg.quantity,
+        "price": float(getattr(leg, "entry_price", 0.0) or leg.current_ltp or 0.0),
+        "strike": leg.strike,
+        "tag": getattr(leg, "strategy_type", StrategyType.NONE).name,
+        "notes": notes,
+    }
+    _append_csv_row(TRADE_BLOTTER_PATH, BLOTTER_FIELDS, entry)
+    _update_blotter_summary(entry)
+
+
+def _log_feature_event(row: Dict[str, Any]) -> None:
+    _append_csv_row(FEATURE_LOG_PATH, FEATURE_FIELDS, row)
+
+
+def _log_environment_state(market: MarketSnapshot, trend_ctx: TrendContext, trade_mode: str) -> None:
+    global _LAST_ENV_LOG
+    now = datetime.now()
+    if _LAST_ENV_LOG and (now - _LAST_ENV_LOG).total_seconds() < 60:
+        return
+    _LAST_ENV_LOG = now
+    context = {
+        "market_state": {
+            "trend": trend_ctx.trend_side.name.lower(),
+            "bull_score": trend_ctx.bull_score,
+            "bear_score": trend_ctx.bear_score,
+            "confidence": trend_ctx.confidence,
+            "spot": market.spot,
+            "vix": market.india_vix,
+            "as_of": market.now.isoformat(),
+        },
+        "strategy_candidates": [],
+    }
+    row = {
+        "timestamp": now.isoformat(),
+        "strategy": "environment",
+        "expiry": "",
+        "exchange_seg": "NSE_FNO",
+        "spot": market.spot,
+        "ce_strike": "",
+        "pe_strike": "",
+        "ce_ltp": "",
+        "pe_ltp": "",
+        "ce_delta": "",
+        "pe_delta": "",
+        "ce_entry": "",
+        "pe_entry": "",
+        "net_credit": "",
+        "warn_only": 0,
+        "trade_mode": trade_mode,
+        "context": json.dumps(context),
+        "block_reason": "",
+        "net_delta": "",
+        "total_notional": "",
+        "positions_summary": "",
+    }
+    _log_feature_event(row)
+
+
+def _log_strategy_event(
+    *,
+    strategy: StrategyType,
+    action: str,
+    reason: str,
+    market: MarketSnapshot,
+    trade_mode: str,
+    legs: List[OptionLeg],
+) -> None:
+    ce_leg = next((leg for leg in legs if leg.side == LegSide.SELL and leg.option_type == OptionType.CALL), None)
+    pe_leg = next((leg for leg in legs if leg.side == LegSide.SELL and leg.option_type == OptionType.PUT), None)
+    context = {"action": action, "reason": reason}
+    row = {
+        "timestamp": datetime.now().isoformat(),
+        "strategy": strategy.name.lower(),
+        "expiry": legs[0].expiry.isoformat() if legs else "",
+        "exchange_seg": "NSE_FNO",
+        "spot": market.spot,
+        "ce_strike": ce_leg.strike if ce_leg else "",
+        "pe_strike": pe_leg.strike if pe_leg else "",
+        "ce_ltp": ce_leg.current_ltp if ce_leg else "",
+        "pe_ltp": pe_leg.current_ltp if pe_leg else "",
+        "ce_delta": "",
+        "pe_delta": "",
+        "ce_entry": ce_leg.entry_price if ce_leg else "",
+        "pe_entry": pe_leg.entry_price if pe_leg else "",
+        "net_credit": (
+            (ce_leg.entry_price if ce_leg else 0.0) + (pe_leg.entry_price if pe_leg else 0.0)
+            if action.startswith("OPEN")
+            else ""
+        ),
+        "warn_only": 0,
+        "trade_mode": trade_mode,
+        "context": json.dumps(context),
+        "block_reason": "",
+        "net_delta": "",
+        "total_notional": "",
+        "positions_summary": "",
+    }
+    _log_feature_event(row)
 
 
 _SECURITY_ID_CACHE: Dict[tuple[str, str, float, str], Optional[str]] = {}
@@ -323,18 +609,97 @@ def _map_positions(rows: list) -> List[OptionLeg]:
                 continue
             qty = abs(int(net))
             side = LegSide.SELL if net < 0 else LegSide.BUY
-            expiry = r.get("expiryDate") or r.get("expiry")
+            symbol = r.get("tradingSymbol") or r.get("symbol") or ""
+
+            def _parse_expiry_from_symbol(sym: str) -> Optional[dt_date]:
+                if not sym:
+                    return None
+                sym = sym.upper().replace("-", " ")
+                parts = sym.split()
+                months = {
+                    "JAN": 1,
+                    "FEB": 2,
+                    "MAR": 3,
+                    "APR": 4,
+                    "MAY": 5,
+                    "JUN": 6,
+                    "JUL": 7,
+                    "AUG": 8,
+                    "SEP": 9,
+                    "OCT": 10,
+                    "NOV": 11,
+                    "DEC": 12,
+                }
+                for idx in range(len(parts) - 2):
+                    if parts[idx].isdigit() and parts[idx + 1] in months:
+                        day = int(parts[idx])
+                        month = months[parts[idx + 1]]
+                        year = datetime.now().year
+                        try:
+                            return dt_date(year, month, day)
+                        except Exception:
+                            continue
+                return None
+
+            expiry = (
+                r.get("expiryDate")
+                or r.get("expiry")
+                or r.get("drvExpiryDate")
+                or r.get("drvExpiry")
+                or r.get("expirydate")
+                or _parse_expiry_from_symbol(symbol)
+            )
             expiry_date = datetime.fromisoformat(str(expiry)).date() if expiry else datetime.now().date()
+
+            def _parse_strike_from_symbol(sym: str) -> Optional[float]:
+                if not sym:
+                    return None
+                import re
+
+                matches = re.findall(r"(\d{4,6}(?:\.\d+)?)", sym)
+                if not matches:
+                    return None
+                try:
+                    return float(matches[-1])
+                except Exception:
+                    return None
+
+            strike = (
+                r.get("strikePrice")
+                or r.get("strike")
+                or r.get("drvStrikePrice")
+                or r.get("drvStrike")
+                or _parse_strike_from_symbol(symbol)
+                or 0
+            )
+            opt_type_raw = (
+                r.get("optionType")
+                or r.get("option_type")
+                or r.get("drvOptionType")
+                or r.get("drv_option_type")
+                or symbol
+                or "C"
+            )
+
+            def _coerce_option_type(val: str) -> OptionType:
+                val = (val or "").upper()
+                if "P" in val:
+                    return OptionType.PUT
+                return OptionType.CALL
+
+            option_type = _coerce_option_type(opt_type_raw)
+
             legs.append(
                 OptionLeg(
                     symbol="NIFTY",
                     expiry=expiry_date,
-                    strike=float(r.get("strikePrice") or r.get("strike") or 0),
-                    option_type=OptionType.CALL if "C" in str(r.get("optionType") or r.get("option_type") or "C").upper() else OptionType.PUT,
+                    strike=float(strike),
+                    option_type=option_type,
                     side=side,
                     quantity=qty,
                     entry_price=float(r.get("avgPrice") or r.get("avg_price") or 0.0),
                     security_id=str(r.get("securityId") or r.get("security_id") or ""),
+                    strategy_type=StrategyType.NONE,
                 )
             )
         except Exception:
@@ -378,12 +743,41 @@ def _map_chain(chain_raw: dict, expiry, symbol: str) -> List[dict]:
     return rows
 
 
+def _update_leg_ltps_from_chain(legs: List[OptionLeg], chain_rows: List[dict]) -> None:
+    lookup: Dict[Tuple[str, float], float] = {}
+    for row in chain_rows or []:
+        try:
+            opt = str(row.get("option_type") or "").upper()
+            strike = float(row.get("strike") or 0.0)
+            ltp = row.get("ltp")
+            if not opt or strike == 0 or ltp is None:
+                continue
+            lookup[(opt, strike)] = float(ltp)
+        except Exception:
+            continue
+    for leg in legs or []:
+        try:
+            opt_name = leg.option_type.value if hasattr(leg.option_type, "value") else str(leg.option_type)
+            opt_name = opt_name.upper()
+            if "CALL" in opt_name and opt_name != "CE":
+                opt_name = "CE"
+            elif "PUT" in opt_name and opt_name != "PE":
+                opt_name = "PE"
+            strike = float(leg.strike)
+            ltp = lookup.get((opt_name, strike))
+            if ltp is not None:
+                leg.current_ltp = ltp
+        except Exception:
+            continue
+
+
 def _compute_mtm(legs: List[OptionLeg]) -> float:
     mtm = 0.0
     for leg in legs:
         if leg.current_ltp is None:
             continue
-        pnl = (leg.entry_price - leg.current_ltp) if leg.side == "SELL" else (leg.current_ltp - leg.entry_price)
+        side = _normalize_leg_side(leg.side)
+        pnl = (leg.entry_price - leg.current_ltp) if side == LegSide.SELL else (leg.current_ltp - leg.entry_price)
         mtm += pnl * leg.quantity
     return mtm
 
@@ -429,22 +823,152 @@ def _fetch_expiry(dw: DhanWrapper):
     return parsed[-1] if parsed else today
 
 
-def build_market_snapshot(dw: DhanWrapper) -> MarketSnapshot:
-    spot = float(dw.get_ltp_once("IDX_I", 13) or 0.0)
+def _place_leg_order(dw: DhanWrapper, leg: OptionLeg, *, close: bool, trade_mode: str) -> None:
+    side = _normalize_leg_side(leg.side)
+    if close:
+        order_side = LegSide.BUY if side == LegSide.SELL else LegSide.SELL
+    else:
+        order_side = side
+    security_id = _ensure_leg_security_id(leg, leg.symbol, leg.expiry)
+    if not security_id:
+        log.error("Skipping leg order due to missing security_id (strike=%s opt=%s)", leg.strike, leg.option_type)
+        return
+    log.info(
+        "Placing %s order sec_id=%s strike=%s opt=%s qty=%s expiry=%s",
+        order_side.value,
+        security_id,
+        leg.strike,
+        leg.option_type.value if hasattr(leg.option_type, "value") else str(leg.option_type),
+        leg.quantity,
+        leg.expiry,
+    )
+    dw.place_order(
+        side=order_side.value,
+        exchange_seg="NSE_FNO",
+        security_id=security_id,
+        quantity=leg.quantity,
+        product_type="MARGIN",
+        order_type="MARKET",
+    )
+    _log_trade_event(trade_mode=trade_mode, side=order_side.value, leg=leg, order_type="MARKET")
+
+
+def _cached_intraday_for_day(dw: DhanWrapper, trade_day: dt_date, interval: int = INTRADAY_INTERVAL_MIN) -> List[dict]:
+    key = (trade_day.isoformat(), interval)
     now = datetime.now()
-    return MarketSnapshot(
+    entry = _INTRADAY_CACHE.get(key)
+    ttl = 60 if trade_day == now.date() else 3600
+    if entry:
+        age = (now - entry["ts"]).total_seconds()
+        if age < ttl:
+            return entry["data"]
+    candles = dw.get_intraday_candles(
+        INDEX_SECURITY_ID,
+        INDEX_EXCHANGE_SEG,
+        INDEX_INSTRUMENT,
+        interval=interval,
+        from_date=trade_day.isoformat(),
+        to_date=trade_day.isoformat(),
+    )
+    if candles:
+        _INTRADAY_CACHE[key] = {"ts": now, "data": candles}
+    elif trade_day < now.date():
+        # cache empty for past non-trading days to avoid repeated calls
+        _INTRADAY_CACHE[key] = {"ts": now, "data": []}
+    return candles
+
+
+def _simplify_candles(raw: List[dict], limit: int = 2) -> List[dict]:
+    simplified: List[dict] = []
+    for candle in raw[:limit]:
+        simplified.append(
+            {
+                "open": float(candle.get("open") or 0.0),
+                "high": float(candle.get("high") or candle.get("open") or 0.0),
+                "low": float(candle.get("low") or candle.get("open") or 0.0),
+                "close": float(candle.get("close") or candle.get("open") or 0.0),
+                "volume": float(candle.get("volume") or 0.0),
+            }
+        )
+    return simplified
+
+
+def _calc_vwap_from_candles(candles: List[dict], fallback: float) -> float:
+    total_volume = 0.0
+    pv_sum = 0.0
+    for candle in candles:
+        vol = float(candle.get("volume") or 0.0)
+        if vol <= 0:
+            continue
+        typical = (float(candle.get("open") or 0.0) + float(candle.get("high") or 0.0) + float(candle.get("low") or 0.0) + float(candle.get("close") or 0.0)) / 4.0
+        total_volume += vol
+        pv_sum += typical * vol
+    if total_volume > 0:
+        return pv_sum / total_volume
+    closes = [float(candle.get("close") or 0.0) for candle in candles if candle.get("close") is not None]
+    return closes[-1] if closes else fallback
+
+
+def _average_volume(candles: List[dict]) -> float:
+    vols = [float(candle.get("volume") or 0.0) for candle in candles if candle.get("volume") not in (None, "")]
+    if not vols:
+        return 0.0
+    return sum(vols) / len(vols)
+
+
+def _prev_day_levels(candles: List[dict], fallback: float) -> Tuple[float, float, float]:
+    highs = [float(candle.get("high") or 0.0) for candle in candles if candle.get("high") is not None]
+    lows = [float(candle.get("low") or 0.0) for candle in candles if candle.get("low") is not None]
+    close = fallback
+    for candle in reversed(candles):
+        if candle.get("close") is not None:
+            close = float(candle.get("close") or 0.0)
+            break
+    high = max(highs) if highs else fallback
+    low = min(lows) if lows else fallback
+    return high, low, close
+
+
+def build_market_snapshot(dw: DhanWrapper, *, avg_volume_hint: float = 0.0) -> Tuple[MarketSnapshot, float, float, float]:
+    now = datetime.now()
+    spot = float(dw.get_ltp_once(INDEX_EXCHANGE_SEG, INDEX_SECURITY_ID) or 0.0)
+    trade_day = now.date()
+    todays_candles = _cached_intraday_for_day(dw, trade_day, INTRADAY_INTERVAL_MIN)
+    if not spot and todays_candles:
+        spot = float(todays_candles[-1].get("close") or 0.0)
+
+    prev_candles: List[dict] = []
+    probe = trade_day - timedelta(days=1)
+    for _ in range(5):
+        if probe < dt_date(2000, 1, 1):
+            break
+        prev = _cached_intraday_for_day(dw, probe, INTRADAY_INTERVAL_MIN)
+        if prev:
+            prev_candles = prev
+            break
+        probe -= timedelta(days=1)
+
+    yesterday_high, yesterday_low, yesterday_close = _prev_day_levels(prev_candles, spot or 0.0)
+    avg_volume = _average_volume(prev_candles)
+    if avg_volume <= 0 and avg_volume_hint:
+        avg_volume = float(avg_volume_hint)
+    vwap = _calc_vwap_from_candles(todays_candles, spot or 0.0)
+    pivot = (yesterday_high + yesterday_low + yesterday_close) / 3.0 if prev_candles else (spot or 0.0)
+
+    snapshot = MarketSnapshot(
         symbol="NIFTY",
         spot=spot,
-        candles_15m=[],  # TODO: wire real candle data
-        yesterday_high=spot,
-        yesterday_low=spot,
+        candles_5m=_simplify_candles(todays_candles, limit=2),
+        yesterday_high=yesterday_high,
+        yesterday_low=yesterday_low,
+        yesterday_close=yesterday_close,
         india_vix=0.0,
         now=now,
     )
+    return snapshot, float(avg_volume), float(vwap), float(pivot)
 
 
 def main() -> None:
-    warn_only = _as_bool(os.getenv("WARN_ONLY"), True)
     poll_sec = float(os.getenv("POLL_SEC", "10"))
     _warm_scrip_master(force=False)
     _ensure_dhan_credentials()
@@ -453,135 +977,228 @@ def main() -> None:
     _write_pid_file()
     lot_size = int(settings.get("lot_size", DEFAULT_SETTINGS["lot_size"]))
     selector = StrategySelector(symbol="NIFTY", lot_size=lot_size)
-    risk = RiskConfig(
-        max_intraday_loss=-3000,
-        intraday_target=4000,
-        allow_carry_forward=False,
-        max_carry_days=0,
-        vix_carry_threshold=12.0,
-        last_entry_time=dtime(14, 45),
-        force_exit_time=dtime(15, 15),
-    )
-    log.info("Regime-aware agent started (warn_only=%s)", warn_only)
+    risk = _build_risk_config(settings)
+    smart_enabled = bool(settings.get("smart_selector_enabled", True))
+    avg_volume_hint = float(settings.get("avg_5m_volume", 0.0))
+    trade_mode = os.getenv("TRADE_MODE", "live")
+    _ensure_csv_headers(TRADE_BLOTTER_PATH, BLOTTER_FIELDS)
+    _ensure_csv_headers(INTEL_LOG_PATH, ["timestamp", "prob_bull", "prob_bear", "prob_sideways", "regime", "strategy", "size_multiplier", "notes", "gap_pct", "vix", "vwap_distance"])
+    _ensure_csv_headers(FEATURE_LOG_PATH, FEATURE_FIELDS)
+    log.info("Regime-aware agent started (mode=%s)", trade_mode)
+    daily_trades = 0
+    current_day = datetime.now().date()
+    day_entries = 0
+    day_legs = 0
+    day_mode = "NORMAL"
+    orb_config = ORBConfig()
+    orb_state = ORBState()
+    basket_peak_mtm = 0.0
+    trail_active = False
+    trail_floor = -1000.0
+    day_pnl = 0.0
+    feat_extractor = FeatureExtractor()
+    regime_scorer = RegimeScorer()
+    learning = LearningManager()
+    policy = PolicyEngine(learning_manager=learning)
 
     while True:
         try:
-            market = build_market_snapshot(dw)
+            today = datetime.now().date()
+            if today != current_day:
+                current_day = today
+                daily_trades = 0
+                day_entries = 0
+                day_legs = 0
+                day_mode = "NORMAL"
+                orb_state = ORBState()
+                basket_peak_mtm = 0.0
+                trail_active = False
+                trail_floor = -1000.0
+                day_pnl = 0.0
+            market, avg_volume, vwap, pivot = build_market_snapshot(dw, avg_volume_hint=avg_volume_hint)
+            market_open = datetime.combine(market.now.date(), dtime(9, 15))
+            if orb_config.enabled and orb_state.orb_levels is None:
+                levels = compute_orb_levels(market.candles_5m, market_open, orb_config)
+                if levels:
+                    orb_state.orb_levels = levels
+            if orb_state.orb_levels:
+                breakout = detect_orb_breakout(market, orb_state.orb_levels, orb_config)
+                orb_state.breakout_signal = breakout if breakout.active else None
+            sr_levels = compute_sr_levels(market, orb_state.orb_levels)
             expiry = _fetch_expiry(dw)
-            positions_raw = dw.get_positions_live()
+            positions_raw = dw.get_positions_raw()
             legs = _map_positions(positions_raw)
-            expiry_str = expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry)
-            chain_raw = dw.get_option_chain(13, "IDX_I", expiry_str)
-            chain = _map_chain(chain_raw, expiry, symbol="NIFTY")
-            basket_mtm = _compute_mtm(legs)
-
-            decision = selector.decide(
-                market=market,
-                option_chain=chain,
-                expiry=expiry,
-                risk=risk,
-                current_positions=legs,
-                basket_mtm=basket_mtm,
+            if legs:
+                log.info(
+                    "[Positions detail] %s",
+                    [
+                        (
+                            leg.side.value if hasattr(leg.side, "value") else str(leg.side),
+                            leg.option_type.value if hasattr(leg.option_type, "value") else str(leg.option_type),
+                            leg.strike,
+                            leg.expiry,
+                            leg.quantity,
+                        )
+                        for leg in legs
+                    ],
             )
-            log.info("Decision=%s strategy=%s reason=%s", decision.action_type, decision.strategy_type.value, decision.reason)
-            if not warn_only and decision.action_type.startswith("OPEN"):
-                if not _is_india_market_open():
+            expiry_str = expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry)
+            chain_raw = dw.get_option_chain(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, expiry_str)
+            chain = _map_chain(chain_raw, expiry, symbol="NIFTY")
+            _update_leg_ltps_from_chain(legs, chain)
+            basket_mtm = _compute_mtm(legs)
+            day_pnl = basket_mtm  # single-basket approximation for open PnL; realized adds into MTM over time
+            if not legs:
+                basket_peak_mtm = 0.0
+                trail_active = False
+                trail_floor = -1000.0
+            # Daily hard stop: lock the day if PnL breaches daily_max_loss
+            forced_decision: Optional[TradeAction] = None
+            if day_mode != "LOCKED_RED" and day_pnl <= risk.daily_max_loss:
+                forced_decision = TradeAction(
+                    action_type="CLOSE_ALL",
+                    strategy_type=StrategyType.NONE,
+                    legs_to_open=[],
+                    legs_to_close=legs,
+                    reason="DAILY_LOCK_RED",
+                )
+                day_mode = "LOCKED_RED"
+            if day_mode != "LOCKED_RED" and basket_mtm <= risk.daily_max_loss:
+                day_mode = "LOCKED_RED"
+            elif day_mode == "NORMAL" and basket_mtm >= risk.daily_target:
+                day_mode = "LOCKED_GREEN"
+            if legs:
+                if basket_mtm > basket_peak_mtm:
+                    basket_peak_mtm = basket_mtm
+                # Hard per-basket SL always enforced
+                if basket_mtm <= -1000.0 and forced_decision is None:
+                    forced_decision = TradeAction(
+                        action_type="CLOSE_ALL",
+                        strategy_type=StrategyType.NONE,
+                        legs_to_open=[],
+                        legs_to_close=legs,
+                        reason="BASKET_SL_HIT",
+                    )
+                if not trail_active and forced_decision is None:
+                    if basket_mtm >= 2500.0:
+                        trail_active = True
+                        trail_floor = max(1500.0, basket_mtm - 1000.0)
+                elif trail_active and forced_decision is None:
+                    desired_floor = max(1500.0, basket_peak_mtm * 0.6)
+                    if desired_floor > trail_floor:
+                        trail_floor = desired_floor
+                    if basket_mtm <= trail_floor:
+                        forced_decision = TradeAction(
+                            action_type="CLOSE_ALL",
+                            strategy_type=StrategyType.NONE,
+                            legs_to_open=[],
+                            legs_to_close=legs,
+                            reason="BASKET_TRAIL_HIT",
+                        )
+            if smart_enabled:
+                trend_ctx = detect_trend_from_open(market, avg_volume, vwap=vwap, pivot=pivot)
+            else:
+                trend_ctx = TrendContext(TrendSide.SIDEWAYS, 0, 0, 0)
+            _log_environment_state(market, trend_ctx, trade_mode)
+
+            if forced_decision and forced_decision.reason == "BASKET_TRAIL_HIT" and basket_mtm >= risk.daily_target:
+                day_mode = "LOCKED_GREEN"
+
+            # Intelligence layer: features -> scores -> policy
+            features = feat_extractor.compute(market, vwap, pivot)
+            scores = regime_scorer.score(features)
+            pol = policy.decide(scores.as_dict())
+            # Override trend context with policy regime when trading
+            if not pol.should_trade:
+                decision = forced_decision or TradeAction("HOLD", StrategyType.NONE, [], [], pol.notes)
+            else:
+                if pol.regime == TrendSide.BULL:
+                    trend_ctx = TrendContext(TrendSide.BULL, int(scores.prob_bull * 10), int(scores.prob_bear * 10), int(pol.confidence * 10))
+                elif pol.regime == TrendSide.BEAR:
+                    trend_ctx = TrendContext(TrendSide.BEAR, int(scores.prob_bull * 10), int(scores.prob_bear * 10), int(pol.confidence * 10))
+                elif pol.regime == TrendSide.SIDEWAYS:
+                    trend_ctx = TrendContext(TrendSide.SIDEWAYS, int(scores.prob_bull * 10), int(scores.prob_bear * 10), int(pol.confidence * 10))
+                decision = (
+                    forced_decision
+                    if forced_decision
+                    else selector.decide(
+                        market=market,
+                        option_chain=chain,
+                        expiry=expiry,
+                        risk=risk,
+                        current_positions=legs,
+                        basket_mtm=basket_mtm,
+                        trend_ctx=trend_ctx,
+                        daily_trades=daily_trades,
+                        day_mode=day_mode,
+                        entries_used=day_entries,
+                        legs_used=day_legs,
+                        orb_state=orb_state,
+                        sr_levels=sr_levels,
+                        reentry_buffer=orb_config.reentry_buffer_points,
+                    )
+                )
+            # Log intelligence snapshot
+            try:
+                with INTEL_LOG_PATH.open("a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(
+                        [
+                            _ist_now().isoformat(),
+                            scores.prob_bull,
+                            scores.prob_bear,
+                            scores.prob_sideways,
+                            pol.regime.name if hasattr(pol, "regime") else "NA",
+                            pol.strategy.name if hasattr(pol, "strategy") else "NA",
+                            pol.size_multiplier if hasattr(pol, "size_multiplier") else 0.0,
+                            pol.notes if hasattr(pol, "notes") else "",
+                            features.gap_pct,
+                            features.vix_value,
+                            features.vwap_distance,
+                        ]
+                    )
+            except Exception:
+                pass
+            log.info(
+                "Decision=%s strategy=%s reason=%s (trend=%s bull=%s bear=%s)",
+                decision.action_type,
+                decision.strategy_type.value,
+                decision.reason,
+                trend_ctx.trend_side.value,
+                trend_ctx.bull_score,
+                trend_ctx.bear_score,
+            )
+            if decision.action_type != "HOLD" and decision.strategy_type != StrategyType.NONE:
+                legs_to_log = decision.legs_to_open if decision.legs_to_open else decision.legs_to_close or legs
+                _log_strategy_event(
+                    strategy=decision.strategy_type,
+                    action=decision.action_type,
+                    reason=decision.reason,
+                    market=market,
+                    trade_mode=trade_mode,
+                    legs=legs_to_log,
+                )
+            if decision.action_type.startswith("OPEN"):
+                if _is_india_market_open():
+                    for leg in decision.legs_to_open:
+                        leg.opened_at = _ist_now()
+                        _place_leg_order(dw, leg, close=False, trade_mode=trade_mode)
+                        day_legs += 1
+                    daily_trades += 1
+                    day_entries += 1
+                else:
                     log.warning("Market closed; skipping OPEN action (%s)", decision.action_type)
-                    continue
-                for leg in decision.legs_to_open:
-                    side = leg.side
-                    if isinstance(side, str):
-                        side = LegSide.BUY if side.upper().startswith("B") else LegSide.SELL
-                    if not leg.security_id:
-                        log.error(
-                            "Skipping %s leg due to missing security_id: strike=%s opt=%s qty=%s expiry=%s",
-                            side,
-                            leg.strike,
-                            leg.option_type.value,
-                            leg.quantity,
-                            leg.expiry,
-                        )
-                        continue
-                    try:
-                        sec_id = int(float(leg.security_id))
-                    except Exception:
-                        log.error(
-                            "Skipping %s leg due to invalid security_id=%s (strike=%s opt=%s)",
-                            side,
-                            leg.security_id,
-                            leg.strike,
-                            leg.option_type.value,
-                        )
-                        continue
-                    log.info(
-                        "Placing %s order sec_id=%s strike=%s opt=%s qty=%s expiry=%s",
-                        side.value if hasattr(side, "value") else str(side),
-                        sec_id,
-                        leg.strike,
-                        leg.option_type.value,
-                        leg.quantity,
-                        leg.expiry,
-                    )
-                    resp = dw.place_order(
-                        side=side,
-                        exchange_seg="NSE_FNO",
-                        security_id=sec_id,
-                        quantity=leg.quantity,
-                        product_type="MARGIN",
-                        order_type="MARKET",
-                    )
-                    log.info("order placed resp=%s", resp)
-            if not warn_only and decision.action_type.startswith("CLOSE"):
-                if not _is_india_market_open():
-                    log.warning("Market closed; skipping CLOSE action (%s)", decision.action_type)
-                    continue
-                for leg in decision.legs_to_close:
-                    side = leg.side
-                    if isinstance(side, str):
-                        side = LegSide.SELL if side.upper().startswith("B") else LegSide.BUY
-                    else:
-                        side = LegSide.BUY if side == LegSide.SELL else LegSide.SELL
-                    if not leg.security_id:
-                        log.error(
-                            "Skipping close leg due to missing security_id: strike=%s opt=%s qty=%s expiry=%s",
-                            leg.strike,
-                            leg.option_type.value,
-                            leg.quantity,
-                            leg.expiry,
-                        )
-                        continue
-                    try:
-                        sec_id = int(float(leg.security_id))
-                    except Exception:
-                        log.error(
-                            "Skipping close leg due to invalid security_id=%s (strike=%s opt=%s)",
-                            leg.security_id,
-                            leg.strike,
-                            leg.option_type.value,
-                        )
-                        continue
-                    log.info(
-                        "Placing close order side=%s sec_id=%s strike=%s opt=%s qty=%s expiry=%s",
-                        side.value if hasattr(side, "value") else str(side),
-                        sec_id,
-                        leg.strike,
-                        leg.option_type.value,
-                        leg.quantity,
-                        leg.expiry,
-                    )
-                    resp = dw.place_order(
-                        side=side,
-                        exchange_seg="NSE_FNO",
-                        security_id=sec_id,
-                        quantity=leg.quantity,
-                        product_type="MARGIN",
-                        order_type="MARKET",
-                    )
-                    log.info("close order resp=%s", resp)
+            elif decision.action_type.startswith("CLOSE"):
+                target_legs = decision.legs_to_close or legs
+                for leg in target_legs:
+                    _place_leg_order(dw, leg, close=True, trade_mode=trade_mode)
+                    day_legs += 1
         except Exception as exc:
             log.exception("Agent loop error: %s", exc)
         time.sleep(poll_sec)
 
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()

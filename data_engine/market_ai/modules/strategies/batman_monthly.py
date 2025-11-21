@@ -23,6 +23,9 @@ class BatmanConfig:
     lot_size: int = 50
     long_wing_distance: int = 300
     short_wing_distance: int = 600
+    hedge_extra_distance: int = 400
+    hedge_price_cap: float = 10.0
+    add_extra_hedges: bool = True
     entry_time: Tuple[int, int] = (15, 15)
     tp_pct: float = 0.025
     sl_pct: float = 0.02
@@ -99,12 +102,16 @@ class BatmanMonthlyStrategy:
         long_put = self._round_strike(atm - self.cfg.long_wing_distance)
         short_call = self._round_strike(atm + self.cfg.short_wing_distance)
         short_put = self._round_strike(atm - self.cfg.short_wing_distance)
+        hedge_call = self._round_strike(short_call + self.cfg.hedge_extra_distance)
+        hedge_put = self._round_strike(short_put - self.cfg.hedge_extra_distance)
         return {
             "atm": atm,
             "long_call": long_call,
             "long_put": long_put,
             "short_call": short_call,
             "short_put": short_put,
+            "hedge_call": hedge_call,
+            "hedge_put": hedge_put,
         }
 
     def _build_legs(self, strikes: Dict[str, float], prices: Dict[str, float]) -> List[BatmanLeg]:
@@ -118,6 +125,29 @@ class BatmanMonthlyStrategy:
             BatmanLeg(strike=strikes["short_put"], option_type="PUT", qty=3, direction="SHORT",
                       entry_price=prices.get(f"PUT:{strikes['short_put']}", 0.0)),
         ]
+        if self.cfg.add_extra_hedges:
+            hc_price = prices.get(f"CALL:{strikes['hedge_call']}", None)
+            hp_price = prices.get(f"PUT:{strikes['hedge_put']}", None)
+            if hc_price is not None and hc_price <= self.cfg.hedge_price_cap:
+                legs.append(
+                    BatmanLeg(
+                        strike=strikes["hedge_call"],
+                        option_type="CALL",
+                        qty=1,
+                        direction="LONG",
+                        entry_price=hc_price,
+                    )
+                )
+            if hp_price is not None and hp_price <= self.cfg.hedge_price_cap:
+                legs.append(
+                    BatmanLeg(
+                        strike=strikes["hedge_put"],
+                        option_type="PUT",
+                        qty=1,
+                        direction="LONG",
+                        entry_price=hp_price,
+                    )
+                )
         return legs
 
     def enter_position(self, entry_time: datetime, spot: float, prices: Dict[str, float]) -> BatmanPosition:

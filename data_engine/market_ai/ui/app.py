@@ -154,7 +154,17 @@ DEFAULT_SETTINGS = {
     "lot_size": 75,
     "leg_sl_pct": 2.5,
     "profit_pct": 2.25,
-    "warn_only": False,
+    "smart_selector_enabled": True,
+    "max_intraday_loss": -3000.0,
+    "intraday_target": 4000.0,
+    "allow_carry_forward": False,
+    "max_carry_days": 0,
+    "vix_carry_threshold": 12.0,
+    "max_daily_trades": 5,
+    "max_daily_loss_pct": 0.03,
+    "avg_5m_volume": 100000.0,
+    "per_leg_sl_mult": 1.6,
+    "per_leg_tp_mult": 0.5,
     "hedge_enabled": True,
     "hedge_delta_breach": 0.30,
     "hedge_premium_hard_x": 2.0,
@@ -162,6 +172,14 @@ DEFAULT_SETTINGS = {
     "hedge_delta_max": 0.12,
     "hedge_price_max": 35.0,
     "hedge_salvage_wing_ltp": 5.0,
+    "vix_adaptive_low": 12.0,
+    "vix_adaptive_high": 20.0,
+    "strangle_delta_low": 0.15,
+    "strangle_delta_high": 0.15,
+    "strangle_offset_low": 150.0,
+    "strangle_offset_high": 150.0,
+    "spread_short_delta_low": 0.25,
+    "spread_short_delta_high": 0.25,
     "risk_max_portfolio_delta": 0.25,
     "risk_max_exposure_pct": 0.05,
     "risk_account_equity": 500000.0,
@@ -301,7 +319,17 @@ def _load_settings() -> Dict[str, Any]:
     merged["lot_size"] = int(merged.get("lot_size", DEFAULT_SETTINGS["lot_size"]))
     merged["leg_sl_pct"] = float(merged.get("leg_sl_pct", DEFAULT_SETTINGS["leg_sl_pct"]))
     merged["profit_pct"] = float(merged.get("profit_pct", DEFAULT_SETTINGS["profit_pct"]))
-    merged["warn_only"] = bool(merged.get("warn_only", DEFAULT_SETTINGS["warn_only"]))
+    merged["smart_selector_enabled"] = bool(merged.get("smart_selector_enabled", DEFAULT_SETTINGS["smart_selector_enabled"]))
+    merged["max_intraday_loss"] = float(merged.get("max_intraday_loss", DEFAULT_SETTINGS["max_intraday_loss"]))
+    merged["intraday_target"] = float(merged.get("intraday_target", DEFAULT_SETTINGS["intraday_target"]))
+    merged["allow_carry_forward"] = bool(merged.get("allow_carry_forward", DEFAULT_SETTINGS["allow_carry_forward"]))
+    merged["max_carry_days"] = int(merged.get("max_carry_days", DEFAULT_SETTINGS["max_carry_days"]))
+    merged["vix_carry_threshold"] = float(merged.get("vix_carry_threshold", DEFAULT_SETTINGS["vix_carry_threshold"]))
+    merged["max_daily_trades"] = int(merged.get("max_daily_trades", DEFAULT_SETTINGS["max_daily_trades"]))
+    merged["max_daily_loss_pct"] = float(merged.get("max_daily_loss_pct", DEFAULT_SETTINGS["max_daily_loss_pct"]))
+    merged["avg_5m_volume"] = float(merged.get("avg_5m_volume", DEFAULT_SETTINGS["avg_5m_volume"]))
+    merged["per_leg_sl_mult"] = float(merged.get("per_leg_sl_mult", DEFAULT_SETTINGS["per_leg_sl_mult"]))
+    merged["per_leg_tp_mult"] = float(merged.get("per_leg_tp_mult", DEFAULT_SETTINGS["per_leg_tp_mult"]))
     merged["hedge_enabled"] = bool(merged.get("hedge_enabled", DEFAULT_SETTINGS["hedge_enabled"]))
     merged["hedge_delta_breach"] = float(merged.get("hedge_delta_breach", DEFAULT_SETTINGS["hedge_delta_breach"]))
     merged["hedge_premium_hard_x"] = float(merged.get("hedge_premium_hard_x", DEFAULT_SETTINGS["hedge_premium_hard_x"]))
@@ -1038,8 +1066,6 @@ def _agent_env() -> dict:
     # convert % -> decimal
     base["SL_PCT"] = str(float(settings.get("leg_sl_pct", 2.5)) / 100.0)
     base["TP_PCT"] = str(float(settings.get("profit_pct", 2.25)) / 100.0)
-    warn_only = bool(settings.get("warn_only")) or base["TRADE_MODE"].lower() == "paper"
-    base["WARN_ONLY"] = "1" if warn_only else "0"
     base["BLOTTER_PATH"] = str(STATE_DIR / "trade_blotter.csv")
     base["BLOTTER_SUMMARY_PATH"] = str(STATE_DIR / "trade_blotter_summary.json")
     base["FEATURE_LOG_PATH"] = str(STATE_DIR / "feature_history.csv")
@@ -1061,8 +1087,6 @@ def _agent_env() -> dict:
     base["BATMAN_SALVAGE_WING_LTP"] = base["HEDGE_SALVAGE_WING_LTP"]
     base["STRATEGY_MODEL_PATH"] = str(STATE_DIR / "strategy_selector_model.json")
     base["STRATEGY_FILE"] = st.session_state.get("strategy_file", "monthly_strangle_with_weekly_hedge.py")
-    if base["STRATEGY_FILE"] == "weekly_theta_strangle.py" and st.session_state.get("weekly_warn_only", True):
-        base["WEEKLY_WARN_ONLY"] = "1"
     # Weekly order params
     if base["STRATEGY_FILE"] == "weekly_theta_strangle.py":
         base["WEEKLY_ORDER_TYPE"] = st.session_state.get("weekly_order_type", "MARKET")
@@ -1086,6 +1110,12 @@ def start_agent() -> None:
         AGENT_LOG.parent.mkdir(parents=True, exist_ok=True)
         AGENT_LOG.touch(exist_ok=True)
         env = _agent_env()
+        # also propagate lot_size to Batman daemon
+        try:
+            lot_size = int(st.session_state.get("lot_size", 75))
+        except Exception:
+            lot_size = 75
+        env["BATMAN_LOT_SIZE"] = str(lot_size)
         def _spawn(path: Path, log_path: Path) -> Optional[int]:
             try:
                 log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1103,7 +1133,15 @@ def start_agent() -> None:
                 st.warning(f"Failed to start {path.name}: {exc}")
                 return None
 
-        agent_pid = _spawn(AGENT_ENTRY, AGENT_LOG)
+        strategy_file = st.session_state.get("strategy_file")
+        if strategy_file == "batman":
+            agent_pid = _spawn(ROOT / "data_engine" / "market_ai" / "scripts" / "ai_batman_daemon.py", LOG_DIR / "batman_daemon.log")
+            monitor_pid = None
+            watcher_pid = None
+        else:
+            agent_pid = _spawn(AGENT_ENTRY, AGENT_LOG)
+            monitor_pid = _spawn(ROOT / "data_engine" / "market_ai" / "scripts" / "run_live_monitor.py", LOG_DIR / "live_monitor.log")
+            watcher_pid = _spawn(ROOT / "data_engine" / "market_ai" / "scripts" / "watch_live_health.py", LOG_DIR / "live_watch.log")
         # one-shot event fetch on start to seed recent events
         try:
             evt_script = ROOT / "data_engine" / "market_ai" / "scripts" / "fetch_public_events.py"
@@ -1111,15 +1149,13 @@ def start_agent() -> None:
                 subprocess.run([PYTHON, str(evt_script)], cwd=str(evt_script.parent), env=env, check=False)
         except Exception:
             pass
-        monitor_pid = _spawn(ROOT / "data_engine" / "market_ai" / "scripts" / "run_live_monitor.py", LOG_DIR / "live_monitor.log")
-        watcher_pid = _spawn(ROOT / "data_engine" / "market_ai" / "scripts" / "watch_live_health.py", LOG_DIR / "live_watch.log")
         if not agent_pid:
             st.error("Agent failed to start.")
             return
         st.session_state["agent_pid"] = agent_pid
-        if monitor_pid:
+        if strategy_file != "batman" and monitor_pid:
             st.session_state["monitor_pid"] = monitor_pid
-        if watcher_pid:
+        if strategy_file != "batman" and watcher_pid:
             st.session_state["watcher_pid"] = watcher_pid
         st.session_state["agent_running"] = True
         st.session_state["agent_started_mode"] = st.session_state.get("trade_mode", "live")
@@ -2534,7 +2570,138 @@ def _settings_tab() -> None:
     with c2:
         leg_sl_pct = st.number_input("Stop-loss per leg (%)", 0.5, 10.0, float(current.get("leg_sl_pct", 2.5)))
         profit_pct = st.number_input("Profit booking (%)", 0.5, 10.0, float(current.get("profit_pct", 2.25)))
-    warn_only = st.checkbox("Warn-only mode (log orders, no execution)", value=bool(current.get("warn_only", False)))
+    smart_selector_enabled = st.checkbox(
+        "Enable smart selector (regime-aware)",
+        value=bool(current.get("smart_selector_enabled", True)),
+        help="Toggle the new trend-aware strangle/spread engine. Disable to fall back to neutral strangles only.",
+    )
+
+    with st.expander("Smart selector & risk"):
+        r1, r2 = st.columns(2)
+        with r1:
+            max_intraday_loss = st.number_input(
+                "Max intraday loss (₹)",
+                -200000.0,
+                -1000.0,
+                float(current.get("max_intraday_loss", -3000.0)),
+                help="Global SL for the basket; agent flattens when MTM <= this value.",
+            )
+            intraday_target = st.number_input(
+                "Intraday target (₹)",
+                1000.0,
+                200000.0,
+                float(current.get("intraday_target", 4000.0)),
+            )
+            partial_target_pct = st.number_input(
+                "Partial target (% of TP)",
+                0.1,
+                0.9,
+                float(current.get("partial_target_pct", 0.65)),
+                help="Book profits early when basket MTM reaches this fraction of the day target.",
+            )
+            max_daily_trades = st.number_input(
+                "Max daily trades",
+                1,
+                20,
+                int(current.get("max_daily_trades", 5)),
+            )
+        with r2:
+            max_daily_loss_pct = st.number_input(
+                "Max daily loss (% of capital)",
+                0.01,
+                0.20,
+                float(current.get("max_daily_loss_pct", 0.03)),
+            )
+            vix_carry_threshold = st.number_input(
+                "VIX carry threshold",
+                8.0,
+                40.0,
+                float(current.get("vix_carry_threshold", 12.0)),
+            )
+            avg_5m_volume = st.number_input(
+                "Avg 5m volume (for open trend)",
+                10000.0,
+                500000.0,
+                float(current.get("avg_5m_volume", 100000.0)),
+            )
+            per_leg_sl_mult = st.number_input(
+                "Per-leg SL multiple",
+                1.0,
+                5.0,
+                float(current.get("per_leg_sl_mult", 1.6)),
+                help="Close the basket if any short leg premium grows to this multiple of its entry price.",
+            )
+            per_leg_tp_mult = st.number_input(
+                "Per-leg TP multiple",
+                0.05,
+                1.0,
+                float(current.get("per_leg_tp_mult", 0.5)),
+                help="Close the basket if any short leg premium decays to this multiple of its entry price.",
+            )
+        allow_carry_forward = st.checkbox("Allow carry forward", value=bool(current.get("allow_carry_forward", False)))
+        max_carry_days = st.number_input(
+            "Max carry days",
+            0,
+            10,
+            int(current.get("max_carry_days", 0)),
+        )
+
+    with st.expander("Adaptive strike selection"):
+        a1, a2 = st.columns(2)
+        with a1:
+            vix_adaptive_low = st.number_input(
+                "VIX lower band",
+                8.0,
+                25.0,
+                float(current.get("vix_adaptive_low", 12.0)),
+                help="When VIX is below this level, use the 'low' strike deltas.",
+            )
+            strangle_delta_low = st.number_input(
+                "Strangle delta (low VIX)",
+                0.05,
+                0.3,
+                float(current.get("strangle_delta_low", 0.12)),
+            )
+            strangle_offset_low = st.number_input(
+                "Strangle offset (low VIX)",
+                50.0,
+                400.0,
+                float(current.get("strangle_offset_low", 220.0)),
+                help="Approx distance (pts) from spot for strangle shorts when vol is low.",
+            )
+            spread_short_delta_low = st.number_input(
+                "Spread short delta (low VIX)",
+                0.05,
+                0.5,
+                float(current.get("spread_short_delta_low", 0.22)),
+            )
+        with a2:
+            vix_adaptive_high = st.number_input(
+                "VIX upper band",
+                10.0,
+                35.0,
+                float(current.get("vix_adaptive_high", 20.0)),
+                help="Above this VIX, use the 'high' strike deltas (closer to ATM).",
+            )
+            strangle_delta_high = st.number_input(
+                "Strangle delta (high VIX)",
+                0.05,
+                0.4,
+                float(current.get("strangle_delta_high", 0.22)),
+            )
+            strangle_offset_high = st.number_input(
+                "Strangle offset (high VIX)",
+                50.0,
+                400.0,
+                float(current.get("strangle_offset_high", 120.0)),
+                help="Approx distance (pts) from spot for strangle shorts when vol is high.",
+            )
+            spread_short_delta_high = st.number_input(
+                "Spread short delta (high VIX)",
+                0.05,
+                0.5,
+                float(current.get("spread_short_delta_high", 0.32)),
+            )
 
     with st.expander("Hedge monitor adjustments"):
         hedge_enabled = st.checkbox(
@@ -2594,7 +2761,26 @@ def _settings_tab() -> None:
             "lot_size": int(lot_size),
             "leg_sl_pct": float(leg_sl_pct),
             "profit_pct": float(profit_pct),
-            "warn_only": bool(warn_only),
+            "smart_selector_enabled": bool(smart_selector_enabled),
+            "max_intraday_loss": float(max_intraday_loss),
+            "intraday_target": float(intraday_target),
+            "partial_target_pct": float(partial_target_pct),
+            "allow_carry_forward": bool(allow_carry_forward),
+            "max_carry_days": int(max_carry_days),
+            "vix_carry_threshold": float(vix_carry_threshold),
+            "max_daily_trades": int(max_daily_trades),
+            "max_daily_loss_pct": float(max_daily_loss_pct),
+            "avg_5m_volume": float(avg_5m_volume),
+            "per_leg_sl_mult": float(per_leg_sl_mult),
+            "per_leg_tp_mult": float(per_leg_tp_mult),
+            "vix_adaptive_low": float(vix_adaptive_low),
+            "vix_adaptive_high": float(vix_adaptive_high),
+            "strangle_delta_low": float(strangle_delta_low),
+            "strangle_delta_high": float(strangle_delta_high),
+            "strangle_offset_low": float(strangle_offset_low),
+            "strangle_offset_high": float(strangle_offset_high),
+            "spread_short_delta_low": float(spread_short_delta_low),
+            "spread_short_delta_high": float(spread_short_delta_high),
             "hedge_enabled": bool(hedge_enabled),
             "hedge_delta_breach": float(hedge_delta_breach),
             "hedge_premium_hard_x": float(hedge_premium_hard_x),
@@ -2869,6 +3055,7 @@ def _sidebar() -> None:
         options=[
             ("Monthly Strangle w/ Hedge", "monthly_strangle_with_weekly_hedge.py"),
             ("Weekly Theta Strangle (alpha live)", "weekly_theta_strangle.py"),
+            ("Batman Monthly (with hedges)", "batman"),
         ],
         format_func=lambda x: x[0],
         key="strategy_choice",
@@ -2880,7 +3067,6 @@ def _sidebar() -> None:
     if choice:
         st.session_state["strategy_file"] = choice[1]
     if st.session_state.get("strategy_file") == "weekly_theta_strangle.py":
-        st.sidebar.checkbox("Weekly: warn only (paper)", value=True, key="weekly_warn_only", disabled=agent_running)
         st.sidebar.selectbox(
             "Weekly order type",
             options=["MARKET", "LIMIT"],

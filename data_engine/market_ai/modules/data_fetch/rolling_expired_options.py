@@ -147,16 +147,16 @@ class RollingExpiredOptionsMarket:
               want: List[str], target_day: date) -> List[Tuple[str, float, Dict[str, Any]]]:
         payload = {
             "exchangeSegment": self.exchange_segment,
-            "interval": self.interval,
+            "interval": "60",
             "securityId": int(security_id),
             "instrument": self.instrument,
-            "expiryFlag": self.expiry_flag,
-            "expiryCode": int(expiry_code),
-            "strike": selector,              # "ATM", "ATM+7", "ATM-12", ...
-            "drvOptionType": opt_type,       # "CALL" / "PUT"
-            "requiredData": want,
+            "expiryFlag": self.expiry_flag,   # e.g. "MONTH"
+            "expiryCode": int(expiry_code),   # e.g. 1
+            "strike": selector,               # e.g. "ATM-10"
+            "drvOptionType": opt_type,        # "CALL" / "PUT"
+            "requiredData": want or ["open", "strike"],
             "fromDate": from_date,
-            "toDate": to_date
+            "toDate": to_date,
         }
         data = self._post(payload) or {}
         node = (data.get("data") or {}).get("ce" if opt_type == "CALL" else "pe") or {}
