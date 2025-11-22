@@ -21,8 +21,8 @@ class BatmanConfig:
     underlying_id: int = 13  # NIFTY
     underlying_seg: str = "NSE_FNO"
     lot_size: int = 50
-    long_wing_distance: int = 300
-    short_wing_distance: int = 600
+    long_wing_distance: int = 300   # buy 1 lot ±300 from spot
+    short_wing_distance: int = 500  # sell 3 lots ±500 from spot
     hedge_extra_distance: int = 400
     hedge_price_cap: float = 10.0
     add_extra_hedges: bool = True

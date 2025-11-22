@@ -81,6 +81,10 @@ FEATURE_FIELDS = [
 _LAST_ENV_LOG: Optional[datetime] = None
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "lot_size": 75,
+    "nifty_lot_size": 75,
+    "nifty_expiry_weekday": "Tuesday",
+    "expiry_shift_if_holiday": True,
+    "holiday_list": [],
     "smart_selector_enabled": True,
     "max_daily_trades": 5,
     "max_daily_loss_pct": 0.03,
@@ -190,6 +194,11 @@ def _load_agent_settings() -> Dict[str, Any]:
             raise TypeError("settings json is not a dict")
         merged = dict(DEFAULT_SETTINGS)
         merged.update(data)
+        # keep lot_size and nifty_lot_size in sync if only one is provided
+        if "nifty_lot_size" not in merged:
+            merged["nifty_lot_size"] = merged.get("lot_size", DEFAULT_SETTINGS["lot_size"])
+        if "lot_size" not in merged:
+            merged["lot_size"] = merged.get("nifty_lot_size", DEFAULT_SETTINGS["nifty_lot_size"])
         return merged
     except Exception as exc:
         log.warning("Failed to load agent settings from %s (%s); falling back to defaults", path, exc)
@@ -783,6 +792,73 @@ def _compute_mtm(legs: List[OptionLeg]) -> float:
 
 
 def _fetch_expiry(dw: DhanWrapper):
+    return _fetch_expiry_with_settings(dw, DEFAULT_SETTINGS)
+
+
+def _weekday_to_int(value) -> Optional[int]:
+    if isinstance(value, int):
+        return value if 0 <= value <= 6 else None
+    if isinstance(value, str):
+        name = value.strip().lower()
+        mapping = {
+            "monday": 0,
+            "tuesday": 1,
+            "wednesday": 2,
+            "thursday": 3,
+            "friday": 4,
+            "saturday": 5,
+            "sunday": 6,
+        }
+        if name in mapping:
+            return mapping[name]
+        try:
+            num = int(name)
+            if 0 <= num <= 6:
+                return num
+        except Exception:
+            return None
+    return None
+
+
+def _parse_holiday_list(settings: Dict[str, Any]) -> set:
+    holidays_raw = settings.get("holiday_list") or []
+    # support comma separated string for backward compatibility
+    if isinstance(holidays_raw, str):
+        holidays_raw = [h.strip() for h in holidays_raw.replace(",", "\n").splitlines() if h.strip()]
+    out = set()
+    for item in holidays_raw:
+        try:
+            clean = str(item).split("T", 1)[0].split(" ", 1)[0]
+            out.add(datetime.fromisoformat(clean).date())
+        except Exception:
+            continue
+    return out
+
+
+def _derive_shifted_holidays(target_weekday: Optional[int], expiries: List[dt_date]) -> set:
+    """
+    If the exchange has shifted expiry (e.g., no Tuesday but a Wednesday expiry),
+    infer the missing target weekday immediately before the shifted expiry as a holiday.
+    """
+    if target_weekday is None or not expiries:
+        return set()
+    today = datetime.now().date()
+    future = [e for e in expiries if e >= today]
+    if not future:
+        return set()
+    future.sort()
+    first_exp = future[0]
+    if first_exp.weekday() == target_weekday:
+        return set()
+    # compute the most recent target_weekday before the shifted expiry
+    delta_days = (first_exp.weekday() - target_weekday) % 7
+    inferred_holiday = first_exp - timedelta(days=delta_days or 7)
+    if inferred_holiday >= today - timedelta(days=7):
+        return {inferred_holiday}
+    return set()
+
+
+def _fetch_expiry_with_settings(dw: DhanWrapper, settings: Dict[str, Any]):
     try:
         expiries = dw.get_optionchain_expirylist("IDX_I", 13)
     except AttributeError:
@@ -817,10 +893,34 @@ def _fetch_expiry(dw: DhanWrapper):
         except Exception:
             continue
     parsed.sort()
-    for candidate in parsed:
-        if candidate >= today:
-            return candidate
-    return parsed[-1] if parsed else today
+    if not parsed:
+        return today
+
+    target_weekday = _weekday_to_int(settings.get("nifty_expiry_weekday", "Tuesday"))
+    holidays = _parse_holiday_list(settings)
+    shift_if_holiday = bool(settings.get("expiry_shift_if_holiday", True))
+    holidays |= _derive_shifted_holidays(target_weekday, parsed)
+
+    def is_valid(cand: dt_date) -> bool:
+        if cand < today:
+            return False
+        if target_weekday is not None and cand.weekday() != target_weekday:
+            return False
+        if shift_if_holiday and cand in holidays:
+            return False
+        return True
+
+    filtered = [c for c in parsed if is_valid(c)]
+    if filtered:
+        return filtered[0]
+
+    # fallback: ignore weekday filter but still respect holiday shift
+    filtered_no_weekday = [c for c in parsed if c >= today and (not shift_if_holiday or c not in holidays)]
+    if filtered_no_weekday:
+        return filtered_no_weekday[0]
+
+    # ultimate fallback: last known expiry
+    return parsed[-1]
 
 
 def _place_leg_order(dw: DhanWrapper, leg: OptionLeg, *, close: bool, trade_mode: str) -> None:
@@ -1025,7 +1125,7 @@ def main() -> None:
                 breakout = detect_orb_breakout(market, orb_state.orb_levels, orb_config)
                 orb_state.breakout_signal = breakout if breakout.active else None
             sr_levels = compute_sr_levels(market, orb_state.orb_levels)
-            expiry = _fetch_expiry(dw)
+            expiry = _fetch_expiry_with_settings(dw, settings)
             positions_raw = dw.get_positions_raw()
             legs = _map_positions(positions_raw)
             if legs:

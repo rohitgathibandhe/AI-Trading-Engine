@@ -146,7 +146,7 @@ class RollingExpiredOptionsMarket:
               from_date: str, to_date: str, expiry_code: int,
               want: List[str], target_day: date) -> List[Tuple[str, float, Dict[str, Any]]]:
         payload = {
-            "exchangeSegment": self.exchange_segment,
+            "exchangeSegment": "IDX_I" if str(self.exchange_segment).upper().startswith("NSE") else self.exchange_segment,
             "interval": "60",
             "securityId": int(security_id),
             "instrument": self.instrument,

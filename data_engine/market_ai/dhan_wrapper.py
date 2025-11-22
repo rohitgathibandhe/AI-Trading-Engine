@@ -524,7 +524,25 @@ class DhanWrapper:
     def get_expiry_list(self, underlying_security_id: int, underlying_seg: str) -> Dict[str, Any]:
         ctx = type("Ctx", (object,), {"get_dhan_http": lambda _: self.http})()
         oc = OptionChain(ctx)
-        return oc.expiry_list(underlying_security_id, underlying_seg)
+        segs = []
+        if underlying_seg and underlying_seg.upper().startswith("NSE"):
+            segs.append("IDX_I")
+        segs.append(underlying_seg)
+        segs.append("NSE_FNO")
+        seen = set()
+        for seg in segs:
+            if not seg or seg in seen:
+                continue
+            seen.add(seg)
+            try:
+                resp = oc.expiry_list(underlying_security_id, seg)
+                if isinstance(resp, dict) and resp.get("data"):
+                    return resp
+                elif resp:
+                    return resp
+            except Exception:
+                continue
+        return {}
 
     def get_optionchain_expirylist(self, underlying_seg: str, underlying_security_id: int) -> List[str]:
         """
@@ -543,7 +561,32 @@ class DhanWrapper:
         expiry_str = self._normalize_expiry_value(expiry)
         if not expiry_str:
             raise ValueError("expiry is required for get_option_chain")
-        return oc.option_chain(underlying_security_id, underlying_seg, expiry_str)
+        segs = []
+        # Primary guess for NIFTY index
+        if underlying_seg and underlying_seg.upper().startswith("NSE"):
+            segs.append("IDX_I")
+        segs.append(underlying_seg)
+        # Legacy fallback
+        segs.append("NSE_FNO")
+        seen = set()
+        for seg in segs:
+            if not seg or seg in seen:
+                continue
+            seen.add(seg)
+            try:
+                resp = oc.option_chain(underlying_security_id, seg, expiry_str)
+                if isinstance(resp, dict):
+                    status = resp.get("status")
+                    data = resp.get("data")
+                    # Accept success or non-empty data
+                    if status == "success" or data:
+                        return resp
+                else:
+                    return resp
+            except Exception:
+                continue
+        # If all attempts fail, return empty dict
+        return {}
 
     def get_intraday_candles(
         self,

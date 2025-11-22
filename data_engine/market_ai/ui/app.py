@@ -153,6 +153,17 @@ LTP_QUEUE: Queue = Queue(maxsize=128)
 DEFAULT_SETTINGS = {
     "max_legs": 1,
     "lot_size": 75,
+    "nifty_lot_size": 75,
+    "nifty_expiry_weekday": "Tuesday",
+    "expiry_shift_if_holiday": True,
+    "holiday_list": [],
+    "batman_long_offset": 300.0,
+    "batman_short_offset": 500.0,
+    "batman_qty_long": 1,
+    "batman_qty_short": 3,
+    "batman_weekly_hedge_enabled": True,
+    "batman_weekly_hedge_price_cap": 12.0,
+    "batman_weekly_hedge_min_distance": 300.0,
     "leg_sl_pct": 2.5,
     "profit_pct": 2.25,
     "smart_selector_enabled": True,
@@ -318,6 +329,9 @@ def _load_settings() -> Dict[str, Any]:
     # ensure types
     merged["max_legs"] = int(merged.get("max_legs", DEFAULT_SETTINGS["max_legs"]))
     merged["lot_size"] = int(merged.get("lot_size", DEFAULT_SETTINGS["lot_size"]))
+    merged["nifty_lot_size"] = int(merged.get("nifty_lot_size", merged["lot_size"]))
+    # keep both lot size fields aligned for backward compatibility
+    merged["lot_size"] = merged.get("nifty_lot_size", merged["lot_size"])
     merged["leg_sl_pct"] = float(merged.get("leg_sl_pct", DEFAULT_SETTINGS["leg_sl_pct"]))
     merged["profit_pct"] = float(merged.get("profit_pct", DEFAULT_SETTINGS["profit_pct"]))
     merged["smart_selector_enabled"] = bool(merged.get("smart_selector_enabled", DEFAULT_SETTINGS["smart_selector_enabled"]))
@@ -341,6 +355,19 @@ def _load_settings() -> Dict[str, Any]:
     merged["risk_max_portfolio_delta"] = float(merged.get("risk_max_portfolio_delta", DEFAULT_SETTINGS["risk_max_portfolio_delta"]))
     merged["risk_max_exposure_pct"] = float(merged.get("risk_max_exposure_pct", DEFAULT_SETTINGS["risk_max_exposure_pct"]))
     merged["risk_account_equity"] = float(merged.get("risk_account_equity", DEFAULT_SETTINGS["risk_account_equity"]))
+    merged["nifty_expiry_weekday"] = merged.get("nifty_expiry_weekday", DEFAULT_SETTINGS["nifty_expiry_weekday"])
+    merged["expiry_shift_if_holiday"] = bool(merged.get("expiry_shift_if_holiday", DEFAULT_SETTINGS["expiry_shift_if_holiday"]))
+    merged["batman_long_offset"] = float(merged.get("batman_long_offset", DEFAULT_SETTINGS["batman_long_offset"]))
+    merged["batman_short_offset"] = float(merged.get("batman_short_offset", DEFAULT_SETTINGS["batman_short_offset"]))
+    merged["batman_qty_long"] = int(merged.get("batman_qty_long", DEFAULT_SETTINGS["batman_qty_long"]))
+    merged["batman_qty_short"] = int(merged.get("batman_qty_short", DEFAULT_SETTINGS["batman_qty_short"]))
+    merged["batman_weekly_hedge_enabled"] = bool(merged.get("batman_weekly_hedge_enabled", DEFAULT_SETTINGS["batman_weekly_hedge_enabled"]))
+    merged["batman_weekly_hedge_price_cap"] = float(merged.get("batman_weekly_hedge_price_cap", DEFAULT_SETTINGS["batman_weekly_hedge_price_cap"]))
+    merged["batman_weekly_hedge_min_distance"] = float(merged.get("batman_weekly_hedge_min_distance", DEFAULT_SETTINGS["batman_weekly_hedge_min_distance"]))
+    holidays_raw = merged.get("holiday_list", DEFAULT_SETTINGS["holiday_list"])
+    if isinstance(holidays_raw, str):
+        holidays_raw = [h.strip() for h in holidays_raw.replace(",", "\n").splitlines() if h.strip()]
+    merged["holiday_list"] = holidays_raw if isinstance(holidays_raw, list) else []
     playbook = merged.get("auto_playbook") or DEFAULT_SETTINGS["auto_playbook"].copy()
     merged["auto_playbook"] = {
         "hedge_on_delta": bool(playbook.get("hedge_on_delta", True)),
@@ -1063,7 +1090,7 @@ def _agent_env() -> dict:
     base["PYTHONPATH"] = os.pathsep.join([str(ROOT)] + ([base["PYTHONPATH"]] if base.get("PYTHONPATH") else []))
     settings = _load_settings()
     base["MAX_STRANGLES"] = str(settings.get("max_legs", 1))
-    base["NIFTY_LOT"] = str(settings.get("lot_size", 75))
+    base["NIFTY_LOT"] = str(settings.get("nifty_lot_size", settings.get("lot_size", 75)))
     # convert % -> decimal
     base["SL_PCT"] = str(float(settings.get("leg_sl_pct", 2.5)) / 100.0)
     base["TP_PCT"] = str(float(settings.get("profit_pct", 2.25)) / 100.0)
@@ -1086,6 +1113,13 @@ def _agent_env() -> dict:
     base["BATMAN_HEDGE_DELTA_MAX"] = base["HEDGE_DELTA_MAX"]
     base["BATMAN_HEDGE_PRICE_MAX"] = base["HEDGE_PRICE_MAX"]
     base["BATMAN_SALVAGE_WING_LTP"] = base["HEDGE_SALVAGE_WING_LTP"]
+    base["BATMAN_LONG_OFFSET"] = str(settings.get("batman_long_offset", 300.0))
+    base["BATMAN_SHORT_OFFSET"] = str(settings.get("batman_short_offset", 500.0))
+    base["BATMAN_QTY_LONG"] = str(settings.get("batman_qty_long", 1))
+    base["BATMAN_QTY_SHORT"] = str(settings.get("batman_qty_short", 3))
+    base["BATMAN_WEEKLY_HEDGE_ENABLED"] = "1" if settings.get("batman_weekly_hedge_enabled", True) else "0"
+    base["BATMAN_WEEKLY_HEDGE_PRICE_CAP"] = str(settings.get("batman_weekly_hedge_price_cap", 12.0))
+    base["BATMAN_WEEKLY_HEDGE_MIN_DISTANCE"] = str(settings.get("batman_weekly_hedge_min_distance", 300.0))
     base["STRATEGY_MODEL_PATH"] = str(STATE_DIR / "strategy_selector_model.json")
     base["STRATEGY_FILE"] = st.session_state.get("strategy_file", "monthly_strangle_with_weekly_hedge.py")
     # Weekly order params
@@ -2564,10 +2598,41 @@ def _settings_tab() -> None:
     st.markdown("### Settings")
     current = _load_settings()
 
+    # Global / index-level settings
+    weekday_opts = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    cur_weekday = current.get("nifty_expiry_weekday", "Tuesday")
+    if isinstance(cur_weekday, int):
+        cur_weekday = weekday_opts[min(max(cur_weekday, 0), 4)]
+    with st.expander("Global (index/expiry) settings", expanded=True):
+        lot_size_global = st.number_input(
+            "NIFTY lot size",
+            50,
+            1000,
+            int(current.get("nifty_lot_size", current.get("lot_size", 75))),
+            help="Used for position sizing across strategies.",
+        )
+        expiry_weekday = st.selectbox(
+            "NIFTY expiry weekday",
+            weekday_opts,
+            index=weekday_opts.index(str(cur_weekday).title()) if str(cur_weekday).title() in weekday_opts else 1,
+            help="Choose the scheduled weekly/monthly expiry day (default Tuesday).",
+        )
+        expiry_shift_if_holiday = st.checkbox(
+            "Shift expiry if configured day is a holiday",
+            value=bool(current.get("expiry_shift_if_holiday", True)),
+            help="Skip the configured expiry day when it is a holiday and use the next available expiry.",
+        )
+        holiday_text = "\n".join(current.get("holiday_list", [])) if isinstance(current.get("holiday_list"), list) else str(current.get("holiday_list") or "")
+        holiday_text = st.text_area(
+            "Holiday list (YYYY-MM-DD, one per line)",
+            value=holiday_text,
+            help="Optional manual holiday overrides used to skip expiry if the configured day is a holiday.",
+        )
+        holiday_list = [h.strip() for h in holiday_text.replace(",", "\n").splitlines() if h.strip()]
+
     c1, c2 = st.columns(2)
     with c1:
         max_legs = st.number_input("Max active strangles", 1, 10, int(current.get("max_legs", 1)))
-        lot_size = st.number_input("Lot size (NIFTY)", 50, 1000, int(current.get("lot_size", 75)))
     with c2:
         leg_sl_pct = st.number_input("Stop-loss per leg (%)", 0.5, 10.0, float(current.get("leg_sl_pct", 2.5)))
         profit_pct = st.number_input("Profit booking (%)", 0.5, 10.0, float(current.get("profit_pct", 2.25)))
@@ -2756,6 +2821,55 @@ def _settings_tab() -> None:
                 help="Do not auto-buy hedges above this LTP.",
             )
 
+    with st.expander("Batman strategy (monthly)"):
+        bat_long_offset = st.number_input(
+            "Long wing distance from spot (pts)",
+            50.0,
+            800.0,
+            float(current.get("batman_long_offset", 300.0)),
+            help="Distance from spot for long hedges (both CE/PE).",
+        )
+        bat_short_offset = st.number_input(
+            "Short body distance from spot (pts)",
+            50.0,
+            1000.0,
+            float(current.get("batman_short_offset", 500.0)),
+            help="Distance from spot for short bodies (both CE/PE).",
+        )
+        bat_qty_long = st.number_input(
+            "Long wing quantity (lots)",
+            1,
+            10,
+            int(current.get("batman_qty_long", 1)),
+            help="Per-side long wings.",
+        )
+        bat_qty_short = st.number_input(
+            "Short body quantity (lots)",
+            1,
+            10,
+            int(current.get("batman_qty_short", 3)),
+            help="Per-side short bodies.",
+        )
+        bat_weekly_hedge_enabled = st.checkbox(
+            "Add cheap weekly hedges",
+            value=bool(current.get("batman_weekly_hedge_enabled", True)),
+            help="Buys far OTM weekly wings to cover the open monthly bodies for margin relief.",
+        )
+        bat_weekly_hedge_cap = st.number_input(
+            "Weekly hedge max LTP (₹)",
+            1.0,
+            50.0,
+            float(current.get("batman_weekly_hedge_price_cap", 12.0)),
+            help="Skip weekly hedges above this premium.",
+        )
+        bat_weekly_hedge_min_dist = st.number_input(
+            "Weekly hedge min distance from spot (pts)",
+            50.0,
+            1200.0,
+            float(current.get("batman_weekly_hedge_min_distance", 300.0)),
+            help="Only pick weekly hedges at least this far OTM.",
+        )
+
     if st.button("💾 Save Settings"):
         SETTINGS_JSON.write_text(json.dumps({
             "max_legs": int(max_legs),
@@ -2789,6 +2903,18 @@ def _settings_tab() -> None:
             "hedge_delta_max": float(hedge_delta_max),
             "hedge_price_max": float(hedge_price_max),
             "hedge_salvage_wing_ltp": float(hedge_salvage),
+            "nifty_expiry_weekday": expiry_weekday,
+            "expiry_shift_if_holiday": bool(expiry_shift_if_holiday),
+            "holiday_list": holiday_list,
+            "nifty_lot_size": int(lot_size),
+            "lot_size": int(lot_size),
+            "batman_long_offset": float(bat_long_offset),
+            "batman_short_offset": float(bat_short_offset),
+            "batman_qty_long": int(bat_qty_long),
+            "batman_qty_short": int(bat_qty_short),
+            "batman_weekly_hedge_enabled": bool(bat_weekly_hedge_enabled),
+            "batman_weekly_hedge_price_cap": float(bat_weekly_hedge_cap),
+            "batman_weekly_hedge_min_distance": float(bat_weekly_hedge_min_dist),
         }, indent=2))
         st.success("Settings saved.")
     with st.expander("Auto Playbook"):

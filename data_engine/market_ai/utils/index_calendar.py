@@ -26,9 +26,15 @@ def last_weekday_of_month(year: int, month: int, weekday: int) -> date:
 
 
 def monthly_expiry_date(target: date) -> date:
-    """Return the standard NSE index monthly expiry (last Thursday) for `target`'s month."""
+    """
+    Return the index monthly expiry for `target`'s month.
 
-    return last_weekday_of_month(target.year, target.month, weekday=3)  # 3 = Thursday
+    Per our NIFTY setup, we treat the monthly expiry as the last Tuesday
+    of the month (weekday=1), shifting earlier if that Tuesday is a holiday
+    via last_weekday_of_month helper.
+    """
+
+    return last_weekday_of_month(target.year, target.month, weekday=1)  # 1 = Tuesday
 
 
 def last_friday_before(expiry: date) -> date:

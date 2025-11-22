@@ -38,29 +38,6 @@ def start_daemon(mode: str = "paper") -> str:
     PID_FILE.write_text(pid)
     return f"Started daemon ({mode}) with PID {pid}"
 
-
-def start_batman_daemon(mode: str = "paper") -> str:
-    """Start the ai_batman_daemon in background."""
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = LOG_DIR / f"batman_daemon_{mode}_{os.getpid()}.log"
-    cmd = [
-        "nohup",
-        "python3", "scripts/ai_batman_daemon.py",
-    ]
-    env = os.environ.copy()
-    env["TRADE_MODE"] = mode
-    proc = subprocess.Popen(
-        " ".join(cmd) + f" > {log_path} 2>&1 & echo $!",
-        shell=True,
-        cwd=DATA_ENGINE,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    pid = proc.stdout.read().decode().strip()
-    PID_FILE.write_text(pid)
-    return f"Started Batman daemon ({mode}) with PID {pid}"
-
 def stop_daemon() -> str:
     if PID_FILE.exists():
         pid = int(PID_FILE.read_text().strip() or 0)
