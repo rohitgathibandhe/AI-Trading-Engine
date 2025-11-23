@@ -124,10 +124,10 @@ class LiveConfig:
     max_requote: int = 2  # attempts to re-place remaining qty if fill not met
     hedge_enabled: bool = bool(int(os.environ.get("WEEKLY_HEDGE_ENABLED", "0")))
     hedge_trigger_pct: float = 0.01  # hedge when MTM drawdown beyond this
-    hedge_distance: int = 200  # points away from ATM for hedge wings
+    hedge_distance: int = int(float(os.environ.get("WEEKLY_HEDGE_DISTANCE", 200)))  # points away from ATM for hedge wings
     hedge_cost_cap: float = 500.0  # max premium spend per hedge leg
     entry_hedge_enabled: bool = True  # buy cheap OTM wings on entry for margin benefit
-    entry_hedge_price_cap: float = 3.5  # do not pay above this per entry hedge leg
+    entry_hedge_price_cap: float = float(os.environ.get("WEEKLY_HEDGE_PRICE_CAP", 3.5))  # do not pay above this per entry hedge leg
     min_days_to_expiry: int = 2  # skip front expiry if fewer days remain
     adopt_legs: list = field(default_factory=lambda: [
         {"side": "SELL", "strike": 26200, "type": "CALL", "qty": 75, "entry": 104.65, "expiry": "2025-11-25"},

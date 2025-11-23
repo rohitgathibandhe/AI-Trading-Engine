@@ -187,6 +187,8 @@ DEFAULT_SETTINGS = {
     "hedge_delta_max": 0.12,
     "hedge_price_max": 35.0,
     "hedge_salvage_wing_ltp": 5.0,
+    "weekly_hedge_distance": 200.0,
+    "weekly_hedge_price_cap": 3.5,
     "vix_adaptive_low": 12.0,
     "vix_adaptive_high": 20.0,
     "strangle_delta_low": 0.15,
@@ -355,6 +357,8 @@ def _load_settings() -> Dict[str, Any]:
     merged["hedge_delta_max"] = float(merged.get("hedge_delta_max", DEFAULT_SETTINGS["hedge_delta_max"]))
     merged["hedge_price_max"] = float(merged.get("hedge_price_max", DEFAULT_SETTINGS["hedge_price_max"]))
     merged["hedge_salvage_wing_ltp"] = float(merged.get("hedge_salvage_wing_ltp", DEFAULT_SETTINGS["hedge_salvage_wing_ltp"]))
+    merged["weekly_hedge_distance"] = float(merged.get("weekly_hedge_distance", DEFAULT_SETTINGS["weekly_hedge_distance"]))
+    merged["weekly_hedge_price_cap"] = float(merged.get("weekly_hedge_price_cap", DEFAULT_SETTINGS["weekly_hedge_price_cap"]))
     merged["risk_max_portfolio_delta"] = float(merged.get("risk_max_portfolio_delta", DEFAULT_SETTINGS["risk_max_portfolio_delta"]))
     merged["risk_max_exposure_pct"] = float(merged.get("risk_max_exposure_pct", DEFAULT_SETTINGS["risk_max_exposure_pct"]))
     merged["risk_account_equity"] = float(merged.get("risk_account_equity", DEFAULT_SETTINGS["risk_account_equity"]))
@@ -1110,6 +1114,8 @@ def _agent_env() -> dict:
     base["HEDGE_DELTA_MAX"] = str(settings.get("hedge_delta_max", 0.12))
     base["HEDGE_PRICE_MAX"] = str(settings.get("hedge_price_max", 35.0))
     base["HEDGE_SALVAGE_WING_LTP"] = str(settings.get("hedge_salvage_wing_ltp", 5.0))
+    base["WEEKLY_HEDGE_DISTANCE"] = str(settings.get("weekly_hedge_distance", 200.0))
+    base["WEEKLY_HEDGE_PRICE_CAP"] = str(settings.get("weekly_hedge_price_cap", 3.5))
     # legacy exports to support older start_agent builds
     base["BATMAN_ENABLED"] = base["HEDGE_ENABLED"]
     base["BATMAN_DELTA_BREACH"] = base["HEDGE_DELTA_BREACH"]
@@ -2661,7 +2667,7 @@ def _settings_tab() -> None:
         help="Toggle the new trend-aware strangle/spread engine. Disable to fall back to neutral strangles only.",
     )
 
-    with st.expander("Smart selector & risk"):
+    with st.expander("Smart selector & risk (general)"):
         r1, r2 = st.columns(2)
         with r1:
             max_intraday_loss = st.number_input(
@@ -2731,7 +2737,7 @@ def _settings_tab() -> None:
             int(current.get("max_carry_days", 0)),
         )
 
-    with st.expander("Adaptive strike selection"):
+    with st.expander("Monthly Strangle: adaptive strike selection"):
         a1, a2 = st.columns(2)
         with a1:
             vix_adaptive_low = st.number_input(
@@ -2788,11 +2794,11 @@ def _settings_tab() -> None:
                 float(current.get("spread_short_delta_high", 0.32)),
             )
 
-    with st.expander("Hedge monitor adjustments"):
+    with st.expander("Weekly Theta Strangle: hedges & rolls"):
         hedge_enabled = st.checkbox(
             "Enable hedge monitor",
             value=bool(current.get("hedge_enabled", True)),
-            help="Detect existing short-body structures, roll stressed legs, and add hedges automatically.",
+            help="Detect existing short-body structures, roll stressed legs, and add hedges automatically for weekly strangle.",
         )
         bc1, bc2 = st.columns(2)
         with bc1:
@@ -2817,6 +2823,14 @@ def _settings_tab() -> None:
                 float(current.get("hedge_salvage_wing_ltp", 5.0)),
                 help="Wings below this value can be considered for salvage/refresh (future use).",
             )
+            weekly_hedge_distance = st.number_input(
+                "Weekly hedge distance (pts)",
+                50.0,
+                1200.0,
+                float(current.get("weekly_hedge_distance", 200.0)),
+                help="Distance from ATM for weekly hedge wings in the weekly strangle live loop.",
+                step=50.0,
+            )
         with bc2:
             hedge_premium_hard_x = st.number_input(
                 "Premium multiple trigger",
@@ -2838,6 +2852,13 @@ def _settings_tab() -> None:
                 200.0,
                 float(current.get("hedge_price_max", 35.0)),
                 help="Do not auto-buy hedges above this LTP.",
+            )
+            weekly_hedge_price_cap = st.number_input(
+                "Weekly hedge price cap (₹)",
+                1.0,
+                100.0,
+                float(current.get("weekly_hedge_price_cap", 3.5)),
+                help="Skip weekly entry hedges above this LTP in the weekly strangle live loop.",
             )
 
     with st.expander("Batman strategy (monthly)"):
@@ -2924,6 +2945,8 @@ def _settings_tab() -> None:
             "hedge_delta_max": float(hedge_delta_max),
             "hedge_price_max": float(hedge_price_max),
             "hedge_salvage_wing_ltp": float(hedge_salvage),
+            "weekly_hedge_distance": float(weekly_hedge_distance),
+            "weekly_hedge_price_cap": float(weekly_hedge_price_cap),
             "nifty_expiry_weekday": expiry_weekday,
             "expiry_shift_if_holiday": bool(expiry_shift_if_holiday),
             "holiday_list": holiday_list,
@@ -3027,7 +3050,7 @@ def _paper_pnl_tab() -> None:
                     pb_df = pd.read_csv(latest_pb) if latest_pb and latest_pb.exists() else pd.DataFrame()
                     if not bt_df.empty:
                         st.markdown("#### Entries and Strikes")
-                        st.dataframe(bt_df, use_container_width=True)
+                        st.dataframe(bt_df, width="stretch")
                         leg_cols = ["long_call", "short_call", "long_put", "short_put"]
                         if all(c in bt_df.columns for c in leg_cols):
                             settings = _load_settings()
@@ -3045,7 +3068,7 @@ def _paper_pnl_tab() -> None:
                                     "qty_long": qty_long,
                                     "qty_short": qty_short,
                                 })
-                            st.dataframe(pd.DataFrame(legs_rows), use_container_width=True)
+                            st.dataframe(pd.DataFrame(legs_rows), width="stretch")
                         else:
                             st.info("Strikes not available in file (expected columns: long_call, short_call, long_put, short_put).")
                         if not pb_df.empty:
@@ -3119,7 +3142,7 @@ def _paper_pnl_tab() -> None:
                 try:
                     import pandas as pd
                     df_trades = pd.read_csv(trades_path)
-                    st.dataframe(df_trades, use_container_width=True)
+                    st.dataframe(df_trades, width="stretch")
                 except Exception as exc:
                     st.warning(f"Could not load trades file: {exc}")
             if summary_path.exists() and show_latest:
@@ -3134,7 +3157,7 @@ def _paper_pnl_tab() -> None:
                     import pandas as pd
                     df_daily = pd.read_csv(daily_path)
                     st.markdown("#### Daily log")
-                    st.dataframe(df_daily, use_container_width=True)
+                    st.dataframe(df_daily, width="stretch")
                 except Exception as exc:
                     st.warning(f"Could not load daily log: {exc}")
             if not trades_path.exists() and not summary_path.exists():
