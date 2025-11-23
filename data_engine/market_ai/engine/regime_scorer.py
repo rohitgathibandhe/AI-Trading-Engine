@@ -19,6 +19,16 @@ class RegimeProbabilities:
         }
 
 
+@dataclass
+class RegimeInputs:
+    gap_pct: float = 0.0
+    trend_strength: float = 0.0
+    orb_break_dir: int = 0   # +1 bull, -1 bear, 0 none
+    bullish_vwap: float = 0.0
+    bearish_vwap: float = 0.0
+    within_sr_band: float = 0.0  # 0-1 measure of being within support/resistance band
+
+
 class RegimeScorer:
     """Weighted, interpretable regime scorer."""
 

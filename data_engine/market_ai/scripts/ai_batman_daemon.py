@@ -113,8 +113,8 @@ def _nearest(strikes: Dict[float, float], target: float) -> float:
     return best
 
 
-def _round50(x: float) -> float:
-    return round(x / 50.0) * 50.0
+def _round_strike(x: float, step: float = 100.0) -> float:
+    return round(x / step) * step
 
 
 def _place_leg(dw: DhanWrapper, expiry_str: str, lot: int, leg: Any, trade_mode: str):
@@ -310,10 +310,10 @@ def main():
     ce_prices = {float(k.split(":")[1]): v for k, v in prices.items() if k.startswith("CALL:")}
     pe_prices = {float(k.split(":")[1]): v for k, v in prices.items() if k.startswith("PUT:")}
 
-    long_ce = _nearest(ce_prices, _round50(spot + long_offset))
-    short_ce = _nearest(ce_prices, _round50(spot + short_offset))
-    long_pe = _nearest(pe_prices, _round50(spot - long_offset))
-    short_pe = _nearest(pe_prices, _round50(spot - short_offset))
+    long_ce = _nearest(ce_prices, _round_strike(spot + long_offset))
+    short_ce = _nearest(ce_prices, _round_strike(spot + short_offset))
+    long_pe = _nearest(pe_prices, _round_strike(spot - long_offset))
+    short_pe = _nearest(pe_prices, _round_strike(spot - short_offset))
 
     # Optional weekly hedges (far OTM, cheap)
     weekly_hedges = []

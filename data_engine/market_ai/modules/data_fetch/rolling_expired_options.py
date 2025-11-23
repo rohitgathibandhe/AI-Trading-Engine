@@ -77,7 +77,7 @@ class RollingExpiredOptionsMarket:
         exchange_segment: str = "NSE_FNO",
         instrument: str = "OPTIDX",
         expiry_flag: str = "MONTH",
-        interval: str = "5",
+        interval: str = "1",
         risk_free_rate: float = 0.06,
         throttle_s: float = 0.35,
         max_retries: int = 4,
@@ -109,6 +109,7 @@ class RollingExpiredOptionsMarket:
 
     # ---------- HTTP ----------
     def _headers(self) -> Dict[str, str]:
+        # Dhan rollingoption requires both access-token and client-id
         return {
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -146,13 +147,13 @@ class RollingExpiredOptionsMarket:
               from_date: str, to_date: str, expiry_code: int,
               want: List[str], target_day: date) -> List[Tuple[str, float, Dict[str, Any]]]:
         payload = {
-            "exchangeSegment": "IDX_I" if str(self.exchange_segment).upper().startswith("NSE") else self.exchange_segment,
-            "interval": "60",
+            "exchangeSegment": self.exchange_segment,
+            "interval": self.interval,
             "securityId": int(security_id),
             "instrument": self.instrument,
             "expiryFlag": self.expiry_flag,   # e.g. "MONTH"
             "expiryCode": int(expiry_code),   # e.g. 1
-            "strike": selector,               # e.g. "ATM-10"
+            "strike": selector,               # e.g. "ATM-10" / "ATM"
             "drvOptionType": opt_type,        # "CALL" / "PUT"
             "requiredData": want or ["open", "strike"],
             "fromDate": from_date,
@@ -231,16 +232,11 @@ class RollingExpiredOptionsMarket:
         return results
 
     def _ladder(self, spot: Optional[float]) -> List[int]:
-        # assume 50pt spacing; seed ~3.5% OTM
-        tick = 50.0
-        k0 = 6 if spot is None else max(2, int((spot * self.seed_otm_pct) // tick))
-        ladder = [k0, k0 + 2, k0 + 4, k0 + 6]
-        # extend ladder for farther strikes (Batman needs ±600)
-        ladder.extend([k0 + 8, k0 + 10, k0 + 12])
-        return sorted(set(ladder))
+        # Simplify to only ATM; API guidance prefers plain ATM selector.
+        return [0]
 
     def _build_side(self, security_id: int, as_of_date: str, expiry_code: int, opt_type: str) -> List[Tuple[float, Dict[str, Any]]]:
-        want = ["open","high","low","close","iv","volume","strike","oi","spot","timestamp"]
+        want = ["open"]  # minimal set per Dhan guidance
         day = _parse_iso(as_of_date); to_date = (day + timedelta(days=1)).isoformat()
 
         # 1) ATM to get spot
@@ -252,24 +248,7 @@ class RollingExpiredOptionsMarket:
             rows_by_selector[str(at[1])] = (at[1], at[2])
         spot = at[2].get("spot") if at else None
 
-        # 2) fixed small ladder
-        ks = self._ladder(spot)
-        for k in ks:
-            if reqs >= self.max_requests: break
-            sel = f"ATM+{k}" if opt_type=="CALL" else f"ATM-{k}"
-            if sel in rows_by_selector: continue
-            got_rows = self._pull(security_id, sel, opt_type, as_of_date, to_date, expiry_code, want, day)
-            reqs += 1
-            if not got_rows:
-                continue
-            for _, K, leg in got_rows:
-                price = float(leg["last_price"])
-                s = float(leg.get("spot") or 0.0)
-                rows_by_selector[str(K)] = (K, leg)
-                if price <= self.min_premium:
-                    break
-                if s > 0 and abs(K - s) / s >= self.max_otm_pct:
-                    break
+        # 2) ladder skipped (ATM only) to avoid selector issues
 
         # ensure uniqueness by strike (server sometimes maps different selectors → same K)
         out_rows: List[Tuple[float, Dict[str, Any]]] = []
@@ -299,7 +278,8 @@ class RollingExpiredOptionsMarket:
         except Exception:
             expiry_day = _parse_iso(as_of_date) + timedelta(days=35)
         as_of = _parse_iso(as_of_date)
-        exp_code = _expiry_code(as_of, expiry_day)
+        # Dhan guidance: use expiryCode=1 for monthly rollingoption
+        exp_code = 1 if self.expiry_flag == "MONTH" else _expiry_code(as_of, expiry_day)
 
         ce_rows = self._build_side(int(underlying_id), as_of_date, exp_code, "CALL")
         pe_rows = self._build_side(int(underlying_id), as_of_date, exp_code, "PUT")

@@ -23,6 +23,8 @@ class BatmanConfig:
     lot_size: int = 50
     long_wing_distance: int = 300   # buy 1 lot ±300 from spot
     short_wing_distance: int = 500  # sell 3 lots ±500 from spot
+    long_qty: int = 1
+    short_qty: int = 3
     hedge_extra_distance: int = 400
     hedge_price_cap: float = 10.0
     add_extra_hedges: bool = True
@@ -116,13 +118,13 @@ class BatmanMonthlyStrategy:
 
     def _build_legs(self, strikes: Dict[str, float], prices: Dict[str, float]) -> List[BatmanLeg]:
         legs = [
-            BatmanLeg(strike=strikes["long_call"], option_type="CALL", qty=1, direction="LONG",
+            BatmanLeg(strike=strikes["long_call"], option_type="CALL", qty=self.cfg.long_qty, direction="LONG",
                       entry_price=prices.get(f"CALL:{strikes['long_call']}", 0.0)),
-            BatmanLeg(strike=strikes["short_call"], option_type="CALL", qty=3, direction="SHORT",
+            BatmanLeg(strike=strikes["short_call"], option_type="CALL", qty=self.cfg.short_qty, direction="SHORT",
                       entry_price=prices.get(f"CALL:{strikes['short_call']}", 0.0)),
-            BatmanLeg(strike=strikes["long_put"], option_type="PUT", qty=1, direction="LONG",
+            BatmanLeg(strike=strikes["long_put"], option_type="PUT", qty=self.cfg.long_qty, direction="LONG",
                       entry_price=prices.get(f"PUT:{strikes['long_put']}", 0.0)),
-            BatmanLeg(strike=strikes["short_put"], option_type="PUT", qty=3, direction="SHORT",
+            BatmanLeg(strike=strikes["short_put"], option_type="PUT", qty=self.cfg.short_qty, direction="SHORT",
                       entry_price=prices.get(f"PUT:{strikes['short_put']}", 0.0)),
         ]
         if self.cfg.add_extra_hedges:
@@ -249,6 +251,7 @@ class BatmanMonthlyStrategy:
         start_period = price_df["date"].min().to_period("M")
         end_period = price_df["date"].max().to_period("M")
         trades: List[Dict[str, Any]] = []
+        timeline: List[Dict[str, Any]] = []
 
         period = start_period
         while period <= end_period:
@@ -277,6 +280,27 @@ class BatmanMonthlyStrategy:
                 mtm_prices = self._mtm_prices(entry_dt.date(), expiry, strike_map, day)
                 pnl = position.mark_to_market(entry_dt + timedelta(days=day), mtm_prices, self.cfg.lot_size)
                 reason = self.evaluate_exit(position, entry_dt + timedelta(days=day), pnl)
+                # capture timeline row
+                timeline.append(
+                    {
+                        "timestamp": entry_dt + timedelta(days=day),
+                        "pnl": pnl,
+                        "long_call": strike_map["long_call"],
+                        "short_call": strike_map["short_call"],
+                        "long_put": strike_map["long_put"],
+                        "short_put": strike_map["short_put"],
+                        "long_call_ltp": mtm_prices.get(f"CALL:{strike_map['long_call']}"),
+                        "short_call_ltp": mtm_prices.get(f"CALL:{strike_map['short_call']}"),
+                        "long_put_ltp": mtm_prices.get(f"PUT:{strike_map['long_put']}"),
+                        "short_put_ltp": mtm_prices.get(f"PUT:{strike_map['short_put']}"),
+                        "long_call_entry": prices.get(f"CALL:{strike_map['long_call']}"),
+                        "short_call_entry": prices.get(f"CALL:{strike_map['short_call']}"),
+                        "long_put_entry": prices.get(f"PUT:{strike_map['long_put']}"),
+                        "short_put_entry": prices.get(f"PUT:{strike_map['short_put']}"),
+                        "qty_long": self.cfg.long_qty,
+                        "qty_short": self.cfg.short_qty,
+                    }
+                )
                 if reason:
                     position.close(entry_dt + timedelta(days=day), reason, mtm_prices, self.cfg.lot_size)
                     exit_reason = reason
@@ -303,12 +327,12 @@ class BatmanMonthlyStrategy:
             "entries": len(trades),
             "total_pnl": sum(t.get("realized_pnl", 0.0) for t in trades)
         }
-        return pd.DataFrame(trades), summary
+        return pd.DataFrame(trades), pd.DataFrame(timeline), summary
 
 
 def run_backtest(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     cfg_clean = dict(cfg)
     cfg_clean.pop("strategy", None)
     strategy = BatmanMonthlyStrategy(cfg_clean)
-    trades_df, summary = strategy.run(df)
-    return trades_df, pd.DataFrame(), summary
+    trades_df, timeline_df, summary = strategy.run(df)
+    return trades_df, timeline_df, summary

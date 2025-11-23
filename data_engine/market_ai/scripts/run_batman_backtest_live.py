@@ -74,20 +74,39 @@ def main() -> None:
         raise FileNotFoundError(f"Expected price CSV at {price_csv}")
 
     daily = load_daily_spot(price_csv)
+    # Optional date filter via env vars BACKTEST_START / BACKTEST_END (YYYY-MM-DD)
+    start_env = os.getenv("BACKTEST_START")
+    end_env = os.getenv("BACKTEST_END")
+    if start_env:
+        try:
+            start_d = datetime.fromisoformat(start_env).date()
+            daily = daily[daily["date"] >= start_d]
+        except Exception:
+            pass
+    if end_env:
+        try:
+            end_d = datetime.fromisoformat(end_env).date()
+            daily = daily[daily["date"] <= end_d]
+        except Exception:
+            pass
     market = RollingExpiredOptionsMarket()
 
     cfg = BatmanConfig()
     cfg.market = market
     cfg_dict = cfg.__dict__
-    trades, _, summary = run_backtest(daily, cfg_dict)
+    trades, timeline, summary = run_backtest(daily, cfg_dict)
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = REPO_ROOT / "reports"
     out_dir.mkdir(parents=True, exist_ok=True)
     trades_path = out_dir / f"batman_backtest_trades_{ts}.csv"
     summary_path = out_dir / f"batman_backtest_summary_{ts}.json"
+    timeline_path = out_dir / f"batman_backtest_playback_{ts}.csv"
     trades.to_csv(trades_path, index=False)
     summary_path.write_text(json.dumps(summary, indent=2))
+    if timeline is not None and not timeline.empty:
+        timeline.to_csv(timeline_path, index=False)
+        print(f"Wrote playback -> {timeline_path}")
     print(f"Wrote trades -> {trades_path}")
     print(f"Wrote summary -> {summary_path}")
 

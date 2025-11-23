@@ -99,6 +99,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "strangle_offset_high": 150.0,
     "spread_short_delta_low": 0.25,
     "spread_short_delta_high": 0.25,
+    "gap_entry_threshold": 0.004,
+    "iv_floor_percentile": 0.2,
 }
 CREDS_FILE = STATE_DIR / "creds.json"
 INDEX_SECURITY_ID = int(os.getenv("MARKET_AI_INDEX_SECURITY_ID", "13"))

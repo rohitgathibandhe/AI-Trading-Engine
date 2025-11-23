@@ -133,6 +133,7 @@ WEEKLY_PLAN_SCRIPT = ROOT / "scripts" / "weekly_plan_cron.sh"
 OPTION_CHAIN_SCRIPT = ROOT / "data_engine/market_ai/scripts/collect_live_option_chain.py"
 WEEKLY_SETTINGS_FILE = BROADER_STATE_DIR / "weekly_plan_settings.json"
 ORDER_INTENT_FILE = STATE_DIR / "order_intents.jsonl"
+LAST_STRATEGY_FILE = STATE_DIR / "last_strategy.json"
 
 AGENT_LOG = STATE_DIR / "agent.log"
 BATMAN_LOG = STATE_DIR / "batman_daemon.log"
@@ -157,6 +158,8 @@ DEFAULT_SETTINGS = {
     "nifty_expiry_weekday": "Tuesday",
     "expiry_shift_if_holiday": True,
     "holiday_list": [],
+    "gap_entry_threshold": 0.004,  # 0.4%
+    "iv_floor_percentile": 0.2,
     "batman_long_offset": 300.0,
     "batman_short_offset": 500.0,
     "batman_qty_long": 1,
@@ -303,7 +306,7 @@ def _init_state() -> None:
 
     ss.setdefault("agent_pid", None)
     ss.setdefault("agent_running", False)
-    ss.setdefault("trade_mode", "live")
+    ss.setdefault("trade_mode", "paper")
     ss.setdefault("refresh_sec", 5)
 
     ss.setdefault("ltp_value", None)
@@ -357,6 +360,8 @@ def _load_settings() -> Dict[str, Any]:
     merged["risk_account_equity"] = float(merged.get("risk_account_equity", DEFAULT_SETTINGS["risk_account_equity"]))
     merged["nifty_expiry_weekday"] = merged.get("nifty_expiry_weekday", DEFAULT_SETTINGS["nifty_expiry_weekday"])
     merged["expiry_shift_if_holiday"] = bool(merged.get("expiry_shift_if_holiday", DEFAULT_SETTINGS["expiry_shift_if_holiday"]))
+    merged["gap_entry_threshold"] = float(merged.get("gap_entry_threshold", DEFAULT_SETTINGS.get("gap_entry_threshold", 0.004)))
+    merged["iv_floor_percentile"] = float(merged.get("iv_floor_percentile", DEFAULT_SETTINGS.get("iv_floor_percentile", 0.2)))
     merged["batman_long_offset"] = float(merged.get("batman_long_offset", DEFAULT_SETTINGS["batman_long_offset"]))
     merged["batman_short_offset"] = float(merged.get("batman_short_offset", DEFAULT_SETTINGS["batman_short_offset"]))
     merged["batman_qty_long"] = int(merged.get("batman_qty_long", DEFAULT_SETTINGS["batman_qty_long"]))
@@ -2604,7 +2609,7 @@ def _settings_tab() -> None:
     if isinstance(cur_weekday, int):
         cur_weekday = weekday_opts[min(max(cur_weekday, 0), 4)]
     with st.expander("Global (index/expiry) settings", expanded=True):
-        lot_size_global = st.number_input(
+        lot_size = st.number_input(
             "NIFTY lot size",
             50,
             1000,
@@ -2629,6 +2634,20 @@ def _settings_tab() -> None:
             help="Optional manual holiday overrides used to skip expiry if the configured day is a holiday.",
         )
         holiday_list = [h.strip() for h in holiday_text.replace(",", "\n").splitlines() if h.strip()]
+        gap_entry_threshold = st.number_input(
+            "Max allowed gap % for neutral entries",
+            0.0,
+            5.0,
+            float(current.get("gap_entry_threshold", 0.4)),
+            help="Skip entries when |gap| exceeds this percent (e.g., 0.4 for 0.4%).",
+        )
+        iv_floor_percentile = st.number_input(
+            "IV floor percentile (0-1)",
+            0.0,
+            1.0,
+            float(current.get("iv_floor_percentile", 0.2)),
+            help="Require IV/VIX percentile above this before entering.",
+        )
 
     c1, c2 = st.columns(2)
     with c1:
@@ -2824,16 +2843,18 @@ def _settings_tab() -> None:
     with st.expander("Batman strategy (monthly)"):
         bat_long_offset = st.number_input(
             "Long wing distance from spot (pts)",
-            50.0,
-            800.0,
+            100.0,
+            1200.0,
             float(current.get("batman_long_offset", 300.0)),
+            step=100.0,
             help="Distance from spot for long hedges (both CE/PE).",
         )
         bat_short_offset = st.number_input(
             "Short body distance from spot (pts)",
-            50.0,
-            1000.0,
+            100.0,
+            1500.0,
             float(current.get("batman_short_offset", 500.0)),
+            step=100.0,
             help="Distance from spot for short bodies (both CE/PE).",
         )
         bat_qty_long = st.number_input(
@@ -2908,6 +2929,8 @@ def _settings_tab() -> None:
             "holiday_list": holiday_list,
             "nifty_lot_size": int(lot_size),
             "lot_size": int(lot_size),
+            "gap_entry_threshold": float(gap_entry_threshold) / 100.0,
+            "iv_floor_percentile": float(iv_floor_percentile),
             "batman_long_offset": float(bat_long_offset),
             "batman_short_offset": float(bat_short_offset),
             "batman_qty_long": int(bat_qty_long),
@@ -2938,12 +2961,187 @@ def _settings_tab() -> None:
 
 
 def _paper_pnl_tab() -> None:
-    st.markdown("### Paper Ledger")
     df, summary = _load_blotter()
 
-    if not summary and (df is None or df.empty):
-        st.info("No paper trades recorded yet. Start the agent in paper mode to populate the blotter.")
-        return
+    # Backtest block is aligned to the currently selected strategy
+    current_strategy_file = st.session_state.get("strategy_file", "")
+    strategy_label = {
+        "batman": "Batman",
+        "weekly_theta_strangle.py": "Weekly Theta Strangle",
+        "monthly_strangle_with_weekly_hedge.py": "Monthly Strangle w/ Hedge",
+    }.get(current_strategy_file, "Selected Strategy")
+
+    # Strategy-specific backtest panels
+    if current_strategy_file == "batman":
+        with st.expander(f"Run Backtest ({strategy_label})", expanded=False):
+            cols_dates = st.columns(2)
+            with cols_dates[0]:
+                start_date = st.date_input("Start date", key="bat_bt_start")
+            with cols_dates[1]:
+                end_date = st.date_input("End date", key="bat_bt_end")
+            btn_run, btn_reset = st.columns(2)
+            with btn_run:
+                if st.button("Run Batman Backtest"):
+                    env = os.environ.copy()
+                    env["DHAN_CLIENT_ID"] = st.session_state.get("client_id", "")
+                    env["DHAN_ACCESS_TOKEN"] = st.session_state.get("access_token", "")
+                    env["BACKTEST_START"] = start_date.isoformat() if start_date else ""
+                    env["BACKTEST_END"] = end_date.isoformat() if end_date else ""
+                    try:
+                        import subprocess
+                        out = subprocess.run(
+                            [PYTHON, str(ROOT / "data_engine/market_ai/scripts/run_batman_backtest_live.py")],
+                            cwd=str(ROOT),
+                            env=env,
+                            capture_output=True,
+                            text=True,
+                            timeout=600,
+                        )
+                        st.code(out.stdout + "\n" + out.stderr, language="log")
+                        st.success("Backtest complete. Check the table below.")
+                        st.session_state["bt_show_latest"] = True
+                    except Exception as exc:
+                        st.error(f"Backtest failed: {exc}")
+            with btn_reset:
+                if st.button("Reset Backtest View"):
+                    for k in list(st.session_state.keys()):
+                        if k.startswith("bat_bt_") or k.startswith("bt_pb_") or k.startswith("bt_tf"):
+                            st.session_state.pop(k, None)
+                    st.session_state.pop("bt_tf", None)
+                    st.session_state["bt_show_latest"] = False
+                    st.success("Backtest view reset. Run a new backtest to see results.")
+
+            # Backtest results (collapsed with run controls)
+            show_latest = st.session_state.get("bt_show_latest", True)
+            from glob import glob
+            reports_dir = ROOT / "reports"
+            bt_files = sorted(glob(str(reports_dir / "batman_backtest_trades_*.csv")))
+            pb_files = sorted(glob(str(reports_dir / "batman_backtest_playback_*.csv")))
+            if bt_files and show_latest:
+                latest_bt = Path(bt_files[-1])
+                st.markdown(f"Latest backtest trades: `{latest_bt.name}`")
+                latest_pb = Path(pb_files[-1]) if pb_files else None
+                try:
+                    import pandas as pd
+                    bt_df = pd.read_csv(latest_bt)
+                    pb_df = pd.read_csv(latest_pb) if latest_pb and latest_pb.exists() else pd.DataFrame()
+                    if not bt_df.empty:
+                        st.markdown("#### Entries and Strikes")
+                        st.dataframe(bt_df, use_container_width=True)
+                        leg_cols = ["long_call", "short_call", "long_put", "short_put"]
+                        if all(c in bt_df.columns for c in leg_cols):
+                            settings = _load_settings()
+                            qty_long = settings.get("batman_qty_long", 1)
+                            qty_short = settings.get("batman_qty_short", 3)
+                            st.markdown("##### Legs by entry")
+                            legs_rows = []
+                            for _, r in bt_df.iterrows():
+                                legs_rows.append({
+                                    "entry_time": r.get("entry_time"),
+                                    "long_call": r.get("long_call"),
+                                    "short_call": r.get("short_call"),
+                                    "long_put": r.get("long_put"),
+                                    "short_put": r.get("short_put"),
+                                    "qty_long": qty_long,
+                                    "qty_short": qty_short,
+                                })
+                            st.dataframe(pd.DataFrame(legs_rows), use_container_width=True)
+                        else:
+                            st.info("Strikes not available in file (expected columns: long_call, short_call, long_put, short_put).")
+                        if not pb_df.empty:
+                            st.markdown("#### Playback timeframe")
+                            pb_df["timestamp"] = pd.to_datetime(pb_df["timestamp"], errors="coerce")
+                            pb_df = pb_df.dropna(subset=["timestamp"]).sort_values("timestamp")
+                            if pb_df.empty:
+                                st.info("Playback data empty after parsing timestamps.")
+                            else:
+                                max_idx = len(pb_df) - 1
+                                cur_idx = st.session_state.get("bt_pb_idx", max_idx)
+                                cur_idx = st.slider("Cursor", 0, max_idx, cur_idx, key="bt_pb_slider_live")
+                                st.session_state["bt_pb_idx"] = cur_idx
+                                row = pb_df.iloc[cur_idx]
+                                pnl = row.get("pnl", 0.0)
+                                st.metric("PNL at cursor", f"₹{pnl:,.2f}", help=str(row.get("timestamp")))
+                                legs_live = []
+                                legs_live.append({"leg": "Long Call", "strike": row.get("long_call"), "qty": row.get("qty_long"), "entry": row.get("long_call_entry"), "ltp": row.get("long_call_ltp")})
+                                legs_live.append({"leg": "Short Call", "strike": row.get("short_call"), "qty": row.get("qty_short"), "entry": row.get("short_call_entry"), "ltp": row.get("short_call_ltp")})
+                                legs_live.append({"leg": "Long Put", "strike": row.get("long_put"), "qty": row.get("qty_long"), "entry": row.get("long_put_entry"), "ltp": row.get("long_put_ltp")})
+                                legs_live.append({"leg": "Short Put", "strike": row.get("short_put"), "qty": row.get("qty_short"), "entry": row.get("short_put_entry"), "ltp": row.get("short_put_ltp")})
+                                st.markdown("##### Legs at cursor")
+                                st.table(legs_live)
+                        else:
+                            st.info("No playback file found (batman_backtest_playback_*.csv). Run backtest to generate.")
+                except Exception as exc:
+                    st.warning(f"Could not load backtest file: {exc}")
+            else:
+                st.info("Run a backtest to see results here.")
+
+    elif current_strategy_file == "weekly_theta_strangle.py":
+        with st.expander(f"Run Backtest ({strategy_label})", expanded=False):
+            btn_run, btn_reset = st.columns(2)
+            with btn_run:
+                if st.button("Run Weekly Strangle Backtest"):
+                    try:
+                        import subprocess
+                        out = subprocess.run(
+                            [
+                                PYTHON,
+                                str(ROOT / "data_engine/market_ai/scripts/run_weekly_theta_backtest.py"),
+                                "--input",
+                                str(ROOT / "reports/intraday_from_rolling_latest.csv"),
+                                "--output-dir",
+                                str(ROOT / "reports/weekly_theta_backtest"),
+                            ],
+                            cwd=str(ROOT),
+                            capture_output=True,
+                            text=True,
+                            timeout=600,
+                        )
+                        st.code(out.stdout + "\n" + out.stderr, language="log")
+                        st.session_state["wt_bt_show"] = True
+                        st.success("Weekly strangle backtest complete.")
+                    except Exception as exc:
+                        st.error(f"Backtest failed: {exc}")
+            with btn_reset:
+                if st.button("Reset Backtest View", key="wbt_reset"):
+                    for k in list(st.session_state.keys()):
+                        if k.startswith("wt_bt_"):
+                            st.session_state.pop(k, None)
+                    st.session_state["wt_bt_show"] = False
+                    st.success("Backtest view reset.")
+
+            show_latest = st.session_state.get("wt_bt_show", True)
+            trades_path = ROOT / "reports/weekly_theta_backtest/weekly_theta_trades.csv"
+            summary_path = ROOT / "reports/weekly_theta_backtest/weekly_theta_summary.json"
+            daily_path = ROOT / "reports/weekly_theta_backtest/weekly_theta_daily_log.csv"
+            if show_latest and trades_path.exists():
+                st.markdown(f"Latest backtest trades: `{trades_path.name}`")
+                try:
+                    import pandas as pd
+                    df_trades = pd.read_csv(trades_path)
+                    st.dataframe(df_trades, use_container_width=True)
+                except Exception as exc:
+                    st.warning(f"Could not load trades file: {exc}")
+            if summary_path.exists() and show_latest:
+                try:
+                    import json as _json
+                    summary_data = _json.loads(summary_path.read_text())
+                    st.json(summary_data)
+                except Exception as exc:
+                    st.warning(f"Could not load summary: {exc}")
+            if daily_path.exists() and show_latest:
+                try:
+                    import pandas as pd
+                    df_daily = pd.read_csv(daily_path)
+                    st.markdown("#### Daily log")
+                    st.dataframe(df_daily, use_container_width=True)
+                except Exception as exc:
+                    st.warning(f"Could not load daily log: {exc}")
+            if not trades_path.exists() and not summary_path.exists():
+                st.info("Run a backtest to see results here.")
+
+    else:
+        st.info(f"Backtest is not available for {strategy_label}.")
 
     total_orders = int(summary.get("total_orders", 0))
     executed_orders = int(summary.get("executed_orders", 0))
@@ -3177,13 +3375,28 @@ def _sidebar() -> None:
         disabled=agent_running,
         help="Stop the agent before switching modes." if agent_running else None,
     )
+    strategy_options = [
+        ("Monthly Strangle w/ Hedge", "monthly_strangle_with_weekly_hedge.py"),
+        ("Weekly Theta Strangle (alpha live)", "weekly_theta_strangle.py"),
+        ("Batman Monthly (with hedges)", "batman"),
+    ]
+    # restore last strategy if present
+    last_strategy_file = None
+    if LAST_STRATEGY_FILE.exists():
+        try:
+            last_strategy_file = json.loads(LAST_STRATEGY_FILE.read_text()).get("strategy_file")
+        except Exception:
+            last_strategy_file = None
+    if last_strategy_file and "strategy_choice" not in st.session_state:
+        for opt in strategy_options:
+            if opt[1] == last_strategy_file:
+                st.session_state["strategy_choice"] = opt
+                st.session_state["strategy_file"] = opt[1]
+                break
+
     st.sidebar.selectbox(
         "Strategy",
-        options=[
-            ("Monthly Strangle w/ Hedge", "monthly_strangle_with_weekly_hedge.py"),
-            ("Weekly Theta Strangle (alpha live)", "weekly_theta_strangle.py"),
-            ("Batman Monthly (with hedges)", "batman"),
-        ],
+        options=strategy_options,
         format_func=lambda x: x[0],
         key="strategy_choice",
         disabled=agent_running,
@@ -3193,6 +3406,10 @@ def _sidebar() -> None:
     choice = st.session_state.get("strategy_choice")
     if choice:
         st.session_state["strategy_file"] = choice[1]
+        try:
+            LAST_STRATEGY_FILE.write_text(json.dumps({"strategy_file": choice[1]}, indent=2))
+        except Exception:
+            pass
     if st.session_state.get("strategy_file") == "weekly_theta_strangle.py":
         st.sidebar.selectbox(
             "Weekly order type",

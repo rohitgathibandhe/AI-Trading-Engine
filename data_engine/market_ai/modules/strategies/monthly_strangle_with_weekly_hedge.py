@@ -776,6 +776,35 @@ def _aggregate_position_stats(rows: List[Dict[str, Any]]) -> Tuple[float, float]
     return total_pnl, deployed
 
 
+def _ensure_daily_state(cfg: LiveConfig) -> None:
+    today = date.today()
+    if cfg._day_date != today:
+        cfg._day_date = today
+        cfg._day_mode = "NORMAL"
+        cfg._baskets_opened_today = 0
+        cfg._day_pnl = 0.0
+        cfg._basket_peak_mtm = 0.0
+        cfg._basket_trail_active = False
+        cfg._basket_trail_floor = cfg.basket_sl
+        cfg._basket_open_at = None
+
+
+def _reset_basket_state(cfg: LiveConfig) -> None:
+    cfg._basket_peak_mtm = 0.0
+    cfg._basket_trail_active = False
+    cfg._basket_trail_floor = cfg.basket_sl
+    cfg._basket_entry_mtm = 0.0
+    cfg._basket_open_at = None
+
+
+def _close_all_positions(dw, cfg: LiveConfig, positions: List[Dict[str, Any]], reason: str) -> None:
+    for row in positions:
+        try:
+            _close_leg(dw, cfg, row, reason=reason)
+        except Exception:
+            LOG.exception("[live] failed closing leg during %s", reason)
+
+
 def _infer_position_delta(row: Dict[str, Any]) -> Optional[float]:
     sources = []
     sources.append(row)
@@ -810,6 +839,92 @@ def _summarize_exposure(rows: List[Dict[str, Any]]) -> Tuple[float, float]:
         if price is not None:
             total_notional += abs(qty) * price
     return net_delta, total_notional
+
+
+def _apply_basket_risk_shell(dw, cfg: LiveConfig, positions: List[Dict[str, Any]], basket_mtm: float) -> bool:
+    """
+    Apply per-basket SL/trailing TP and daily loss lock.
+    Returns True if positions were closed (caller should skip further processing in that iteration).
+    """
+    _ensure_daily_state(cfg)
+    cfg._day_pnl = basket_mtm
+
+    # Daily hard stop
+    if cfg._day_mode != "LOCKED_RED" and basket_mtm <= cfg.daily_max_loss:
+        LOG.warning("[live] daily loss %.0f <= limit %.0f -> locking day", basket_mtm, cfg.daily_max_loss)
+        _record_activity_event(cfg, "daily_lock", "Daily max loss breached, flattening", severity="warning")
+        _close_all_positions(dw, cfg, positions, reason="DAILY_MAX_LOSS")
+        cfg._day_mode = "LOCKED_RED"
+        cfg.enable_strangle_entry = False
+        _reset_basket_state(cfg)
+        return True
+
+    if cfg._day_mode == "LOCKED_RED":
+        cfg.enable_strangle_entry = False
+        return False
+    if cfg._day_mode == "LOCKED_GREEN":
+        cfg.enable_strangle_entry = False
+
+    # Basket tracking
+    if not positions:
+        _reset_basket_state(cfg)
+        return False
+
+    if cfg._basket_open_at is None:
+        cfg._basket_open_at = datetime.now()
+        cfg._basket_entry_mtm = basket_mtm
+        cfg._basket_peak_mtm = basket_mtm
+        cfg._basket_trail_floor = cfg.basket_sl
+        cfg._basket_trail_active = False
+
+    cfg._basket_peak_mtm = max(cfg._basket_peak_mtm, basket_mtm)
+
+    # Pre-trail SL
+    if not cfg._basket_trail_active and basket_mtm <= cfg.basket_sl:
+        LOG.warning("[live] basket MTM %.0f <= SL %.0f -> exit", basket_mtm, cfg.basket_sl)
+        _record_activity_event(cfg, "basket_exit", "Basket SL hit", severity="warning", context={"mtm": basket_mtm})
+        _close_all_positions(dw, cfg, positions, reason="BASKET_SL_HIT")
+        _reset_basket_state(cfg)
+        return True
+
+    # Activate trailing once PT reached
+    if (not cfg._basket_trail_active) and basket_mtm >= cfg.basket_trail_start:
+        cfg._basket_trail_active = True
+        cfg._basket_trail_floor = max(cfg.basket_trail_floor_min, basket_mtm - 1000.0)
+        LOG.info(
+            "[live] basket trail activated at mtm %.0f floor %.0f",
+            basket_mtm,
+            cfg._basket_trail_floor,
+        )
+
+    if cfg._basket_trail_active:
+        desired_floor = max(cfg.basket_trail_floor_min, cfg._basket_peak_mtm * cfg.basket_trail_lock_fraction)
+        if desired_floor > cfg._basket_trail_floor:
+            cfg._basket_trail_floor = desired_floor
+        if basket_mtm <= cfg._basket_trail_floor:
+            LOG.info(
+                "[live] basket trail floor hit (mtm %.0f floor %.0f peak %.0f)",
+                basket_mtm,
+                cfg._basket_trail_floor,
+                cfg._basket_peak_mtm,
+            )
+            _record_activity_event(
+                cfg,
+                "basket_exit",
+                "Basket trail floor hit",
+                severity="info",
+                context={"mtm": basket_mtm, "floor": cfg._basket_trail_floor, "peak": cfg._basket_peak_mtm},
+            )
+            _close_all_positions(dw, cfg, positions, reason="BASKET_TRAIL_HIT")
+            _reset_basket_state(cfg)
+            return True
+
+    if cfg._day_mode == "NORMAL" and basket_mtm >= cfg.daily_target:
+        cfg._day_mode = "LOCKED_GREEN"
+        cfg.enable_strangle_entry = False
+        LOG.info("[live] daily target reached (%.0f); locking new entries", basket_mtm)
+
+    return False
 
 
 def _record_environment_snapshot(
@@ -2188,6 +2303,8 @@ class LiveConfig:
     risk_per_leg_sl_mult: float = 2.0
     order_retry_limit: int = 2
     order_retry_delay_sec: float = 0.75
+    gap_entry_threshold: float = 0.004  # 0.4%
+    iv_floor_percentile: float = 0.2
     order_slippage_limit_pct: float = 1.5
     max_consecutive_order_failures: int = 3
     circuit_cooldown_minutes: float = 5.0
@@ -2217,6 +2334,23 @@ class LiveConfig:
         "flatten_on_delta": False,
         "flatten_on_exposure": False,
     })
+    # Basket & daily risk shell
+    basket_sl: float = -1000.0
+    basket_trail_start: float = 2500.0
+    basket_trail_lock_fraction: float = 0.6
+    basket_trail_floor_min: float = 1500.0
+    daily_max_loss: float = -2000.0
+    daily_target: float = 2500.0
+    max_baskets_per_day: int = 2
+    _basket_peak_mtm: float = field(default=0.0, repr=False, compare=False)
+    _basket_trail_active: bool = field(default=False, repr=False, compare=False)
+    _basket_trail_floor: float = field(default=-1000.0, repr=False, compare=False)
+    _basket_entry_mtm: float = field(default=0.0, repr=False, compare=False)
+    _basket_open_at: Optional[datetime] = field(default=None, repr=False, compare=False)
+    _day_date: Optional[date] = field(default=None, repr=False, compare=False)
+    _day_mode: str = field(default="NORMAL", repr=False, compare=False)
+    _baskets_opened_today: int = field(default=0, repr=False, compare=False)
+    _day_pnl: float = field(default=0.0, repr=False, compare=False)
 
 
 
@@ -3545,6 +3679,54 @@ def monitor_and_manage_positions(
     positions: List[Dict[str, Any]],
     ingestor: Optional[OptionChainIngestor],
 ) -> None:
+    # Basket-level MTM checks (per strangle basket)
+    total_pnl, _ = _aggregate_position_stats(positions)
+    _ensure_daily_state(cfg)
+    cfg._day_pnl = total_pnl
+    if not positions:
+        _reset_basket_state(cfg)
+        return
+
+    # Initialize basket state on first observation of open positions
+    if cfg._basket_open_at is None:
+        cfg._basket_entry_mtm = total_pnl
+        cfg._basket_peak_mtm = total_pnl
+        cfg._basket_trail_active = False
+        cfg._basket_trail_floor = cfg.basket_sl
+        cfg._basket_open_at = datetime.now()
+
+    # Per-basket SL and trailing TP
+    cfg._basket_peak_mtm = max(cfg._basket_peak_mtm, total_pnl)
+    if not cfg._basket_trail_active:
+        if total_pnl <= cfg.basket_sl:
+            _record_activity_event(cfg, "basket_exit", f"Basket SL hit @ {total_pnl:.0f}", severity="warning")
+            _close_all_positions(dw, cfg, positions, reason="BASKET_SL_HIT")
+            _reset_basket_state(cfg)
+            return
+        if total_pnl >= cfg.basket_trail_start:
+            cfg._basket_trail_active = True
+            cfg._basket_trail_floor = max(cfg.basket_trail_floor_min, total_pnl - 1000.0)
+            _record_activity_event(
+                cfg,
+                "basket_trail_start",
+                f"Trail armed at floor {cfg._basket_trail_floor:.0f}",
+                severity="info",
+            )
+    else:
+        desired_floor = max(cfg.basket_trail_floor_min, cfg._basket_peak_mtm * cfg.basket_trail_lock_fraction)
+        if desired_floor > cfg._basket_trail_floor:
+            cfg._basket_trail_floor = desired_floor
+        if total_pnl <= cfg._basket_trail_floor:
+            _record_activity_event(
+                cfg,
+                "basket_exit",
+                f"Basket trail hit floor {cfg._basket_trail_floor:.0f} @ {total_pnl:.0f}",
+                severity="warning",
+            )
+            _close_all_positions(dw, cfg, positions, reason="BASKET_TRAIL_HIT")
+            _reset_basket_state(cfg)
+            return
+
     for row in positions:
         try:
             decision = _needs_exit(row, cfg.sl_pct, cfg.tp_pct)
@@ -3789,6 +3971,13 @@ def monitor_and_manage_positions(
 
 
 def execute_new_strangle(dw, cfg: LiveConfig) -> None:
+    _ensure_daily_state(cfg)
+    if cfg._day_mode in ("LOCKED_RED", "LOCKED_GREEN"):
+        LOG.info("[live] skipping entry; day mode %s", cfg._day_mode)
+        return
+    if cfg._baskets_opened_today >= cfg.max_baskets_per_day:
+        LOG.info("[live] baskets opened today %s >= limit %s; skipping entry", cfg._baskets_opened_today, cfg.max_baskets_per_day)
+        return
     spot = _safe_float(dw.get_ltp_once(NIFTY_SEG, NIFTY_SCRIP), None)
     if spot is None or spot <= 0:
         cached = _safe_float(getattr(cfg, "last_spot", None), None)
@@ -3878,6 +4067,12 @@ def execute_new_strangle(dw, cfg: LiveConfig) -> None:
     cfg.last_spot = spot
     cfg._last_spot_warn_at = None
     _place_strangle_and_hedge(dw, cfg, spot)
+    cfg._baskets_opened_today += 1
+    cfg._basket_open_at = datetime.now()
+    cfg._basket_entry_mtm = 0.0
+    cfg._basket_peak_mtm = 0.0
+    cfg._basket_trail_active = False
+    cfg._basket_trail_floor = cfg.basket_sl
 
 
 def run_live(
@@ -3925,11 +4120,11 @@ def run_live(
                 and (r.get("exchangeSegment") or "").upper().startswith("NSE_FNO")
                 and int(float(r.get("netQty") or 0)) != 0
             ]
+            total_pnl, deployed_cap = _aggregate_position_stats(rows)
 
             if risk_mgr is None:
                 risk_mgr = _get_risk_manager(cfg)
             if risk_mgr:
-                total_pnl, deployed_cap = _aggregate_position_stats(rows)
                 risk_mgr.on_mtm(total_pnl)
                 if cfg._auto_blocked_by_risk and risk_mgr.allow_trade():
                     cfg.enable_strangle_entry = True
@@ -3959,6 +4154,22 @@ def run_live(
 
             if normalized_rows is None:
                 normalized_rows = _normalize_positions(rows)
+
+            basket_closed = _apply_basket_risk_shell(dw, cfg, normalized_rows, total_pnl if "total_pnl" in locals() else 0.0)
+            if basket_closed:
+                normalized_rows = _normalize_positions(dw.get_positions_live() or [])
+                open_deriv_rows = [
+                    r
+                    for r in (normalized_rows or [])
+                    if isinstance(r, dict)
+                    and (r.get("exchangeSegment") or "").upper().startswith("NSE_FNO")
+                    and int(float(r.get("netQty") or 0)) != 0
+                ]
+                has_live_strangle = bool(open_deriv_rows)
+                # After flattening due to risk, skip to next loop iteration.
+                time.sleep(max(1.0, float(getattr(cfg, "poll_sec", 5.0))))
+                loop_iter += 1
+                continue
             # External manual actions (from live monitor watcher) can request flatten/hedge
             _consume_external_manual_action(cfg)
             _sync_managed_leg_inventory(cfg, normalized_rows)
@@ -4047,6 +4258,27 @@ def run_live(
                             state.trend,
                             state.volatility,
                         )
+                    # Entry guards based on gap/IV floors
+                    gap_thr = getattr(cfg, "gap_entry_threshold", 0.004)
+                    iv_floor = getattr(cfg, "iv_floor_percentile", 0.2)
+                    gap_val = state.features.get("gap_pct") if state and state.features else None
+                    iv_pct = None
+                    if state and state.features:
+                        iv_pct = state.features.get("iv_percentile") or state.features.get("vix_percentile")
+                    blocked = False
+                    if gap_val is not None and abs(gap_val) >= gap_thr:
+                        cfg.enable_strangle_entry = False
+                        blocked = True
+                        LOG.info("[entry] blocked: gap %.3f >= threshold %.3f", gap_val, gap_thr)
+                    if not blocked and iv_pct is not None and iv_pct < iv_floor:
+                        cfg.enable_strangle_entry = False
+                        blocked = True
+                        LOG.info("[entry] blocked: IV pct %.3f < floor %.3f", iv_pct, iv_floor)
+                    if not blocked and not getattr(cfg, "enable_strangle_entry", True):
+                        # if previously disabled by selector, leave it
+                        pass
+                    elif not blocked:
+                        cfg.enable_strangle_entry = True
                 else:
                     LOG.debug("[env] insufficient data for market state analysis")
 
@@ -4061,10 +4293,18 @@ def run_live(
             managed_legs = cfg._managed_entry_leg_ids or {}
             agent_active = max(0, len(managed_legs) // 2)
             max_strangles = max(0, int(getattr(cfg, "max_strangles", 1)))
+
+            _ensure_daily_state(cfg)
+            if cfg._day_mode == "LOCKED_RED":
+                cfg.enable_strangle_entry = False
+            if cfg._day_mode == "LOCKED_GREEN":
+                cfg.enable_strangle_entry = False
+
             if (
                 not has_live_strangle
                 and getattr(cfg, "enable_strangle_entry", True)
                 and agent_active < max_strangles
+                and cfg._baskets_opened_today < cfg.max_baskets_per_day
             ):
                 execute_new_strangle(dw, cfg)
             else:
@@ -4072,6 +4312,8 @@ def run_live(
                     LOG.debug("[live] existing strangle detected; monitoring only")
                 elif not getattr(cfg, "enable_strangle_entry", True):
                     LOG.debug("[live] strangle entry disabled by selector")
+                elif cfg._baskets_opened_today >= cfg.max_baskets_per_day:
+                    LOG.debug("[live] basket entry limit reached for today (%s)", cfg._baskets_opened_today)
                 else:
                     LOG.debug("[live] max agent strangles reached (%s)", agent_active)
         except Exception as exc:

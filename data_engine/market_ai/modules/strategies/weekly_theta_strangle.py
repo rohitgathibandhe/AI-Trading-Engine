@@ -142,6 +142,8 @@ class LiveConfig:
     basket_hedge_dd: float = -2000.0
     auto_adopt_open_positions: bool = True  # adopt live F&O legs automatically
     auto_adopt_underlying: str = "NIFTY"    # only adopt if symbol matches
+    gap_entry_threshold: float = 0.004  # 0.4%
+    iv_floor_percentile: float = 0.2
 
 
 def run_live(dw, cfg: LiveConfig) -> None:
@@ -308,6 +310,16 @@ def run_live(dw, cfg: LiveConfig) -> None:
             LOG.warning("[weekly_live] no spot from option chain; skipping entry this cycle")
             time.sleep(cfg.poll_seconds * 2)
             continue
+        # Gap/IV entry guards (best-effort; uses last cached spot as previous close)
+        prev_spot = getattr(cfg, "last_spot", None)
+        if prev_spot and prev_spot > 0:
+            gap_pct = (spot - prev_spot) / prev_spot
+            if abs(gap_pct) >= cfg.gap_entry_threshold:
+                LOG.info("[weekly_live] skip entry: gap %.3f >= threshold %.3f", gap_pct, cfg.gap_entry_threshold)
+                time.sleep(cfg.poll_seconds * 2)
+                cfg.last_spot = spot
+                continue
+        cfg.last_spot = spot
         # skip if holiday on expiry or trade day based on events
         if _holiday_block(now, expiry):
             LOG.info("[weekly_live] Holiday block for trade/expiry date; skipping entry")
