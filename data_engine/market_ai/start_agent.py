@@ -133,6 +133,12 @@ from market_ai.strategies import (  # noqa: E402
     ORBState,
     TradeAction,
 )
+# Monthly strangle manager (rule-based)
+from market_ai.strategies.monthly_strangle_manager import (
+    MonthlyStrangleConfig,
+    manage_basket as manage_monthly_basket,
+    propose_entry as propose_monthly_entry,
+)
 from market_ai.strategies.trend_detector import detect_trend_from_open
 from market_ai.strategies.orb_detector import ORBConfig, compute_orb_levels, detect_orb_breakout
 from market_ai.strategies.sr_levels import compute_sr_levels
@@ -151,7 +157,115 @@ root = logging.getLogger()
 root.setLevel(logging.INFO)
 root.handlers = [handler, console]
 log = logging.getLogger("start_agent")
+LAST_STRATEGY_FILE = STATE_DIR / "last_strategy.json"
 
+# Which strategy file was chosen in the UI (if any)
+SELECTED_STRATEGY_FILE = None
+if LAST_STRATEGY_FILE.exists():
+    try:
+        SELECTED_STRATEGY_FILE = json.loads(LAST_STRATEGY_FILE.read_text()).get("strategy_file")
+    except Exception:
+        SELECTED_STRATEGY_FILE = None
+
+# Cache for daily candles to compute higher-timeframe filters
+_DAILY_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def _fetch_daily_candles(dw: DhanWrapper, days: int = 40) -> List[Dict[str, Any]]:
+    today = dt_date.today()
+    start = (today - timedelta(days=days)).isoformat()
+    end = today.isoformat()
+    key = f"{start}:{end}"
+    cached = _DAILY_CACHE.get(key)
+    if cached:
+        return cached
+    candles = dw.get_daily_candles(
+        security_id=INDEX_SECURITY_ID,
+        exchange_segment=INDEX_EXCHANGE_SEG,
+        instrument_type=INDEX_INSTRUMENT,
+        from_date=start,
+        to_date=end,
+    )
+    _DAILY_CACHE[key] = candles
+    return candles
+
+
+def _compute_adx(candles: List[Dict[str, Any]], period: int = 14) -> float:
+    """
+    Minimal ADX implementation on daily candles (dicts with high/low/close).
+    Returns 0.0 if insufficient data.
+    """
+    if len(candles) < period + 1:
+        return 0.0
+    trs = []
+    plus_dm = []
+    minus_dm = []
+    for i in range(1, len(candles)):
+        h = candles[i]["high"]
+        l = candles[i]["low"]
+        c_prev = candles[i - 1]["close"]
+        tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
+        up_move = h - candles[i - 1]["high"]
+        down_move = candles[i - 1]["low"] - l
+        trs.append(tr)
+        plus_dm.append(up_move if up_move > down_move and up_move > 0 else 0)
+        minus_dm.append(down_move if down_move > up_move and down_move > 0 else 0)
+    def _ewm(vals):
+        alpha = 1 / period
+        sm = vals[0]
+        out = []
+        for v in vals:
+            sm = sm + alpha * (v - sm)
+            out.append(sm)
+        return out
+    trn = _ewm(trs)
+    pdmn = _ewm(plus_dm)
+    mdmn = _ewm(minus_dm)
+    dx = []
+    for t, p, m in zip(trn, pdmn, mdmn):
+        if t == 0:
+            dx.append(0.0)
+            continue
+        pdi = 100 * (p / t)
+        mdi = 100 * (m / t)
+        denom = pdi + mdi
+        dx.append(0.0 if denom == 0 else 100 * abs(pdi - mdi) / denom)
+    adx = _ewm(dx)[-1] if dx else 0.0
+    return adx
+
+
+def _compute_monthly_filters(candles: List[Dict[str, Any]], spot: float) -> Dict[str, float]:
+    """
+    Compute ADX, max_body_pct (last 3 days), gap_pct, monthly_range_frac.
+    """
+    res = {"adx": 0.0, "max_body_pct": 0.0, "gap_pct": 0.0, "monthly_range_frac": 0.5}
+    if not candles:
+        return res
+    # ADX
+    res["adx"] = _compute_adx(candles, period=14)
+    # Gap pct from last two daily candles
+    if len(candles) >= 2:
+        prev_close = candles[-2]["close"]
+        today_open = candles[-1]["open"]
+        if prev_close:
+            res["gap_pct"] = (today_open - prev_close) / prev_close * 100.0
+    # Max body pct last 3 days
+    bodies = []
+    for c in candles[-3:]:
+        body = abs(c["close"] - c["open"])
+        ref = c["open"] if c["open"] else 1.0
+        bodies.append(body / ref * 100.0)
+    if bodies:
+        res["max_body_pct"] = max(bodies)
+    # Monthly range fraction over last 20 days
+    window = candles[-20:] if len(candles) >= 20 else candles
+    highs = [c["high"] for c in window]
+    lows = [c["low"] for c in window]
+    hi = max(highs) if highs else spot
+    lo = min(lows) if lows else spot
+    rng = hi - lo if hi != lo else 1.0
+    res["monthly_range_frac"] = (spot - lo) / rng
+    return res
 
 def _load_saved_creds() -> Dict[str, str]:
     if not CREDS_FILE.exists():
@@ -1197,6 +1311,71 @@ def main() -> None:
                             legs_to_close=legs,
                             reason="BASKET_TRAIL_HIT",
                         )
+
+            # Branch: Monthly Strangle w/ Hedge uses rule-based manager
+            if SELECTED_STRATEGY_FILE == "monthly_strangle_with_weekly_hedge.py":
+                cfg = MonthlyStrangleConfig()
+                daily_candles = _fetch_daily_candles(dw, days=40)
+                daily_feats = _compute_monthly_filters(daily_candles, market.spot)
+                adx_val = daily_feats["adx"]
+                max_body_pct = daily_feats["max_body_pct"]
+                gap_pct_daily = daily_feats["gap_pct"]
+                monthly_range_frac = daily_feats["monthly_range_frac"]
+                if legs:
+                    margin_est = sum(
+                        abs((leg.entry_price or leg.current_ltp or 0.0) * leg.quantity)
+                        for leg in legs
+                        if leg.side == LegSide.SELL
+                    ) or 1.0
+                    # Map leg deltas if available from chain
+                    delta_map = {}
+                    for row in chain:
+                        key = (row.get("strike"), row.get("option_type"))
+                        delta_map[key] = row.get("delta")
+                    leg_deltas = []
+                    for leg in legs:
+                        key = (leg.strike, "CE" if leg.option_type == OptionType.CALL else "PE")
+                        leg_deltas.append(delta_map.get(key, 0.0))
+                    decision = manage_monthly_basket(
+                        now=now,
+                        expiry=expiry,
+                        margin_deployed=margin_est,
+                        basket_mtm=basket_mtm,
+                        legs=legs,
+                        attempt_count=0,
+                        cfg=cfg,
+                        leg_deltas=leg_deltas,
+                        adx=adx_val,
+                    )
+                else:
+                    decision = propose_monthly_entry(
+                        now=now,
+                        spot=market.spot,
+                        adx=adx_val,
+                        max_body_pct=max_body_pct,
+                        gap_pct=gap_pct_daily,
+                        monthly_range_frac=monthly_range_frac,
+                        vix=market.india_vix,
+                        vix_rising=True,
+                        option_chain=chain,
+                        expiry=expiry,
+                        lot_size=settings.get("lot_size", 75),
+                        cfg=cfg,
+                    )
+                _log_strategy_event(
+                    strategy=decision.strategy_type,
+                    action=decision.action_type,
+                    reason=decision.reason,
+                    market=market,
+                    basket_mtm=basket_mtm,
+                    basket_peak=basket_peak_mtm,
+                    trail_floor=trail_floor,
+                )
+                if decision.action_type != "HOLD" and decision.legs_to_open:
+                    _log_trade_event_batch(trade_mode, decision.legs_to_open, executed=trade_mode == "live")
+                if decision.action_type in ("CLOSE_ALL", "CLOSE_LEGS") and decision.legs_to_close:
+                    _log_trade_event_batch(trade_mode, decision.legs_to_close, executed=trade_mode == "live", close=True)
+                continue
             if smart_enabled:
                 trend_ctx = detect_trend_from_open(market, avg_volume, vwap=vwap, pivot=pivot)
             else:

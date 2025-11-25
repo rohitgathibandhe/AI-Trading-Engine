@@ -666,6 +666,79 @@ class DhanWrapper:
         candles.sort(key=lambda item: item.get("timestamp") or datetime.min)
         return candles
 
+    def get_daily_candles(
+        self,
+        security_id: int,
+        exchange_segment: str,
+        instrument_type: str = "INDEX",
+        *,
+        from_date: str,
+        to_date: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch daily OHLCV from /charts/historical via the HistoricalData helper.
+        Returns a list of dicts sorted by timestamp with keys: timestamp, open, high, low, close, volume.
+        """
+        try:
+            resp = self._historical.historical_daily_data(
+                security_id=security_id,
+                exchange_segment=exchange_segment,
+                instrument_type=instrument_type,
+                from_date=from_date,
+                to_date=to_date,
+                expiry_code=0,
+            )
+        except Exception as exc:
+            self.log.exception("[historical] daily fetch failed: %s", exc)
+            return []
+
+        data: Any = resp
+        if isinstance(data, dict):
+            for key in ("data", "Data", "candles", "CANDLES"):
+                if key in data:
+                    data = data[key]
+                    break
+        if isinstance(data, dict):
+            for key in ("data", "candles"):
+                if key in data:
+                    data = data[key]
+                    break
+        if not isinstance(data, list):
+            return []
+
+        candles: List[Dict[str, Any]] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            ts = self._parse_timestamp(
+                self._pick(
+                    row,
+                    "timestamp",
+                    "time",
+                    "datetime",
+                    "dateTime",
+                )
+            )
+            o = self._as_float(self._pick(row, "open", "Open", "o"))
+            h = self._as_float(self._pick(row, "high", "High", "h"))
+            l = self._as_float(self._pick(row, "low", "Low", "l"))
+            c = self._as_float(self._pick(row, "close", "Close", "c"))
+            v = self._as_float(self._pick(row, "volume", "Volume", "v"))
+            if None in (o, h, l, c):
+                continue
+            candles.append(
+                {
+                    "timestamp": ts,
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "volume": v if v is not None else 0.0,
+                }
+            )
+        candles.sort(key=lambda item: item.get("timestamp") or datetime.min)
+        return candles
+
     # -------- LTP (single + bulk) --------
 
     @staticmethod
