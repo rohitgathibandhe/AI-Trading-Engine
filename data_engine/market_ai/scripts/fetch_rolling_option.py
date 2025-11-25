@@ -128,6 +128,21 @@ def run_rolling_option(args: argparse.Namespace, out_dir: Path) -> None:
         cfg_kwargs["option_types"] = option_types
     if required_data:
         cfg_kwargs["required_data"] = required_data
+    else:
+        # Ensure strike is included by default to match Dhan guidance
+        cfg_kwargs["required_data"] = [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "oi",
+            "iv",
+            "spot",
+            "strike",
+            "timestamp",
+            "expiryDate",
+        ]
     cfg = RollingOptionConfig(**cfg_kwargs)
     parquet_paths = ingestor.fetch_range(cfg)
     if parquet_paths:

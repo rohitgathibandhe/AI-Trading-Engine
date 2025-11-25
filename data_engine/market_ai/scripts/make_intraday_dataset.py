@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--selector", default=None, help="(Deprecated) single selector tag to filter on.")
     parser.add_argument(
         "--selectors",
-        default="ATM,ATM+2,ATM-2,ATM+4,ATM-4,ATM+6,ATM-6",
+        default="ATM,ATM+2,ATM-2,ATM+4,ATM-4,ATM+6,ATM-6,ATM+8,ATM-8,ATM+10,ATM-10,ATM+12,ATM-12",
         help="Comma separated list of selectors; first entry becomes the ATM baseline.",
     )
     parser.add_argument("--output", type=Path, default=Path("reports/intraday_from_rolling.csv"))
@@ -130,6 +130,50 @@ def _build_selector_block(df: pd.DataFrame, selector: str, include_spot: bool) -
     return merged
 
 
+def _pick_by_distance(
+    df: pd.DataFrame,
+    spot_map: pd.Series,
+    option_type: str,
+    offsets: List[int],
+) -> pd.DataFrame:
+    """
+    For each timestamp, pick the contract whose strike is closest to spot±offset.
+    Offsets are in absolute points.
+    """
+    records = []
+    grouped = df.groupby("timestamp")
+    for ts, g in grouped:
+        spot = spot_map.get(ts)
+        if pd.isna(spot):
+            continue
+        for off in offsets:
+            if option_type == "CALL":
+                target = spot + off
+                candidates = g[g["strikePrice"] >= target]
+                if candidates.empty:
+                    candidates = g[g["strikePrice"] <= target]
+            else:
+                target = spot - off
+                candidates = g[g["strikePrice"] <= target]
+                if candidates.empty:
+                    candidates = g[g["strikePrice"] >= target]
+            if candidates.empty:
+                continue
+            picked = candidates.loc[(candidates["strikePrice"] - target).abs().idxmin()]
+            rec = {
+                "timestamp": ts,
+                "offset": off,
+                "strike": picked.get("strikePrice"),
+                "ltp": picked.get("ltp"),
+                "delta": picked.get("delta"),
+                "iv": picked.get("iv"),
+                "oi": picked.get("oi"),
+                "volume": picked.get("volume"),
+            }
+            records.append(rec)
+    return pd.DataFrame.from_records(records)
+
+
 def process_day(day_dir: Path, selectors: List[str], tz: str) -> Optional[pd.DataFrame]:
     parquet_path = day_dir / "rolling_option.parquet"
     if not parquet_path.exists():
@@ -175,6 +219,32 @@ def process_day(day_dir: Path, selectors: List[str], tz: str) -> Optional[pd.Dat
     merged = pd.merge(merged, call_top, on="timestamp", how="left")
     merged = pd.merge(merged, put_top, on="timestamp", how="left")
     merged = merged.sort_values("timestamp")
+
+    # Distance-based selectors (strangle-friendly)
+    try:
+        spot_map = merged.set_index("timestamp")["spot"]
+        calls = df.loc[df["optionTypeNorm"] == "CALL", ["timestamp", "strikePrice", "ltp", "delta", "iv", "oi", "volume"]]
+        puts = df.loc[df["optionTypeNorm"] == "PUT", ["timestamp", "strikePrice", "ltp", "delta", "iv", "oi", "volume"]]
+        offsets_pts = [250, 300, 350, 400]
+        for off in offsets_pts:
+            cblock = _pick_by_distance(calls, spot_map, "CALL", [off])
+            pblock = _pick_by_distance(puts, spot_map, "PUT", [off])
+            if not cblock.empty:
+                merged = merged.merge(
+                    cblock.add_prefix(f"call_off{off}_"),
+                    left_on="timestamp",
+                    right_on=f"call_off{off}_timestamp",
+                    how="left",
+                ).drop(columns=[f"call_off{off}_timestamp"])
+            if not pblock.empty:
+                merged = merged.merge(
+                    pblock.add_prefix(f"put_off{off}_"),
+                    left_on="timestamp",
+                    right_on=f"put_off{off}_timestamp",
+                    how="left",
+                ).drop(columns=[f"put_off{off}_timestamp"])
+    except Exception:
+        pass
 
     expiry_map = (
         df[["timestamp", "expiryDate"]]

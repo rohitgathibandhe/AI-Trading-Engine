@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 import json
 import pandas as pd
+import pyarrow.parquet as pq
 
 SCRIPT_PATH = Path(__file__).resolve()
 # parents: [scripts, market_ai, data_engine, repo_root]
@@ -27,30 +28,62 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from market_ai.modules.strategies.batman_monthly import run_backtest, BatmanConfig  # noqa: E402
-from market_ai.modules.data_fetch.rolling_expired_options import RollingExpiredOptionsMarket  # noqa: E402
 
 
 STATE_CREDS = REPO_ROOT / "data_engine" / "market_ai" / "state" / "creds.json"
+ROLLING_ROOT = REPO_ROOT / "data_engine" / "market_ai" / "state" / "rolling_option"
 
 
-def load_creds_from_state() -> bool:
-    if os.getenv("DHAN_CLIENT_ID") and os.getenv("DHAN_ACCESS_TOKEN"):
-        return True
-    if not STATE_CREDS.exists():
-        return False
-    try:
-        import json
+class LocalRollingMarket:
+    """
+    Lightweight adapter that reads cached rolling_option parquet files
+    from data_engine/market_ai/state/rolling_option/YYYY-MM-DD/rolling_option.parquet
+    and serves a dict[strike]->{'ce':{last_price}, 'pe':{last_price}}.
+    """
 
-        data = json.loads(STATE_CREDS.read_text())
-        cid = data.get("client_id")
-        tok = data.get("access_token")
-        if cid and tok:
-            os.environ.setdefault("DHAN_CLIENT_ID", str(cid))
-            os.environ.setdefault("DHAN_ACCESS_TOKEN", str(tok))
-            return True
-    except Exception:
-        return False
-    return False
+    def __init__(self, root: Path = ROLLING_ROOT):
+        self.root = Path(root)
+
+    def get_option_chain(self, underlying_id: int, expiry_or_tag: str, as_of_date: str, underlying_seg: str = "NSE_FNO"):
+        day_dir = self.root / as_of_date
+        parquet_path = day_dir / "rolling_option.parquet"
+        if not parquet_path.exists():
+            return {}
+        try:
+            df = pq.read_table(parquet_path).to_pandas()
+        except Exception:
+            return {}
+        if "expiryDate" not in df.columns or "strikePrice" not in df.columns or "optionType" not in df.columns:
+            return {}
+        df["expiryDate"] = pd.to_datetime(df["expiryDate"], errors="coerce").dt.date
+        try:
+            target_expiry = datetime.fromisoformat(expiry_or_tag).date()
+        except Exception:
+            target_expiry = None
+        if target_expiry:
+            df = df.loc[df["expiryDate"] == target_expiry]
+        if df.empty:
+            return {}
+        # prefer last quote per strike/optionType
+        if "tradeTime" in df.columns and "tradeDate" in df.columns:
+            df["ts"] = pd.to_datetime(df["tradeDate"] + " " + df["tradeTime"], errors="coerce")
+        elif "timestamp" in df.columns:
+            df["ts"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        else:
+            df["ts"] = pd.NaT
+        df = df.sort_values("ts")
+        latest = df.groupby(["strikePrice", "optionType"]).tail(1)
+        chain = {}
+        for _, row in latest.iterrows():
+            strike = str(float(row["strikePrice"]))
+            node = chain.setdefault(strike, {})
+            last = row.get("ltp") or row.get("last_price") or row.get("close") or row.get("open") or 0.0
+            opt_type = str(row["optionType"]).strip().upper()
+            if opt_type == "CALL":
+                node["ce"] = {"last_price": float(last)}
+            elif opt_type == "PUT":
+                node["pe"] = {"last_price": float(last)}
+        return chain
 
 
 def load_daily_spot(csv_path: Path) -> pd.DataFrame:
@@ -65,10 +98,6 @@ def load_daily_spot(csv_path: Path) -> pd.DataFrame:
 
 
 def main() -> None:
-    creds_ok = load_creds_from_state()
-    if not creds_ok:
-        raise RuntimeError("Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN or ensure state/creds.json exists.")
-
     price_csv = REPO_ROOT / "reports" / "intraday_from_rolling_latest.csv"
     if not price_csv.exists():
         raise FileNotFoundError(f"Expected price CSV at {price_csv}")
@@ -89,7 +118,7 @@ def main() -> None:
             daily = daily[daily["date"] <= end_d]
         except Exception:
             pass
-    market = RollingExpiredOptionsMarket()
+    market = LocalRollingMarket()
 
     cfg = BatmanConfig()
     cfg.market = market

@@ -187,8 +187,8 @@ DEFAULT_SETTINGS = {
     "hedge_delta_max": 0.12,
     "hedge_price_max": 35.0,
     "hedge_salvage_wing_ltp": 5.0,
-    "weekly_hedge_distance": 200.0,
-    "weekly_hedge_price_cap": 3.5,
+    "weekly_hedge_distance": 300.0,
+    "weekly_hedge_price_cap": 6.0,
     "vix_adaptive_low": 12.0,
     "vix_adaptive_high": 20.0,
     "strangle_delta_low": 0.15,
@@ -1824,7 +1824,20 @@ def _render_payoff_analyzer(open_rows, dw):
                     "Model Px": round(g["price"], 2),
                 })
             import pandas as pd
-            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            df_g = pd.DataFrame(rows)
+            if not df_g.empty:
+                total_row = {
+                    "Leg": "Total",
+                    "Side": "",
+                    "Qty": np.nan,
+                    "Δ": df_g["Δ"].sum(),
+                    "Γ": df_g["Γ"].sum(),
+                    "Θ/day": df_g["Θ/day"].sum(),
+                    "Vega": df_g["Vega"].sum(),
+                    "Model Px": df_g["Model Px"].sum(),
+                }
+                df_g = pd.concat([df_g, pd.DataFrame([total_row])], ignore_index=True)
+            st.dataframe(df_g, hide_index=True, width="stretch")
 
 # =============================================================================
 # Agent Logs tab
@@ -2853,13 +2866,7 @@ def _settings_tab() -> None:
                 float(current.get("hedge_price_max", 35.0)),
                 help="Do not auto-buy hedges above this LTP.",
             )
-            weekly_hedge_price_cap = st.number_input(
-                "Weekly hedge price cap (₹)",
-                1.0,
-                100.0,
-                float(current.get("weekly_hedge_price_cap", 3.5)),
-                help="Skip weekly entry hedges above this LTP in the weekly strangle live loop.",
-            )
+            # Weekly strangle disabled; hide related controls.
 
     with st.expander("Batman strategy (monthly)"):
         bat_long_offset = st.number_input(
@@ -3400,7 +3407,6 @@ def _sidebar() -> None:
     )
     strategy_options = [
         ("Monthly Strangle w/ Hedge", "monthly_strangle_with_weekly_hedge.py"),
-        ("Weekly Theta Strangle (alpha live)", "weekly_theta_strangle.py"),
         ("Batman Monthly (with hedges)", "batman"),
     ]
     # restore last strategy if present

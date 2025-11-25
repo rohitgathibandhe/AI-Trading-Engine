@@ -53,21 +53,22 @@ __all__ = [
 
 @dataclass
 class EntryRules:
-    min_premium_pct: float = 0.016
+    # Require at least ~1.2% of spot as combined credit to avoid thin weeks.
+    min_premium_pct: float = 0.012
     min_iv_rank: float = 0.05
     max_iv_rank: float = 1.0
     max_prev_range_pct: float = 0.035
     min_prev_range_pct: float = 0.003
     demand_prev_break: bool = True
     min_days_to_target_expiry: int = 0
-    max_gap_pct: float = 0.01  # 1% gap guard
+    max_gap_pct: float = 0.008  # 0.8% gap guard
 
 
 @dataclass
 class WeeklyTargets:
-    pnl_target: float = 6_000.0
-    pnl_stop: float = 4_000.0
-    trailing_lock_pct: float = 0.25
+    pnl_target: float = 3_000.0
+    pnl_stop: float = 2_000.0
+    trailing_lock_pct: float = 0.1667  # lock ~500 on 3k
     hard_exit_day: int = 3  # Thursday (0=Mon)
     max_hold_days: int = 5
 
@@ -94,6 +95,21 @@ class WeeklyConfig:
     ml_exit_min_prob: float = 0.6
     directional_enabled: bool = True
     directional_bias_threshold: float = 0.02
+    strict_skip: bool = True
+    min_leg_premium: float = 30.0
+    min_combined_premium: float = 120.0
+    min_strike_distance: float = 250.0
+    min_vix: float = 11.0
+    max_gap_pct: float = 0.015
+    min_combined_premium_pct: float = 0.012
+    max_combined_premium_pct: float = 0.028
+    max_intraday_range_pct: float = 0.015
+    max_abs_trend_20: float = 0.05
+    min_hold_days: int = 2
+    isolation_multiple: float = 2.5  # leg LTP vs entry to isolate
+    recovery_trigger: float = 1500.0
+    recovery_floor: float = 500.0
+    hard_stop: float = 3500.0
 
 
 # ---------------------- Live (placeholder, conservative) ----------------------
@@ -124,10 +140,10 @@ class LiveConfig:
     max_requote: int = 2  # attempts to re-place remaining qty if fill not met
     hedge_enabled: bool = bool(int(os.environ.get("WEEKLY_HEDGE_ENABLED", "0")))
     hedge_trigger_pct: float = 0.01  # hedge when MTM drawdown beyond this
-    hedge_distance: int = int(float(os.environ.get("WEEKLY_HEDGE_DISTANCE", 200)))  # points away from ATM for hedge wings
+    hedge_distance: int = int(float(os.environ.get("WEEKLY_HEDGE_DISTANCE", 300)))  # points away from ATM for hedge wings
     hedge_cost_cap: float = 500.0  # max premium spend per hedge leg
     entry_hedge_enabled: bool = True  # buy cheap OTM wings on entry for margin benefit
-    entry_hedge_price_cap: float = float(os.environ.get("WEEKLY_HEDGE_PRICE_CAP", 3.5))  # do not pay above this per entry hedge leg
+    entry_hedge_price_cap: float = float(os.environ.get("WEEKLY_HEDGE_PRICE_CAP", 6.0))  # do not pay above this per entry hedge leg
     min_days_to_expiry: int = 2  # skip front expiry if fewer days remain
     adopt_legs: list = field(default_factory=lambda: [
         {"side": "SELL", "strike": 26200, "type": "CALL", "qty": 75, "entry": 104.65, "expiry": "2025-11-25"},
@@ -137,8 +153,8 @@ class LiveConfig:
         {"side": "BUY",  "strike": 26900, "type": "CALL", "qty": 75,  "entry": 5.10,  "expiry": "2025-11-25"},
         {"side": "BUY",  "strike": 27200, "type": "CALL", "qty": 150, "entry": 3.20,  "expiry": "2025-11-25"},
     ])  # optional pre-existing legs to manage
-    basket_tp_abs: float = 4000.0
-    basket_sl_abs: float = -3000.0
+    basket_tp_abs: float = 2500.0
+    basket_sl_abs: float = -2000.0
     basket_hedge_dd: float = -2000.0
     auto_adopt_open_positions: bool = True  # adopt live F&O legs automatically
     auto_adopt_underlying: str = "NIFTY"    # only adopt if symbol matches
@@ -168,6 +184,7 @@ def run_live(dw, cfg: LiveConfig) -> None:
             LOG.warning("[weekly_live] failed to log intent: %s", exc)
 
     open_position: Optional[Dict[str, Any]] = None
+    week_lock_expiry: Optional[datetime.date] = None
 
     def _adopt_if_needed(live_positions: list) -> bool:
         nonlocal open_position
@@ -242,35 +259,62 @@ def run_live(dw, cfg: LiveConfig) -> None:
             if open_position.get("adopted"):
                 _manage_adopted(dw, cfg, open_position, now)
             else:
-                ce_ltp = pe_ltp = None
-                ltps = _fetch_ltps(dw, cfg.underlying_seg, [open_position["ce_sec_id"], open_position["pe_sec_id"]])
-                ce_ltp = ltps.get(open_position["ce_sec_id"])
-                pe_ltp = ltps.get(open_position["pe_sec_id"])
-                pnl, pnl_pct = _compute_mtm(open_position, ce_ltp, pe_ltp)
-                open_position["mtm"] = pnl
-                open_position["mtm_pct"] = pnl_pct
-                if pnl_pct is not None:
-                    LOG.debug("[weekly_live] MTM pnl=%.2f pnl%%=%.2f", pnl or 0.0, pnl_pct * 100)
+                pnl_live, ltps_live = _compute_live_mtm(dw, cfg, open_position)
+                open_position["mtm"] = pnl_live
+                if pnl_live is not None:
+                    LOG.debug("[weekly_live] MTM pnl=%.2f", pnl_live)
                 age_days = (now.date() - open_position["entry_date"].date()).days
-                # exit at/after expiry date end-of-day
                 expiry_date = open_position.get("expiry_date")
-                if expiry_date and now.date() >= expiry_date and now.hour >= cfg.hard_exit_hour:
-                    LOG.info("[weekly_live] Expiry reached, closing")
+                is_expiry_day = bool(expiry_date and now.date() == expiry_date)
+
+                trail_active = open_position.get("trail_active", False)
+                trail_floor = open_position.get("trail_floor")
+                peak = open_position.get("peak_mtm", pnl_live if pnl_live is not None else 0.0)
+                if pnl_live is not None:
+                    peak = max(peak, pnl_live)
+                    open_position["peak_mtm"] = peak
+
+                if pnl_live is not None and not trail_active and pnl_live >= cfg.basket_tp_abs:
+                    trail_active = True
+                    trail_floor = pnl_live - 500.0
+                    open_position["trail_active"] = True
+                    open_position["trail_floor"] = trail_floor
+                    LOG.info("[weekly_live] TP hit %.0f, trail activated floor=%.0f", pnl_live, trail_floor or 0.0)
+
+                if trail_active and trail_floor is not None and pnl_live is not None:
+                    desired = max(trail_floor, peak - 500.0)
+                    if desired > trail_floor:
+                        trail_floor = desired
+                        open_position["trail_floor"] = trail_floor
+                    if pnl_live <= trail_floor:
+                        LOG.info("[weekly_live] Trail floor hit (mtm %.0f floor %.0f), closing", pnl_live, trail_floor)
+                        _close_weekly(dw, open_position, cfg)
+                        week_lock_expiry = expiry_date
+                        open_position = None
+                        time.sleep(cfg.poll_seconds)
+                        continue
+
+                if pnl_live is not None and pnl_live <= -cfg.basket_sl_abs:
+                    LOG.info("[weekly_live] SL hit %.0f, closing", pnl_live)
                     _close_weekly(dw, open_position, cfg)
+                    week_lock_expiry = expiry_date
                     open_position = None
-                if pnl_pct is not None and pnl_pct >= cfg.tp_pct:
-                    LOG.info("[weekly_live] TP hit %.2f%%, closing", pnl_pct * 100)
+                elif pnl_live is not None and pnl_live >= cfg.basket_tp_abs and not trail_active:
+                    LOG.info("[weekly_live] TP hit %.0f, closing", pnl_live)
                     _close_weekly(dw, open_position, cfg)
+                    week_lock_expiry = expiry_date
                     open_position = None
-                elif pnl_pct is not None and pnl_pct <= -cfg.sl_pct:
-                    LOG.info("[weekly_live] SL hit %.2f%%, closing", pnl_pct * 100)
+                elif is_expiry_day and pnl_live is not None and pnl_live >= 3000.0:
+                    LOG.info("[weekly_live] Expiry-day profit %.0f, closing", pnl_live)
                     _close_weekly(dw, open_position, cfg)
+                    week_lock_expiry = expiry_date
                     open_position = None
                 elif age_days >= cfg.max_hold_days or (now.hour >= cfg.hard_exit_hour and now.minute >= cfg.hard_exit_minute):
                     LOG.info("[weekly_live] Time exit (age=%s days), closing", age_days)
                     _close_weekly(dw, open_position, cfg)
+                    week_lock_expiry = expiry_date
                     open_position = None
-                elif cfg.hedge_enabled and (pnl_pct or 0) <= -cfg.hedge_trigger_pct and not (open_position.get("hedged")):
+                elif cfg.hedge_enabled and pnl_live is not None and (pnl_live <= cfg.basket_hedge_dd) and not (open_position.get("hedged")):
                     if _maybe_hedge(dw, cfg, open_position):
                         open_position["hedged"] = True
                         _write_status(status_path, open_position)
@@ -283,12 +327,18 @@ def run_live(dw, cfg: LiveConfig) -> None:
             LOG.debug("[weekly_live] other positions open (%d), skipping entry", len(open_deriv))
             time.sleep(cfg.poll_seconds * 2)
             continue
+        if week_lock_expiry and now.date() <= week_lock_expiry:
+            LOG.info("[weekly_live] week already traded (expiry %s); skipping new basket", week_lock_expiry)
+            time.sleep(cfg.poll_seconds * 4)
+            continue
         if weekday != cfg.entry_day:
             time.sleep(cfg.poll_seconds * 4)
             continue
         if now.hour < cfg.entry_hour or (now.hour == cfg.entry_hour and now.minute < cfg.entry_minute):
             time.sleep(cfg.poll_seconds)
             continue
+        # gap filter: if abs gap >1% before 10:30, defer
+        prev_spot_cached = getattr(cfg, "last_spot", None)
         # block entry if high importance event within window
         if _events_block(cfg.event_block_hours):
             LOG.info("[weekly_live] High-importance event within %sh, skipping entry", cfg.event_block_hours)
@@ -310,14 +360,14 @@ def run_live(dw, cfg: LiveConfig) -> None:
             LOG.warning("[weekly_live] no spot from option chain; skipping entry this cycle")
             time.sleep(cfg.poll_seconds * 2)
             continue
-        # Gap/IV entry guards (best-effort; uses last cached spot as previous close)
-        prev_spot = getattr(cfg, "last_spot", None)
+        # Gap guard: if large gap and before 10:30, skip for now
+        prev_spot = prev_spot_cached or getattr(cfg, "last_spot", None)
         if prev_spot and prev_spot > 0:
-            gap_pct = (spot - prev_spot) / prev_spot
-            if abs(gap_pct) >= cfg.gap_entry_threshold:
-                LOG.info("[weekly_live] skip entry: gap %.3f >= threshold %.3f", gap_pct, cfg.gap_entry_threshold)
-                time.sleep(cfg.poll_seconds * 2)
+            gap_pct = abs(spot - prev_spot) / prev_spot
+            if gap_pct > 0.01 and (now.hour < 10 or (now.hour == 10 and now.minute < 30)):
+                LOG.info("[weekly_live] gap %.3f>1%% before 10:30, deferring entry", gap_pct)
                 cfg.last_spot = spot
+                time.sleep(cfg.poll_seconds * 4)
                 continue
         cfg.last_spot = spot
         # skip if holiday on expiry or trade day based on events
@@ -325,22 +375,78 @@ def run_live(dw, cfg: LiveConfig) -> None:
             LOG.info("[weekly_live] Holiday block for trade/expiry date; skipping entry")
             time.sleep(cfg.poll_seconds * 4)
             continue
-        atm = _round_to_int(spot, 50)
-        strikes = {"CE": atm, "PE": atm}
+        # Select short strikes ~0.15 delta / >=300 pts OTM with premium filters
+        offsets = [6, 7]  # 300, 350 pts
+        strikes = {}
+        secs = {}
+        prices = {}
+        def _pick_short(opt: str) -> bool:
+            for off in offsets:
+                strike = _round_to_int(spot + off * 50 if opt == "CE" else spot - off * 50, 50)
+                try:
+                    refresh_scrip_master(force=False)
+                    sec = resolve_option_security_id(cfg.underlying_symbol, expiry, strike, opt)
+                except Exception:
+                    sec = None
+                if not sec:
+                    continue
+                try:
+                    ltp = dw.get_ltp_once(cfg.underlying_seg, sec) if hasattr(dw, "get_ltp_once") else None
+                except Exception:
+                    ltp = None
+                if ltp is None or ltp < 30:
+                    continue
+                strikes[opt] = strike
+                secs[opt] = sec
+                prices[opt] = ltp
+                return True
+            return False
 
-        def _resolve(sec_type: str) -> Optional[int]:
-            try:
-                refresh_scrip_master(force=False)
-                return resolve_option_security_id(cfg.underlying_symbol, expiry, strikes[sec_type], sec_type)
-            except Exception:
-                return None
-
-        ce_sec = _resolve("CE")
-        pe_sec = _resolve("PE")
-        if not ce_sec or not pe_sec:
-            LOG.warning("[weekly_live] could not resolve sec ids for strikes %s", strikes)
-            time.sleep(cfg.poll_seconds * 2)
+        ok_ce = _pick_short("CE")
+        ok_pe = _pick_short("PE")
+        if not ok_ce or not ok_pe:
+            LOG.info("[weekly_live] short strikes not found with premium floor; skipping week")
+            time.sleep(cfg.poll_seconds * 4)
             continue
+        if (prices.get("CE", 0) + prices.get("PE", 0)) < 120:
+            LOG.info("[weekly_live] combined premium < 120; skipping week")
+            time.sleep(cfg.poll_seconds * 4)
+            continue
+
+        # Hedges: try distance +/- hedge_distance, price 2-12 (15 fallback)
+        hedge_sec = {}
+        hedge_price = {}
+        hedge_offsets = [cfg.hedge_distance/50.0, cfg.hedge_distance/50.0 + 1]
+        def _pick_hedge(opt: str) -> bool:
+            for off in hedge_offsets:
+                strike = _round_to_int(strikes.get(opt) + (off * 50 if opt == "CE" else -off * 50), 50)
+                try:
+                    sec = resolve_option_security_id(cfg.underlying_symbol, expiry, strike, opt)
+                except Exception:
+                    sec = None
+                if not sec:
+                    continue
+                try:
+                    ltp = dw.get_ltp_once(cfg.underlying_seg, sec) if hasattr(dw, "get_ltp_once") else None
+                except Exception:
+                    ltp = None
+                if ltp is None:
+                    continue
+                if 2 <= ltp <= 12 or ltp <= 15:
+                    hedge_sec[opt] = sec
+                    hedge_price[opt] = ltp
+                    return True
+            return False
+
+        hedge_ok = _pick_hedge("CE") and _pick_hedge("PE")
+        if not hedge_ok:
+            LOG.info("[weekly_live] hedge strikes not found within price caps; skipping week")
+            time.sleep(cfg.poll_seconds * 4)
+            continue
+
+        ce_sec = secs["CE"]
+        pe_sec = secs["PE"]
+        atm = _round_to_int(spot, 50)
 
         intent = {
             "timestamp": now.isoformat(timespec="seconds"),
@@ -350,6 +456,14 @@ def run_live(dw, cfg: LiveConfig) -> None:
             "atm": atm,
             "ce_sec_id": ce_sec,
             "pe_sec_id": pe_sec,
+            "ce_strike": strikes.get("CE"),
+            "pe_strike": strikes.get("PE"),
+            "ce_entry": prices.get("CE"),
+            "pe_entry": prices.get("PE"),
+            "ce_hedge_sec": hedge_sec.get("CE"),
+            "pe_hedge_sec": hedge_sec.get("PE"),
+            "ce_hedge_price": hedge_price.get("CE"),
+            "pe_hedge_price": hedge_price.get("PE"),
             "lot_size": cfg.lot_size,
             "qty": cfg.qty,
             "warn_only": cfg.warn_only,
@@ -402,6 +516,10 @@ def run_live(dw, cfg: LiveConfig) -> None:
                 "ce_order_id": ce_order_id,
                 "pe_order_id": pe_order_id,
                 "hedged": False,
+                "ce_hedge_sec": hedge_sec.get("CE"),
+                "pe_hedge_sec": hedge_sec.get("PE"),
+                "ce_hedge_price": hedge_price.get("CE"),
+                "pe_hedge_price": hedge_price.get("PE"),
             }
             LOG.info("[weekly_live] Entered weekly strangle CE %s PE %s", ce_sec, pe_sec)
             _write_status(status_path, open_position)
@@ -547,6 +665,29 @@ def _compute_mtm(pos: Dict[str, Any], ce_ltp: Optional[float], pe_ltp: Optional[
     pnl = entry_credit - current_debit
     pnl_pct = pnl / entry_credit if entry_credit else None
     return pnl, pnl_pct
+
+
+def _compute_live_mtm(dw, cfg: LiveConfig, pos: Dict[str, Any]) -> Tuple[Optional[float], Dict[str, float]]:
+    """
+    Pull current LTPs for entry shorts and compute MTM for the basket.
+    """
+    ltps: Dict[str, float] = {}
+    ce_sec = pos.get("ce_sec_id")
+    pe_sec = pos.get("pe_sec_id")
+    if not ce_sec or not pe_sec:
+        return None, ltps
+    try:
+        ltps["ce"] = dw.get_ltp_once(cfg.underlying_seg, ce_sec) if hasattr(dw, "get_ltp_once") else None
+    except Exception:
+        ltps["ce"] = None
+    try:
+        ltps["pe"] = dw.get_ltp_once(cfg.underlying_seg, pe_sec) if hasattr(dw, "get_ltp_once") else None
+    except Exception:
+        ltps["pe"] = None
+    ce_ltp = ltps.get("ce")
+    pe_ltp = ltps.get("pe")
+    pnl, _ = _compute_mtm(pos, ce_ltp, pe_ltp)
+    return pnl, ltps
 
 
 def _manage_adopted(dw, cfg: LiveConfig, pos: Dict[str, Any], now: datetime) -> None:
@@ -1082,6 +1223,10 @@ class WeeklyPosition:
     long_put_strike: Optional[float] = None
     best_pnl: float = 0.0
     target_expiry: Optional[pd.Timestamp] = None
+    ce_closed: bool = False
+    pe_closed: bool = False
+    realized_offset: float = 0.0  # realized PnL from isolated leg
+    recovery_floor: Optional[float] = None
 
     def entry_credit(self) -> float:
         credit = (self.entry_call + self.entry_put) - (self.long_call_entry + self.long_put_entry)
@@ -1097,7 +1242,7 @@ class WeeklyPosition:
         long_call_ltp = long_call_ltp or 0.0
         long_put_ltp = long_put_ltp or 0.0
         debit = (call_ltp + put_ltp - long_call_ltp - long_put_ltp) * self.qty * self.lot_size
-        return self.entry_credit() - debit
+        return self.entry_credit() - debit + self.realized_offset
 
 
 class WeeklyThetaStrangle:
@@ -1150,7 +1295,9 @@ class WeeklyThetaStrangle:
                 # Safety: week rolled but we still have a position -> force close at prev close price.
                 self._close_position(close, reason="week_roll")
                 return
-            pnl = self.position.current_pnl(close["atm_call_ltp"], close["atm_put_ltp"])
+            # isolate legs if they blow through isolation multiple
+            self._maybe_isolate(close)
+            pnl = self.position.current_pnl(close.get("atm_call_ltp", 0.0), close.get("atm_put_ltp", 0.0))
             self.position.best_pnl = max(self.position.best_pnl, pnl)
             exit_reason = self._check_exit(weekday, pnl, morning, close)
             if exit_reason:
@@ -1205,7 +1352,7 @@ class WeeklyThetaStrangle:
         if self.position is None:
             return
         current_pos = self.position
-        current_legs = self._resolve_close_legs(row, current_pos.structure)
+        current_legs = self._resolve_close_legs(row, current_pos)
         pnl = self.position.current_pnl(
             current_legs["short_call"],
             current_legs["short_put"],
@@ -1234,9 +1381,21 @@ class WeeklyThetaStrangle:
     def _entry_allowed(self, day_rows: pd.DataFrame) -> Tuple[bool, Optional[str]]:
         rules = self.cfg.entry_rules
         day_rows = day_rows.sort_values("timestamp")
+        # Skip partial days (likely holidays/early close)
+        if len(day_rows) < 300:
+            return False, "partial_day"
         row = day_rows.iloc[0]
+        # Hard premium guard: legs must be >=30 and combined >=120 (configurable)
+        min_leg = getattr(self.cfg, "min_leg_premium", 30.0)
+        min_combined = getattr(self.cfg, "min_combined_premium", 120.0)
+        c_ltp = row.get("atm_call_ltp")
+        p_ltp = row.get("atm_put_ltp")
+        if (pd.isna(c_ltp) or c_ltp < min_leg) or (pd.isna(p_ltp) or p_ltp < min_leg) or ((c_ltp or 0) + (p_ltp or 0) < min_combined):
+            return False, "premium_floor"
         premium_pct = row.get("combined_premium_pct")
-        if pd.isna(premium_pct) or premium_pct < rules.min_premium_pct:
+        min_cpct = getattr(self.cfg, "min_combined_premium_pct", rules.min_premium_pct)
+        max_cpct = getattr(self.cfg, "max_combined_premium_pct", 1.0)
+        if pd.isna(premium_pct) or not (min_cpct <= premium_pct <= max_cpct):
             return False, "premium_lt_min"
         iv_rank = row.get("iv_rank")
         if not pd.isna(iv_rank) and not (rules.min_iv_rank <= iv_rank <= rules.max_iv_rank):
@@ -1259,8 +1418,30 @@ class WeeklyThetaStrangle:
         prev_close = row.get("prev_day_close")
         if not pd.isna(prev_close) and spot:
             gap_pct = abs(spot - prev_close) / max(prev_close, 1.0)
-            if gap_pct > getattr(rules, "max_gap_pct", 0.01):
+            if gap_pct > getattr(self.cfg, "max_gap_pct", getattr(rules, "max_gap_pct", 0.01)):
                 return False, "gap_guard"
+            if gap_pct > 0.012:
+                return False, "gap_guard_hard"
+        # simple VIX guard if present
+        vix_val = row.get("india_vix") or row.get("vix")
+        if vix_val and vix_val < getattr(self.cfg, "min_vix", 0):
+            return False, "vix_floor"
+        # trend hard guard
+        t20 = row.get("spot_trend_20")
+        if t20 and abs(t20) > 0.06:
+            return False, "trend_guard_hard"
+        # intraday range guard
+        max_range = getattr(self.cfg, "max_intraday_range_pct", None)
+        if max_range is not None:
+            rng = row.get("spot_intraday_range_pct")
+            if rng and rng > max_range:
+                return False, "range_guard"
+        # trend guard
+        max_trend = getattr(self.cfg, "max_abs_trend_20", None)
+        if max_trend is not None:
+            t20 = row.get("spot_trend_20")
+            if t20 and abs(t20) > max_trend:
+                return False, "trend_guard"
         expiry, days_to = self._target_expiry_info(row)
         min_days = getattr(rules, "min_days_to_target_expiry", 0)
         if expiry is None:
@@ -1301,15 +1482,57 @@ class WeeklyThetaStrangle:
 
     def _resolve_entry_legs(self, row: pd.Series, structure: str) -> Optional[Dict[str, float]]:
         structure = structure.upper()
-        short_call = row.get("atm_call_ltp")
-        short_put = row.get("atm_put_ltp")
-        if pd.isna(short_call) or pd.isna(short_put):
+        # Prefer OTM strikes ~±300 pts (fallback 250) with price filters.
+        point_offsets = [300, 250]
+        selector_offsets = [6, 5]  # fallback if distance columns missing
+
+        def _pick_short(opt: str) -> Tuple[Optional[float], Optional[float]]:
+            # First, distance-based columns (call_off300_ltp, put_off300_ltp, etc.)
+            for pts in point_offsets:
+                field_ltp = f"{opt}_off{pts}_ltp"
+                field_strike = f"{opt}_off{pts}_strike"
+                ltp = row.get(field_ltp)
+                strike = row.get(field_strike)
+                if pd.isna(ltp) or pd.isna(strike):
+                    continue
+                if ltp < 30.0:
+                    continue
+                return float(ltp), float(strike)
+            # Fallback to selector-based columns (ATM±N buckets)
+            for off in selector_offsets:
+                field_ltp = _selector_field(opt, off if opt == "call" else -off, "ltp")
+                field_strike = _selector_field(opt, off if opt == "call" else -off, "strike")
+                ltp = row.get(field_ltp)
+                strike = row.get(field_strike)
+                if pd.isna(ltp) or pd.isna(strike):
+                    continue
+                if ltp < 30.0:
+                    continue
+                return float(ltp), float(strike)
+            return None, None
+
+        short_call, sc_strike = _pick_short("call")
+        short_put, sp_strike = _pick_short("put")
+        if short_call is None or short_put is None or sc_strike is None or sp_strike is None:
             return None
+
+        # distance guard
+        min_distance = max(250.0, getattr(self.cfg, "min_strike_distance", 250.0))
+        spot = row.get("spot")
+        if spot:
+            if abs(sc_strike - spot) < min_distance or abs(spot - sp_strike) < min_distance:
+                return None
+
+        # combined premium filter
+        min_combined = getattr(self.cfg, "min_combined_premium", 120.0)
+        if (short_call + short_put) < min_combined:
+            return None
+
         legs = {
             "short_call": float(short_call),
             "short_put": float(short_put),
-            "short_call_strike": float(row.get("atm_call_strike", 0.0)) if not pd.isna(row.get("atm_call_strike")) else None,
-            "short_put_strike": float(row.get("atm_put_strike", 0.0)) if not pd.isna(row.get("atm_put_strike")) else None,
+            "short_call_strike": float(sc_strike),
+            "short_put_strike": float(sp_strike),
             "structure": structure,
         }
         if structure == "BULL_PUT_SPREAD":
@@ -1351,20 +1574,34 @@ class WeeklyThetaStrangle:
         legs["long_put_strike"] = float(row.get(_selector_field("put", -offset, "strike"), 0.0)) if not pd.isna(row.get(_selector_field("put", -offset, "strike"))) else None
         return legs
 
-    def _resolve_close_legs(self, row: pd.Series, structure: str) -> Dict[str, float]:
+    def _resolve_close_legs(self, row: pd.Series, pos: WeeklyPosition) -> Dict[str, float]:
+        def _lp_for_strike(opt: str, strike: Optional[float], closed: bool) -> float:
+            if closed:
+                return 0.0
+            if strike is None:
+                return float(row.get(f"atm_{opt}_ltp", 0.0))
+            for off in (250, 300, 350, 400):
+                s = row.get(f"{opt}_off{off}_strike")
+                l = row.get(f"{opt}_off{off}_ltp")
+                if pd.isna(s) or pd.isna(l):
+                    continue
+                if abs(float(s) - float(strike)) < 0.001:
+                    return float(l)
+            return float(row.get(f"atm_{opt}_ltp", 0.0))
+
         legs = {
-            "short_call": float(row.get("atm_call_ltp", 0.0)),
-            "short_put": float(row.get("atm_put_ltp", 0.0)),
+            "short_call": _lp_for_strike("call", pos.short_call_strike, pos.ce_closed),
+            "short_put": _lp_for_strike("put", pos.short_put_strike, pos.pe_closed),
         }
-        if structure == "BULL_PUT_SPREAD":
+        if pos.structure == "BULL_PUT_SPREAD":
             long_put = row.get(_selector_field("put", -2, "ltp"))
             legs["long_put"] = float(long_put) if not pd.isna(long_put) else 0.0
             return legs
-        if structure == "BEAR_CALL_SPREAD":
+        if pos.structure == "BEAR_CALL_SPREAD":
             long_call = row.get(_selector_field("call", 2, "ltp"))
             legs["long_call"] = float(long_call) if not pd.isna(long_call) else 0.0
             return legs
-        if structure != "IRON_CONDOR":
+        if pos.structure != "IRON_CONDOR":
             return legs
         offset = max(1, int(self.cfg.wing_offset))
         long_call = row.get(_selector_field("call", offset, "ltp"))
@@ -1394,6 +1631,47 @@ class WeeklyThetaStrangle:
         if target_expiry is not None and pd.isna(target_expiry):
             target_expiry = None
         return target_expiry, target_days
+
+    def _maybe_isolate(self, row: pd.Series) -> None:
+        if self.position is None:
+            return
+        pos = self.position
+        iso_mult = getattr(self.cfg, "isolation_multiple", 2.5)
+        changes = []
+        # CE leg
+        if not pos.ce_closed and pos.entry_call > 0:
+            ce_ltp = row.get("atm_call_ltp")
+            if ce_ltp and ce_ltp >= pos.entry_call * iso_mult:
+                realized = (pos.entry_call - ce_ltp) * pos.qty * pos.lot_size
+                pos.realized_offset += realized
+                pos.entry_call = 0.0
+                pos.ce_closed = True
+                changes.append(("CE_ISO", realized, ce_ltp))
+        # PE leg
+        if not pos.pe_closed and pos.entry_put > 0:
+            pe_ltp = row.get("atm_put_ltp")
+            if pe_ltp and pe_ltp >= pos.entry_put * iso_mult:
+                realized = (pos.entry_put - pe_ltp) * pos.qty * pos.lot_size
+                pos.realized_offset += realized
+                pos.entry_put = 0.0
+                pos.pe_closed = True
+                changes.append(("PE_ISO", realized, pe_ltp))
+        for tag, realized, leg_ltp in changes:
+            self.trades.append(
+                {
+                    "timestamp": pd.to_datetime(row["timestamp"]),
+                    "action": "CLOSE",
+                    "call_ltp": row.get("atm_call_ltp"),
+                    "put_ltp": row.get("atm_put_ltp"),
+                    "realized": realized,
+                    "reason": tag,
+                }
+            )
+        # Recovery trigger
+        if (pos.ce_closed or pos.pe_closed) and pos.recovery_floor is None:
+            pnl = pos.current_pnl(row.get("atm_call_ltp", 0.0), row.get("atm_put_ltp", 0.0))
+            if pnl >= getattr(self.cfg, "recovery_trigger", 1500.0):
+                pos.recovery_floor = getattr(self.cfg, "recovery_floor", 500.0)
 
     def _events_for(self, current_date: datetime.date) -> List[Dict[str, Any]]:
         if not self._event_calendar:
@@ -1508,10 +1786,20 @@ class WeeklyThetaStrangle:
         ml_reason = self._ml_exit_decision(weekday, pnl, morning_row, close_row)
         if ml_reason:
             return ml_reason
+        # hard stop first
+        if pnl <= -abs(self.cfg.hard_stop):
+            return "hard_stop"
+        # recovery trail after isolation trigger
+        if self.position and self.position.recovery_floor is not None:
+            if pnl <= self.position.recovery_floor:
+                return "recovery_trail"
+        # min hold guard
+        if self.position:
+            days_held = (weekday - self.cfg.entry_day) % 7
+            if days_held < max(1, self.cfg.min_hold_days):
+                return None
         if pnl >= targets.pnl_target:
             return "target_hit"
-        if pnl <= -targets.pnl_stop:
-            return "weekly_stop"
         if self.position:
             lock_floor = self.position.best_pnl * (1 - targets.trailing_lock_pct)
             if lock_floor and pnl <= lock_floor:
@@ -1648,6 +1936,12 @@ def run_backtest(df: pd.DataFrame, cfg_dict: Optional[Any] = None) -> Tuple[pd.D
         df["trade_date"] = pd.to_datetime(df["source_date"]).dt.date
     else:
         df["trade_date"] = df["timestamp"].dt.date
+    # strict skip: require valid premiums
+    min_leg = getattr(cfg, "min_leg_premium", 30.0)
+    min_combined = getattr(cfg, "min_combined_premium", 120.0)
+    df = df[(df["atm_call_ltp"] > 0) & (df["atm_put_ltp"] > 0)]
+    df = df[(df["atm_call_ltp"] >= min_leg) & (df["atm_put_ltp"] >= min_leg)]
+    df = df[(df["atm_call_ltp"] + df["atm_put_ltp"]) >= min_combined]
     last_rows = None
     for date, day_rows in df.groupby("trade_date"):
         strat.on_new_day(day_rows)

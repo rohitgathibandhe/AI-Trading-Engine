@@ -129,6 +129,8 @@ class RollingExpiredOptionsMarket:
                 payload.get("toDate"),
                 payload.get("drvOptionType"),
             )
+            # ensure requiredData includes strike
+            payload.setdefault("requiredData", ["open", "high", "low", "close", "iv", "volume", "oi", "spot", "strike"])
             resp = requests.post(url, headers=self._headers(), json=payload, timeout=30)
             if resp.status_code in (429, 500, 502, 503, 504):
                 wait = min(2.0 * attempt, 8.0)

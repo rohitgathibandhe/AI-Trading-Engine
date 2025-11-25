@@ -18,6 +18,7 @@ import pandas as pd
 import requests
 
 from .dhan_api import SimpleDhanClient, _raise_for_status
+import time
 
 LOG = logging.getLogger(__name__)
 
@@ -68,6 +69,11 @@ class RollingOptionIngestor:
         self.client = client or SimpleDhanClient()
         self.out_dir = Path(out_dir or Path(__file__).resolve().parents[2] / "state" / "rolling_option")
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        # Throttle between requests to avoid DH-904 rate limits
+        try:
+            self.throttle_s = float(os.environ.get("DHAN_ROLLING_THROTTLE", "6.0"))
+        except Exception:
+            self.throttle_s = 6.0
 
     def fetch_range(self, cfg: RollingOptionConfig) -> List[Path]:
         if not cfg.security_id:
@@ -136,6 +142,16 @@ class RollingOptionIngestor:
                         json=payload,
                         timeout=self.client.timeout,
                     )
+                    if resp.status_code == 429:
+                        wait = min(max(self.throttle_s, 2.0 * attempt), 12.0) if 'attempt' in locals() else self.throttle_s
+                        LOG.warning("rollingoption 429 rate limit; sleeping %.1fs and retrying once", wait)
+                        time.sleep(wait)
+                        resp = requests.post(
+                            self.client._url(ROLLING_OPTION_PATH),
+                            headers=self.client.headers,
+                            json=payload,
+                            timeout=self.client.timeout,
+                        )
                     _raise_for_status(resp)
                     data = resp.json()
                     records.extend(
@@ -146,6 +162,8 @@ class RollingOptionIngestor:
                             expiry_hint=cfg.expiry,
                         )
                     )
+                    # Backoff between requests to respect rate limits
+                    time.sleep(self.throttle_s)
             chunk_start = chunk_end + timedelta(days=1)
 
         return self._write_records(records)
