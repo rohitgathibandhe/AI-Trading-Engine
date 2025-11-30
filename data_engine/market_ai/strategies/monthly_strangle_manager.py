@@ -280,7 +280,8 @@ def manage_basket(
 
     # Hard exits
     if leg_deltas:
-        high_delta_legs = [d for d in leg_deltas if abs(d) > 0.25]
+        safe_leg_deltas = [d for d in leg_deltas if d is not None]
+        high_delta_legs = [d for d in safe_leg_deltas if abs(d) > 0.25]
         if len(high_delta_legs) >= 2:
             return TradeAction("CLOSE_ALL", StrategyType.STRANGLE, [], legs, "Both legs high delta; exiting basket")
     if adx is not None and adx > 30:
@@ -302,3 +303,9 @@ def manage_basket(
         # We signal HOLD; upstream can tighten SL to trail_lock
         return TradeAction("HOLD", StrategyType.STRANGLE, [], [], f"Trail suggested lock>{trail_lock:.0f}")
     return TradeAction("HOLD", StrategyType.STRANGLE, [], [], "Hold")
+
+
+def should_roll_winning_leg(now: datetime, expiry: date) -> bool:
+    """Guard to block rolling the winning leg in the last 5 days to expiry."""
+    dte = (expiry - now.date()).days
+    return dte > 5

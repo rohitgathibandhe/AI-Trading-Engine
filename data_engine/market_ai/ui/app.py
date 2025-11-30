@@ -393,7 +393,7 @@ def _load_blotter() -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
     _ensure_csv_exists(BLOTTER_CSV, STRAT_BLOTTER_FIELDS)
     if BLOTTER_CSV.exists():
         try:
-            df = pd.read_csv(BLOTTER_CSV)
+            df = pd.read_csv(BLOTTER_CSV, low_memory=False)
             if not df.empty and "timestamp" in df.columns:
                 df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
                 df = df.sort_values("timestamp")
@@ -414,7 +414,7 @@ def _load_feature_history(limit: int = 200) -> Optional[pd.DataFrame]:
     if not FEATURE_LOG_CSV.exists():
         return None
     try:
-        df = pd.read_csv(FEATURE_LOG_CSV)
+        df = pd.read_csv(FEATURE_LOG_CSV, low_memory=False)
     except Exception:
         return None
     if df.empty:
@@ -432,7 +432,7 @@ def _load_equity_history(limit: Optional[int] = None) -> Optional[pd.DataFrame]:
     if not EQUITY_LOG_CSV.exists():
         return None
     try:
-        df = pd.read_csv(EQUITY_LOG_CSV)
+        df = pd.read_csv(EQUITY_LOG_CSV, low_memory=False)
     except Exception:
         return None
     if df.empty or "timestamp" not in df.columns:
@@ -2991,6 +2991,7 @@ def _settings_tab() -> None:
 
 
 def _paper_pnl_tab() -> None:
+    import pandas as pd
     df, summary = _load_blotter()
 
     # Backtest block is aligned to the currently selected strategy
@@ -3053,8 +3054,8 @@ def _paper_pnl_tab() -> None:
                 latest_pb = Path(pb_files[-1]) if pb_files else None
                 try:
                     import pandas as pd
-                    bt_df = pd.read_csv(latest_bt)
-                    pb_df = pd.read_csv(latest_pb) if latest_pb and latest_pb.exists() else pd.DataFrame()
+                    bt_df = pd.read_csv(latest_bt, low_memory=False)
+                    pb_df = pd.read_csv(latest_pb, low_memory=False) if latest_pb and latest_pb.exists() else pd.DataFrame()
                     if not bt_df.empty:
                         st.markdown("#### Entries and Strikes")
                         st.dataframe(bt_df, width="stretch")
@@ -3147,8 +3148,7 @@ def _paper_pnl_tab() -> None:
             if show_latest and trades_path.exists():
                 st.markdown(f"Latest backtest trades: `{trades_path.name}`")
                 try:
-                    import pandas as pd
-                    df_trades = pd.read_csv(trades_path)
+                    df_trades = pd.read_csv(trades_path, low_memory=False)
                     st.dataframe(df_trades, width="stretch")
                 except Exception as exc:
                     st.warning(f"Could not load trades file: {exc}")
@@ -3161,8 +3161,7 @@ def _paper_pnl_tab() -> None:
                     st.warning(f"Could not load summary: {exc}")
             if daily_path.exists() and show_latest:
                 try:
-                    import pandas as pd
-                    df_daily = pd.read_csv(daily_path)
+                    df_daily = pd.read_csv(daily_path, low_memory=False)
                     st.markdown("#### Daily log")
                     st.dataframe(df_daily, width="stretch")
                 except Exception as exc:

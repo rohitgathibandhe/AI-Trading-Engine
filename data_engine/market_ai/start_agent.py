@@ -454,11 +454,13 @@ def _update_blotter_summary(entry: Dict[str, Any]) -> None:
 
 
 def _log_trade_event(*, trade_mode: str, side: str, leg: OptionLeg, order_type: str, notes: str = "") -> None:
+    # In paper mode, mark events as non-executed to avoid inflating executed count.
+    executed_flag = 0 if trade_mode == "paper" else 1
     entry = {
         "timestamp": datetime.now().isoformat(),
         "trade_mode": trade_mode,
         "warn_only": 0,
-        "executed": 1,
+        "executed": executed_flag,
         "side": side,
         "order_type": order_type,
         "exchange_seg": "NSE_FNO",
@@ -530,10 +532,19 @@ def _log_strategy_event(
     market: MarketSnapshot,
     trade_mode: str,
     legs: List[OptionLeg],
+    basket_mtm: float | None = None,
+    basket_peak: float | None = None,
+    trail_floor: float | None = None,
 ) -> None:
     ce_leg = next((leg for leg in legs if leg.side == LegSide.SELL and leg.option_type == OptionType.CALL), None)
     pe_leg = next((leg for leg in legs if leg.side == LegSide.SELL and leg.option_type == OptionType.PUT), None)
     context = {"action": action, "reason": reason}
+    if basket_mtm is not None:
+        context["basket_mtm"] = basket_mtm
+    if basket_peak is not None:
+        context["basket_peak"] = basket_peak
+    if trail_floor is not None:
+        context["trail_floor"] = trail_floor
     row = {
         "timestamp": datetime.now().isoformat(),
         "strategy": strategy.name.lower(),
@@ -1045,6 +1056,10 @@ def _place_leg_order(dw: DhanWrapper, leg: OptionLeg, *, close: bool, trade_mode
         order_side = LegSide.BUY if side == LegSide.SELL else LegSide.SELL
     else:
         order_side = side
+    if trade_mode == "paper":
+        # Paper: do not hit broker; log a synthetic blotter row once.
+        _log_trade_event(trade_mode=trade_mode, side=order_side.value, leg=leg, order_type="MARKET", notes="paper")
+        return
     security_id = _ensure_leg_security_id(leg, leg.symbol, leg.expiry)
     if not security_id:
         log.error("Skipping leg order due to missing security_id (strike=%s opt=%s)", leg.strike, leg.option_type)
@@ -1219,6 +1234,7 @@ def main() -> None:
 
     while True:
         try:
+            now = datetime.now()
             today = datetime.now().date()
             if today != current_day:
                 current_day = today
@@ -1231,6 +1247,11 @@ def main() -> None:
                 trail_active = False
                 trail_floor = -1000.0
                 day_pnl = 0.0
+            # Skip processing on weekends when the market is closed.
+            if now.weekday() >= 5:
+                log.info("Weekend detected; market is closed. Sleeping for %ss.", poll_sec)
+                time.sleep(poll_sec)
+                continue
             market, avg_volume, vwap, pivot = build_market_snapshot(dw, avg_volume_hint=avg_volume_hint)
             market_open = datetime.combine(market.now.date(), dtime(9, 15))
             if orb_config.enabled and orb_state.orb_levels is None:
@@ -1242,9 +1263,9 @@ def main() -> None:
                 orb_state.breakout_signal = breakout if breakout.active else None
             sr_levels = compute_sr_levels(market, orb_state.orb_levels)
             expiry = _fetch_expiry_with_settings(dw, settings)
-            positions_raw = dw.get_positions_raw()
-            legs = _map_positions(positions_raw)
-            if legs:
+            positions_raw = [] if trade_mode == "paper" else dw.get_positions_raw()
+            legs = _map_positions([] if trade_mode == "paper" else positions_raw)
+            if legs and trade_mode != "paper":
                 log.info(
                     "[Positions detail] %s",
                     [
@@ -1257,7 +1278,7 @@ def main() -> None:
                         )
                         for leg in legs
                     ],
-            )
+                )
             expiry_str = expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry)
             chain_raw = dw.get_option_chain(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, expiry_str)
             chain = _map_chain(chain_raw, expiry, symbol="NIFTY")
@@ -1336,6 +1357,8 @@ def main() -> None:
                     for leg in legs:
                         key = (leg.strike, "CE" if leg.option_type == OptionType.CALL else "PE")
                         leg_deltas.append(delta_map.get(key, 0.0))
+                    # Replace None with 0.0 to avoid abs(None) crashes
+                    leg_deltas = [d if d is not None else 0.0 for d in leg_deltas]
                     decision = manage_monthly_basket(
                         now=now,
                         expiry=expiry,
@@ -1362,19 +1385,33 @@ def main() -> None:
                         lot_size=settings.get("lot_size", 75),
                         cfg=cfg,
                     )
+                # Paper-mode margin gate: assume virtual capital 1,000,000
+                if decision.action_type == "OPEN" and trade_mode == "paper" and decision.legs_to_open:
+                    required_margin = 0.0
+                    for leg in decision.legs_to_open:
+                        if leg.side == LegSide.SELL:
+                            px = (leg.entry_price or leg.current_ltp or 0.0)
+                            required_margin += abs(px * leg.quantity)
+                    if required_margin > 1_000_000:
+                        log.info("Paper: skipping entry due to virtual margin check (need %.0f, cap 1,000,000)", required_margin)
+                        decision = TradeAction("HOLD", decision.strategy_type, [], [], "Paper margin insufficient")
                 _log_strategy_event(
                     strategy=decision.strategy_type,
                     action=decision.action_type,
                     reason=decision.reason,
                     market=market,
+                    legs=legs,
+                    trade_mode=trade_mode,
                     basket_mtm=basket_mtm,
                     basket_peak=basket_peak_mtm,
                     trail_floor=trail_floor,
                 )
                 if decision.action_type != "HOLD" and decision.legs_to_open:
-                    _log_trade_event_batch(trade_mode, decision.legs_to_open, executed=trade_mode == "live")
+                    for leg in decision.legs_to_open:
+                        _log_trade_event(trade_mode=trade_mode, side=leg.side.value, leg=leg, order_type="MARKET")
                 if decision.action_type in ("CLOSE_ALL", "CLOSE_LEGS") and decision.legs_to_close:
-                    _log_trade_event_batch(trade_mode, decision.legs_to_close, executed=trade_mode == "live", close=True)
+                    for leg in decision.legs_to_close:
+                        _log_trade_event(trade_mode=trade_mode, side=leg.side.value, leg=leg, order_type="MARKET", notes="close")
                 continue
             if smart_enabled:
                 trend_ctx = detect_trend_from_open(market, avg_volume, vwap=vwap, pivot=pivot)
