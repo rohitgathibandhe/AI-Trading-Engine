@@ -3079,28 +3079,77 @@ def _pick_strangle_strikes_simple(nifty_spot: float, step: int = 100) -> Tuple[i
 
 
 def _choose_monthly_expiry(payload: Dict[str, Any]) -> Optional[str]:
-    if not isinstance(payload, dict):
-        return None
-    data = payload.get("data", payload)
-    if isinstance(data, dict):
-        for key in ("expiryList", "expiries", "data"):
-            expiries = data.get(key)
-            if isinstance(expiries, list) and expiries:
-                for item in expiries:
-                    if item:
-                        return str(item)
-        if data.get("expiry"):
-            return str(data.get("expiry"))
-    elif isinstance(data, list) and data:
-        return str(data[0])
-    return None
+    """
+    Select monthly expiry: if >=14 days left in current month expiry, use it; otherwise use next month.
+    We assume monthly expiry = last Tuesday of month (user calendar).
+    """
+    today = date.today()
+
+    # Collect all future expiries from payload
+    expiries: List[date] = []
+    def _add_item(item: Any) -> None:
+        try:
+            if item:
+                d = datetime.strptime(str(item), "%Y-%m-%d").date()
+                if d >= today:
+                    expiries.append(d)
+        except Exception:
+            pass
+
+    if isinstance(payload, dict):
+        data = payload.get("data", payload)
+        if isinstance(data, dict):
+            for key in ("expiryList", "expiries", "data", "expiry"):
+                val = data.get(key)
+                if isinstance(val, list):
+                    for item in val:
+                        _add_item(item)
+                elif isinstance(val, str):
+                    _add_item(val)
+        elif isinstance(data, list):
+            for item in data:
+                _add_item(item)
+    elif isinstance(payload, list):
+        for item in payload:
+            _add_item(item)
+
+    # Target monthly expiry based on 14-day rule
+    cur_exp = _last_tuesday_of_month(today.year, today.month)
+    if cur_exp < today:
+        # already past, use next month
+        ny, nm = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
+        cur_exp = _last_tuesday_of_month(ny, nm)
+    days_to_cur = (cur_exp - today).days
+    if days_to_cur >= 14:
+        target = cur_exp
+    else:
+        ny, nm = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
+        target = _last_tuesday_of_month(ny, nm)
+
+    expiries = sorted(set(expiries))
+    if expiries:
+        # exact match
+        for d in expiries:
+            if d == target:
+                return d.isoformat()
+        # closest same-month future date
+        same_month = [d for d in expiries if d.year == target.year and d.month == target.month and d >= today]
+        if same_month:
+            return same_month[0].isoformat()
+        # fallback to nearest future
+        return expiries[0].isoformat()
+
+    # fallback if list empty
+    return target.isoformat()
 
 
 def _infer_default_expiry() -> Optional[str]:
     today = date.today()
-    next_month = date(today.year + (1 if today.month == 12 else 0), (today.month % 12) + 1, 1)
-    guess = next_month - timedelta(days=1)
-    return guess.isoformat()
+    cur = _last_tuesday_of_month(today.year, today.month)
+    if (cur - today).days < 14:
+        ny, nm = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
+        cur = _last_tuesday_of_month(ny, nm)
+    return cur.isoformat()
 
 
 def _match_chain_row(df: Optional[pd.DataFrame], strike: float, opt_type: str) -> Optional[Dict[str, Any]]:
@@ -3547,6 +3596,38 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
 
     pe_id, pe_price = pe_info
     ce_id, ce_price = ce_info
+
+    # Guard: live chain should not return zero; if it does, skip and log
+    if pe_price is None or pe_price <= 0 or ce_price is None or ce_price <= 0:
+        LOG.warning("[live] invalid LTP for strangle entry: CE %s @ %s, PE %s @ %s",
+                    ce_strike, ce_price, pe_strike, pe_price)
+        _record_feature(
+            cfg,
+            {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "strategy": getattr(cfg, "strategy_name", "monthly_strangle_with_weekly_hedge"),
+                "trade_mode": cfg.trade_mode,
+                "warn_only": True,
+                "context": json.dumps(
+                    {
+                        "event": "zero_ltp",
+                        "pe_strike": pe_strike,
+                        "ce_strike": ce_strike,
+                        "expiry": expiry,
+                        "pe_price": pe_price,
+                        "ce_price": ce_price,
+                    }
+                ),
+            },
+        )
+        cfg._last_strangle_entry_attempt = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "reason": "zero_ltp",
+            "pe_strike": pe_strike,
+            "ce_strike": ce_strike,
+            "expiry": expiry,
+        }
+        return
     entry_credit = cfg.lot_size * ((pe_price or 0.0) + (ce_price or 0.0))
     notional = cfg.lot_size * nifty_spot * 2.0
     if risk_mgr:

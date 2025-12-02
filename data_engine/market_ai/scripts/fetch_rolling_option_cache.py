@@ -26,6 +26,9 @@ import requests
 
 ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = ROOT / "state"
+# Prefer UI/agent creds stored under market_ai/state/creds.json (same file start_agent uses).
+MARKET_AI_STATE = ROOT / "market_ai" / "state"
+CREDS_FILE = MARKET_AI_STATE / "creds.json"
 ROLLING_DIR = STATE_DIR / "rolling_option"
 ROLLING_DIR.mkdir(parents=True, exist_ok=True)
 MANIFEST = STATE_DIR / "rolling_option_manifest.json"
@@ -74,12 +77,25 @@ def fetch_chunk(
         "expiryCode": 1,
         "strike": strike,
         "drvOptionType": option_type,
-        "requiredData": ["open", "close", "strike", "oi", "iv", "volume", "spot"],
+        # Include greeks so backtests can build deltas.
+        "requiredData": [
+            "open",
+            "close",
+            "strike",
+            "oi",
+            "iv",
+            "volume",
+            "spot",
+            "delta",
+            "gamma",
+            "theta",
+            "vega",
+        ],
         "fromDate": from_d.isoformat(),
         "toDate": to_d.isoformat(),
     }
     last_exc = None
-    for attempt in range(4):  # initial + 3 retries
+    for attempt in range(6):  # initial + 5 retries
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=30)
             resp.raise_for_status()
@@ -115,8 +131,18 @@ def main():
 
     cid = os.getenv("DHAN_CLIENT_ID", "").strip()
     tok = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
+    # If env is missing, attempt to load the same creds the UI/start_agent uses.
+    if (not cid or not tok) and CREDS_FILE.exists():
+        try:
+            creds = json.loads(CREDS_FILE.read_text())
+            cid = cid or creds.get("client_id", "").strip()
+            tok = tok or creds.get("access_token", "").strip()
+            log.info("Loaded DHAN creds from %s", CREDS_FILE.name)
+        except Exception as exc:
+            log.warning("Failed to load creds from %s: %s", CREDS_FILE, exc)
+
     if not cid or not tok:
-        raise SystemExit("DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN not set")
+        raise SystemExit("DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN not set (env or creds.json)")
     headers = {
         "access-token": tok,
         "client-id": cid,

@@ -397,6 +397,10 @@ def _load_blotter() -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
             if not df.empty and "timestamp" in df.columns:
                 df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
                 df = df.sort_values("timestamp")
+            # Ensure numeric columns are coerced (prevents Arrow dtype errors)
+            for col in ("quantity", "price", "strike", "executed", "warn_only"):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
         except Exception as exc:
             st.warning(f"Failed to read paper blotter: {exc}")
             df = None
@@ -408,6 +412,19 @@ def _load_blotter() -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
             summary = {}
 
     return df, summary
+
+
+def _reset_paper_blotter() -> None:
+    """
+    Clear the paper blotter files so a fresh paper session
+    starts with an empty order log.
+    """
+    for path in (BLOTTER_CSV, BLOTTER_SUMMARY):
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
 
 
 def _load_feature_history(limit: int = 200) -> Optional[pd.DataFrame]:
@@ -1153,6 +1170,10 @@ def start_agent() -> None:
         st.error(f"start_agent.py not found at: {AGENT_ENTRY}")
         return
     try:
+        # If starting in paper mode, clear any previous blotter so we don't
+        # show stale paper trades from an old session.
+        if st.session_state.get("trade_mode", "live") == "paper":
+            _reset_paper_blotter()
         AGENT_LOG.parent.mkdir(parents=True, exist_ok=True)
         AGENT_LOG.touch(exist_ok=True)
         env = _agent_env()
@@ -1486,20 +1507,66 @@ def _positions_tab(dw) -> None:
         mapped_closed = []
         total_realized = 0.0
         for r in uniq:
-            realized = F(r, "realizedProfit", 0.0)
-            total_realized += realized
+            # Prefer intraday (day*) fields to mirror Dhan's "Today's Closed" view
+            day_buy_qty = I(r, "dayBuyQty", 0)
+            day_sell_qty = I(r, "daySellQty", 0)
+            day_buy_avg = F(r, "dayBuyAvg", 0.0)
+            day_sell_avg = F(r, "daySellAvg", 0.0)
+
+            buy_qty = day_buy_qty if day_buy_qty > 0 else I(r, "buyQty", 0)
+            sell_qty = day_sell_qty if day_sell_qty > 0 else I(r, "sellQty", 0)
+            cost_price = F(r, "costPrice", 0.0)
+
+            raw_buy_avg = day_buy_avg if day_buy_avg > 0 else F(r, "buyAvg", 0.0)
+            raw_sell_avg = day_sell_avg if day_sell_avg > 0 else F(r, "sellAvg", 0.0)
+
+            qty = max(buy_qty, sell_qty)
+
+            # Entry side heuristic: if any carry forward sell qty → sell-first, else if carry forward buy → buy-first
+            carry_s = I(r, "carryForwardSellQty", 0)
+            carry_b = I(r, "carryForwardBuyQty", 0)
+            entry_side = "SELL" if carry_s > 0 else ("BUY" if carry_b > 0 else None)
+
+            # Fallback: use realized P&L sign only if entry side still unknown
+            pnl_field = F(r, "realizedProfit", None)
+            if entry_side is None and pnl_field is not None:
+                entry_side = "SELL" if pnl_field >= 0 else "BUY"
+            if entry_side is None:
+                entry_side = "SELL" if sell_qty >= buy_qty else "BUY"
+
+            # Display prices to match Dhan:
+            # - Entry price = costPrice (broker provided)
+            # - Exit price = opposite leg average (raw averages)
+            if entry_side == "SELL":
+                sell_avg_display = cost_price if cost_price > 0 else raw_sell_avg
+                buy_avg_display = raw_buy_avg
+                ltp_display = raw_sell_avg  # requested mapping
+            else:
+                buy_avg_display = cost_price if cost_price > 0 else raw_buy_avg
+                sell_avg_display = raw_sell_avg
+                ltp_display = raw_sell_avg  # still show exit price per request
+
+            # Prefer broker P&L
+            pnl_calc = pnl_field if pnl_field is not None else (sell_avg_display * sell_qty) - (buy_avg_display * buy_qty)
+
+            total_realized += pnl_calc
+
             mapped_closed.append({
-                "Symbol":   S(r, "tradingSymbol"),
+                "Name":     S(r, "tradingSymbol"),
                 "Product":  S(r, "productType"),
-                "Qty":      max(I(r, "buyQty", 0), I(r, "sellQty", 0)),  # show traded size
-                "Buy Avg":  F(r, "buyAvg", 0.0),
-                "Sell Avg": F(r, "sellAvg", 0.0),
-                "LTP":      F(r, "costPrice", 0.0),
-                "P&L":      realized,
+                "Qty":      qty,
+                "Buy Avg Price":  buy_avg_display,
+                "Sell Avg Price": sell_avg_display,
+                "LTP":      ltp_display,
+                "P&L":      pnl_calc,
+                "_entry_side": entry_side,
+                "_raw":    r,
             })
 
         import pandas as pd
         df_closed = pd.DataFrame(mapped_closed)
+        # Hide internal columns before display
+        df_closed = df_closed.drop(columns=[c for c in df_closed.columns if str(c).startswith("_")], errors="ignore")
         try:
             df_closed["Qty"] = df_closed["Qty"].astype("Int64")
         except Exception:
@@ -1510,7 +1577,12 @@ def _positions_tab(dw) -> None:
         st.markdown("#### Today’s Closed Trades")
         styler_closed = (
             df_closed.style
-            .format({"Buy Avg": "₹ {:.2f}", "Sell Avg": "₹ {:.2f}", "LTP": "₹ {:.2f}", "P&L": "₹ {:.2f}"})
+            .format({
+                "Buy Avg Price": "₹ {:.2f}",
+                "Sell Avg Price": "₹ {:.2f}",
+                "LTP": "₹ {:.2f}",
+                "P&L": "₹ {:.2f}",
+            })
             .apply(_pnl_style_col_closed, subset=["P&L"], axis=0)
         )
         st.dataframe(styler_closed, hide_index=True, width="stretch")
@@ -2998,6 +3070,7 @@ def _paper_pnl_tab() -> None:
     current_strategy_file = st.session_state.get("strategy_file", "")
     strategy_label = {
         "batman": "Batman",
+        "batman_v2_paper": "Batman V2 (paper)",
         "weekly_theta_strangle.py": "Weekly Theta Strangle",
         "monthly_strangle_with_weekly_hedge.py": "Monthly Strangle w/ Hedge",
     }.get(current_strategy_file, "Selected Strategy")
@@ -3033,77 +3106,69 @@ def _paper_pnl_tab() -> None:
                         st.session_state["bt_show_latest"] = True
                     except Exception as exc:
                         st.error(f"Backtest failed: {exc}")
-            with btn_reset:
-                if st.button("Reset Backtest View"):
-                    for k in list(st.session_state.keys()):
-                        if k.startswith("bat_bt_") or k.startswith("bt_pb_") or k.startswith("bt_tf"):
-                            st.session_state.pop(k, None)
-                    st.session_state.pop("bt_tf", None)
-                    st.session_state["bt_show_latest"] = False
-                    st.success("Backtest view reset. Run a new backtest to see results.")
+    elif current_strategy_file == "batman_v2_paper":
+        st.info("Backtest not yet wired for Batman V2 (paper). Use paper mode in the agent to test.")
+        with btn_reset:
+            if st.button("Reset Backtest View"):
+                for k in list(st.session_state.keys()):
+                    if k.startswith("bat_bt_") or k.startswith("bt_pb_") or k.startswith("bt_tf"):
+                        st.session_state.pop(k, None)
+                st.session_state.pop("bt_tf", None)
+                st.session_state["bt_show_latest"] = False
+                st.success("Backtest view reset. Run a new backtest to see results.")
 
-            # Backtest results (collapsed with run controls)
-            show_latest = st.session_state.get("bt_show_latest", True)
-            from glob import glob
-            reports_dir = ROOT / "reports"
-            bt_files = sorted(glob(str(reports_dir / "batman_backtest_trades_*.csv")))
-            pb_files = sorted(glob(str(reports_dir / "batman_backtest_playback_*.csv")))
-            if bt_files and show_latest:
-                latest_bt = Path(bt_files[-1])
-                st.markdown(f"Latest backtest trades: `{latest_bt.name}`")
-                latest_pb = Path(pb_files[-1]) if pb_files else None
-                try:
-                    import pandas as pd
-                    bt_df = pd.read_csv(latest_bt, low_memory=False)
-                    pb_df = pd.read_csv(latest_pb, low_memory=False) if latest_pb and latest_pb.exists() else pd.DataFrame()
-                    if not bt_df.empty:
-                        st.markdown("#### Entries and Strikes")
-                        st.dataframe(bt_df, width="stretch")
-                        leg_cols = ["long_call", "short_call", "long_put", "short_put"]
-                        if all(c in bt_df.columns for c in leg_cols):
-                            settings = _load_settings()
-                            qty_long = settings.get("batman_qty_long", 1)
-                            qty_short = settings.get("batman_qty_short", 3)
-                            st.markdown("##### Legs by entry")
-                            legs_rows = []
-                            for _, r in bt_df.iterrows():
-                                legs_rows.append({
-                                    "entry_time": r.get("entry_time"),
-                                    "long_call": r.get("long_call"),
-                                    "short_call": r.get("short_call"),
-                                    "long_put": r.get("long_put"),
-                                    "short_put": r.get("short_put"),
-                                    "qty_long": qty_long,
-                                    "qty_short": qty_short,
-                                })
-                            st.dataframe(pd.DataFrame(legs_rows), width="stretch")
-                        else:
-                            st.info("Strikes not available in file (expected columns: long_call, short_call, long_put, short_put).")
-                        if not pb_df.empty:
-                            st.markdown("#### Playback timeframe")
-                            pb_df["timestamp"] = pd.to_datetime(pb_df["timestamp"], errors="coerce")
-                            pb_df = pb_df.dropna(subset=["timestamp"]).sort_values("timestamp")
-                            if pb_df.empty:
-                                st.info("Playback data empty after parsing timestamps.")
-                            else:
-                                max_idx = len(pb_df) - 1
-                                cur_idx = st.session_state.get("bt_pb_idx", max_idx)
-                                cur_idx = st.slider("Cursor", 0, max_idx, cur_idx, key="bt_pb_slider_live")
-                                st.session_state["bt_pb_idx"] = cur_idx
-                                row = pb_df.iloc[cur_idx]
-                                pnl = row.get("pnl", 0.0)
-                                st.metric("PNL at cursor", f"₹{pnl:,.2f}", help=str(row.get("timestamp")))
-                                legs_live = []
-                                legs_live.append({"leg": "Long Call", "strike": row.get("long_call"), "qty": row.get("qty_long"), "entry": row.get("long_call_entry"), "ltp": row.get("long_call_ltp")})
-                                legs_live.append({"leg": "Short Call", "strike": row.get("short_call"), "qty": row.get("qty_short"), "entry": row.get("short_call_entry"), "ltp": row.get("short_call_ltp")})
-                                legs_live.append({"leg": "Long Put", "strike": row.get("long_put"), "qty": row.get("qty_long"), "entry": row.get("long_put_entry"), "ltp": row.get("long_put_ltp")})
-                                legs_live.append({"leg": "Short Put", "strike": row.get("short_put"), "qty": row.get("qty_short"), "entry": row.get("short_put_entry"), "ltp": row.get("short_put_ltp")})
-                                st.markdown("##### Legs at cursor")
-                                st.table(legs_live)
-                        else:
-                            st.info("No playback file found (batman_backtest_playback_*.csv). Run backtest to generate.")
-                except Exception as exc:
-                    st.warning(f"Could not load backtest file: {exc}")
+        # Backtest results (collapsed with run controls)
+        show_latest = st.session_state.get("bt_show_latest", True)
+        from glob import glob
+        reports_dir = ROOT / "reports"
+        bt_files = sorted(glob(str(reports_dir / "batman_backtest_trades_*.csv")))
+        if bt_files and show_latest:
+            latest_bt = Path(bt_files[-1])
+            st.markdown(f"Latest backtest trades: `{latest_bt.name}`")
+            latest_pb = Path(pb_files[-1]) if pb_files else None
+            try:
+                import pandas as pd
+                bt_df = pd.read_csv(latest_bt, low_memory=False)
+                pb_df = pd.read_csv(latest_pb, low_memory=False) if latest_pb and latest_pb.exists() else pd.DataFrame()
+                if not bt_df.empty:
+                    st.markdown("#### Entries and Strikes")
+                    st.dataframe(bt_df, width="stretch")
+                    leg_cols = ["long_call", "short_call", "long_put", "short_put"]
+                    if all(c in bt_df.columns for c in leg_cols):
+                        settings = _load_settings()
+                        qty_long = settings.get("batman_qty_long", 1)
+                        qty_short = settings.get("batman_qty_short", 3)
+                        st.markdown("##### Legs by entry")
+                        legs_rows = []
+                        for _, r in bt_df.iterrows():
+                            legs_rows.append({
+                                "entry_time": r.get("entry_time"),
+                                "long_call": r.get("long_call"),
+                                "short_call": r.get("short_call"),
+                                "long_put": r.get("long_put"),
+                                "short_put": r.get("short_put"),
+                                "qty_long": qty_long,
+                                "qty_short": qty_short,
+                            })
+                        st.dataframe(pd.DataFrame(legs_rows), width="stretch")
+                    else:
+                        st.info("Strikes not available in file (expected columns: long_call, short_call, long_put, short_put).")
+                if not pb_df.empty:
+                    st.markdown("#### Playback timeframe")
+                    pb_df["timestamp"] = pd.to_datetime(pb_df["timestamp"], errors="coerce")
+                    pb_df = pb_df.dropna(subset=["timestamp"]).sort_values("timestamp")
+                    if pb_df.empty:
+                        st.info("Playback data empty after parsing timestamps.")
+                    else:
+                        max_idx = len(pb_df) - 1
+                        cur_idx = st.session_state.get("bt_pb_idx", max_idx)
+                        cur_idx = st.slider("Cursor", 0, max_idx, cur_idx, key="bt_pb_slider_live")
+                        st.session_state["bt_pb_idx"] = cur_idx
+                        row = pb_df.iloc[cur_idx]
+                        st.metric("PNL at cursor", f"₹{row.get('pnl_at_cursor', 0):,.2f}")
+                    st.dataframe(pb_df, width="stretch")
+            except Exception as exc:
+                st.warning(f"Could not load latest backtest: {exc}")
             else:
                 st.info("Run a backtest to see results here.")
 
@@ -3196,6 +3261,7 @@ def _paper_pnl_tab() -> None:
         st.dataframe(show_df.fillna(""), width="stretch")
 
         executed_df = show_df[show_df.get("executed", 0) == 1].copy()
+        fig = None
         if not executed_df.empty and "timestamp" in executed_df.columns:
             executed_df.sort_values("timestamp", inplace=True)
             executed_df["signed_notional"] = pd.to_numeric(executed_df.get("price"), errors="coerce").fillna(0.0) \
@@ -3212,7 +3278,8 @@ def _paper_pnl_tab() -> None:
                 name="Net Credit",
             ))
             fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=40))
-        st.plotly_chart(fig, width="stretch")
+        if fig is not None:
+            st.plotly_chart(fig, width="stretch")
 
     if summary:
         st.markdown("#### Latest Summary")
@@ -3407,6 +3474,8 @@ def _sidebar() -> None:
     strategy_options = [
         ("Monthly Strangle w/ Hedge", "monthly_strangle_with_weekly_hedge.py"),
         ("Batman Monthly (with hedges)", "batman"),
+        # Paper-only experimental double-ratio version
+        ("Batman V2 (paper)", "batman_v2_paper"),
     ]
     # restore last strategy if present
     last_strategy_file = None

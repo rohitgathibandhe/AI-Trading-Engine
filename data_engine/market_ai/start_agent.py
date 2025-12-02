@@ -1231,6 +1231,9 @@ def main() -> None:
     regime_scorer = RegimeScorer()
     learning = LearningManager()
     policy = PolicyEngine(learning_manager=learning)
+    batman_v2_notice_logged = False
+    from market_ai.strategies import BatmanStrategy, BatmanConfig
+    batman_v2: Optional[BatmanStrategy] = None
 
     while True:
         try:
@@ -1250,6 +1253,44 @@ def main() -> None:
             # Skip processing on weekends when the market is closed.
             if now.weekday() >= 5:
                 log.info("Weekend detected; market is closed. Sleeping for %ss.", poll_sec)
+                time.sleep(poll_sec)
+                continue
+            if SELECTED_STRATEGY_FILE == "batman_v2_paper":
+                if batman_v2 is None:
+                    batman_v2 = BatmanStrategy(BatmanConfig())
+                # Build a minimal feature set
+                daily_candles = _fetch_daily_candles(dw, days=40)
+                feats = _compute_monthly_filters(daily_candles, 0)
+                vix_val = feats.get("vix", 0.0)
+                gap_pct = feats.get("gap_pct", 0.0)
+                monthly_pos = feats.get("monthly_range_frac", 0.5)
+                expiry = _fetch_expiry_with_settings(dw, settings)
+                chain_raw = dw.get_option_chain(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, expiry.isoformat())
+                chain = _map_chain(chain_raw, expiry, symbol="NIFTY")
+                # Entry if none
+                if batman_v2.state is None or not batman_v2.state.is_active():
+                    entered = batman_v2.maybe_enter(
+                        as_of=now,
+                        spot=market.spot if 'market' in locals() else 0,
+                        expiry=expiry,
+                        vix=vix_val,
+                        gap_pct=gap_pct,
+                        monthly_range_pos=monthly_pos,
+                        chain=chain,
+                    )
+                    if entered:
+                        log.info("Batman V2 (paper) entered: expiry=%s", expiry)
+                else:
+                    # update tick
+                    batman_v2.on_tick(
+                        as_of=now,
+                        spot=market.spot if 'market' in locals() else 0,
+                        vix=vix_val,
+                        adx=feats.get("adx", 0.0),
+                        chain=chain,
+                    )
+                    if batman_v2.state and not batman_v2.state.is_active():
+                        log.info("Batman V2 (paper) exited.")
                 time.sleep(poll_sec)
                 continue
             market, avg_volume, vwap, pivot = build_market_snapshot(dw, avg_volume_hint=avg_volume_hint)

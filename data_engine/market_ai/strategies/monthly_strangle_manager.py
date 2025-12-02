@@ -140,12 +140,19 @@ def _passes_filters(
 
 def _delta_in_band(delta: float, band: Tuple[float, float]) -> bool:
     lo, hi = band
-    return lo <= abs(delta) <= hi
+    if delta is None:
+        return False
+    try:
+        val = float(delta)
+    except Exception:
+        return False
+    return lo <= abs(val) <= hi
 
 
 def pick_strikes_from_chain(
     chain: List[dict],
     short_band: Tuple[float, float],
+    spot: float,
 ) -> Tuple[Optional[dict], Optional[dict]]:
     """
     Pick CE/PE shorts by delta band. Expects chain entries with keys:
@@ -154,16 +161,59 @@ def pick_strikes_from_chain(
     """
     ce = None
     pe = None
+
     for row in chain:
         if row.get("option_type") == "CE" and _delta_in_band(row.get("delta", 0.0), short_band):
-            if row.get("ltp", 0) > 0:
+            if _ltp_ok(row):
                 ce = row
                 break
     for row in chain:
         if row.get("option_type") == "PE" and _delta_in_band(row.get("delta", 0.0), short_band):
-            if row.get("ltp", 0) > 0:
+            if _ltp_ok(row):
                 pe = row
                 break
+
+    def _ltp_ok(row: dict) -> bool:
+        try:
+            val = row.get("ltp", 0.0)
+            val = 0.0 if val is None else float(val)
+            return val > 0.0
+        except Exception:
+            return False
+
+    def _strike_val(row: dict) -> Optional[float]:
+        try:
+            return float(row.get("strike"))
+        except Exception:
+            return None
+
+    # Fallback: distance-based selection when greeks are missing
+    if ce is None:
+        ce_candidates = [
+            r for r in chain
+            if r.get("option_type") == "CE"
+            and _ltp_ok(r)
+            and _strike_val(r) is not None
+            and _strike_val(r) >= spot + 250
+        ]
+        if ce_candidates:
+            ce = sorted(
+                ce_candidates,
+                key=lambda r: abs(_strike_val(r) - (spot + 300)),
+            )[0]
+    if pe is None:
+        pe_candidates = [
+            r for r in chain
+            if r.get("option_type") == "PE"
+            and _ltp_ok(r)
+            and _strike_val(r) is not None
+            and _strike_val(r) <= spot - 250
+        ]
+        if pe_candidates:
+            pe = sorted(
+                pe_candidates,
+                key=lambda r: abs(_strike_val(r) - (spot - 300)),
+            )[0]
     return ce, pe
 
 
@@ -208,7 +258,7 @@ def propose_entry(
     if not _passes_filters(now, now.date(), expiry, adx, max_body_pct, gap_pct, monthly_range_frac, vix, vix_rising, cfg.entry):
         return TradeAction("HOLD", StrategyType.STRANGLE, [], [], "Entry filters not satisfied")
 
-    ce_row, pe_row = pick_strikes_from_chain(option_chain, cfg.strikes.short_delta_band)
+    ce_row, pe_row = pick_strikes_from_chain(option_chain, cfg.strikes.short_delta_band, spot)
     if not ce_row or not pe_row:
         return TradeAction("HOLD", StrategyType.STRANGLE, [], [], "No strikes in delta band")
 
