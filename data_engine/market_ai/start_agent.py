@@ -841,36 +841,60 @@ def _map_positions(rows: list) -> List[OptionLeg]:
     return legs
 
 
-def _map_chain(chain_raw: dict, expiry, symbol: str) -> List[dict]:
+def _map_chain(chain_raw: Any, expiry, symbol: str) -> List[dict]:
+    """
+    Normalize a raw DHAN option chain response into a list of rows with:
+      expiry, option_type ("CE"/"PE"), strike, ltp, delta, security_id.
+
+    Supports both legacy and v2 /v2/optionchain shapes by delegating to
+    _coerce_chain_dict, which walks through 'data'/'oc'/etc.
+    """
     rows: List[dict] = []
     chain_dict = _coerce_chain_dict(chain_raw)
     if not isinstance(chain_dict, dict):
         return rows
+
     expiry_str = expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry)
+
     for strike, legs in chain_dict.items():
         if not isinstance(legs, dict):
             continue
+        try:
+            strike_f = float(strike)
+        except Exception:
+            continue
+
         for opt_name, opt_data in (legs or {}).items():
             if not isinstance(opt_data, dict):
                 continue
-            option_type = "CE" if opt_name.lower().startswith("c") else "PE"
+
+            opt_name_u = str(opt_name).upper()
+            option_type = "CE" if opt_name_u.startswith("C") else "PE"
+
+            # Dhan v2 keeps greeks under "greeks"/"Greeks"
+            greeks = opt_data.get("greeks") or opt_data.get("Greeks") or {}
+
             sec_id = opt_data.get("securityId") or opt_data.get("security_id")
             if not sec_id:
-                resolved = _resolve_security_id_cached(symbol, expiry_str, float(strike), option_type)
+                resolved = _resolve_security_id_cached(symbol, expiry_str, strike_f, option_type)
                 if resolved:
                     sec_id = resolved
+
+            ltp = (
+                opt_data.get("last_price")
+                or opt_data.get("LastPrice")
+                or opt_data.get("ltp")
+                or opt_data.get("LTP")
+                or opt_data.get("close")
+            )
+
             rows.append(
                 {
                     "expiry": expiry,
                     "option_type": option_type,
-                    "strike": float(strike),
-                    "ltp": (
-                        opt_data.get("last_price")
-                        or opt_data.get("LastPrice")
-                        or opt_data.get("ltp")
-                        or opt_data.get("close")
-                    ),
-                    "delta": opt_data.get("delta"),
+                    "strike": strike_f,
+                    "ltp": ltp,
+                    "delta": greeks.get("delta") or opt_data.get("delta"),
                     "security_id": sec_id,
                 }
             )
@@ -1319,6 +1343,7 @@ def main() -> None:
                     ],
                 )
             expiry_str = expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry)
+            log.info("[OC request] underlying=%s expiry=%s trade_mode=%s", INDEX_SECURITY_ID, expiry_str, trade_mode)
             chain_raw = dw.get_option_chain(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, expiry_str)
             chain = _map_chain(chain_raw, expiry, symbol="NIFTY")
             _update_leg_ltps_from_chain(legs, chain)
@@ -1553,9 +1578,6 @@ def main() -> None:
         except Exception as exc:
             log.exception("Agent loop error: %s", exc)
         time.sleep(poll_sec)
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()

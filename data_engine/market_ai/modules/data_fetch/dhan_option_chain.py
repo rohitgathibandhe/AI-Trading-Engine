@@ -77,7 +77,8 @@ class RateLimitedOptionChain:
         if key in self._cache:
             ts, data = self._cache[key]
             if now - ts < self.min_interval_sec:
-                self.log.debug("OC cache hit for %s exp=%s", underlying_scrip, expiry)
+                age = now - ts
+                self.log.info("OC CACHE HIT: underlying=%s expiry=%s age=%.2fs", underlying_scrip, expiry, age)
                 return data
 
         # Enforce global min interval between real calls
@@ -86,7 +87,8 @@ class RateLimitedOptionChain:
             # If we have cache, use it; else wait remaining
             if key in self._cache:
                 ts, data = self._cache[key]
-                self.log.debug("OC cache (global throttle) for %s exp=%s", underlying_scrip, expiry)
+                age = now - ts
+                self.log.info("OC CACHE HIT (global throttle): underlying=%s expiry=%s age=%.2fs", underlying_scrip, expiry, age)
                 return data
             sleep_s = self.min_interval_sec - elapsed
             self.log.debug("OC throttling %.2fs before real call", sleep_s)
@@ -113,7 +115,7 @@ class RateLimitedOptionChain:
         now = time.monotonic()
         self._last_global_call_ts = now
         self._cache[key] = (now, data)
-        self.log.debug("OC fetched fresh for %s exp=%s", underlying_scrip, expiry)
+        self.log.info("OC API CALL: underlying=%s expiry=%s (fresh)", underlying_scrip, expiry)
         return data
 
 class OptionChain:
