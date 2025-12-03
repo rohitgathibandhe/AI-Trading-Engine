@@ -1,4 +1,5 @@
 {
   "python.envFile": "${workspaceFolder}/.env",
-  "python.pythonPath": "/Users/Rohit/.venv/data_engine_py310/bin/python"
+  "python.pythonPath": "/Users/Rohit/.venv/data_engine_py310/bin/python",
+  "chatgpt.openOnStartup": true
 }
