@@ -283,21 +283,19 @@ def _ensure_dhan_credentials() -> None:
     tok_file = str(saved.get("access_token") or "").strip()
     cid_env = os.getenv("DHAN_CLIENT_ID", "").strip()
     tok_env = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
-    updated = False
-    if cid_file and cid_file != cid_env:
+    # Always prefer the saved creds if available (overwrites stale env)
+    if cid_file:
         os.environ["DHAN_CLIENT_ID"] = cid_file
-        updated = True
-        log.info("DHAN_CLIENT_ID loaded from %s", CREDS_FILE)
-    if tok_file and tok_file != tok_env:
+        if cid_file != cid_env:
+            log.info("DHAN_CLIENT_ID loaded from %s (overwrote env)", CREDS_FILE)
+    if tok_file:
         os.environ["DHAN_ACCESS_TOKEN"] = tok_file
-        updated = True
-        log.info("DHAN_ACCESS_TOKEN loaded from %s", CREDS_FILE)
+        if tok_file != tok_env:
+            log.info("DHAN_ACCESS_TOKEN loaded from %s (overwrote env)", CREDS_FILE)
     cid_final = os.getenv("DHAN_CLIENT_ID", "").strip()
     tok_final = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
     if not cid_final or not tok_final:
         log.warning("DHAN credentials not found in env or %s; agent will fail to authenticate.", CREDS_FILE)
-    elif not updated:
-        log.info("DHAN credentials already present in environment.")
 
 
 def _load_agent_settings() -> Dict[str, Any]:

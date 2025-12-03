@@ -1,8 +1,9 @@
 # market_ai/modules/data_fetch/dhan_option_chain.py
 from __future__ import annotations
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from datetime import date, datetime
 import logging, time
+import requests
 
 from market_ai.modules.data_fetch.dhan_api import (
     SimpleDhanClient,
@@ -43,6 +44,77 @@ def _normalize(oc: Any) -> Dict[str, Any]:
                 continue
         return out
     return {}
+
+
+class RateLimitedOptionChain:
+    """
+    Lightweight shared client that respects Dhan's 1 call / 3s limit for /v2/optionchain.
+    Caches recent responses per (UnderlyingScrip, Expiry) for min_interval_sec.
+    """
+
+    def __init__(self, base_url: str, client_id: str, access_token: str):
+        self.base_url = base_url.rstrip("/")
+        self.client_id = client_id
+        self.access_token = access_token
+        self.min_interval_sec: float = 3.0  # as confirmed by Dhan support
+        # (UnderlyingScrip, Expiry) -> (last_ts, response)
+        self._cache: Dict[Tuple[int, str], Tuple[float, dict]] = {}
+        self._last_global_call_ts: float = 0.0
+        self.log = LOG
+
+    def _headers(self) -> dict:
+        return {
+            "access-token": self.access_token,
+            "client-id": self.client_id,
+            "Content-Type": "application/json",
+        }
+
+    def get_option_chain(self, underlying_scrip: int, expiry: str, underlying_seg: str = "IDX_I") -> dict:
+        key = (underlying_scrip, expiry)
+        now = time.monotonic()
+
+        # Return cached value if fresh
+        if key in self._cache:
+            ts, data = self._cache[key]
+            if now - ts < self.min_interval_sec:
+                self.log.debug("OC cache hit for %s exp=%s", underlying_scrip, expiry)
+                return data
+
+        # Enforce global min interval between real calls
+        elapsed = now - self._last_global_call_ts
+        if elapsed < self.min_interval_sec:
+            # If we have cache, use it; else wait remaining
+            if key in self._cache:
+                ts, data = self._cache[key]
+                self.log.debug("OC cache (global throttle) for %s exp=%s", underlying_scrip, expiry)
+                return data
+            sleep_s = self.min_interval_sec - elapsed
+            self.log.debug("OC throttling %.2fs before real call", sleep_s)
+            time.sleep(max(0, sleep_s))
+
+        url = f"{self.base_url}/v2/optionchain"
+        payload = {
+            "UnderlyingScrip": underlying_scrip,
+            "UnderlyingSeg": underlying_seg,
+            "Expiry": expiry,
+        }
+
+        def _do_call() -> requests.Response:
+            return requests.post(url, headers=self._headers(), json=payload, timeout=5)
+
+        resp = _do_call()
+        if resp.status_code == 429:
+            self.log.warning("OC 429 received; sleeping %.1fs and retrying once", self.min_interval_sec)
+            time.sleep(self.min_interval_sec)
+            resp = _do_call()
+        resp.raise_for_status()
+
+        data = resp.json()
+        now = time.monotonic()
+        self._last_global_call_ts = now
+        self._cache[key] = (now, data)
+        self.log.debug("OC fetched fresh for %s exp=%s", underlying_scrip, expiry)
+        return data
 
 class OptionChain:
     """LIVE OC via DHAN (for *current/future* expiries). Not suitable for history."""
@@ -113,3 +185,78 @@ def _pick_first_future(expiries: List[str]) -> Optional[str]:
             continue
     if not fut: return None
     return sorted(fut)[0].isoformat()
+
+# ---------- Parsing helpers ----------
+
+def _num(val) -> Optional[float]:
+    try:
+        return float(val)
+    except Exception:
+        return None
+
+def _first(*vals):
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+def parse_option_chain_rows(oc_resp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Flatten the Dhan optionchain response into a list of rows (one per CE/PE per strike).
+
+    Expected shapes we have seen:
+      {"data": {
+          "last_price": 24964.25,
+          "oc": {
+              "25000.000000": {"ce": {...}, "pe": {...}},
+              ...
+          }
+       }, "status": "success"}
+
+    Returns list of dicts with keys:
+      strike, option_type, last_price, oi, volume, implied_volatility,
+      delta, theta, gamma, vega, raw
+    """
+    if not isinstance(oc_resp, dict):
+        return []
+
+    data = oc_resp.get("data") or oc_resp
+    oc = data.get("oc") if isinstance(data, dict) else None
+    if not isinstance(oc, dict):
+        # fall back: maybe response IS the oc dict already
+        if isinstance(oc_resp.get("oc"), dict):
+            oc = oc_resp["oc"]
+        else:
+            return []
+
+    rows: List[Dict[str, Any]] = []
+
+    for strike_key, node in oc.items():
+        strike_f = None
+        try:
+            strike_f = float(str(strike_key))
+        except Exception:
+            continue
+        for opt_field, opt_type in (("ce", "CE"), ("pe", "PE")):
+            leg = node.get(opt_field) or {}
+            greeks = leg.get("greeks") or leg.get("Greeks") or {}
+            row = {
+                "strike": strike_f,
+                "option_type": opt_type,
+                "last_price": _num(_first(
+                    leg.get("last_price"), leg.get("lastPrice"),
+                    leg.get("ltp"), leg.get("LTP"),
+                )),
+                "oi": _num(leg.get("oi") or leg.get("open_interest")),
+                "volume": _num(leg.get("volume")),
+                "implied_volatility": _num(_first(
+                    leg.get("implied_volatility"), leg.get("impliedVolatility"), leg.get("iv"),
+                )),
+                "delta": _num(_first(greeks.get("delta"), leg.get("delta"))),
+                "theta": _num(greeks.get("theta")),
+                "gamma": _num(greeks.get("gamma")),
+                "vega": _num(greeks.get("vega")),
+                "raw": leg,
+            }
+            rows.append(row)
+    return rows

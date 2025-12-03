@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 import requests
 from pathlib import Path
 from dataclasses import dataclass
@@ -17,7 +18,13 @@ from datetime import datetime, date as dt_date, time as dtime
 from enum import Enum
 import re
 import importlib.util
+import json
+import logging
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+# Shared singleton & locks for rate-limited option chain access
+_SHARED_WRAPPER: Optional["DhanWrapper"] = None
+_SHARED_WRAPPER_LOCK = threading.Lock()
 
 try:
     from zoneinfo import ZoneInfo  # py3.9+
@@ -175,6 +182,11 @@ class DhanWrapper:
       - Live positions with multiple fallbacks
       - Simple background LTP poller
     """
+
+    # Shared throttle across all instances (UI + agent). Dhan allows 1 OC call / 3s.
+    _GLOBAL_CHAIN_LOCK = threading.Lock()
+    _GLOBAL_LAST_CHAIN_TS: float = 0.0
+    _GLOBAL_CHAIN_COOLDOWN_UNTIL: Optional[float] = None
 
     @staticmethod
     def _normalize_expiry_value(expiry: Any) -> Optional[str]:
@@ -358,6 +370,34 @@ class DhanWrapper:
         """
         return self.get_positions_live()
 
+    def _load_creds_from_state(self) -> None:
+        """
+        Ensure env creds align with state/creds.json (used by Streamlit UI).
+        Helps when code is run outside start_agent.
+        """
+        # state directory lives at data_engine/market_ai/state
+        state_dir = Path(__file__).resolve().parent / "state"
+        creds_file = state_dir / "creds.json"
+        if not creds_file.exists():
+            return
+        try:
+            data = json.loads(creds_file.read_text())
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        cid = str(data.get("client_id") or "").strip()
+        tok = str(data.get("access_token") or "").strip()
+        updated = False
+        if cid and os.getenv("DHAN_CLIENT_ID", "").strip() != cid:
+            os.environ["DHAN_CLIENT_ID"] = cid
+            updated = True
+        if tok and os.getenv("DHAN_ACCESS_TOKEN", "").strip() != tok:
+            os.environ["DHAN_ACCESS_TOKEN"] = tok
+            updated = True
+        if updated:
+            logging.getLogger("dhan_wrapper").info("Loaded DHAN creds from state/creds.json")
+
     def __init__(
         self,
         dhan_client_id: Optional[str] = None,
@@ -366,6 +406,8 @@ class DhanWrapper:
         http_pool: Optional[dict] = None,
         disable_ssl: bool = False,
     ):
+        # Align env with UI-saved creds before reading
+        self._load_creds_from_state()
         self.client_id: str = (dhan_client_id or os.getenv("DHAN_CLIENT_ID", "")).strip()
         self.access_token: str = (access_token or os.getenv("DHAN_ACCESS_TOKEN", "")).strip()
         if not self.client_id or not self.access_token:
@@ -384,6 +426,11 @@ class DhanWrapper:
         self.endpoints: DhanEndpoints = DhanEndpoints()
         self._sdk_context = _SDKContext(self.http)
         self._historical = HistoricalData(self._sdk_context)
+        # Simple in-memory throttling/cache for option-chain to avoid 429
+        self._last_chain_ts: Optional[float] = None
+        self._last_chain_key: Optional[str] = None
+        self._last_chain_resp: Optional[Dict[str, Any]] = None
+        self._chain_cooldown_until: Optional[float] = None
 
         # poller state
         self._stop: threading.Event = threading.Event()
@@ -561,6 +608,51 @@ class DhanWrapper:
         expiry_str = self._normalize_expiry_value(expiry)
         if not expiry_str:
             raise ValueError("expiry is required for get_option_chain")
+
+        key = f"{underlying_security_id}:{underlying_seg}:{expiry_str}"
+        now = time.time()
+
+        # Global/shared throttle: Dhan allows 1 request / 3 seconds.
+        with self._GLOBAL_CHAIN_LOCK:
+            last_ts = max(
+                self._GLOBAL_LAST_CHAIN_TS or 0.0,
+                self._last_chain_ts or 0.0,
+            )
+            cooldown_until = (
+                self._GLOBAL_CHAIN_COOLDOWN_UNTIL
+                if self._GLOBAL_CHAIN_COOLDOWN_UNTIL is not None
+                else self._chain_cooldown_until
+            )
+
+            # If we recently hit 429, honor cooldown for all instances
+            if cooldown_until and now < cooldown_until:
+                wait_for = cooldown_until - now
+                self.log.warning(
+                    "[option_chain] cooling down after 429; wait %.1fs",
+                    wait_for,
+                )
+                time.sleep(max(0, wait_for))
+                now = time.time()
+
+            # Throttle to 1 call / 3s globally
+            if last_ts and now - last_ts < 3.0:
+                wait_for = 3.0 - (now - last_ts)
+                self.log.debug(
+                    "[option_chain] throttling for %.2fs to respect global 1/3s limit",
+                    wait_for,
+                )
+                time.sleep(wait_for)
+                now = time.time()
+
+        # throttle: reuse recent response for same expiry
+        if (
+            self._last_chain_resp is not None
+            and self._last_chain_key == key
+            and self._last_chain_ts is not None
+            and now - self._last_chain_ts < 3.0
+        ):
+            return self._last_chain_resp
+
         segs = []
         # Primary guess for NIFTY index
         if underlying_seg and underlying_seg.upper().startswith("NSE"):
@@ -569,24 +661,57 @@ class DhanWrapper:
         # Legacy fallback
         segs.append("NSE_FNO")
         seen = set()
+
+        def _try_fetch(seg: str) -> Optional[Dict[str, Any]]:
+            try:
+                resp = oc.option_chain(underlying_security_id, seg, expiry_str)
+            except Exception as exc:
+                self.log.warning(f"[option_chain] fetch failed seg={seg}: {exc}")
+                return None
+            if isinstance(resp, dict):
+                status = resp.get("status")
+                data = resp.get("data")
+                # Explicit 429 handling
+                if status == "failed" and isinstance(data, dict) and "805" in data:
+                    self.log.warning("[option_chain] 429 rate limit hit; backing off 90s")
+                    cooldown = time.time() + 90.0
+                    self._chain_cooldown_until = cooldown
+                    with self._GLOBAL_CHAIN_LOCK:
+                        self._GLOBAL_CHAIN_COOLDOWN_UNTIL = cooldown
+                    return None
+                if status == "success" or data:
+                    return resp
+            elif resp:
+                return resp
+            return None
+
+        resp: Optional[Dict[str, Any]] = None
         for seg in segs:
             if not seg or seg in seen:
                 continue
             seen.add(seg)
-            try:
-                resp = oc.option_chain(underlying_security_id, seg, expiry_str)
-                if isinstance(resp, dict):
-                    status = resp.get("status")
-                    data = resp.get("data")
-                    # Accept success or non-empty data
-                    if status == "success" or data:
-                        return resp
-                else:
-                    return resp
-            except Exception:
-                continue
-        # If all attempts fail, return empty dict
-        return {}
+            for attempt in range(3):
+                resp = _try_fetch(seg)
+                if resp is not None:
+                    break
+                # backoff to avoid 429
+                time.sleep(1.5)
+            if resp is not None:
+                break
+
+        if resp is None:
+            return {}
+
+        # cache successful fetch
+        ts_now = time.time()
+        self._last_chain_resp = resp
+        self._last_chain_ts = ts_now
+        # update shared markers
+        with self._GLOBAL_CHAIN_LOCK:
+            self._GLOBAL_LAST_CHAIN_TS = ts_now
+            self._GLOBAL_CHAIN_COOLDOWN_UNTIL = None
+        self._last_chain_key = key
+        return resp
 
     def get_intraday_candles(
         self,
@@ -1132,3 +1257,17 @@ class DhanWrapper:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
         self._thread = None
+
+
+def get_shared_dhan_wrapper() -> "DhanWrapper":
+    """
+    Return a process-wide shared DhanWrapper so that option-chain throttling
+    (1 call / 3s) is respected across agent + UI callers.
+    """
+    global _SHARED_WRAPPER
+    if _SHARED_WRAPPER is not None:
+        return _SHARED_WRAPPER
+    with _SHARED_WRAPPER_LOCK:
+        if _SHARED_WRAPPER is None:
+            _SHARED_WRAPPER = DhanWrapper()
+    return _SHARED_WRAPPER

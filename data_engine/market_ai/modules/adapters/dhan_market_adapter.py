@@ -34,6 +34,8 @@ try:
 except Exception as exc:  # pragma: no cover - import wiring issue
     raise ImportError("market_ai.modules.data_fetch.dhan_option_chain missing") from exc
 
+_RateLimitedOC = getattr(_doc, "RateLimitedOptionChain", None)
+
 for _cand in ("OptionChain", "OptionChainAdapter", "DhanOptionChainAdapter", "DhanOptionChain"):
     if hasattr(_doc, _cand):
         _OptionChainCls = getattr(_doc, _cand)
@@ -57,6 +59,21 @@ class DhanMarketAdapter:
         self.cfg = config
         # Optional: instantiate option-chain facade if available
         self._chain = _OptionChainCls(config) if _OptionChainCls else None
+        # Shared rate-limited OC client (respects 1 call / 3s)
+        self._oc_client = None
+        if _RateLimitedOC:
+            base_url = (
+                config.get("broker", {}).get("base_url")
+                or config.get("dhan", {}).get("base_url")
+                or "https://api.dhan.co"
+            )
+            cid = config.get("broker", {}).get("client_id") or config.get("dhan", {}).get("client_id") or ""
+            tok = config.get("broker", {}).get("access_token") or config.get("dhan", {}).get("access_token") or ""
+            if cid and tok:
+                try:
+                    self._oc_client = _RateLimitedOC(base_url=base_url, client_id=cid, access_token=tok)
+                except Exception:
+                    self._oc_client = None
         # Basic caches to make synthetic OHLC look smoother within a session
         self._last_spot: Dict[str, float] = {}
 
