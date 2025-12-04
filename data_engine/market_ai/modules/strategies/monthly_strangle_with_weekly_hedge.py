@@ -334,6 +334,36 @@ def _record_order_audit(entry: Dict[str, Any]) -> None:
         LOG.debug("[audit] failed to append order audit entry")
 
 
+def _extract_delta(leg: Any) -> Optional[float]:
+    """Best-effort delta extraction from an option leg payload."""
+    if not isinstance(leg, dict):
+        return None
+    for key in ("delta", "Delta"):
+        if key in leg:
+            val = _safe_float(leg.get(key), None)
+            if val is not None:
+                return val
+    greeks = leg.get("greeks") or leg.get("Greeks") or {}
+    if isinstance(greeks, dict):
+        val = _safe_float(greeks.get("delta"), None)
+        if val is not None:
+            return val
+    return None
+
+
+def _estimate_pop_from_deltas(call_delta: Optional[float], put_delta: Optional[float]) -> Optional[float]:
+    """
+    Rough POP proxy from short-leg deltas: 1 - (|Δcall| + |Δput|).
+    Capped to [0, 1] and expressed as percent.
+    """
+    deltas = [d for d in (call_delta, put_delta) if d is not None]
+    if not deltas:
+        return None
+    pop_raw = 1.0 - sum(abs(d) for d in deltas)
+    pop_raw = max(0.0, min(1.0, pop_raw))
+    return pop_raw * 100.0
+
+
 def _enqueue_order_intent(intent: Dict[str, Any]) -> None:
     try:
         ORDER_INTENT_QUEUE.parent.mkdir(parents=True, exist_ok=True)
@@ -1149,7 +1179,7 @@ def _extract_leg_from_chain_sources(
     opt_type: str,
     symbol: str,
     expiry: str,
-) -> Optional[Tuple[int, Optional[float]]]:
+) -> Optional[Tuple[int, Optional[float], Dict[str, Any]]]:
     if not chain_sources:
         return None
 
@@ -1183,7 +1213,7 @@ def _extract_leg_from_chain_sources(
             return _safe_float(key_hint, None)
         return None
 
-    def _maybe_leg(entry: Any, key_hint: Optional[Any]) -> Optional[Tuple[int, Optional[float]]]:
+    def _maybe_leg(entry: Any, key_hint: Optional[Any]) -> Optional[Tuple[int, Optional[float], Dict[str, Any]]]:
         if not isinstance(entry, dict):
             return None
 
@@ -1222,7 +1252,7 @@ def _extract_leg_from_chain_sources(
         price_val = _extract_price(leg_dict)
         if price_val is None:
             price_val = _extract_price(parent_dict)
-        return int(sec_id), price_val
+        return int(sec_id), price_val, leg_dict or parent_dict
 
     str_keys = set()
     str_int = str(int(round(strike_val)))
@@ -2814,6 +2844,15 @@ def _roll_short_leg(
             new_row.get("strike"),
             qty,
         )
+        prev_delta = _extract_delta(row)
+        new_delta = _extract_delta(new_row)
+        if prev_delta is not None or new_delta is not None:
+            prev_txt = f"{prev_delta:.2f}" if prev_delta is not None else "—"
+            new_txt = f"{new_delta:.2f}" if new_delta is not None else "—"
+            delta_note = f"; Δ {prev_txt}->{new_txt}"
+        else:
+            delta_note = ""
+        rationale_txt = f"Rolled {opt_type} from {prev_strike} to {new_row.get('strike')} due to {reason}{delta_note}"
         _record_activity_event(
             cfg,
             "roll_execute",
@@ -2825,6 +2864,9 @@ def _roll_short_leg(
                 "prev_strike": prev_strike,
                 "new_strike": new_row.get("strike"),
                 "qty": qty,
+                "prev_delta": prev_delta,
+                "new_delta": new_delta,
+                "rationale": rationale_txt,
             },
         )
         risk_mgr = _get_risk_manager(cfg)
@@ -3502,7 +3544,7 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
     data = _coerce_dict(oc_dict.get("data")) or oc_dict
     chain_sources = _collect_option_chain_sources(data)
 
-    def _find_by_strike(strike: int, typ: str) -> Optional[Tuple[int, Optional[float]]]:
+    def _find_by_strike(strike: int, typ: str) -> Optional[Tuple[int, Optional[float], Dict[str, Any]]]:
         def _fallback_leg_lookup() -> Optional[Tuple[int, Optional[float]]]:
             sec_id = _resolve_security_id_with_refresh(NIFTY_SYMBOL, expiry, strike, typ)
             if sec_id is None:
@@ -3558,10 +3600,11 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
                 if row_dict.get(key) is not None:
                     price_val = _safe_float(row_dict.get(key), None)
                     break
-            return sec_id, price_val
+            return sec_id, price_val, {}
         fallback = _fallback_leg_lookup()
         if fallback:
-            return fallback
+            sec_fallback, price_fallback = fallback
+            return sec_fallback, price_fallback, {}
         return None
 
     pe_info = _find_by_strike(pe_strike, "PUT")
@@ -3594,8 +3637,11 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
         }
         return
 
-    pe_id, pe_price = pe_info
-    ce_id, ce_price = ce_info
+    pe_id, pe_price, pe_leg = pe_info
+    ce_id, ce_price, ce_leg = ce_info
+
+    pe_delta = _extract_delta(pe_leg)
+    ce_delta = _extract_delta(ce_leg)
 
     # Guard: live chain should not return zero; if it does, skip and log
     if pe_price is None or pe_price <= 0 or ce_price is None or ce_price <= 0:
@@ -3630,6 +3676,15 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
         return
     entry_credit = cfg.lot_size * ((pe_price or 0.0) + (ce_price or 0.0))
     notional = cfg.lot_size * nifty_spot * 2.0
+    cushion_pct = None
+    if nifty_spot and nifty_spot > 0:
+        try:
+            lower_gap = (nifty_spot - pe_strike) / nifty_spot
+            upper_gap = (ce_strike - nifty_spot) / nifty_spot
+            cushion_pct = min(lower_gap, upper_gap) * 100.0
+        except Exception:
+            cushion_pct = None
+    pop_pct = _estimate_pop_from_deltas(ce_delta, pe_delta)
     if risk_mgr:
         if not risk_mgr.allow_trade():
             reason = getattr(risk_mgr, "last_block_reason", None) or "risk_block"
@@ -3700,7 +3755,7 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
             hedge_price = None
             lookup = _find_by_strike(hedge[1], "PUT")
             if lookup:
-                _, hedge_price = lookup
+                _, hedge_price, _ = lookup
             _submit_order(
                 dw,
                 cfg,
@@ -3724,7 +3779,7 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
             hedge_price = None
             lookup = _find_by_strike(hedge[1], "CALL")
             if lookup:
-                _, hedge_price = lookup
+                _, hedge_price, _ = lookup
             _submit_order(
                 dw,
                 cfg,
@@ -3743,12 +3798,30 @@ def _place_strangle_and_hedge(dw, cfg: LiveConfig, nifty_spot: float) -> None:
                 severity="info",
                 context={"structure": "strangle", "leg": "CALL", "qty": qty},
             )
+        summary_bits = []
+        if cushion_pct is not None:
+            summary_bits.append(f"~{cushion_pct:.2f}% cushion to wings")
+        if pop_pct is not None:
+            summary_bits.append(f"POP≈{pop_pct:.1f}% (delta proxy)")
+        if ce_delta is not None or pe_delta is not None:
+            ce_txt = f"{ce_delta:.2f}" if ce_delta is not None else "—"
+            pe_txt = f"{pe_delta:.2f}" if pe_delta is not None else "—"
+            summary_bits.append(f"ΔC {ce_txt} / ΔP {pe_txt}")
+        summary = "; ".join([s for s in summary_bits if s])
         _record_activity_event(
             cfg,
             "entry",
-            f"Opened strangle CE {ce_strike} / PE {pe_strike}",
+            f"Opened strangle CE {ce_strike} / PE {pe_strike}" + (f" ({summary})" if summary else ""),
             severity="info",
-            context={"credit": entry_credit, "spot": nifty_spot},
+            context={
+                "credit": entry_credit,
+                "spot": nifty_spot,
+                "ce_delta": ce_delta,
+                "pe_delta": pe_delta,
+                "cushion_pct": cushion_pct,
+                "pop_pct": pop_pct,
+                "rationale": "Picked balanced strikes around spot for symmetric risk; aim to capture premium with defined cushion.",
+            },
         )
     cfg._last_block_reason = None
     cfg._last_block_timestamp = None

@@ -753,6 +753,27 @@ class DhanWrapper:
                 if key in data:
                     data = data[key]
                     break
+        if isinstance(data, dict) and {"open", "high", "low", "close"}.issubset(data.keys()):
+            opens = data.get("open", [])
+            highs = data.get("high", [])
+            lows = data.get("low", [])
+            closes = data.get("close", [])
+            vols = data.get("volume", [])
+            ts = data.get("timestamp", [])
+            temp: List[Dict[str, Any]] = []
+            length = min(len(opens), len(highs), len(lows), len(closes))
+            for i in range(length):
+                temp.append(
+                    {
+                        "timestamp": self._parse_timestamp(ts[i]) if i < len(ts) else None,
+                        "open": opens[i],
+                        "high": highs[i],
+                        "low": lows[i],
+                        "close": closes[i],
+                        "volume": vols[i] if i < len(vols) else 0.0,
+                    }
+                )
+            data = temp
         if not isinstance(data, list):
             return []
 
@@ -828,6 +849,27 @@ class DhanWrapper:
                 if key in data:
                     data = data[key]
                     break
+        if isinstance(data, dict) and {"open", "high", "low", "close"}.issubset(data.keys()):
+            opens = data.get("open", [])
+            highs = data.get("high", [])
+            lows = data.get("low", [])
+            closes = data.get("close", [])
+            vols = data.get("volume", [])
+            ts = data.get("timestamp", [])
+            temp_list: List[Dict[str, Any]] = []
+            length = min(len(opens), len(highs), len(lows), len(closes))
+            for i in range(length):
+                temp_list.append(
+                    {
+                        "timestamp": self._parse_timestamp(ts[i]) if i < len(ts) else None,
+                        "open": opens[i],
+                        "high": highs[i],
+                        "low": lows[i],
+                        "close": closes[i],
+                        "volume": vols[i] if i < len(vols) else 0.0,
+                    }
+                )
+            data = temp_list
         if not isinstance(data, list):
             return []
 

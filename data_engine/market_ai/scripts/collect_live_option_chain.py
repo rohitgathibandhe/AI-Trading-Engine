@@ -2,12 +2,60 @@
 """Collect live option chain snapshots and store them locally."""
 from __future__ import annotations
 
-import argparse
-import json
 import os
+import json
+from pathlib import Path
+
+# --- Auto-load DHAN creds from state/creds.json (prefer file) ---
+SCRIPT_DIR = Path(__file__).resolve().parent          # .../data_engine/market_ai/scripts
+MARKET_AI_DIR = SCRIPT_DIR.parent                     # .../data_engine/market_ai
+REPO_ROOT = MARKET_AI_DIR.parent                      # .../AI-Trading-Engine (repo root)
+
+# Try both market_ai/state/creds.json (default) and repo-level state/creds.json (fallback)
+_CRED_PATHS = [
+    MARKET_AI_DIR / "state" / "creds.json",
+    REPO_ROOT / "state" / "creds.json",
+]
+
+cid_env = os.environ.get("DHAN_CLIENT_ID", "").strip()
+tok_env = os.environ.get("DHAN_ACCESS_TOKEN", "").strip()
+
+loaded = False
+for _path in _CRED_PATHS:
+    if _path.exists():
+        try:
+            creds = json.loads(_path.read_text())
+            cid = str(creds.get("client_id", "")).strip()
+            tok = str(creds.get("access_token", "")).strip()
+            if cid and tok:
+                os.environ["DHAN_CLIENT_ID"] = cid
+                os.environ["DHAN_ACCESS_TOKEN"] = tok
+                print(
+                    f"[collect_live_option_chain] Loaded DHAN creds from {_path} "
+                    f"(client_id={cid}, token_prefix={tok[:8]})"
+                )
+                loaded = True
+                break
+            else:
+                print(
+                    f"[collect_live_option_chain] WARNING: creds.json at {_path} "
+                    f"missing client_id or access_token"
+                )
+        except Exception as e:
+            print(f"[collect_live_option_chain] WARNING: Failed to load creds from {_path}: {e}")
+
+if not loaded:
+    if cid_env and tok_env:
+        print(
+            "[collect_live_option_chain] Using DHAN creds from environment "
+            f"(client_id={cid_env}, token_prefix={tok_env[:8]})"
+        )
+    else:
+        print("[collect_live_option_chain] WARNING: No DHAN creds found in files or environment.")
+
+import argparse
 import sys
 from datetime import datetime
-from pathlib import Path
 
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]

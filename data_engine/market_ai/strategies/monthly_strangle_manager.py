@@ -35,8 +35,9 @@ class EntryFilters:
     monthly_range_band: Tuple[float, float] = (0.3, 0.7)
     vix_min: float = 12.0
     vix_rising_ok: bool = True
-    entry_window_start: time = time(9, 20)
-    entry_window_end: time = time(10, 30)
+    entry_window_start: time = time(9, 30)
+    entry_window_end: time = time(13, 0)
+    enforce_in_paper: bool = False
     cycle_day_min: int = 1
     cycle_day_max: int = 7
     allow_early_next_cycle: bool = True
@@ -94,7 +95,9 @@ class MonthlyStrangleConfig:
 # --------------------------------------------------------------------------- #
 
 
-def _in_entry_window(now: datetime, cfg: EntryFilters) -> bool:
+def _in_entry_window(now: datetime, cfg: EntryFilters, trade_mode: str = "live") -> bool:
+    if trade_mode == "paper" and not cfg.enforce_in_paper:
+        return True
     return cfg.entry_window_start <= now.time() <= cfg.entry_window_end
 
 
@@ -120,8 +123,9 @@ def _passes_filters(
     vix: float,
     vix_rising: bool,
     cfg: EntryFilters,
+    trade_mode: str = "live",
 ) -> bool:
-    if not _in_entry_window(now, cfg):
+    if not _in_entry_window(now, cfg, trade_mode):
         return False
     if not _within_cycle_day(entry_date, expiry, cfg):
         return False
@@ -159,6 +163,21 @@ def pick_strikes_from_chain(
     { 'strike', 'option_type', 'delta', 'ltp', 'expiry', 'security_id' }
     Returns (ce_short, pe_short) dicts or (None, None) if not found.
     """
+    def _ltp_ok(row: dict) -> bool:
+        """Guard to ensure leg has a positive LTP before selection."""
+        try:
+            val = row.get("ltp", 0.0)
+            val = 0.0 if val is None else float(val)
+            return val > 0.0
+        except Exception:
+            return False
+
+    def _strike_val(row: dict) -> Optional[float]:
+        try:
+            return float(row.get("strike"))
+        except Exception:
+            return None
+
     ce = None
     pe = None
 
@@ -172,20 +191,6 @@ def pick_strikes_from_chain(
             if _ltp_ok(row):
                 pe = row
                 break
-
-    def _ltp_ok(row: dict) -> bool:
-        try:
-            val = row.get("ltp", 0.0)
-            val = 0.0 if val is None else float(val)
-            return val > 0.0
-        except Exception:
-            return False
-
-    def _strike_val(row: dict) -> Optional[float]:
-        try:
-            return float(row.get("strike"))
-        except Exception:
-            return None
 
     # Fallback: distance-based selection when greeks are missing
     if ce is None:
@@ -250,12 +255,25 @@ def propose_entry(
     expiry: date,
     lot_size: int,
     cfg: MonthlyStrangleConfig,
+    trade_mode: str = "live",
 ) -> TradeAction:
     """
     Decide whether to open a new monthly strangle.
     Returns a TradeAction OPEN with 4 legs, or HOLD with reason.
     """
-    if not _passes_filters(now, now.date(), expiry, adx, max_body_pct, gap_pct, monthly_range_frac, vix, vix_rising, cfg.entry):
+    if not _passes_filters(
+        now,
+        now.date(),
+        expiry,
+        adx,
+        max_body_pct,
+        gap_pct,
+        monthly_range_frac,
+        vix,
+        vix_rising,
+        cfg.entry,
+        trade_mode=trade_mode,
+    ):
         return TradeAction("HOLD", StrategyType.STRANGLE, [], [], "Entry filters not satisfied")
 
     ce_row, pe_row = pick_strikes_from_chain(option_chain, cfg.strikes.short_delta_band, spot)

@@ -24,6 +24,10 @@ from datetime import datetime, timedelta, time as datetime_time
 from typing import Iterable
 from typing import Optional, Dict, Any, Tuple, List
 from queue import Queue, Empty
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover
+    psutil = None
 
 # --- Bootstrap PYTHONPATH for VS Code/Streamlit launches ---
 _ROOT = Path(__file__).resolve().parents[3]  # repo root
@@ -126,6 +130,7 @@ ACTION_STATUS_FILE = STATE_DIR / "manual_action_status.json"
 PLAYBOOK_HISTORY_FILE = STATE_DIR / "playbook_history.jsonl"
 ROLLING_SUMMARY_FILE = STATE_DIR / "rolling_option_summary.json"
 SELECTOR_SUMMARY_FILE = STATE_DIR / "strategy_selector_training_summary.json"
+ENTRY_STATUS_FILE = STATE_DIR / "entry_criteria_status.json"
 BROADER_STATE_DIR = ROOT / "state"
 BROADER_STATE_DIR.mkdir(parents=True, exist_ok=True)
 WEEKLY_PLAN_FILE = BROADER_STATE_DIR / "weekly_plan.json"
@@ -204,6 +209,18 @@ DEFAULT_SETTINGS = {
         "hedge_on_delta": True,
         "flatten_on_delta": False,
         "flatten_on_exposure": False,
+    },
+    "monthly_filters": {
+        "use_adx": True,
+        "adx_length": 14,
+        "adx_max": 25.0,
+        "use_gap": True,
+        "max_gap_pct": 0.8,
+        "use_range_band": True,
+        "range_band_min": 0.3,
+        "range_band_max": 0.7,
+        "use_vix": False,
+        "min_vix": 12.0,
     },
 }
 
@@ -331,6 +348,10 @@ def _load_settings() -> Dict[str, Any]:
         if legacy in data and new not in data:
             data[new] = data[legacy]
     merged = {**DEFAULT_SETTINGS, **data}
+    # ensure nested monthly_filters exist and merge defaults
+    mf_default = DEFAULT_SETTINGS.get("monthly_filters", {})
+    mf_data = data.get("monthly_filters", {}) if isinstance(data, dict) else {}
+    merged["monthly_filters"] = {**mf_default, **(mf_data or {})}
     # ensure types
     merged["max_legs"] = int(merged.get("max_legs", DEFAULT_SETTINGS["max_legs"]))
     merged["lot_size"] = int(merged.get("lot_size", DEFAULT_SETTINGS["lot_size"]))
@@ -386,6 +407,7 @@ def _load_settings() -> Dict[str, Any]:
     return merged
 
 
+@st.cache_data(show_spinner=False, ttl=5)
 def _load_blotter() -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
     df: Optional[pd.DataFrame] = None
     summary: Dict[str, Any] = {}
@@ -427,6 +449,7 @@ def _reset_paper_blotter() -> None:
             pass
 
 
+@st.cache_data(show_spinner=False, ttl=5)
 def _load_feature_history(limit: int = 200) -> Optional[pd.DataFrame]:
     if not FEATURE_LOG_CSV.exists():
         return None
@@ -445,6 +468,7 @@ def _load_feature_history(limit: int = 200) -> Optional[pd.DataFrame]:
     return df.reset_index(drop=True)
 
 
+@st.cache_data(show_spinner=False, ttl=5)
 def _load_equity_history(limit: Optional[int] = None) -> Optional[pd.DataFrame]:
     if not EQUITY_LOG_CSV.exists():
         return None
@@ -486,6 +510,7 @@ def _load_equity_history(limit: Optional[int] = None) -> Optional[pd.DataFrame]:
     return df.reset_index(drop=True)
 
 
+@st.cache_data(show_spinner=False, ttl=30)
 def _load_rolling_summary() -> Dict[str, Any]:
     if not ROLLING_SUMMARY_FILE.exists():
         return {}
@@ -495,6 +520,7 @@ def _load_rolling_summary() -> Dict[str, Any]:
         return {}
 
 
+@st.cache_data(show_spinner=False, ttl=30)
 def _load_selector_summary() -> Dict[str, Any]:
     if not SELECTOR_SUMMARY_FILE.exists():
         return {}
@@ -803,6 +829,7 @@ def _render_risk_alerts(feature_df: Optional[pd.DataFrame]) -> None:
         )
 
 
+@st.cache_data(show_spinner=False, ttl=5)
 def _load_playbook_history(limit: int = 10) -> List[Dict[str, Any]]:
     if not PLAYBOOK_HISTORY_FILE.exists():
         return []
@@ -928,6 +955,39 @@ def _read_tail(path: Path, lines: int = 50) -> List[str]:
         return data[-lines:]
     except Exception:
         return []
+
+
+def _load_entry_status() -> Optional[Dict[str, Any]]:
+    if not ENTRY_STATUS_FILE.exists():
+        return None
+    try:
+        return json.loads(ENTRY_STATUS_FILE.read_text())
+    except Exception:
+        return None
+
+
+def _cpu_snapshot() -> Dict[str, Any]:
+    """
+    Lightweight CPU snapshot for Observability tab.
+    Uses psutil if available; otherwise falls back to loadavg.
+    """
+    system_pct = None
+    proc_pct = None
+    load1 = None
+    try:
+        if psutil:
+            system_pct = psutil.cpu_percent(interval=0.2)
+            proc_pct = psutil.Process().cpu_percent(interval=0.1)
+    except Exception:
+        system_pct = None
+        proc_pct = None
+    try:
+        if hasattr(os, "getloadavg"):
+            la = os.getloadavg()
+            load1 = la[0]
+    except Exception:
+        load1 = None
+    return {"system_pct": system_pct, "proc_pct": proc_pct, "load1": load1}
 
 
 def _clear_stale_pid_file() -> None:
@@ -2451,6 +2511,7 @@ ORDER_INTENT_QUEUE = STATE_DIR / "order_intents.jsonl"
 PLAYBOOK_STATUS_LOG = STATE_DIR / "playbook_status.jsonl"
 
 
+@st.cache_data(show_spinner=False, ttl=5)
 def _load_jsonl(path: Path, limit: int = 200) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
@@ -2573,6 +2634,18 @@ def _observability_tab() -> None:
         _render_selector_training_summary(selector_summary)
         st.divider()
 
+    # Lightweight CPU monitor to catch runaway Streamlit/requests loops
+    cpu = _cpu_snapshot()
+    cpu_cols = st.columns(3)
+    with cpu_cols[0]:
+        st.metric("CPU (system)", f"{cpu['system_pct']:.1f}%" if cpu.get("system_pct") is not None else "—")
+    with cpu_cols[1]:
+        st.metric("CPU (app proc)", f"{cpu['proc_pct']:.1f}%" if cpu.get("proc_pct") is not None else "—")
+    with cpu_cols[2]:
+        st.metric("Load avg (1m)", f"{cpu['load1']:.2f}" if cpu.get("load1") is not None else "—")
+    st.caption("High CPU here can mean overly frequent refresh or API retries; increase refresh interval if pegged.")
+    st.divider()
+
     pid = ss.get("agent_pid")
     running_flag = bool(ss.get("agent_running"))
     alive_flag = _pid_alive(pid)
@@ -2693,6 +2766,7 @@ def _observability_tab() -> None:
 def _settings_tab() -> None:
     st.markdown("### Settings")
     current = _load_settings()
+    filters = current.get("monthly_filters", DEFAULT_SETTINGS["monthly_filters"])
 
     # Global / index-level settings
     weekday_opts = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
@@ -2879,6 +2953,94 @@ def _settings_tab() -> None:
                 float(current.get("spread_short_delta_high", 0.32)),
             )
 
+    with st.expander("Monthly Strangle: entry filters"):
+        # ADX row
+        adx_cols = st.columns([1.2, 0.5, 0.5])
+        with adx_cols[0]:
+            use_adx = st.checkbox(
+                "Enable ADX filter",
+                value=bool(filters.get("use_adx", True)),
+                help="Skip entry when ADX is above the threshold.",
+            )
+        with adx_cols[1]:
+            adx_max = st.number_input(
+                "Max ADX",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(filters.get("adx_max", 25.0)),
+                step=1.0,
+            )
+        with adx_cols[2]:
+            adx_length = st.number_input(
+                "ADX length",
+                min_value=5,
+                max_value=50,
+                value=int(filters.get("adx_length", 14)),
+                step=1,
+            )
+
+        st.divider()
+        # Gap row
+        gap_cols = st.columns([1.2, 0.5])
+        with gap_cols[0]:
+            use_gap = st.checkbox(
+                "Enable gap filter",
+                value=bool(filters.get("use_gap", True)),
+                help="Skip entry on large opening gaps.",
+            )
+        with gap_cols[1]:
+            max_gap_pct = st.number_input(
+                "Max gap (%)",
+                min_value=0.0,
+                max_value=10.0,
+                value=float(filters.get("max_gap_pct", 0.8)),
+                step=0.1,
+            )
+
+        st.divider()
+        # Range row
+        range_cols = st.columns([1.2, 0.5, 0.5])
+        with range_cols[0]:
+            use_range_band = st.checkbox(
+                "Enable monthly range band filter",
+                value=bool(filters.get("use_range_band", True)),
+                help="Avoid entries near monthly extremes.",
+            )
+        with range_cols[1]:
+            range_band_min = st.slider(
+                "Range band min",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(filters.get("range_band_min", 0.3)),
+                step=0.05,
+            )
+        with range_cols[2]:
+            range_band_max = st.slider(
+                "Range band max",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(filters.get("range_band_max", 0.7)),
+                step=0.05,
+            )
+
+        st.divider()
+        # VIX row
+        vix_cols = st.columns([1.2, 0.5])
+        with vix_cols[0]:
+            use_vix = st.checkbox(
+                "Enable VIX filter",
+                value=bool(filters.get("use_vix", False)),
+                help="Require VIX (or proxy) to be at or above the threshold.",
+            )
+        with vix_cols[1]:
+            min_vix = st.number_input(
+                "Min VIX",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(filters.get("min_vix", 12.0)),
+                step=0.5,
+            )
+
     with st.expander("Weekly Theta Strangle: hedges & rolls"):
         hedge_enabled = st.checkbox(
             "Enable hedge monitor",
@@ -3040,6 +3202,18 @@ def _settings_tab() -> None:
             "batman_weekly_hedge_enabled": bool(bat_weekly_hedge_enabled),
             "batman_weekly_hedge_price_cap": float(bat_weekly_hedge_cap),
             "batman_weekly_hedge_min_distance": float(bat_weekly_hedge_min_dist),
+            "monthly_filters": {
+                "use_adx": bool(use_adx),
+                "adx_length": int(adx_length),
+                "adx_max": float(adx_max),
+                "use_gap": bool(use_gap),
+                "max_gap_pct": float(max_gap_pct),
+                "use_range_band": bool(use_range_band),
+                "range_band_min": float(range_band_min),
+                "range_band_max": float(range_band_max),
+                "use_vix": bool(use_vix),
+                "min_vix": float(min_vix),
+            },
         }, indent=2))
         st.success("Settings saved.")
     with st.expander("Auto Playbook"):
@@ -3066,224 +3240,106 @@ def _paper_pnl_tab() -> None:
     import pandas as pd
     df, summary = _load_blotter()
 
-    # Backtest block is aligned to the currently selected strategy
-    current_strategy_file = st.session_state.get("strategy_file", "")
-    strategy_label = {
-        "batman": "Batman",
-        "batman_v2_paper": "Batman V2 (paper)",
-        "weekly_theta_strangle.py": "Weekly Theta Strangle",
-        "monthly_strangle_with_weekly_hedge.py": "Monthly Strangle w/ Hedge",
-    }.get(current_strategy_file, "Selected Strategy")
+    status = _load_entry_status()
+    if status:
+        # Lazy import to avoid module resolution before sys.path bootstrap
+        from market_ai.strategies.monthly_strangle_manager import MonthlyStrangleConfig
+        st.markdown("#### Entry Criteria Status")
+        crit = status.get("criteria", {})
+        vals = status.get("values", {})
+        cfg = MonthlyStrangleConfig().entry
 
-    # Strategy-specific backtest panels
-    if current_strategy_file == "batman":
-        with st.expander(f"Run Backtest ({strategy_label})", expanded=False):
-            cols_dates = st.columns(2)
-            with cols_dates[0]:
-                start_date = st.date_input("Start date", key="bat_bt_start")
-            with cols_dates[1]:
-                end_date = st.date_input("End date", key="bat_bt_end")
-            btn_run, btn_reset = st.columns(2)
-            with btn_run:
-                if st.button("Run Batman Backtest"):
-                    env = os.environ.copy()
-                    env["DHAN_CLIENT_ID"] = st.session_state.get("client_id", "")
-                    env["DHAN_ACCESS_TOKEN"] = st.session_state.get("access_token", "")
-                    env["BACKTEST_START"] = start_date.isoformat() if start_date else ""
-                    env["BACKTEST_END"] = end_date.isoformat() if end_date else ""
-                    try:
-                        import subprocess
-                        out = subprocess.run(
-                            [PYTHON, str(ROOT / "data_engine/market_ai/scripts/run_batman_backtest_live.py")],
-                            cwd=str(ROOT),
-                            env=env,
-                            capture_output=True,
-                            text=True,
-                            timeout=600,
-                        )
-                        st.code(out.stdout + "\n" + out.stderr, language="log")
-                        st.success("Backtest complete. Check the table below.")
-                        st.session_state["bt_show_latest"] = True
-                    except Exception as exc:
-                        st.error(f"Backtest failed: {exc}")
-    elif current_strategy_file == "batman_v2_paper":
-        st.info("Backtest not yet wired for Batman V2 (paper). Use paper mode in the agent to test.")
-        with btn_reset:
-            if st.button("Reset Backtest View"):
-                for k in list(st.session_state.keys()):
-                    if k.startswith("bat_bt_") or k.startswith("bt_pb_") or k.startswith("bt_tf"):
-                        st.session_state.pop(k, None)
-                st.session_state.pop("bt_tf", None)
-                st.session_state["bt_show_latest"] = False
-                st.success("Backtest view reset. Run a new backtest to see results.")
+        def _flag(ok: bool) -> str:
+            return "✅ Condition satisfied" if ok else "❌ Condition not satisfied"
 
-        # Backtest results (collapsed with run controls)
-        show_latest = st.session_state.get("bt_show_latest", True)
-        from glob import glob
-        reports_dir = ROOT / "reports"
-        bt_files = sorted(glob(str(reports_dir / "batman_backtest_trades_*.csv")))
-        if bt_files and show_latest:
-            latest_bt = Path(bt_files[-1])
-            st.markdown(f"Latest backtest trades: `{latest_bt.name}`")
-            latest_pb = Path(pb_files[-1]) if pb_files else None
-            try:
-                import pandas as pd
-                bt_df = pd.read_csv(latest_bt, low_memory=False)
-                pb_df = pd.read_csv(latest_pb, low_memory=False) if latest_pb and latest_pb.exists() else pd.DataFrame()
-                if not bt_df.empty:
-                    st.markdown("#### Entries and Strikes")
-                    st.dataframe(bt_df, width="stretch")
-                    leg_cols = ["long_call", "short_call", "long_put", "short_put"]
-                    if all(c in bt_df.columns for c in leg_cols):
-                        settings = _load_settings()
-                        qty_long = settings.get("batman_qty_long", 1)
-                        qty_short = settings.get("batman_qty_short", 3)
-                        st.markdown("##### Legs by entry")
-                        legs_rows = []
-                        for _, r in bt_df.iterrows():
-                            legs_rows.append({
-                                "entry_time": r.get("entry_time"),
-                                "long_call": r.get("long_call"),
-                                "short_call": r.get("short_call"),
-                                "long_put": r.get("long_put"),
-                                "short_put": r.get("short_put"),
-                                "qty_long": qty_long,
-                                "qty_short": qty_short,
-                            })
-                        st.dataframe(pd.DataFrame(legs_rows), width="stretch")
-                    else:
-                        st.info("Strikes not available in file (expected columns: long_call, short_call, long_put, short_put).")
-                if not pb_df.empty:
-                    st.markdown("#### Playback timeframe")
-                    pb_df["timestamp"] = pd.to_datetime(pb_df["timestamp"], errors="coerce")
-                    pb_df = pb_df.dropna(subset=["timestamp"]).sort_values("timestamp")
-                    if pb_df.empty:
-                        st.info("Playback data empty after parsing timestamps.")
-                    else:
-                        max_idx = len(pb_df) - 1
-                        cur_idx = st.session_state.get("bt_pb_idx", max_idx)
-                        cur_idx = st.slider("Cursor", 0, max_idx, cur_idx, key="bt_pb_slider_live")
-                        st.session_state["bt_pb_idx"] = cur_idx
-                        row = pb_df.iloc[cur_idx]
-                        st.metric("PNL at cursor", f"₹{row.get('pnl_at_cursor', 0):,.2f}")
-                    st.dataframe(pb_df, width="stretch")
-            except Exception as exc:
-                st.warning(f"Could not load latest backtest: {exc}")
-            else:
-                st.info("Run a backtest to see results here.")
+        thr = status.get("thresholds", {})
 
-    elif current_strategy_file == "weekly_theta_strangle.py":
-        with st.expander(f"Run Backtest ({strategy_label})", expanded=False):
-            btn_run, btn_reset = st.columns(2)
-            with btn_run:
-                if st.button("Run Weekly Strangle Backtest"):
-                    try:
-                        import subprocess
-                        out = subprocess.run(
-                            [
-                                PYTHON,
-                                str(ROOT / "data_engine/market_ai/scripts/run_weekly_theta_backtest.py"),
-                                "--input",
-                                str(ROOT / "reports/intraday_from_rolling_latest.csv"),
-                                "--output-dir",
-                                str(ROOT / "reports/weekly_theta_backtest"),
-                            ],
-                            cwd=str(ROOT),
-                            capture_output=True,
-                            text=True,
-                            timeout=600,
-                        )
-                        st.code(out.stdout + "\n" + out.stderr, language="log")
-                        st.session_state["wt_bt_show"] = True
-                        st.success("Weekly strangle backtest complete.")
-                    except Exception as exc:
-                        st.error(f"Backtest failed: {exc}")
-            with btn_reset:
-                if st.button("Reset Backtest View", key="wbt_reset"):
-                    for k in list(st.session_state.keys()):
-                        if k.startswith("wt_bt_"):
-                            st.session_state.pop(k, None)
-                    st.session_state["wt_bt_show"] = False
-                    st.success("Backtest view reset.")
+        def _fmt(val: Any) -> str:
+            # Keep None as N/A so missing signals are obvious; avoid turning None into 0.0
+            return "N/A" if val is None else ("—" if val == "" else str(val))
 
-            show_latest = st.session_state.get("wt_bt_show", True)
-            trades_path = ROOT / "reports/weekly_theta_backtest/weekly_theta_trades.csv"
-            summary_path = ROOT / "reports/weekly_theta_backtest/weekly_theta_summary.json"
-            daily_path = ROOT / "reports/weekly_theta_backtest/weekly_theta_daily_log.csv"
-            if show_latest and trades_path.exists():
-                st.markdown(f"Latest backtest trades: `{trades_path.name}`")
-                try:
-                    df_trades = pd.read_csv(trades_path, low_memory=False)
-                    st.dataframe(df_trades, width="stretch")
-                except Exception as exc:
-                    st.warning(f"Could not load trades file: {exc}")
-            if summary_path.exists() and show_latest:
-                try:
-                    import json as _json
-                    summary_data = _json.loads(summary_path.read_text())
-                    st.json(summary_data)
-                except Exception as exc:
-                    st.warning(f"Could not load summary: {exc}")
-            if daily_path.exists() and show_latest:
-                try:
-                    df_daily = pd.read_csv(daily_path, low_memory=False)
-                    st.markdown("#### Daily log")
-                    st.dataframe(df_daily, width="stretch")
-                except Exception as exc:
-                    st.warning(f"Could not load daily log: {exc}")
-            if not trades_path.exists() and not summary_path.exists():
-                st.info("Run a backtest to see results here.")
+        def _with_status(label: str, ok: bool, enabled: bool = True) -> str:
+            icon = "✅" if ok else "❌"
+            return f"{icon} {label} [status: {ok}]"
 
+        entries = [
+            f"- {_with_status('Entry window', bool(crit.get('entry_window')))} (now {vals.get('now_time', '—')} / window {thr.get('window_start','—')}-{thr.get('window_end','—')})",
+            f"- {_with_status('Cycle day', bool(crit.get('cycle_day')))} (day {vals.get('day_of_month','—')} / DTE {vals.get('dte','—')} | allowed days {thr.get('cycle_day_min','—')}-{thr.get('cycle_day_max','—')} or DTE in {thr.get('early_next_cycle_days','—')})",
+            f"- {_with_status('ADX', bool(crit.get('adx_ok')), enabled=thr.get('use_adx', True))} (current {_fmt(vals.get('adx'))} / max {_fmt(thr.get('adx_max'))})",
+            f"- {_with_status('Gap %', bool(crit.get('gap_ok')))} (current {_fmt(vals.get('gap_pct'))} / limit ±{thr.get('gap_max_pct', '—')})",
+            f"- {_with_status('Range pos', bool(crit.get('range_ok')), enabled=thr.get('use_range', True))} (current {_fmt(vals.get('monthly_range_frac'))} / band {thr.get('range_band', '—')})",
+            f"- {_with_status('VIX', bool(crit.get('vix_ok')), enabled=thr.get('use_vix', True))} (current {_fmt(vals.get('vix'))} / min {_fmt(thr.get('vix_min'))})",
+        ]
+
+        st.markdown(
+            "\n".join(entries)
+        )
+        st.caption(f"Last check: {status.get('timestamp')} · Expiry: {vals.get('expiry')}")
+        st.divider()
     else:
-        st.info(f"Backtest is not available for {strategy_label}.")
+        st.info("No entry status yet. Ensure the agent is running (paper) to populate criteria checks.")
 
-    total_orders = int(summary.get("total_orders", 0))
-    executed_orders = int(summary.get("executed_orders", 0))
-    warn_orders = int(summary.get("warn_only_orders", 0))
-    credit = float(summary.get("credit_value", 0.0))
-    debit = float(summary.get("debit_value", 0.0))
-    net = float(summary.get("net_value", 0.0))
+    st.markdown("#### Open Positions (Paper)")
+    if df is None or df.empty:
+        st.info("No paper trades recorded yet.")
+        return
+    paper_df = df.loc[df.get("trade_mode") == "paper"].copy()
+    if paper_df.empty:
+        st.info("No paper trades recorded yet.")
+        return
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Orders Logged", total_orders, warn_orders, help="Total blotter entries (delta shows warn-only count)")
-    c2.metric("Executed Orders", executed_orders)
-    net_delta = credit if net >= 0 else -debit
-    c3.metric("Net Credit", f"₹{net:,.2f}", f"₹{net_delta:,.2f}")
+    positions: Dict[str, Dict[str, Any]] = {}
+    for _, row in paper_df.iterrows():
+        name = row.get("notes") or row.get("strike") or row.get("security_id") or "Unknown"
+        try:
+            qty = int(row.get("quantity") or 0)
+        except Exception:
+            qty = 0
+        try:
+            price = float(row.get("price") or 0.0)
+        except Exception:
+            price = 0.0
+        side = str(row.get("side") or "").upper()
+        key = str(name)
+        if key not in positions:
+            positions[key] = {
+                "name": key,
+                "product": "PAPER",
+                "qty": 0,
+                "notional": 0.0,
+            }
+        pos = positions[key]
+        direction = 1 if side == "SELL" else -1
+        pos["qty"] += direction * qty
+        pos["notional"] += direction * qty * price
 
-    if df is not None and not df.empty:
-        st.markdown("#### Order Blotter")
-        show_df = df.copy()
-        if "timestamp" in show_df.columns:
-            show_df["timestamp"] = pd.to_datetime(show_df["timestamp"], errors="coerce")
-        for col in ("warn_only", "executed"):
-            if col in show_df.columns:
-                show_df[col] = pd.to_numeric(show_df[col], errors="coerce").astype('Int64')
-        st.dataframe(show_df.fillna(""), width="stretch")
+    table_rows = []
+    for pos in positions.values():
+        if pos["qty"] == 0:
+            continue
+        qty = abs(pos["qty"])
+        avg = pos["notional"] / pos["qty"] if pos["qty"] != 0 else 0.0
+        table_rows.append({
+            "B/S": "S" if pos["qty"] > 0 else "B",
+            "Name": pos["name"],
+            "Product": pos["product"],
+            "Qty": qty,
+            "Avg Price": avg,
+            "LTP": "—",
+            "P&L": "—",
+        })
 
-        executed_df = show_df[show_df.get("executed", 0) == 1].copy()
-        fig = None
-        if not executed_df.empty and "timestamp" in executed_df.columns:
-            executed_df.sort_values("timestamp", inplace=True)
-            executed_df["signed_notional"] = pd.to_numeric(executed_df.get("price"), errors="coerce").fillna(0.0) \
-                * pd.to_numeric(executed_df.get("quantity"), errors="coerce").fillna(0.0) \
-                * executed_df["side"].map({"SELL": 1.0, "BUY": -1.0}).fillna(0.0)
-            executed_df["cumulative"] = executed_df["signed_notional"].cumsum()
+    if not table_rows:
+        st.caption("Paper ledger has no open positions (all closed).")
+        return
 
-            st.markdown("#### Cumulative Executed Credit")
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=executed_df["timestamp"],
-                y=executed_df["cumulative"],
-                mode="lines+markers",
-                name="Net Credit",
-            ))
-            fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=40))
-        if fig is not None:
-            st.plotly_chart(fig, width="stretch")
-
-    if summary:
-        st.markdown("#### Latest Summary")
-        st.json(summary)
+    df_pos = pd.DataFrame(table_rows)
+    try:
+        df_pos["Qty"] = df_pos["Qty"].astype("Int64")
+    except Exception:
+        pass
+    styler = df_pos.style.format({"Avg Price": "₹ {:.2f}"})
+    st.dataframe(styler, hide_index=True, width="stretch")
 
 
 def _weekly_plan_tab() -> None:

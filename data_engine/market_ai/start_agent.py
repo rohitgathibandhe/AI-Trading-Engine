@@ -39,6 +39,7 @@ FEATURE_LOG_PATH = STATE_DIR / "feature_history.csv"
 INTEL_LOG_PATH = STATE_DIR / "intel_log.csv"
 TRADE_BLOTTER_PATH = STATE_DIR / "trade_blotter.csv"
 TRADE_BLOTTER_SUMMARY = STATE_DIR / "trade_blotter_summary.json"
+ENTRY_STATUS_FILE = STATE_DIR / "entry_criteria_status.json"
 BLOTTER_FIELDS = [
     "timestamp",
     "trade_mode",
@@ -101,6 +102,18 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "spread_short_delta_high": 0.25,
     "gap_entry_threshold": 0.004,
     "iv_floor_percentile": 0.2,
+    "monthly_filters": {
+        "use_adx": True,
+        "adx_length": 14,
+        "adx_max": 25.0,
+        "use_gap": True,
+        "max_gap_pct": 0.8,
+        "use_range_band": True,
+        "range_band_min": 0.3,
+        "range_band_max": 0.7,
+        "use_vix": False,
+        "min_vix": 12.0,
+    },
 }
 CREDS_FILE = STATE_DIR / "creds.json"
 INDEX_SECURITY_ID = int(os.getenv("MARKET_AI_INDEX_SECURITY_ID", "13"))
@@ -138,7 +151,10 @@ from market_ai.strategies.monthly_strangle_manager import (
     MonthlyStrangleConfig,
     manage_basket as manage_monthly_basket,
     propose_entry as propose_monthly_entry,
+    _in_entry_window,
+    _within_cycle_day,
 )
+from market_ai.signals.monthly_signals import MonthlyFiltersConfig
 from market_ai.strategies.trend_detector import detect_trend_from_open
 from market_ai.strategies.orb_detector import ORBConfig, compute_orb_levels, detect_orb_breakout
 from market_ai.strategies.sr_levels import compute_sr_levels
@@ -169,6 +185,7 @@ if LAST_STRATEGY_FILE.exists():
 
 # Cache for daily candles to compute higher-timeframe filters
 _DAILY_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+_MONTHLY_FILTER_DEFAULTS = DEFAULT_SETTINGS["monthly_filters"]
 
 
 def _fetch_daily_candles(dw: DhanWrapper, days: int = 40) -> List[Dict[str, Any]]:
@@ -190,13 +207,13 @@ def _fetch_daily_candles(dw: DhanWrapper, days: int = 40) -> List[Dict[str, Any]
     return candles
 
 
-def _compute_adx(candles: List[Dict[str, Any]], period: int = 14) -> float:
+def _compute_adx(candles: List[Dict[str, Any]], period: int = 14) -> Optional[float]:
     """
     Minimal ADX implementation on daily candles (dicts with high/low/close).
-    Returns 0.0 if insufficient data.
+    Returns None if insufficient data.
     """
     if len(candles) < period + 1:
-        return 0.0
+        return None
     trs = []
     plus_dm = []
     minus_dm = []
@@ -230,7 +247,7 @@ def _compute_adx(candles: List[Dict[str, Any]], period: int = 14) -> float:
         mdi = 100 * (m / t)
         denom = pdi + mdi
         dx.append(0.0 if denom == 0 else 100 * abs(pdi - mdi) / denom)
-    adx = _ewm(dx)[-1] if dx else 0.0
+    adx = _ewm(dx)[-1] if dx else None
     return adx
 
 
@@ -238,7 +255,7 @@ def _compute_monthly_filters(candles: List[Dict[str, Any]], spot: float) -> Dict
     """
     Compute ADX, max_body_pct (last 3 days), gap_pct, monthly_range_frac.
     """
-    res = {"adx": 0.0, "max_body_pct": 0.0, "gap_pct": 0.0, "monthly_range_frac": 0.5}
+    res = {"adx": None, "max_body_pct": None, "gap_pct": None, "monthly_range_frac": None}
     if not candles:
         return res
     # ADX
@@ -267,6 +284,12 @@ def _compute_monthly_filters(candles: List[Dict[str, Any]], spot: float) -> Dict
     res["monthly_range_frac"] = (spot - lo) / rng
     return res
 
+
+def _build_monthly_filters_config(settings: Dict[str, Any]) -> MonthlyFiltersConfig:
+    data = settings.get("monthly_filters", {}) if settings else {}
+    merged = {**_MONTHLY_FILTER_DEFAULTS, **(data or {})}
+    return MonthlyFiltersConfig.from_dict(merged)
+
 def _load_saved_creds() -> Dict[str, str]:
     if not CREDS_FILE.exists():
         return {}
@@ -275,6 +298,14 @@ def _load_saved_creds() -> Dict[str, str]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _write_entry_status(payload: Dict[str, Any]) -> None:
+    """Persist entry criteria status for the UI."""
+    try:
+        ENTRY_STATUS_FILE.write_text(json.dumps(payload, indent=2, default=str))
+    except Exception:
+        log.exception("Failed to write entry status")
 
 
 def _ensure_dhan_credentials() -> None:
@@ -313,6 +344,11 @@ def _load_agent_settings() -> Dict[str, Any]:
             merged["nifty_lot_size"] = merged.get("lot_size", DEFAULT_SETTINGS["lot_size"])
         if "lot_size" not in merged:
             merged["lot_size"] = merged.get("nifty_lot_size", DEFAULT_SETTINGS["nifty_lot_size"])
+        # ensure monthly_filters present and merged
+        mf_default = DEFAULT_SETTINGS.get("monthly_filters", {})
+        mf_data = data.get("monthly_filters", {}) if isinstance(data, dict) else {}
+        mf_merged = {**mf_default, **(mf_data or {})}
+        merged["monthly_filters"] = mf_merged
         return merged
     except Exception as exc:
         log.warning("Failed to load agent settings from %s (%s); falling back to defaults", path, exc)
@@ -1400,12 +1436,80 @@ def main() -> None:
             # Branch: Monthly Strangle w/ Hedge uses rule-based manager
             if SELECTED_STRATEGY_FILE == "monthly_strangle_with_weekly_hedge.py":
                 cfg = MonthlyStrangleConfig()
+                filters_cfg = _build_monthly_filters_config(settings)
                 daily_candles = _fetch_daily_candles(dw, days=40)
                 daily_feats = _compute_monthly_filters(daily_candles, market.spot)
-                adx_val = daily_feats["adx"]
-                max_body_pct = daily_feats["max_body_pct"]
-                gap_pct_daily = daily_feats["gap_pct"]
-                monthly_range_frac = daily_feats["monthly_range_frac"]
+                daily_count = len(daily_candles)
+                adx_val = daily_feats["adx"] if daily_count >= 15 else None
+                max_body_pct = daily_feats["max_body_pct"] if daily_count >= 3 else None
+                gap_pct_daily = daily_feats["gap_pct"] if daily_count >= 2 else None
+                monthly_range_frac = daily_feats["monthly_range_frac"] if daily_count >= 1 else None
+                vix_val = market.india_vix if market.india_vix not in (None, 0.0) else None
+
+                # Persist entry criteria status for the UI
+                try:
+                    expiry_date = expiry if isinstance(expiry, dt_date) else expiry.date()
+                except Exception:
+                    expiry_date = None
+                entry_cfg = cfg.entry
+                use_adx = bool(filters_cfg.use_adx)
+                use_range = bool(filters_cfg.use_range_band)
+                use_vix = bool(filters_cfg.use_vix)
+                use_gap = bool(filters_cfg.use_gap)
+
+                entry_window_ok = _in_entry_window(now, entry_cfg, trade_mode)
+                cycle_day_ok = _within_cycle_day(now.date(), expiry_date, entry_cfg) if expiry_date else False
+                body_ok = max_body_pct is not None and max_body_pct <= entry_cfg.max_body_pct
+                gap_ok = True if not use_gap else (gap_pct_daily is not None and abs(gap_pct_daily) <= filters_cfg.max_gap_pct)
+                range_ok = True if not use_range else (
+                    monthly_range_frac is not None
+                    and filters_cfg.range_band_min <= monthly_range_frac <= filters_cfg.range_band_max
+                )
+                vix_ok = True if not use_vix else (vix_val is not None and vix_val >= filters_cfg.min_vix)
+                adx_ok = True if not use_adx else (adx_val is not None and adx_val < filters_cfg.adx_max)
+                dte = (expiry_date - now.date()).days if expiry_date else None
+                status_payload = {
+                    "timestamp": now.isoformat(timespec="seconds"),
+                    "mode": trade_mode,
+                    "criteria": {
+                        "entry_window": entry_window_ok,
+                        "cycle_day": cycle_day_ok,
+                        "adx_ok": adx_ok,
+                        "body_ok": body_ok,
+                        "gap_ok": gap_ok,
+                        "range_ok": range_ok,
+                        "vix_ok": vix_ok,
+                    },
+                    "values": {
+                        "adx": adx_val,
+                        "max_body_pct": max_body_pct,
+                        "gap_pct": gap_pct_daily,
+                        "monthly_range_frac": monthly_range_frac,
+                        "vix": vix_val,
+                        "expiry": expiry_date.isoformat() if expiry_date else None,
+                        "now_time": now.strftime("%H:%M:%S"),
+                        "day_of_month": now.day,
+                        "dte": dte,
+                        "candles_daily_count": daily_count,
+                    },
+                    "thresholds": {
+                        "use_adx": use_adx,
+                        "use_range": use_range,
+                        "use_vix": use_vix,
+                        "use_gap": use_gap,
+                        "adx_max": filters_cfg.adx_max,
+                        "adx_length": filters_cfg.adx_length,
+                        "gap_max_pct": filters_cfg.max_gap_pct,
+                        "range_band": [filters_cfg.range_band_min, filters_cfg.range_band_max],
+                        "vix_min": filters_cfg.min_vix,
+                        "window_start": entry_cfg.entry_window_start.strftime("%H:%M"),
+                        "window_end": entry_cfg.entry_window_end.strftime("%H:%M"),
+                        "cycle_day_min": entry_cfg.cycle_day_min,
+                        "cycle_day_max": entry_cfg.cycle_day_max,
+                        "early_next_cycle_days": list(entry_cfg.early_next_cycle_days),
+                    },
+                }
+                _write_entry_status(status_payload)
                 if legs:
                     margin_est = sum(
                         abs((leg.entry_price or leg.current_ltp or 0.0) * leg.quantity)
@@ -1448,6 +1552,7 @@ def main() -> None:
                         expiry=expiry,
                         lot_size=settings.get("lot_size", 75),
                         cfg=cfg,
+                        trade_mode=trade_mode,
                     )
                 # Paper-mode margin gate: assume virtual capital 1,000,000
                 if decision.action_type == "OPEN" and trade_mode == "paper" and decision.legs_to_open:
