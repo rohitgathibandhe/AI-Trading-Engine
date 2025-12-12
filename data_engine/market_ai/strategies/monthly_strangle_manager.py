@@ -233,6 +233,7 @@ def build_option_leg(row: dict, side: LegSide, qty: int, strategy: StrategyType)
         entry_price=float(row.get("ltp", 0.0)),
         security_id=str(row.get("security_id") or ""),
         current_ltp=float(row.get("ltp", 0.0)),
+        delta=row.get("delta"),
         strategy_type=strategy,
     )
 
@@ -253,7 +254,8 @@ def propose_entry(
     vix_rising: bool,
     option_chain: List[dict],
     expiry: date,
-    lot_size: int,
+    short_qty: int,
+    hedge_qty: int,
     cfg: MonthlyStrangleConfig,
     trade_mode: str = "live",
 ) -> TradeAction:
@@ -280,25 +282,37 @@ def propose_entry(
     if not ce_row or not pe_row:
         return TradeAction("HOLD", StrategyType.STRANGLE, [], [], "No strikes in delta band")
 
-    ce_leg = build_option_leg(ce_row, LegSide.SELL, lot_size, StrategyType.STRANGLE)
-    pe_leg = build_option_leg(pe_row, LegSide.SELL, lot_size, StrategyType.STRANGLE)
+    def _find_chain_row(strike: float, opt_type: str) -> Optional[dict]:
+        for row in option_chain:
+            try:
+                if abs(float(row.get("strike", 0.0)) - strike) < 1e-6 and str(row.get("option_type")).upper() == opt_type:
+                    return row
+            except Exception:
+                continue
+        return None
+
+    ce_leg = build_option_leg(ce_row, LegSide.SELL, short_qty, StrategyType.STRANGLE)
+    pe_leg = build_option_leg(pe_row, LegSide.SELL, short_qty, StrategyType.STRANGLE)
     legs_to_open: List[OptionLeg] = [ce_leg, pe_leg]
-    credit = ce_leg.entry_price * lot_size + pe_leg.entry_price * lot_size
+    credit = ce_leg.entry_price * short_qty + pe_leg.entry_price * short_qty
 
     # Hedge candidates: further OTM by distance
     hedge_ce = {**ce_row, "strike": ce_leg.strike + cfg.hedges.min_distance, "ltp": None}
     hedge_pe = {**pe_row, "strike": pe_leg.strike - cfg.hedges.min_distance, "ltp": None}
+    hedge_ce_row = _find_chain_row(hedge_ce["strike"], "CE") or hedge_ce
+    hedge_pe_row = _find_chain_row(hedge_pe["strike"], "PE") or hedge_pe
     if cfg.hedges.enable_weekly_hedge:
         # attach hedges with placeholder prices (actual pricing happens upstream)
         legs_to_open.append(
             OptionLeg(
                 symbol=ce_leg.symbol,
                 expiry=ce_leg.expiry,
-                strike=hedge_ce["strike"],
+                strike=hedge_ce_row["strike"],
                 option_type=OptionType.CALL,
                 side=LegSide.BUY,
-                quantity=lot_size,
-                entry_price=0.0,
+                quantity=hedge_qty,
+                entry_price=float(hedge_ce_row.get("ltp") or 0.0),
+                delta=hedge_ce_row.get("delta"),
                 strategy_type=StrategyType.STRANGLE,
             )
         )
@@ -306,11 +320,12 @@ def propose_entry(
             OptionLeg(
                 symbol=pe_leg.symbol,
                 expiry=pe_leg.expiry,
-                strike=hedge_pe["strike"],
+                strike=hedge_pe_row["strike"],
                 option_type=OptionType.PUT,
                 side=LegSide.BUY,
-                quantity=lot_size,
-                entry_price=0.0,
+                quantity=hedge_qty,
+                entry_price=float(hedge_pe_row.get("ltp") or 0.0),
+                delta=hedge_pe_row.get("delta"),
                 strategy_type=StrategyType.STRANGLE,
             )
         )

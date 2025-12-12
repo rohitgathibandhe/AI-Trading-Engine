@@ -40,6 +40,7 @@ INTEL_LOG_PATH = STATE_DIR / "intel_log.csv"
 TRADE_BLOTTER_PATH = STATE_DIR / "trade_blotter.csv"
 TRADE_BLOTTER_SUMMARY = STATE_DIR / "trade_blotter_summary.json"
 ENTRY_STATUS_FILE = STATE_DIR / "entry_criteria_status.json"
+STRATEGY_STATE_FILE = STATE_DIR / "strategy_state.json"
 BLOTTER_FIELDS = [
     "timestamp",
     "trade_mode",
@@ -52,6 +53,8 @@ BLOTTER_FIELDS = [
     "security_id",
     "quantity",
     "price",
+    "delta",
+    "expiry",
     "strike",
     "tag",
     "notes",
@@ -102,6 +105,13 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "spread_short_delta_high": 0.25,
     "gap_entry_threshold": 0.004,
     "iv_floor_percentile": 0.2,
+    "short_lots": 1,
+    "hedge_lots_live": 1.0,
+    "hedge_lots_paper": 0.33,
+    "cycle_day_min": 1,
+    "cycle_day_max": 7,
+    "allow_early_next_cycle": True,
+    "early_next_cycle_days": [5, 7],
     "monthly_filters": {
         "use_adx": True,
         "adx_length": 14,
@@ -289,6 +299,93 @@ def _build_monthly_filters_config(settings: Dict[str, Any]) -> MonthlyFiltersCon
     data = settings.get("monthly_filters", {}) if settings else {}
     merged = {**_MONTHLY_FILTER_DEFAULTS, **(data or {})}
     return MonthlyFiltersConfig.from_dict(merged)
+
+
+def _paper_positions_from_blotter() -> Optional[pd.DataFrame]:
+    try:
+        df = pd.read_csv(TRADE_BLOTTER_PATH)
+    except Exception:
+        return None
+    if df.empty:
+        return None
+    df = df[df.get("trade_mode") == "paper"].copy()
+    if df.empty:
+        return None
+    # signed qty
+    def _signed(row):
+        try:
+            qty = int(row.get("quantity") or 0)
+        except Exception:
+            qty = 0
+        side = str(row.get("side") or "").upper()
+        return qty if side == "SELL" else -qty
+    df["signed_qty"] = df.apply(_signed, axis=1)
+    grouped = df.groupby(["strike"], as_index=False).agg(
+        {
+            "signed_qty": "sum",
+            "price": "mean",
+            "delta": "mean",
+            "expiry": "last",
+        }
+    )
+    grouped.rename(columns={"signed_qty": "net_qty"}, inplace=True)
+    grouped["product"] = "PAPER"
+    return grouped
+
+
+def load_strategy_state() -> Dict[str, Any]:
+    if not STRATEGY_STATE_FILE.exists():
+        return {}
+    try:
+        data = json.loads(STRATEGY_STATE_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        log.exception("Failed to load strategy state")
+        return {}
+
+
+def save_strategy_state(state: Dict[str, Any]) -> None:
+    try:
+        STRATEGY_STATE_FILE.write_text(json.dumps(state, indent=2))
+    except Exception:
+        log.exception("Failed to save strategy state")
+
+
+def is_monthly_strangle_open(expiry: str) -> bool:
+    state = load_strategy_state()
+    return (
+        state.get("MONTHLY_STRANGLE", {})
+        .get(expiry, {})
+        .get("status")
+        == "OPEN"
+    )
+
+
+def _build_monthly_basket_id(expiry: str) -> str:
+    expiry_token = expiry.replace("-", "")
+    timestamp = _ist_now().strftime("%H%M%S")
+    return f"MS_{expiry_token}_{timestamp}"
+
+
+def _mark_monthly_strangle_open(expiry: str, basket_id: str) -> None:
+    state = load_strategy_state()
+    bucket = state.setdefault("MONTHLY_STRANGLE", {})
+    bucket[expiry] = {
+        "status": "OPEN",
+        "opened_at": _now_iso(),
+        "basket_id": basket_id,
+    }
+    save_strategy_state(state)
+
+
+def _mark_monthly_strangle_closed(expiry: str) -> None:
+    state = load_strategy_state()
+    bucket = state.setdefault("MONTHLY_STRANGLE", {})
+    entry = bucket.setdefault(expiry, {})
+    entry["status"] = "CLOSED"
+    entry["closed_at"] = _now_iso()
+    save_strategy_state(state)
+
 
 def _load_saved_creds() -> Dict[str, str]:
     if not CREDS_FILE.exists():
@@ -502,6 +599,8 @@ def _log_trade_event(*, trade_mode: str, side: str, leg: OptionLeg, order_type: 
         "security_id": _ensure_leg_security_id(leg, leg.symbol, leg.expiry) or "",
         "quantity": leg.quantity,
         "price": float(getattr(leg, "entry_price", 0.0) or leg.current_ltp or 0.0),
+        "delta": getattr(leg, "delta", None),
+        "expiry": getattr(leg, "expiry", "") if leg and getattr(leg, "expiry", None) is not None else "",
         "strike": leg.strike,
         "tag": getattr(leg, "strategy_type", StrategyType.NONE).name,
         "notes": notes,
@@ -589,8 +688,8 @@ def _log_strategy_event(
         "pe_strike": pe_leg.strike if pe_leg else "",
         "ce_ltp": ce_leg.current_ltp if ce_leg else "",
         "pe_ltp": pe_leg.current_ltp if pe_leg else "",
-        "ce_delta": "",
-        "pe_delta": "",
+        "ce_delta": getattr(ce_leg, "delta", ""),
+        "pe_delta": getattr(pe_leg, "delta", ""),
         "ce_entry": ce_leg.entry_price if ce_leg else "",
         "pe_entry": pe_leg.entry_price if pe_leg else "",
         "net_credit": (
@@ -671,6 +770,10 @@ def _as_bool(val: Optional[str], default: bool) -> bool:
 def _ist_now() -> datetime:
     tz = ZoneInfo("Asia/Kolkata") if ZoneInfo else None
     return datetime.now(tz) if tz else datetime.now()
+
+
+def _now_iso() -> str:
+    return _ist_now().isoformat(timespec="seconds")
 
 
 def _is_india_market_open(now: Optional[datetime] = None) -> bool:
@@ -1362,8 +1465,13 @@ def main() -> None:
                 orb_state.breakout_signal = breakout if breakout.active else None
             sr_levels = compute_sr_levels(market, orb_state.orb_levels)
             expiry = _fetch_expiry_with_settings(dw, settings)
-            positions_raw = [] if trade_mode == "paper" else dw.get_positions_raw()
-            legs = _map_positions([] if trade_mode == "paper" else positions_raw)
+            if trade_mode == "paper":
+                positions_df = _paper_positions_from_blotter()
+                legs: List[OptionLeg] = []
+            else:
+                positions_raw = dw.get_positions_raw()
+                legs = _map_positions(positions_raw)
+                positions_df = None  # live positions handled via legs
             if legs and trade_mode != "paper":
                 log.info(
                     "[Positions detail] %s",
@@ -1452,6 +1560,19 @@ def main() -> None:
                 except Exception:
                     expiry_date = None
                 entry_cfg = cfg.entry
+                entry_cfg.cycle_day_min = int(settings.get("cycle_day_min", entry_cfg.cycle_day_min))
+                entry_cfg.cycle_day_max = int(settings.get("cycle_day_max", entry_cfg.cycle_day_max))
+                entry_cfg.allow_early_next_cycle = bool(settings.get("allow_early_next_cycle", entry_cfg.allow_early_next_cycle))
+                enc_days = settings.get("early_next_cycle_days", entry_cfg.early_next_cycle_days)
+                try:
+                    entry_cfg.early_next_cycle_days = (int(enc_days[0]), int(enc_days[1]))
+                except Exception:
+                    entry_cfg.early_next_cycle_days = entry_cfg.early_next_cycle_days
+                # Sync thresholds from settings-driven filters
+                entry_cfg.adx_max = float(filters_cfg.adx_max)
+                entry_cfg.max_gap_pct = float(filters_cfg.max_gap_pct)
+                entry_cfg.monthly_range_band = (float(filters_cfg.range_band_min), float(filters_cfg.range_band_max))
+                entry_cfg.vix_min = float(filters_cfg.min_vix)
                 use_adx = bool(filters_cfg.use_adx)
                 use_range = bool(filters_cfg.use_range_band)
                 use_vix = bool(filters_cfg.use_vix)
@@ -1539,21 +1660,40 @@ def main() -> None:
                         adx=adx_val,
                     )
                 else:
-                    decision = propose_monthly_entry(
-                        now=now,
-                        spot=market.spot,
-                        adx=adx_val,
-                        max_body_pct=max_body_pct,
-                        gap_pct=gap_pct_daily,
-                        monthly_range_frac=monthly_range_frac,
-                        vix=market.india_vix,
-                        vix_rising=True,
-                        option_chain=chain,
-                        expiry=expiry,
-                        lot_size=settings.get("lot_size", 75),
-                        cfg=cfg,
-                        trade_mode=trade_mode,
-                    )
+                    # Strategy-level gate: only one active basket per expiry.
+                    if is_monthly_strangle_open(expiry_str):
+                        log.info(
+                            "[MonthlyStrangle] HOLD: basket already OPEN for expiry %s",
+                            expiry_str,
+                        )
+                        decision = TradeAction(
+                            action_type="HOLD",
+                            strategy_type=StrategyType.STRANGLE,
+                            legs_to_open=[],
+                            legs_to_close=[],
+                            reason="MONTHLY_BASKET_ALREADY_OPEN",
+                        )
+                    else:
+                        lot_qty = int(settings.get("lot_size", 75))
+                        short_qty = int(lot_qty * float(settings.get("short_lots", 1)))
+                        hedge_mult = float(settings.get("hedge_lots_live" if trade_mode == "live" else "hedge_lots_paper", 1.0))
+                        hedge_qty = int(lot_qty * hedge_mult)
+                        decision = propose_monthly_entry(
+                            now=now,
+                            spot=market.spot,
+                            adx=adx_val,
+                            max_body_pct=max_body_pct,
+                            gap_pct=gap_pct_daily,
+                            monthly_range_frac=monthly_range_frac,
+                            vix=market.india_vix,
+                            vix_rising=True,
+                            option_chain=chain,
+                            expiry=expiry,
+                            short_qty=short_qty,
+                            hedge_qty=hedge_qty,
+                            cfg=cfg,
+                            trade_mode=trade_mode,
+                        )
                 # Paper-mode margin gate: assume virtual capital 1,000,000
                 if decision.action_type == "OPEN" and trade_mode == "paper" and decision.legs_to_open:
                     required_margin = 0.0
@@ -1581,6 +1721,12 @@ def main() -> None:
                 if decision.action_type in ("CLOSE_ALL", "CLOSE_LEGS") and decision.legs_to_close:
                     for leg in decision.legs_to_close:
                         _log_trade_event(trade_mode=trade_mode, side=leg.side.value, leg=leg, order_type="MARKET", notes="close")
+                if decision.strategy_type == StrategyType.STRANGLE and decision.action_type == "OPEN" and decision.legs_to_open:
+                    if not is_monthly_strangle_open(expiry_str):
+                        basket_id = _build_monthly_basket_id(expiry_str)
+                        _mark_monthly_strangle_open(expiry_str, basket_id)
+                if decision.strategy_type == StrategyType.STRANGLE and decision.action_type in ("CLOSE_ALL", "CLOSE_LEGS") and decision.legs_to_close:
+                    _mark_monthly_strangle_closed(expiry_str)
                 continue
             if smart_enabled:
                 trend_ctx = detect_trend_from_open(market, avg_volume, vwap=vwap, pivot=pivot)

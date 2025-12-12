@@ -42,6 +42,7 @@ class OptionLeg:
     entry_price: float = 0.0
     security_id: Optional[str] = None
     current_ltp: Optional[float] = None
+    delta: Optional[float] = None
     strategy_type: StrategyType = StrategyType.NONE
     opened_at: Optional[datetime] = None
 

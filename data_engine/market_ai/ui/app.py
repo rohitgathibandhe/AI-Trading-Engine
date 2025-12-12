@@ -49,19 +49,42 @@ except ImportError:  # fallback for older builds
 
 
 # =============================================================================
-# Auto-refresh helper
+# Page constants & auto-refresh helper
 # =============================================================================
-def _auto_refresh() -> None:
-    """Trigger periodic reruns so LTP and positions update without manual refresh."""
+PAGE_TRADE = "Trade"
+PAGE_POSITIONS = "Positions"
+PAGE_STRATEGY_MONITOR = "Strategy Monitor"
+PAGE_OBSERVABILITY = "Observability"
+PAGE_WEEKLY_PLAN = "Weekly Plan"
+PAGE_PAPER_PNL = "Paper P&L"
+PAGE_AGENT_LOGS = "Agent Logs"
+PAGE_SETTINGS = "Settings"
+
+REFRESHABLE_PAGES = {
+    PAGE_TRADE,
+    PAGE_POSITIONS,
+    PAGE_STRATEGY_MONITOR,
+    PAGE_OBSERVABILITY,
+    PAGE_WEEKLY_PLAN,
+    PAGE_PAPER_PNL,
+    PAGE_AGENT_LOGS,
+}
+
+
+def _auto_refresh(active_page: str) -> None:
+    """Trigger periodic reruns for live pages; skip static pages like Settings."""
+    if active_page not in REFRESHABLE_PAGES:
+        return
     try:
-        refresh_sec = max(1, int(st.session_state.get("refresh_sec", 5)))
+        refresh_sec = max(0, int(st.session_state.get("refresh_sec", 5)))
     except Exception:
         refresh_sec = 5
-
+    if refresh_sec <= 0:
+        return
+    key = f"auto_refresh_{active_page.replace(' ', '_').lower()}"
     if st_autorefresh is not None:
-        st_autorefresh(interval=refresh_sec * 1000, key="auto_refresh_tick")
+        st_autorefresh(interval=refresh_sec * 1000, key=key)
     else:
-        # fallback: rely on browser refresh every ~refresh_sec seconds via hidden script
         placeholder = st.empty()
         placeholder.markdown(
             f"""
@@ -175,6 +198,9 @@ DEFAULT_SETTINGS = {
     "leg_sl_pct": 2.5,
     "profit_pct": 2.25,
     "smart_selector_enabled": True,
+    "short_lots": 1,
+    "hedge_lots_live": 1.0,
+    "hedge_lots_paper": 0.33,
     "max_intraday_loss": -3000.0,
     "intraday_target": 4000.0,
     "allow_carry_forward": False,
@@ -371,6 +397,13 @@ def _load_settings() -> Dict[str, Any]:
     merged["avg_5m_volume"] = float(merged.get("avg_5m_volume", DEFAULT_SETTINGS["avg_5m_volume"]))
     merged["per_leg_sl_mult"] = float(merged.get("per_leg_sl_mult", DEFAULT_SETTINGS["per_leg_sl_mult"]))
     merged["per_leg_tp_mult"] = float(merged.get("per_leg_tp_mult", DEFAULT_SETTINGS["per_leg_tp_mult"]))
+    merged["short_lots"] = int(merged.get("short_lots", DEFAULT_SETTINGS.get("short_lots", 1)))
+    merged["hedge_lots_live"] = float(merged.get("hedge_lots_live", DEFAULT_SETTINGS.get("hedge_lots_live", 1.0)))
+    merged["hedge_lots_paper"] = float(merged.get("hedge_lots_paper", DEFAULT_SETTINGS.get("hedge_lots_paper", 0.33)))
+    merged["cycle_day_min"] = int(merged.get("cycle_day_min", 1))
+    merged["cycle_day_max"] = int(merged.get("cycle_day_max", 7))
+    merged["allow_early_next_cycle"] = bool(merged.get("allow_early_next_cycle", True))
+    merged["early_next_cycle_days"] = merged.get("early_next_cycle_days", [5, 7])
     merged["hedge_enabled"] = bool(merged.get("hedge_enabled", DEFAULT_SETTINGS["hedge_enabled"]))
     merged["hedge_delta_breach"] = float(merged.get("hedge_delta_breach", DEFAULT_SETTINGS["hedge_delta_breach"]))
     merged["hedge_premium_hard_x"] = float(merged.get("hedge_premium_hard_x", DEFAULT_SETTINGS["hedge_premium_hard_x"]))
@@ -1345,7 +1378,6 @@ def _funds_cards(funds: Dict[str, Any]) -> None:
             st.write("—" if val is None else f"₹ {val:,.0f}")
 
 def _nifty_tile() -> None:
-    _auto_refresh()
     _drain_ltp_queue_into_state()
     st.markdown("### NIFTY Spot Price")
     dw = st.session_state.get("dw")
@@ -2899,6 +2931,13 @@ def _settings_tab() -> None:
     with st.expander("Monthly Strangle: adaptive strike selection"):
         a1, a2 = st.columns(2)
         with a1:
+            short_lots = st.number_input(
+                "Short lots",
+                1,
+                20,
+                int(current.get("short_lots", 1)),
+                help="Number of lots to short per leg.",
+            )
             vix_adaptive_low = st.number_input(
                 "VIX lower band",
                 8.0,
@@ -2926,6 +2965,22 @@ def _settings_tab() -> None:
                 float(current.get("spread_short_delta_low", 0.22)),
             )
         with a2:
+            hedge_lots_live = st.number_input(
+                "Hedge lots (live)",
+                0.0,
+                5.0,
+                float(current.get("hedge_lots_live", 1.0)),
+                step=0.25,
+                help="Hedge size multiplier (lots) in live mode.",
+            )
+            hedge_lots_paper = st.number_input(
+                "Hedge lots (paper)",
+                0.0,
+                5.0,
+                float(current.get("hedge_lots_paper", 0.33)),
+                step=0.25,
+                help="Hedge size multiplier (lots) in paper mode.",
+            )
             vix_adaptive_high = st.number_input(
                 "VIX upper band",
                 10.0,
@@ -3040,6 +3095,38 @@ def _settings_tab() -> None:
                 value=float(filters.get("min_vix", 12.0)),
                 step=0.5,
             )
+        st.divider()
+        # Cycle day window
+        cycle_cols = st.columns([0.5, 0.5, 0.6])
+        with cycle_cols[0]:
+            cycle_day_min = st.number_input(
+                "Min cycle day",
+                min_value=1,
+                max_value=31,
+                value=int(current.get("cycle_day_min", 1)),
+                step=1,
+            )
+        with cycle_cols[1]:
+            cycle_day_max = st.number_input(
+                "Max cycle day",
+                min_value=1,
+                max_value=31,
+                value=int(current.get("cycle_day_max", 7)),
+                step=1,
+            )
+        with cycle_cols[2]:
+            allow_early = st.checkbox(
+                "Allow early next cycle",
+                value=bool(current.get("allow_early_next_cycle", True)),
+                help="Permit entries when DTE is within the early-next-cycle window.",
+            )
+            enc_days = current.get("early_next_cycle_days", [5, 7])
+            try:
+                enc_lo, enc_hi = int(enc_days[0]), int(enc_days[1])
+            except Exception:
+                enc_lo, enc_hi = 5, 7
+            early_lo = st.number_input("Early next cycle (min DTE)", min_value=0, max_value=30, value=enc_lo, step=1)
+            early_hi = st.number_input("Early next cycle (max DTE)", min_value=0, max_value=30, value=enc_hi, step=1)
 
     with st.expander("Weekly Theta Strangle: hedges & rolls"):
         hedge_enabled = st.checkbox(
@@ -3099,6 +3186,14 @@ def _settings_tab() -> None:
                 200.0,
                 float(current.get("hedge_price_max", 35.0)),
                 help="Do not auto-buy hedges above this LTP.",
+            )
+            weekly_hedge_price_cap = st.number_input(
+                "Weekly hedge max LTP (₹)",
+                0.0,
+                100.0,
+                float(current.get("weekly_hedge_price_cap", 6.0)),
+                help="Skip weekly hedges above this premium for weekly strangle loop.",
+                step=0.5,
             )
             # Weekly strangle disabled; hide related controls.
 
@@ -3188,6 +3283,13 @@ def _settings_tab() -> None:
             "hedge_salvage_wing_ltp": float(hedge_salvage),
             "weekly_hedge_distance": float(weekly_hedge_distance),
             "weekly_hedge_price_cap": float(weekly_hedge_price_cap),
+            "short_lots": int(short_lots),
+            "hedge_lots_live": float(hedge_lots_live),
+            "hedge_lots_paper": float(hedge_lots_paper),
+            "cycle_day_min": int(cycle_day_min),
+            "cycle_day_max": int(cycle_day_max),
+            "allow_early_next_cycle": bool(allow_early),
+            "early_next_cycle_days": [int(early_lo), int(early_hi)],
             "nifty_expiry_weekday": expiry_weekday,
             "expiry_shift_if_holiday": bool(expiry_shift_if_holiday),
             "holiday_list": holiday_list,
@@ -3249,35 +3351,131 @@ def _paper_pnl_tab() -> None:
         vals = status.get("values", {})
         cfg = MonthlyStrangleConfig().entry
 
-        def _flag(ok: bool) -> str:
-            return "✅ Condition satisfied" if ok else "❌ Condition not satisfied"
-
         thr = status.get("thresholds", {})
 
-        def _fmt(val: Any) -> str:
-            # Keep None as N/A so missing signals are obvious; avoid turning None into 0.0
-            return "N/A" if val is None else ("—" if val == "" else str(val))
+        def _fmt(val: Any, digits: int = 2) -> str:
+            if val is None or val == "":
+                return "N/A"
+            try:
+                return f"{float(val):.{digits}f}"
+            except Exception:
+                return str(val)
 
-        def _with_status(label: str, ok: bool, enabled: bool = True) -> str:
-            icon = "✅" if ok else "❌"
-            return f"{icon} {label} [status: {ok}]"
+        def render_filter_row(label: str, enabled: bool, condition_ok: Optional[bool], detail: str) -> str:
+            if not enabled:
+                icon = "⚪"
+                status_text = "disabled"
+            elif condition_ok is None:
+                icon = "⚪"
+                status_text = "data missing"
+            elif condition_ok:
+                icon = "✅"
+                status_text = "enabled · PASS"
+            else:
+                icon = "❌"
+                status_text = "enabled · FAIL"
+            return f"- {icon} {label} [{status_text}] {detail}"
+
+        # derive condition_ok using thresholds only when enabled
+        adx_enabled = bool(thr.get("use_adx", True))
+        adx_val = vals.get("adx")
+        adx_max = thr.get("adx_max")
+        adx_ok = None if not adx_enabled or adx_val is None or adx_max is None else float(adx_val) <= float(adx_max)
+
+        gap_enabled = bool(thr.get("use_gap", True))
+        gap_val = vals.get("gap_pct")
+        gap_lim = thr.get("gap_max_pct")
+        gap_ok = None if not gap_enabled or gap_val is None or gap_lim is None else abs(float(gap_val)) <= float(gap_lim)
+
+        range_enabled = bool(thr.get("use_range", True))
+        range_val = vals.get("monthly_range_frac")
+        range_band = thr.get("range_band", [None, None])
+        range_ok = None
+        try:
+            rmin, rmax = float(range_band[0]), float(range_band[1])
+            if range_enabled and range_val is not None:
+                range_ok = rmin <= float(range_val) <= rmax
+        except Exception:
+            range_ok = None
+
+        vix_enabled = bool(thr.get("use_vix", True))
+        vix_val = vals.get("vix")
+        vix_min = thr.get("vix_min")
+        vix_ok = None if not vix_enabled or vix_val is None or vix_min is None else float(vix_val) >= float(vix_min)
 
         entries = [
-            f"- {_with_status('Entry window', bool(crit.get('entry_window')))} (now {vals.get('now_time', '—')} / window {thr.get('window_start','—')}-{thr.get('window_end','—')})",
-            f"- {_with_status('Cycle day', bool(crit.get('cycle_day')))} (day {vals.get('day_of_month','—')} / DTE {vals.get('dte','—')} | allowed days {thr.get('cycle_day_min','—')}-{thr.get('cycle_day_max','—')} or DTE in {thr.get('early_next_cycle_days','—')})",
-            f"- {_with_status('ADX', bool(crit.get('adx_ok')), enabled=thr.get('use_adx', True))} (current {_fmt(vals.get('adx'))} / max {_fmt(thr.get('adx_max'))})",
-            f"- {_with_status('Gap %', bool(crit.get('gap_ok')))} (current {_fmt(vals.get('gap_pct'))} / limit ±{thr.get('gap_max_pct', '—')})",
-            f"- {_with_status('Range pos', bool(crit.get('range_ok')), enabled=thr.get('use_range', True))} (current {_fmt(vals.get('monthly_range_frac'))} / band {thr.get('range_band', '—')})",
-            f"- {_with_status('VIX', bool(crit.get('vix_ok')), enabled=thr.get('use_vix', True))} (current {_fmt(vals.get('vix'))} / min {_fmt(thr.get('vix_min'))})",
+            render_filter_row(
+                "Entry window",
+                enabled=True,
+                condition_ok=bool(crit.get("entry_window")),
+                detail=f"(now {vals.get('now_time', '—')} / window {thr.get('window_start','—')}-{thr.get('window_end','—')})",
+            ),
+            render_filter_row(
+                "Cycle day",
+                enabled=True,
+                condition_ok=bool(crit.get("cycle_day")),
+                detail=f"(day {vals.get('day_of_month','—')} / DTE {vals.get('dte','—')} | allowed days {thr.get('cycle_day_min','—')}-{thr.get('cycle_day_max','—')} or DTE in {thr.get('early_next_cycle_days','—')})",
+            ),
+            render_filter_row(
+                "ADX",
+                enabled=adx_enabled,
+                condition_ok=adx_ok,
+                detail=f"(current {_fmt(adx_val)} / max {_fmt(adx_max) if adx_enabled else '—'})",
+            ),
+            render_filter_row(
+                "Gap %",
+                enabled=gap_enabled,
+                condition_ok=gap_ok,
+                detail=f"(current {_fmt(gap_val)} / limit ±{_fmt(gap_lim) if gap_enabled else '—'})",
+            ),
+            render_filter_row(
+                "Range pos",
+                enabled=range_enabled,
+                condition_ok=range_ok,
+                detail=f"(current {_fmt(range_val)} / band {range_band if range_enabled else '—'})",
+            ),
+            render_filter_row(
+                "VIX",
+                enabled=vix_enabled,
+                condition_ok=vix_ok,
+                detail=f"(current {_fmt(vix_val)} / min {_fmt(vix_min) if vix_enabled else '—'})",
+            ),
         ]
 
-        st.markdown(
-            "\n".join(entries)
-        )
+        st.markdown("\n".join(entries))
         st.caption(f"Last check: {status.get('timestamp')} · Expiry: {vals.get('expiry')}")
         st.divider()
     else:
         st.info("No entry status yet. Ensure the agent is running (paper) to populate criteria checks.")
+
+    # Show recent paper entries (from feature_history)
+    feat_df = _load_feature_history(limit=200)
+    if feat_df is not None and not feat_df.empty:
+        # filter to action OPEN in context and trade_mode paper
+        recent_entries = []
+        for _, row in feat_df.iterrows():
+            ctx = _parse_context_blob(row.get("context"))
+            action = ctx.get("action")
+            if action != "OPEN":
+                continue
+            if str(row.get("trade_mode") or "").lower() != "paper":
+                continue
+            recent_entries.append({
+                "timestamp": row.get("timestamp"),
+                "expiry": row.get("expiry"),
+                "spot": row.get("spot"),
+                "ce_strike": row.get("ce_strike"),
+                "pe_strike": row.get("pe_strike"),
+                "ce_delta": row.get("ce_delta"),
+                "pe_delta": row.get("pe_delta"),
+                "credit": ctx.get("credit") or ctx.get("net_credit") or row.get("net_credit"),
+                "reason": ctx.get("reason"),
+            })
+        if recent_entries:
+            st.markdown("#### Recent Paper Entries")
+            ent_df = pd.DataFrame(recent_entries).tail(5)
+            st.dataframe(ent_df, hide_index=True, width="stretch")
+            st.divider()
 
     st.markdown("#### Open Positions (Paper)")
     if df is None or df.empty:
@@ -3290,7 +3488,14 @@ def _paper_pnl_tab() -> None:
 
     positions: Dict[str, Dict[str, Any]] = {}
     for _, row in paper_df.iterrows():
-        name = row.get("notes") or row.get("strike") or row.get("security_id") or "Unknown"
+        strike_val = row.get("strike")
+        if strike_val is None or (isinstance(strike_val, float) and pd.isna(strike_val)):
+            name = str(row.get("notes") or row.get("security_id") or "Unknown")
+        else:
+            try:
+                name = f"{float(strike_val):.0f}"
+            except Exception:
+                name = str(strike_val)
         try:
             qty = int(row.get("quantity") or 0)
         except Exception:
@@ -3300,18 +3505,20 @@ def _paper_pnl_tab() -> None:
         except Exception:
             price = 0.0
         side = str(row.get("side") or "").upper()
+        expiry_val = row.get("expiry") or ""
+        delta_val = row.get("delta") if "delta" in row else None
+        key = (name, expiry_val)
         key = str(name)
-        if key not in positions:
-            positions[key] = {
-                "name": key,
-                "product": "PAPER",
-                "qty": 0,
-                "notional": 0.0,
-            }
-        pos = positions[key]
+        pos = positions.setdefault(key, {"name": name, "expiry": expiry_val, "product": "PAPER", "qty": 0, "notional": 0.0, "delta_sum": 0.0, "delta_qty": 0})
         direction = 1 if side == "SELL" else -1
         pos["qty"] += direction * qty
         pos["notional"] += direction * qty * price
+        try:
+            if delta_val not in (None, "", "nan"):
+                pos["delta_sum"] += direction * qty * float(delta_val)
+                pos["delta_qty"] += abs(qty)
+        except Exception:
+            pass
 
     table_rows = []
     for pos in positions.values():
@@ -3319,12 +3526,20 @@ def _paper_pnl_tab() -> None:
             continue
         qty = abs(pos["qty"])
         avg = pos["notional"] / pos["qty"] if pos["qty"] != 0 else 0.0
+        avg_delta = None
+        try:
+            if pos.get("delta_qty"):
+                avg_delta = pos.get("delta_sum", 0.0) / pos.get("delta_qty", 1)
+        except Exception:
+            avg_delta = None
         table_rows.append({
             "B/S": "S" if pos["qty"] > 0 else "B",
             "Name": pos["name"],
+            "Expiry": pos.get("expiry") or "",
             "Product": pos["product"],
             "Qty": qty,
             "Avg Price": avg,
+            "Delta": avg_delta if avg_delta is not None else "—",
             "LTP": "—",
             "P&L": "—",
         })
@@ -3637,6 +3852,42 @@ def _rehydrate_dw_if_needed() -> None:
     ss["creds_verified"] = True
     _post_dw_setup(dw)
 
+def _render_trade_page() -> None:
+    st.markdown("## Funds Overview")
+    _funds_cards(st.session_state.get("funds", {}))
+    st.divider()
+    _nifty_tile()
+
+
+def _render_positions_page() -> None:
+    st.markdown("## Positions")
+    _positions_tab(st.session_state.get("dw"))
+
+
+def _render_strategy_monitor_page() -> None:
+    _strategy_monitor_tab()
+
+
+def _render_observability_page() -> None:
+    _observability_tab()
+
+
+def _render_weekly_plan_page() -> None:
+    _weekly_plan_tab()
+
+
+def _render_paper_pnl_page() -> None:
+    _paper_pnl_tab()
+
+
+def _render_agent_logs_page() -> None:
+    _agent_logs_tab()
+
+
+def _render_settings_page() -> None:
+    _settings_tab()
+
+
 def main() -> None:
     st.set_page_config(page_title="Algo Agent Dashboard", layout="wide")
     _init_state()
@@ -3649,49 +3900,46 @@ def main() -> None:
 
     _rehydrate_dw_if_needed()
 
-    tab_labels = ["Trade", "Positions", "Strategy Monitor", "Observability", "Weekly Plan"]
     show_paper = ss.get("trade_mode") == "paper"
+    page_options = [PAGE_TRADE, PAGE_POSITIONS, PAGE_STRATEGY_MONITOR, PAGE_OBSERVABILITY, PAGE_WEEKLY_PLAN]
     if show_paper:
-        tab_labels.append("Paper P&L")
-    tab_labels.extend(["Agent Logs", "Settings"])
+        page_options.append(PAGE_PAPER_PNL)
+    page_options.extend([PAGE_AGENT_LOGS, PAGE_SETTINGS])
 
-    tabs = st.tabs(tab_labels)
+    # remember last page to avoid flicker on reruns
+    # persist selected page to avoid jumping back to Trade on reruns
+    if "active_page_selector" not in st.session_state:
+        st.session_state["active_page_selector"] = PAGE_TRADE
 
-    idx = 0
-    with tabs[idx]:
-        st.markdown("## Funds Overview")
-        _funds_cards(st.session_state.get("funds", {}))
-        st.divider()
-        _nifty_tile()
-    idx += 1
+    st.radio(
+        "Navigation",
+        page_options,
+        key="active_page_selector",
+        horizontal=True,
+    )
+    active_page = st.session_state.get("active_page_selector", PAGE_TRADE)
 
-    with tabs[idx]:
-        _positions_tab(st.session_state.get("dw"))
-    idx += 1
+    if active_page in REFRESHABLE_PAGES:
+        _auto_refresh(active_page)
 
-    with tabs[idx]:
-        _strategy_monitor_tab()
-    idx += 1
-
-    with tabs[idx]:
-        _observability_tab()
-    idx += 1
-
-    with tabs[idx]:
-        _weekly_plan_tab()
-    idx += 1
-
-    if show_paper:
-        with tabs[idx]:
-            _paper_pnl_tab()
-        idx += 1
-
-    with tabs[idx]:
-        _agent_logs_tab()
-    idx += 1
-
-    with tabs[idx]:
-        _settings_tab()
+    page_placeholder = st.empty()
+    with page_placeholder.container():
+        if active_page == PAGE_TRADE:
+            _render_trade_page()
+        elif active_page == PAGE_POSITIONS:
+            _render_positions_page()
+        elif active_page == PAGE_STRATEGY_MONITOR:
+            _render_strategy_monitor_page()
+        elif active_page == PAGE_OBSERVABILITY:
+            _render_observability_page()
+        elif active_page == PAGE_WEEKLY_PLAN:
+            _render_weekly_plan_page()
+        elif active_page == PAGE_PAPER_PNL and show_paper:
+            _render_paper_pnl_page()
+        elif active_page == PAGE_AGENT_LOGS:
+            _render_agent_logs_page()
+        elif active_page == PAGE_SETTINGS:
+            _render_settings_page()
 
     # gentle pause so the UI cadence feels steady with refresh slider
     time.sleep(max(0.1, float(st.session_state.get("refresh_sec", 5))))
