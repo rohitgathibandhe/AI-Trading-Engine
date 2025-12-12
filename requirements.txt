@@ -4,3 +4,4 @@ numpy
 requests
 scikit-learn
 feedparser>=6.0
+psutil>=5.9
