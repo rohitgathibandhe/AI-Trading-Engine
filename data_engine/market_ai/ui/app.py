@@ -20,9 +20,9 @@ import json
 import time
 import subprocess
 from pathlib import Path
-from datetime import datetime, timedelta, time as datetime_time
+from datetime import datetime, timedelta, time as datetime_time, date as datetime_date
 from typing import Iterable
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, cast
 from queue import Queue, Empty
 try:
     import psutil  # type: ignore
@@ -147,6 +147,8 @@ STATE_DIR = ENGINE_DIR / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 CONTROL_DIR = ENGINE_DIR / "control"
 CONTROL_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR = ROOT / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 RISK_RESET_FILE = CONTROL_DIR / "risk_reset.json"
 ENTRY_BLOCK_STATE = STATE_DIR / "entry_block_status.json"
 ACTION_STATUS_FILE = STATE_DIR / "manual_action_status.json"
@@ -594,7 +596,7 @@ def _render_rolling_data_quality(summary: Dict[str, Any]) -> None:
     if selectors:
         sel_df = pd.DataFrame(selectors, columns=["Selector", "Rows"])
         st.caption("Top selectors")
-        st.dataframe(sel_df.head(10), hide_index=True, width="stretch")
+        st.dataframe(sel_df.head(10), hide_index=True, use_container_width=True)
 
     if summary.get("missing_dates"):
         st.caption("Recent missing trading days")
@@ -620,7 +622,7 @@ def _render_selector_training_summary(summary: Dict[str, Any]) -> None:
         df = pd.DataFrame(metrics)
         display_cols = ["strategy", "samples", "train_rmse", "val_rmse", "val_r2"]
         df = df[display_cols]
-        st.dataframe(df.sort_values("val_rmse"), width="stretch")
+        st.dataframe(df.sort_values("val_rmse"), use_container_width=True)
 
 
 def _parse_context_blob(value: Any) -> Dict[str, Any]:
@@ -788,8 +790,8 @@ def _predict_delta_breach(equity_df: Optional[pd.DataFrame], risk_limits: Dict[s
         return None
     last_idx = len(df) - 1
     remaining = None
+    target = delta_cap if slope > 0 else -delta_cap
     try:
-        target = delta_cap if slope > 0 else -delta_cap
         steps = (target - (slope * last_idx + intercept)) / slope
         if steps > 0:
             remaining = steps
@@ -1115,7 +1117,7 @@ def _new_dw() -> Optional[Any]:
         st.error("Enter Client ID and Access Token.")
         return None
     try:
-        return DhanWrapper(dhan_client_id=cid, access_token=tok)
+        return cast(Any, DhanWrapper)(dhan_client_id=cid, access_token=tok)
     except Exception as e:
         st.error(f"Failed to create Dhan client: {e}")
         return None
@@ -1434,21 +1436,25 @@ def _positions_tab(dw) -> None:
             v = _raw(r).get(k)  # fallback
         return v if v is not None else default
 
-    def F(r, k, default=0.0):
+    def F(r, k, default: Optional[float] = 0.0) -> Optional[float]:
         try:
             v = r.get(k)
             if v is None:
                 v = _raw(r).get(k)
-            return float(v) if v is not None else float(default)
+            if v is None:
+                return default
+            return float(v)
         except Exception:
-            return float(default)
+            return default
 
-    def I(r, k, default=0):
+    def I(r, k, default: int = 0) -> int:
         try:
             v = r.get(k)
             if v is None:
                 v = _raw(r).get(k)
-            return int(float(v)) if v is not None else int(default)
+            if v is None:
+                return int(default)
+            return int(float(v))
         except Exception:
             return int(default)
 
@@ -1456,8 +1462,14 @@ def _positions_tab(dw) -> None:
         return str(r.get("position_type") or r.get("side") or S(r, "positionType")).upper()
 
     def _net_qty(r: Dict[str, Any]) -> int:
-        if r.get("qty") is not None:
-            return int(r.get("qty"))
+        raw_qty = r.get("qty")
+        if raw_qty is None:
+            raw_qty = _raw(r).get("qty")
+        if raw_qty is not None:
+            try:
+                return int(float(raw_qty))
+            except Exception:
+                pass
         return I(r, "netQty", 0)
 
     def _security_id(r: Dict[str, Any]) -> Optional[int]:
@@ -1511,7 +1523,7 @@ def _positions_tab(dw) -> None:
             typ = _pt(r)
             sym = r.get("symbol") or S(r, "tradingSymbol")
             prod = r.get("product") or S(r, "productType")
-            cost_price = F(r, "cost_price", F(r, "avg_price", 0.0))
+            cost_price = F(r, "cost_price", F(r, "avg_price", 0.0)) or 0.0
             buy_avg = r.get("buy_avg")
             if buy_avg is None:
                 buy_avg = F(r, "buyAvg", None)
@@ -1521,6 +1533,7 @@ def _positions_tab(dw) -> None:
             unreal = r.get("unrealized_profit")
             if unreal is None:
                 unreal = F(r, "unrealizedProfit", 0.0)
+            unreal = float(unreal or 0.0)
             seg = r.get("exchange_seg") or S(r, "exchangeSegment")
             sid = _security_id(r)
             live_ltp = ltp_map.get((seg, sid)) if seg and sid is not None else None
@@ -1573,7 +1586,7 @@ def _positions_tab(dw) -> None:
             .format({"Avg Price": "₹ {:.2f}", "LTP": "₹ {:.2f}", "P&L": "₹ {:.2f}"})
             .apply(_pnl_style_col, subset=["P&L"], axis=0)
         )
-        st.dataframe(styler_open, hide_index=True, width="stretch")
+        st.dataframe(styler_open, hide_index=True, use_container_width=True)
         total_color = "#2e7d32" if total_unreal > 0 else ("#d32f2f" if total_unreal < 0 else "inherit")
         st.markdown(f"<span style='color:{total_color};'>Total Unrealized P&L: ₹ {total_unreal:,.2f}</span>", unsafe_allow_html=True)
     else:
@@ -1585,7 +1598,7 @@ def _positions_tab(dw) -> None:
     closed_candidates = [r for r in rows if _pt(r) == "CLOSED" or _net_qty(r) == 0]
     closed_today = [
         r for r in closed_candidates
-        if I(r, "dayBuyQty", 0) > 0 or I(r, "daySellQty", 0) > 0 or F(r, "realizedProfit", 0.0) != 0.0
+        if I(r, "dayBuyQty", 0) > 0 or I(r, "daySellQty", 0) > 0 or float(F(r, "realizedProfit", 0.0) or 0.0) != 0.0
     ]
 
     if closed_today:
@@ -1603,15 +1616,15 @@ def _positions_tab(dw) -> None:
             # Prefer intraday (day*) fields to mirror Dhan's "Today's Closed" view
             day_buy_qty = I(r, "dayBuyQty", 0)
             day_sell_qty = I(r, "daySellQty", 0)
-            day_buy_avg = F(r, "dayBuyAvg", 0.0)
-            day_sell_avg = F(r, "daySellAvg", 0.0)
+            day_buy_avg = float(F(r, "dayBuyAvg", 0.0) or 0.0)
+            day_sell_avg = float(F(r, "daySellAvg", 0.0) or 0.0)
 
             buy_qty = day_buy_qty if day_buy_qty > 0 else I(r, "buyQty", 0)
             sell_qty = day_sell_qty if day_sell_qty > 0 else I(r, "sellQty", 0)
-            cost_price = F(r, "costPrice", 0.0)
+            cost_price = float(F(r, "costPrice", 0.0) or 0.0)
 
-            raw_buy_avg = day_buy_avg if day_buy_avg > 0 else F(r, "buyAvg", 0.0)
-            raw_sell_avg = day_sell_avg if day_sell_avg > 0 else F(r, "sellAvg", 0.0)
+            raw_buy_avg = day_buy_avg if day_buy_avg > 0 else float(F(r, "buyAvg", 0.0) or 0.0)
+            raw_sell_avg = day_sell_avg if day_sell_avg > 0 else float(F(r, "sellAvg", 0.0) or 0.0)
 
             qty = max(buy_qty, sell_qty)
 
@@ -1678,7 +1691,7 @@ def _positions_tab(dw) -> None:
             })
             .apply(_pnl_style_col_closed, subset=["P&L"], axis=0)
         )
-        st.dataframe(styler_closed, hide_index=True, width="stretch")
+        st.dataframe(styler_closed, hide_index=True, use_container_width=True)
         closed_color = "#2e7d32" if total_realized > 0 else ("#d32f2f" if total_realized < 0 else "inherit")
         st.markdown(f"<span style='color:{closed_color};'>Realized P&L (today): ₹ {total_realized:,.2f}</span>", unsafe_allow_html=True)
     else:
@@ -1959,7 +1972,7 @@ def _render_payoff_analyzer(open_rows, dw):
                               xaxis_title="Spot Price", yaxis_title="Net P&L (₹)",
                               template="plotly_white", height=520,
                               legend=dict(orientation="h"))
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True, key="payoff_chart")
 
             # Quick stats
             mx = np.nanmax(total_exp)
@@ -2002,7 +2015,7 @@ def _render_payoff_analyzer(open_rows, dw):
                     "Model Px": df_g["Model Px"].sum(),
                 }
                 df_g = pd.concat([df_g, pd.DataFrame([total_row])], ignore_index=True)
-            st.dataframe(df_g, hide_index=True, width="stretch")
+            st.dataframe(df_g, hide_index=True, use_container_width=True)
 
 # =============================================================================
 # Agent Logs tab
@@ -2064,16 +2077,17 @@ def _render_blotter_panel(blotter_df: Optional[pd.DataFrame], summary: Dict[str,
         fallback = _fallback_blotter_from_positions()
         if fallback is not None:
             st.info("No agent trades recorded yet. Showing live positions (read-only).")
-            st.dataframe(fallback, hide_index=True, width="stretch")
+            st.dataframe(fallback, hide_index=True, use_container_width=True)
         else:
             st.info("No trades recorded yet.")
         return
     table = blotter_df.copy()
     if "timestamp" in table.columns:
-        table["timestamp"] = table["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        ts = pd.to_datetime(table["timestamp"], errors="coerce")
+        table["timestamp"] = ts.dt.strftime("%Y-%m-%d %H:%M:%S")  # type: ignore[attr-defined]
     latest = table.tail(100)
     columns = [c for c in ["timestamp", "trade_mode", "side", "order_type", "product_type", "quantity", "price", "strike", "notes"] if c in latest.columns]
-    st.dataframe(latest[columns], hide_index=True, width="stretch")
+    st.dataframe(latest[columns], hide_index=True, use_container_width=True)
     st.caption("Showing the latest 100 blotter entries.")
 
 
@@ -2231,7 +2245,7 @@ def _render_environment_summary(feature_df: Optional[pd.DataFrame]) -> None:
 
     if candidates:
         df = pd.DataFrame(candidates)
-        st.dataframe(df[[c for c in ["name", "score", "confidence", "sizing_hint", "rationale"] if c in df.columns]], width="stretch")
+        st.dataframe(df[[c for c in ["name", "score", "confidence", "sizing_hint", "rationale"] if c in df.columns]], use_container_width=True)
     else:
         st.caption("Strategy recommender idle – waiting for sufficient data.")
 
@@ -2285,7 +2299,7 @@ def _render_live_monitor_snapshot() -> None:
             df = pd.DataFrame(positions)
             df = df.rename(columns={"symbol": "Symbol", "pnl": "PnL", "pnl_pct": "PnL %", "risk_flag": "Risk"})
             show_cols = [c for c in ["Symbol", "PnL", "PnL %", "Risk", "bias", "distance_to_support_pct", "distance_to_resistance_pct", "notes"] if c in df.columns]
-            st.dataframe(df[show_cols], width="stretch", hide_index=True)
+            st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
         else:
             st.info("No positions in snapshot.")
     evs = data.get("events") or []
@@ -2417,10 +2431,11 @@ def _render_capital_telemetry(
         height=320,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
     )
-    chart_kwargs = {"width": "stretch"}
-    if chart_key:
-        chart_kwargs["key"] = chart_key
-    st.plotly_chart(fig, **chart_kwargs)
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        key=chart_key if chart_key is not None else None,
+    )
     return df
 
 
@@ -2507,7 +2522,7 @@ def _render_exposure_monitor(
                 bgcolor="rgba(249,115,22,0.2)",
             )
 
-    st.plotly_chart(fig, width="stretch", key="exposure_monitor_chart")
+    st.plotly_chart(fig, use_container_width=True, key="exposure_monitor_chart")
 
 
 def _date_range_controls(key_prefix: str = "date_range") -> Tuple[datetime, datetime]:
@@ -2519,10 +2534,21 @@ def _date_range_controls(key_prefix: str = "date_range") -> Tuple[datetime, date
         key=f"{key_prefix}_picker",
         help="Filter telemetry/logs to the selected dates.",
     )
-    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
-        start_date, end_date = date_range
+    # Streamlit returns a tuple of date when range=True, or a single date otherwise.
+    start_date: datetime_date
+    end_date: datetime_date
+    if isinstance(date_range, tuple):
+        if len(date_range) == 2:
+            start_date = cast(datetime_date, date_range[0])
+            end_date = cast(datetime_date, date_range[1])
+        elif len(date_range) == 1:
+            start_date = end_date = cast(datetime_date, date_range[0])
+        else:
+            start_date = end_date = today
+    elif isinstance(date_range, list) and len(date_range) >= 1:
+        start_date = end_date = cast(datetime_date, date_range[0])
     else:
-        start_date = end_date = date_range
+        start_date = end_date = cast(datetime_date, date_range)
     if start_date > end_date:
         start_date, end_date = end_date, start_date
     start_dt = datetime.combine(start_date, datetime_time.min)
@@ -2595,7 +2621,7 @@ def _render_order_audit_panel() -> None:
         intent_df = pd.DataFrame(intents)
         if "timestamp" in intent_df.columns:
             intent_df["timestamp"] = pd.to_datetime(intent_df["timestamp"], errors="coerce")
-        st.dataframe(intent_df.tail(50), width="stretch")
+        st.dataframe(intent_df.tail(50), use_container_width=True)
     else:
         st.info("No queued order intents.")
 
@@ -2604,7 +2630,7 @@ def _render_order_audit_panel() -> None:
         audit_df = pd.DataFrame(audits)
         if "timestamp" in audit_df.columns:
             audit_df["timestamp"] = pd.to_datetime(audit_df["timestamp"], errors="coerce")
-        st.dataframe(audit_df.tail(50), width="stretch")
+        st.dataframe(audit_df.tail(50), use_container_width=True)
     else:
         st.info("No audit entries yet.")
 
@@ -2617,7 +2643,7 @@ def _render_playbook_panel() -> None:
         status_df = pd.DataFrame(status_rows)
         if "timestamp" in status_df.columns:
             status_df["timestamp"] = pd.to_datetime(status_df["timestamp"], errors="coerce")
-        st.dataframe(status_df.tail(20), width="stretch")
+        st.dataframe(status_df.tail(20), use_container_width=True)
     if history:
         st.caption("Recent Steps")
         for entry in history:
@@ -3475,7 +3501,7 @@ def _paper_pnl_tab() -> None:
         if recent_entries:
             st.markdown("#### Recent Paper Entries")
             ent_df = pd.DataFrame(recent_entries).tail(5)
-            st.dataframe(ent_df, hide_index=True, width="stretch")
+            st.dataframe(ent_df, hide_index=True, use_container_width=True)
             st.divider()
 
     st.markdown("#### Open Positions (Paper)")
@@ -3555,7 +3581,7 @@ def _paper_pnl_tab() -> None:
     except Exception:
         pass
     styler = df_pos.style.format({"Avg Price": "₹ {:.2f}"})
-    st.dataframe(styler, hide_index=True, width="stretch")
+    st.dataframe(styler, hide_index=True, use_container_width=True)
 
 
 def _weekly_plan_tab() -> None:
@@ -3711,7 +3737,7 @@ def _weekly_plan_tab() -> None:
                 df = pd.DataFrame([latest])
                 if "expiry" in df.columns:
                     st.caption(f"Expiry: {df.loc[0, 'expiry']}")
-                st.dataframe(df, width="stretch")
+                st.dataframe(df, use_container_width=True)
     else:
         st.info(f"No plan file yet. Expected at `{plan_path}`.")
 
@@ -3719,7 +3745,7 @@ def _weekly_plan_tab() -> None:
     st.markdown("### Recent Weekly Intents")
     if intents:
         df = pd.DataFrame(intents)
-        st.dataframe(df, width="stretch")
+        st.dataframe(df, use_container_width=True)
     else:
         st.caption("No intents logged yet.")
 
