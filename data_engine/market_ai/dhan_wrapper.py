@@ -65,9 +65,10 @@ __all__ = [
 # Ensure local checkout is on sys.path so the vendored dhan_sdk works even when
 # PYTHONPATH was not exported (common when launching via Streamlit/UI).
 HERE = Path(__file__).resolve()
-ROOT = HERE.parents[2]  # repo root
-PKG_DIR = HERE.parents[1]  # data_engine/market_ai
-for p in (str(ROOT), str(PKG_DIR)):
+ROOT = HERE.parents[2]          # repo root
+DATA_ENGINE_DIR = HERE.parents[1]  # .../data_engine
+LOCAL_PKG_DIR = HERE.parent        # .../data_engine/market_ai (needed for top-level 'dhan_sdk')
+for p in (str(ROOT), str(DATA_ENGINE_DIR), str(LOCAL_PKG_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 

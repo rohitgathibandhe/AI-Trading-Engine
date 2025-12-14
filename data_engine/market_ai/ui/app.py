@@ -1123,10 +1123,11 @@ def _new_dw() -> Optional[Any]:
 def _drain_ltp_queue_into_state() -> None:
     """Transfer any pending LTP updates from background thread to session_state."""
     ss = st.session_state
-    while True:
+    while not LTP_QUEUE.empty():
         try:
             ltp, ts = LTP_QUEUE.get_nowait()
         except Empty:
+            # Race: another consumer drained between empty() check and get_nowait()
             break
         ss["ltp_value"] = ltp
         ss["ltp_ts"] = ts
