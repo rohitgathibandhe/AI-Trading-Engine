@@ -18,6 +18,7 @@ import pandas as pd
 import requests
 
 from .dhan_api import SimpleDhanClient, _raise_for_status
+from .dhan_api import get_expiry_list_for_underlying
 import time
 
 LOG = logging.getLogger(__name__)
@@ -113,6 +114,14 @@ class RollingOptionIngestor:
         option_types = cfg.option_types or ("CALL", "PUT")
         required = list(cfg.required_data or DEFAULT_REQUIRED_DATA)
 
+        # Pre-fetch expiry list so we can stamp expiry when the payload omits it.
+        try:
+            expiry_list = get_expiry_list_for_underlying(self.client, int(cfg.security_id), cfg.segment, use_cache=True)
+            expiry_list = sorted(expiry_list)
+        except Exception as exc:
+            LOG.warning("Could not fetch expiry list; expiry stamping may be missing: %s", exc)
+            expiry_list = []
+
         chunk_start = base_start
         while chunk_start <= base_end:
             chunk_end = min(chunk_start + timedelta(days=MAX_ROLLING_WINDOW_DAYS - 1), base_end)
@@ -137,11 +146,11 @@ class RollingOptionIngestor:
                         payload["toDate"],
                     )
                     resp = requests.post(
-                        self.client._url(ROLLING_OPTION_PATH),
-                        headers=self.client.headers,
-                        json=payload,
-                        timeout=self.client.timeout,
-                    )
+                    self.client._url(ROLLING_OPTION_PATH),
+                    headers=self.client.headers,
+                    json=payload,
+                    timeout=self.client.timeout,
+                )
                     if resp.status_code == 429:
                         wait = min(max(self.throttle_s, 2.0 * attempt), 12.0) if 'attempt' in locals() else self.throttle_s
                         LOG.warning("rollingoption 429 rate limit; sleeping %.1fs and retrying once", wait)
@@ -159,7 +168,7 @@ class RollingOptionIngestor:
                             data,
                             option_type=option_type,
                             selector=strike,
-                            expiry_hint=cfg.expiry,
+                            expiry_hint=self._choose_expiry(expiry_list, dt_hint=chunk_start),
                         )
                     )
                     # Backoff between requests to respect rate limits
@@ -238,6 +247,22 @@ class RollingOptionIngestor:
             }
             rows.append(record)
         return rows
+
+    @staticmethod
+    def _choose_expiry(expiries: Sequence[str], dt_hint: date) -> Optional[str]:
+        """
+        Pick the nearest expiry on/after the trade date when API omits expiryDate.
+        """
+        if not expiries:
+            return None
+        for exp in expiries:
+            try:
+                d = datetime.strptime(exp, "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if d >= dt_hint:
+                return d.isoformat()
+        return expiries[-1] if expiries else None
 
     def _write_records(self, records: Iterable[Dict[str, Any]]) -> List[Path]:
         records = list(records)

@@ -53,15 +53,24 @@ class LocalRollingMarket:
             df = pq.read_table(parquet_path).to_pandas()
         except Exception:
             return {}
-        if "expiryDate" not in df.columns or "strikePrice" not in df.columns or "optionType" not in df.columns:
+        if "strikePrice" not in df.columns or "optionType" not in df.columns:
             return {}
-        df["expiryDate"] = pd.to_datetime(df["expiryDate"], errors="coerce").dt.date
+        # Derive expiry: fall back to monthly expiry if missing
+        target_expiry = None
         try:
             target_expiry = datetime.fromisoformat(expiry_or_tag).date()
         except Exception:
-            target_expiry = None
-        if target_expiry:
-            df = df.loc[df["expiryDate"] == target_expiry]
+            pass
+        if "expiryDate" in df.columns:
+            df["expiryDate"] = pd.to_datetime(df["expiryDate"], errors="coerce").dt.date
+            if target_expiry:
+                # If expiry missing in snapshot, tag it to target_expiry
+                if not df["expiryDate"].notna().any():
+                    df["expiryDate"] = target_expiry
+                df = df.loc[df["expiryDate"] == target_expiry]
+        elif target_expiry is not None:
+            df["expiryDate"] = target_expiry
+
         if df.empty:
             return {}
         # prefer last quote per strike/optionType
@@ -79,9 +88,9 @@ class LocalRollingMarket:
             node = chain.setdefault(strike, {})
             last = row.get("ltp") or row.get("last_price") or row.get("close") or row.get("open") or 0.0
             opt_type = str(row["optionType"]).strip().upper()
-            if opt_type == "CALL":
+            if opt_type in ("CALL", "CE"):
                 node["ce"] = {"last_price": float(last)}
-            elif opt_type == "PUT":
+            elif opt_type in ("PUT", "PE"):
                 node["pe"] = {"last_price": float(last)}
         return chain
 
