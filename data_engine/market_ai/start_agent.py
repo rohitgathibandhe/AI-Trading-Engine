@@ -103,6 +103,26 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "strangle_offset_high": 150.0,
     "spread_short_delta_low": 0.25,
     "spread_short_delta_high": 0.25,
+    # Batman V2 (paper) defaults
+    "batman_v2_target_delta": 0.22,
+    "batman_v2_delta_low": 0.20,
+    "batman_v2_delta_high": 0.25,
+    "batman_v2_net_credit_required": True,
+    "batman_v2_max_entry_time": "10:30",
+    "batman_v2_min_vix": 12.0,
+    "batman_v2_max_gap_pct": 1.0,
+    "batman_v2_monthly_band_low": 0.2,
+    "batman_v2_monthly_band_high": 0.8,
+    "batman_v2_lots": 1,
+    "batman_v2_lot_size": 75,
+    "batman_v2_capital": 500000.0,
+    "batman_v2_max_loss_pct": -0.03,
+    "batman_v2_max_both_delta": 0.45,
+    "batman_v2_dte_exit": 3,
+    "batman_v2_be_buffer": 50.0,
+    "batman_v2_mtm_naked_loss_x": 1.8,
+    "batman_v2_roll_recovery_x": 0.5,
+    "batman_v2_roll_hold_dte": 3,
     "gap_entry_threshold": 0.004,
     "iv_floor_percentile": 0.2,
     "short_lots": 1,
@@ -1418,7 +1438,32 @@ def main() -> None:
                 continue
             if SELECTED_STRATEGY_FILE == "batman_v2_paper":
                 if batman_v2 is None:
-                    batman_v2 = BatmanStrategy(BatmanConfig())
+                    bat_cfg = BatmanConfig(
+                        target_delta=float(settings.get("batman_v2_target_delta", 0.22)),
+                        delta_band=(
+                            float(settings.get("batman_v2_delta_low", 0.20)),
+                            float(settings.get("batman_v2_delta_high", 0.25)),
+                        ),
+                        net_credit_required=bool(settings.get("batman_v2_net_credit_required", True)),
+                        max_entry_time=str(settings.get("batman_v2_max_entry_time", "10:30")),
+                        min_vix=float(settings.get("batman_v2_min_vix", 12.0)),
+                        max_gap_pct=float(settings.get("batman_v2_max_gap_pct", 1.0)),
+                        monthly_center_band=(
+                            float(settings.get("batman_v2_monthly_band_low", 0.2)),
+                            float(settings.get("batman_v2_monthly_band_high", 0.8)),
+                        ),
+                        lots=int(settings.get("batman_v2_lots", 1)),
+                        lot_size=int(settings.get("batman_v2_lot_size", settings.get("lot_size", 75))),
+                        capital=float(settings.get("batman_v2_capital", 500000.0)),
+                        max_loss_pct=float(settings.get("batman_v2_max_loss_pct", -0.03)),
+                        max_both_side_delta=float(settings.get("batman_v2_max_both_delta", 0.45)),
+                        dte_exit=int(settings.get("batman_v2_dte_exit", 3)),
+                        be_buffer=float(settings.get("batman_v2_be_buffer", 50.0)),
+                        mtm_naked_loss_x=float(settings.get("batman_v2_mtm_naked_loss_x", 1.8)),
+                        roll_recovery_x=float(settings.get("batman_v2_roll_recovery_x", 0.5)),
+                        roll_hold_dte=int(settings.get("batman_v2_roll_hold_dte", 3)),
+                    )
+                    batman_v2 = BatmanStrategy(bat_cfg)
                 # Build a minimal feature set
                 daily_candles = _fetch_daily_candles(dw, days=40)
                 feats = _compute_monthly_filters(daily_candles, 0)

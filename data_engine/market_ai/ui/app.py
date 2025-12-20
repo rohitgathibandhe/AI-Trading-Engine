@@ -230,6 +230,26 @@ DEFAULT_SETTINGS = {
     "strangle_offset_high": 150.0,
     "spread_short_delta_low": 0.25,
     "spread_short_delta_high": 0.25,
+    # Batman V2 (paper) defaults
+    "batman_v2_target_delta": 0.22,
+    "batman_v2_delta_low": 0.20,
+    "batman_v2_delta_high": 0.25,
+    "batman_v2_net_credit_required": True,
+    "batman_v2_max_entry_time": "10:30",
+    "batman_v2_min_vix": 12.0,
+    "batman_v2_max_gap_pct": 1.0,
+    "batman_v2_monthly_band_low": 0.2,
+    "batman_v2_monthly_band_high": 0.8,
+    "batman_v2_lots": 1,
+    "batman_v2_lot_size": 75,
+    "batman_v2_capital": 500000.0,
+    "batman_v2_max_loss_pct": -0.03,
+    "batman_v2_max_both_delta": 0.45,
+    "batman_v2_dte_exit": 3,
+    "batman_v2_be_buffer": 50.0,
+    "batman_v2_mtm_naked_loss_x": 1.8,
+    "batman_v2_roll_recovery_x": 0.5,
+    "batman_v2_roll_hold_dte": 3,
     "risk_max_portfolio_delta": 0.25,
     "risk_max_exposure_pct": 0.05,
     "risk_account_equity": 500000.0,
@@ -3275,6 +3295,137 @@ def _settings_tab() -> None:
             help="Only pick weekly hedges at least this far OTM.",
         )
 
+    with st.expander("Batman V2 (paper only)"):
+        b2_col1, b2_col2, b2_col3 = st.columns(3)
+        with b2_col1:
+            b2_target_delta = st.number_input(
+                "Target delta",
+                0.05,
+                0.5,
+                float(current.get("batman_v2_target_delta", 0.22)),
+                step=0.01,
+            )
+            b2_delta_low = st.number_input(
+                "Delta band (low)",
+                0.01,
+                0.5,
+                float(current.get("batman_v2_delta_low", 0.20)),
+                step=0.01,
+            )
+            b2_delta_high = st.number_input(
+                "Delta band (high)",
+                0.01,
+                0.7,
+                float(current.get("batman_v2_delta_high", 0.25)),
+                step=0.01,
+            )
+            b2_net_credit = st.checkbox(
+                "Require net credit",
+                value=bool(current.get("batman_v2_net_credit_required", True)),
+            )
+            b2_max_entry_time = st.text_input(
+                "Max entry time (HH:MM)",
+                value=str(current.get("batman_v2_max_entry_time", "10:30")),
+            )
+        with b2_col2:
+            b2_min_vix = st.number_input(
+                "Min VIX",
+                5.0,
+                40.0,
+                float(current.get("batman_v2_min_vix", 12.0)),
+                step=0.5,
+            )
+            b2_max_gap_pct = st.number_input(
+                "Max gap % abs",
+                0.0,
+                5.0,
+                float(current.get("batman_v2_max_gap_pct", 1.0)),
+                step=0.1,
+                help="Skip if open gap exceeds this percent.",
+            )
+            b2_monthly_band_low = st.number_input(
+                "Monthly range band low",
+                0.0,
+                1.0,
+                float(current.get("batman_v2_monthly_band_low", 0.2)),
+                step=0.05,
+            )
+            b2_monthly_band_high = st.number_input(
+                "Monthly range band high",
+                0.0,
+                1.0,
+                float(current.get("batman_v2_monthly_band_high", 0.8)),
+                step=0.05,
+            )
+            b2_lots = st.number_input(
+                "Lots per side",
+                1,
+                20,
+                int(current.get("batman_v2_lots", 1)),
+            )
+        with b2_col3:
+            b2_lot_size = st.number_input(
+                "Lot size",
+                50,
+                1000,
+                int(current.get("batman_v2_lot_size", current.get("lot_size", 75))),
+            )
+            b2_capital = st.number_input(
+                "Capital (₹)",
+                100000.0,
+                5000000.0,
+                float(current.get("batman_v2_capital", 500000.0)),
+                step=50000.0,
+            )
+            b2_max_loss_pct = st.number_input(
+                "Max loss % of capital",
+                -1.0,
+                0.0,
+                float(current.get("batman_v2_max_loss_pct", -0.03)),
+                step=0.005,
+                help="E.g., -0.03 = stop at -3% of capital.",
+            )
+            b2_max_both_delta = st.number_input(
+                "Max both-side delta",
+                0.0,
+                1.0,
+                float(current.get("batman_v2_max_both_delta", 0.45)),
+                step=0.05,
+            )
+            b2_dte_exit = st.number_input(
+                "Exit when DTE <= (days)",
+                0,
+                10,
+                int(current.get("batman_v2_dte_exit", 3)),
+            )
+            b2_be_buffer = st.number_input(
+                "BE buffer (pts)",
+                0.0,
+                500.0,
+                float(current.get("batman_v2_be_buffer", 50.0)),
+                step=10.0,
+            )
+            b2_mtm_naked_loss_x = st.number_input(
+                "Naked MTM loss trigger (x entry)",
+                0.5,
+                5.0,
+                float(current.get("batman_v2_mtm_naked_loss_x", 1.8)),
+                step=0.1,
+            )
+            b2_roll_recovery_x = st.number_input(
+                "Roll recovery fraction",
+                0.1,
+                2.0,
+                float(current.get("batman_v2_roll_recovery_x", 0.5)),
+                step=0.05,
+            )
+            b2_roll_hold_dte = st.number_input(
+                "Hold rolled leg DTE <= (days)",
+                0,
+                10,
+                int(current.get("batman_v2_roll_hold_dte", 3)),
+            )
+
     if st.button("💾 Save Settings"):
         SETTINGS_JSON.write_text(json.dumps({
             "max_legs": int(max_legs),
@@ -3331,6 +3482,25 @@ def _settings_tab() -> None:
             "batman_weekly_hedge_enabled": bool(bat_weekly_hedge_enabled),
             "batman_weekly_hedge_price_cap": float(bat_weekly_hedge_cap),
             "batman_weekly_hedge_min_distance": float(bat_weekly_hedge_min_dist),
+            "batman_v2_target_delta": float(b2_target_delta),
+            "batman_v2_delta_low": float(b2_delta_low),
+            "batman_v2_delta_high": float(b2_delta_high),
+            "batman_v2_net_credit_required": bool(b2_net_credit),
+            "batman_v2_max_entry_time": str(b2_max_entry_time),
+            "batman_v2_min_vix": float(b2_min_vix),
+            "batman_v2_max_gap_pct": float(b2_max_gap_pct),
+            "batman_v2_monthly_band_low": float(b2_monthly_band_low),
+            "batman_v2_monthly_band_high": float(b2_monthly_band_high),
+            "batman_v2_lots": int(b2_lots),
+            "batman_v2_lot_size": int(b2_lot_size),
+            "batman_v2_capital": float(b2_capital),
+            "batman_v2_max_loss_pct": float(b2_max_loss_pct),
+            "batman_v2_max_both_delta": float(b2_max_both_delta),
+            "batman_v2_dte_exit": int(b2_dte_exit),
+            "batman_v2_be_buffer": float(b2_be_buffer),
+            "batman_v2_mtm_naked_loss_x": float(b2_mtm_naked_loss_x),
+            "batman_v2_roll_recovery_x": float(b2_roll_recovery_x),
+            "batman_v2_roll_hold_dte": int(b2_roll_hold_dte),
             "monthly_filters": {
                 "use_adx": bool(use_adx),
                 "adx_length": int(adx_length),
