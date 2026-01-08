@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum, auto
 from typing import List, Optional, Tuple, Dict, Any
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class BatmanSide(Enum):
@@ -29,14 +32,17 @@ class BatmanConfig:
     lots: int = 1
     lot_size: int = 75
     capital: float = 500_000.0
-    # Risk
-    max_loss_pct: float = -0.03  # of capital
+    # PnL management on deployed capital
+    tp_pct_deployed: float = 0.025  # +2.5% of deployed capital
+    sl_pct_deployed: float = 0.02   # -2% of deployed capital
+    time_exit_days: int = 2         # safety exit near expiry
+    # Risk/structure guards (kept for selection only)
     max_both_side_delta: float = 0.45
-    dte_exit: int = 3
     be_buffer: float = 50.0
     mtm_naked_loss_x: float = 1.8  # if naked leg LTP >= 1.8x entry
     roll_recovery_x: float = 0.5   # recover 50% of adjustment loss
     roll_hold_dte: int = 3
+    one_trade_per_expiry: bool = True
 
 
 @dataclass
@@ -64,6 +70,8 @@ class BatmanLeg:
 @dataclass
 class BatmanState:
     created_at: datetime
+    opened_at: datetime
+    deployed_capital: float
     expiry: date
     long_put: BatmanLeg
     short_put_1: BatmanLeg
@@ -77,6 +85,7 @@ class BatmanState:
     adjustment_loss: float = 0.0
     rolled_leg: Optional[BatmanLeg] = None
     rolled_realized: float = 0.0
+    just_opened: bool = True
 
     def all_legs(self) -> List[BatmanLeg]:
         return [
@@ -109,6 +118,9 @@ class BatmanStrategy:
         self.cfg = cfg
         self.state: Optional[BatmanState] = None
         self.notice_logged = False
+        self.last_exit_at: Optional[datetime] = None
+        self.last_dte_check_date: Optional[date] = None
+        self.entered_expiries: set[date] = set()
 
     # API expected by start_agent
     def maybe_enter(
@@ -116,22 +128,32 @@ class BatmanStrategy:
         as_of: datetime,
         spot: float,
         expiry: date,
-        vix: float,
+        vix: Optional[float],
         gap_pct: float,
-        monthly_range_pos: float,
+        monthly_range_pos: Optional[float],
         chain: List[Dict[str, Any]],
     ) -> Optional[BatmanState]:
         if self.state and self.state.is_active():
             return self.state
+        if self.cfg.one_trade_per_expiry and expiry in self.entered_expiries:
+            logger.info("Batman V2 entry blocked: already traded this expiry")
+            return None
 
         hhmm = as_of.strftime("%H:%M")
         if hhmm > self.cfg.max_entry_time:
             return None
-        if vix < self.cfg.min_vix:
-            return None
+        vix_gate_enabled = self.cfg.min_vix is not None and self.cfg.min_vix > 0
+        if vix_gate_enabled:
+            if vix is None:
+                logger.info("Batman V2 entry blocked: VIX_MISSING (min_vix=%.2f)", self.cfg.min_vix)
+                return None
+            if vix < self.cfg.min_vix:
+                return None
         if abs(gap_pct) > self.cfg.max_gap_pct:
             return None
         lo, hi = self.cfg.monthly_center_band
+        if monthly_range_pos is None:
+            return None
         if not (lo <= monthly_range_pos <= hi):
             return None
 
@@ -148,6 +170,8 @@ class BatmanStrategy:
 
         state = BatmanState(
             created_at=as_of,
+            opened_at=as_of,
+            deployed_capital=self.cfg.capital,
             expiry=expiry,
             long_put=lp,
             short_put_1=sp1,
@@ -159,58 +183,36 @@ class BatmanStrategy:
         self.state = state
         return state
 
-    def on_tick(self, as_of: datetime, spot: float, vix: float, adx: float, chain: List[Dict[str, Any]]) -> Optional[str]:
+    def on_tick(self, as_of: datetime, spot: float, vix: Optional[float], adx: float, chain: List[Dict[str, Any]]) -> Optional[str]:
         state = self.state
         if not state or not state.is_active():
             return None
 
+        # Skip exit checks on the entry tick only
+        if state.just_opened:
+            state.just_opened = False
+            return "HOLD"
+
         self._refresh(state, chain)
         pnl = self._compute_pnl(state)
         state.pnl_unrealized = pnl
+        tp = state.deployed_capital * self.cfg.tp_pct_deployed
+        sl = state.deployed_capital * self.cfg.sl_pct_deployed
 
-        # Hard loss
-        if pnl <= self.cfg.max_loss_pct * self.cfg.capital:
-            self._flatten("HARD_STOP")
-            return "HARD_STOP"
+        today = as_of.date()
+        dte = (state.expiry - today).days
 
-        # Both sides delta stressed
-        if self._both_sides_delta_stressed(state):
-            self._flatten("BOTH_DELTA")
-            return "BOTH_DELTA"
+        if pnl >= tp:
+            self._flatten("TP_DEPLOYED", as_of=as_of)
+            return "TP_DEPLOYED"
+        if pnl <= -sl:
+            self._flatten("SL_DEPLOYED", as_of=as_of)
+            return "SL_DEPLOYED"
+        if dte <= self.cfg.time_exit_days:
+            self._flatten("TIME_EXIT_SAFETY", as_of=as_of)
+            return "TIME_EXIT_SAFETY"
 
-        # DTE exit
-        dte = (state.expiry - as_of.date()).days
-        if dte <= self.cfg.dte_exit:
-            self._flatten("DTE_EXIT")
-            return "DTE_EXIT"
-
-        # Breach simple BE approx
-        be_low, be_high = self._estimate_be(state)
-        if state.phase is BatmanPhase.FULL:
-            challenged = self._detect_challenged_side(state, spot, be_low, be_high)
-            if challenged:
-                self._adjust_structure(state, challenged, chain)
-                return "ADJUST"
-        else:
-            # managing rolled naked
-            rolled = state.rolled_leg
-            if rolled:
-                # recompute rolled PnL
-                if rolled.last_price is not None:
-                    rolled_pnl = (rolled.entry_price - rolled.last_price) * rolled.quantity * self.cfg.lot_size
-                    state.rolled_realized = rolled_pnl
-                rec_target = abs(state.adjustment_loss) * self.cfg.roll_recovery_x
-                if state.rolled_realized >= rec_target:
-                    self._exit_leg(rolled, "ROLL_RECOVERED")
-                    self._flatten("ROLL_DONE")
-                    return "ROLL_DONE"
-                rolled_dte = (rolled.expiry - as_of.date()).days
-                if rolled_dte <= self.cfg.roll_hold_dte:
-                    self._exit_leg(rolled, "ROLL_DTE")
-                    self._flatten("ROLL_DTE")
-                    return "ROLL_DTE"
-
-        return None
+        return "HOLD"
 
     def _refresh(self, state: BatmanState, chain: List[Dict[str, Any]]) -> None:
         lookup = {}
@@ -242,9 +244,17 @@ class BatmanStrategy:
             return False
         return max(call_d) > self.cfg.max_both_side_delta and max(put_d) > self.cfg.max_both_side_delta
 
-    def _flatten(self, reason: str) -> None:
+    def _flatten(self, reason: str, as_of: Optional[datetime] = None) -> None:
         if self.state:
             self.state.phase = BatmanPhase.CLOSED
+        exit_ts = as_of or datetime.now()
+        self.last_exit_at = exit_ts
+        # track expiries already traded
+        try:
+            if self.state:
+                self.entered_expiries.add(self.state.expiry)
+        except Exception:
+            pass
 
     def _pick_side(
         self, rows: List[Dict[str, Any]], spot: float, side: BatmanSide
@@ -268,7 +278,15 @@ class BatmanStrategy:
             if scored:
                 break
         if not scored:
-            return None, None, None
+            # Fallback: pick closest strikes to spot if deltas unavailable
+            try:
+                rows_sorted = sorted(rows, key=lambda r: abs(float(r.get("strike", 0)) - float(r.get("spot", 0))))
+            except Exception:
+                rows_sorted = rows
+            if len(rows_sorted) < 2:
+                return None, None, None
+            short = rows_sorted[0]
+            long = rows_sorted[1]
         scored.sort(key=lambda x: abs(x[0] - self.cfg.target_delta))
         short = scored[0][1]
         # Long further OTM: pick smallest abs delta below short
@@ -276,7 +294,7 @@ class BatmanStrategy:
         if not long_rows:
             return None, None, None
         long = sorted(long_rows, key=lambda r: abs((r.get("delta") or 0) - 0.1))[0]
-        qty_short = self.cfg.lots * self.cfg.lot_size
+        qty_short = self.cfg.lots * self.cfg.lot_size * 3  # 3 shorts per side
         qty_long = self.cfg.lots * self.cfg.lot_size
         leg_long = BatmanLeg(
             side=side,

@@ -76,24 +76,14 @@ def _auto_refresh(active_page: str) -> None:
     if active_page not in REFRESHABLE_PAGES:
         return
     try:
-        refresh_sec = max(0, int(st.session_state.get("refresh_sec", 5)))
+        refresh_sec = max(1, int(st.session_state.get("refresh_sec", 5)))
     except Exception:
         refresh_sec = 5
-    if refresh_sec <= 0:
-        return
+    # Use Streamlit's native autorefresh (server-side rerun, not page reload)
     key = f"auto_refresh_{active_page.replace(' ', '_').lower()}"
+    # Only use Streamlit's built-in autorefresh; avoid JS full-page reloads.
     if st_autorefresh is not None:
         st_autorefresh(interval=refresh_sec * 1000, key=key)
-    else:
-        placeholder = st.empty()
-        placeholder.markdown(
-            f"""
-            <script>
-                setTimeout(function() {{ window.location.reload(); }}, {refresh_sec * 1000});
-            </script>
-            """,
-            unsafe_allow_html=True,
-        )
 
 
 def _load_weekly_settings() -> Dict[str, Any]:
@@ -375,6 +365,7 @@ def _init_state() -> None:
     ss.setdefault("agent_running", False)
     ss.setdefault("trade_mode", "paper")
     ss.setdefault("refresh_sec", 5)
+    ss.setdefault("clear_paper_blotter_on_start", False)
 
     ss.setdefault("ltp_value", None)
     ss.setdefault("ltp_ts", None)
@@ -1286,9 +1277,8 @@ def start_agent() -> None:
         st.error(f"start_agent.py not found at: {AGENT_ENTRY}")
         return
     try:
-        # If starting in paper mode, clear any previous blotter so we don't
-        # show stale paper trades from an old session.
-        if st.session_state.get("trade_mode", "live") == "paper":
+        # If explicitly requested, clear previous paper blotter before start
+        if st.session_state.get("trade_mode", "live") == "paper" and st.session_state.get("clear_paper_blotter_on_start"):
             _reset_paper_blotter()
         AGENT_LOG.parent.mkdir(parents=True, exist_ok=True)
         AGENT_LOG.touch(exist_ok=True)
@@ -3674,72 +3664,132 @@ def _paper_pnl_tab() -> None:
             st.dataframe(ent_df, hide_index=True, use_container_width=True)
             st.divider()
 
+    # Stable containers to avoid wiping the table on each rerun
+    if "paper_positions_container" not in st.session_state:
+        st.session_state["paper_positions_container"] = st.container()
+    if "paper_positions_total" not in st.session_state:
+        st.session_state["paper_positions_total"] = st.empty()
+    table_ph = st.session_state["paper_positions_container"]
+    total_ph = st.session_state["paper_positions_total"]
     st.markdown("#### Open Positions (Paper)")
+    cached = st.session_state.get("paper_positions_cache")
+    # If the cached read was empty, try a fresh uncached read to avoid transient blanks
+    if (df is None or df.empty) and BLOTTER_CSV.exists():
+        try:
+            df = pd.read_csv(BLOTTER_CSV, low_memory=False)
+            if not df.empty and "timestamp" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+                df = df.sort_values("timestamp")
+        except Exception:
+            pass
     if df is None or df.empty:
-        st.info("No paper trades recorded yet.")
+        if cached:
+            st.caption("Showing last cached paper positions (no new data yet).")
+            table_ph.dataframe(cached["df"], hide_index=True, use_container_width=True, height=320, key="paper_positions_table")
+            total_ph.markdown(cached["total_html"], unsafe_allow_html=True)
+        else:
+            st.info("No paper trades recorded yet.")
+            table_ph.empty()
+            total_ph.empty()
         return
     paper_df = df.loc[df.get("trade_mode") == "paper"].copy()
     if paper_df.empty:
-        st.info("No paper trades recorded yet.")
-        return
-
-    positions: Dict[str, Dict[str, Any]] = {}
-    for _, row in paper_df.iterrows():
-        strike_val = row.get("strike")
-        if strike_val is None or (isinstance(strike_val, float) and pd.isna(strike_val)):
-            name = str(row.get("notes") or row.get("security_id") or "Unknown")
+        if cached:
+            st.caption("Showing last cached paper positions (no new data yet).")
+            table_ph.dataframe(cached["df"], hide_index=True, use_container_width=True, height=320, key="paper_positions_table")
+            total_ph.markdown(cached["total_html"], unsafe_allow_html=True)
         else:
-            try:
-                name = f"{float(strike_val):.0f}"
-            except Exception:
-                name = str(strike_val)
-        try:
-            qty = int(row.get("quantity") or 0)
-        except Exception:
-            qty = 0
-        try:
-            price = float(row.get("price") or 0.0)
-        except Exception:
-            price = 0.0
-        side = str(row.get("side") or "").upper()
-        expiry_val = row.get("expiry") or ""
-        delta_val = row.get("delta") if "delta" in row else None
-        key = (name, expiry_val)
-        key = str(name)
-        pos = positions.setdefault(key, {"name": name, "expiry": expiry_val, "product": "PAPER", "qty": 0, "notional": 0.0, "delta_sum": 0.0, "delta_qty": 0})
-        direction = 1 if side == "SELL" else -1
-        pos["qty"] += direction * qty
-        pos["notional"] += direction * qty * price
-        try:
-            if delta_val not in (None, "", "nan"):
-                pos["delta_sum"] += direction * qty * float(delta_val)
-                pos["delta_qty"] += abs(qty)
-        except Exception:
-            pass
+            st.info("No paper trades recorded yet.")
+            table_ph.empty()
+            total_ph.empty()
+        return
+    # Focus on the latest expiry to avoid mixing old paper legs
+    try:
+        latest_expiry = paper_df["expiry"].dropna().max()
+        if latest_expiry:
+            paper_df = paper_df.loc[paper_df["expiry"] == latest_expiry]
+    except Exception:
+        pass
 
-    table_rows = []
-    for pos in positions.values():
-        if pos["qty"] == 0:
-            continue
-        qty = abs(pos["qty"])
-        avg = pos["notional"] / pos["qty"] if pos["qty"] != 0 else 0.0
-        avg_delta = None
+    # Build leg state from blotter: entry price from OPEN, LTP from MTM
+    try:
+        paper_df = paper_df.sort_values("timestamp")
+    except Exception:
+        pass
+    legs: Dict[tuple, Dict[str, Any]] = {}
+    for _, row in paper_df.iterrows():
         try:
-            if pos.get("delta_qty"):
-                avg_delta = pos.get("delta_sum", 0.0) / pos.get("delta_qty", 1)
+            sec_id = row.get("security_id")
+            strike = row.get("strike")
+            expiry_val = row.get("expiry") or ""
+            side = str(row.get("side") or "").upper()
+            qty = int(row.get("quantity") or 0)
+            price = float(row.get("price") or 0.0)
+            notes = str(row.get("notes") or "").upper()
         except Exception:
-            avg_delta = None
-        table_rows.append({
-            "B/S": "S" if pos["qty"] > 0 else "B",
-            "Name": pos["name"],
-            "Expiry": pos.get("expiry") or "",
-            "Product": pos["product"],
-            "Qty": qty,
-            "Avg Price": avg,
-            "Delta": avg_delta if avg_delta is not None else "—",
-            "LTP": "—",
-            "P&L": "—",
-        })
+            continue
+        key = (sec_id, strike, expiry_val)  # aggregate per instrument
+        leg = legs.setdefault(
+            key,
+            {
+                "entry": None,
+                "entry_qty": 0,
+                "ltp": None,
+                "qty": 0,
+                "side": side,
+                "strike": strike,
+                "expiry": expiry_val,
+                "sec_id": sec_id,
+            },
+        )
+        if notes == "OPEN":
+            # accumulate quantity and average entry
+            prev_qty = leg.get("entry_qty", 0)
+            signed = qty if side == "SELL" else -qty
+            new_qty = prev_qty + signed
+            if new_qty != 0:
+                prev_entry = leg.get("entry") or 0.0
+                leg["entry"] = ((prev_entry * prev_qty) + (price * signed)) / new_qty
+                leg["entry_qty"] = new_qty
+            leg["qty"] = new_qty
+            leg["side"] = "SELL" if new_qty > 0 else "BUY"
+        elif notes == "MTM":
+            leg["ltp"] = price
+            # keep latest qty from MTM as current open qty
+            leg["qty"] = qty if side == "SELL" else -qty
+            leg["side"] = "SELL" if leg["qty"] > 0 else "BUY"
+
+    table_rows: List[Dict[str, Any]] = []
+    total_pnl = 0.0
+    for leg in legs.values():
+        entry_px = leg.get("entry")
+        ltp_px = leg.get("ltp") if leg.get("ltp") not in (None, "") else entry_px
+        if entry_px is None:
+            continue
+        qty = abs(int(leg.get("qty") or leg.get("entry_qty") or 0))
+        side = leg.get("side")
+        pnl = None
+        try:
+            if ltp_px is not None:
+                if side == "SELL":
+                    pnl = (entry_px - ltp_px) * qty
+                else:
+                    pnl = (ltp_px - entry_px) * qty
+                total_pnl += pnl
+        except Exception:
+            pnl = None
+        table_rows.append(
+            {
+                "B/S": "S" if side == "SELL" else "B",
+                "Strike": leg.get("strike"),
+                "Expiry": leg.get("expiry"),
+                "SecID": leg.get("sec_id"),
+                "Qty": qty,
+                "Entry": entry_px,
+                "LTP": ltp_px if ltp_px is not None else "—",
+                "P&L": pnl if pnl is not None else "—",
+            }
+        )
 
     if not table_rows:
         st.caption("Paper ledger has no open positions (all closed).")
@@ -3750,8 +3800,35 @@ def _paper_pnl_tab() -> None:
         df_pos["Qty"] = df_pos["Qty"].astype("Int64")
     except Exception:
         pass
-    styler = df_pos.style.format({"Avg Price": "₹ {:.2f}"})
-    st.dataframe(styler, hide_index=True, use_container_width=True)
+    def _pnl_style_col(col):
+        styles = []
+        for v in col:
+            if v in ("—", None):
+                styles.append("")
+            elif v < 0:
+                styles.append("color: #d32f2f; font-weight: 600;")
+            elif v > 0:
+                styles.append("color: #2e7d32; font-weight: 600;")
+            else:
+                styles.append("")
+        return styles
+
+    styler = (
+        df_pos.style
+        .format({"Entry": "₹ {:.2f}", "LTP": "₹ {:.2f}", "P&L": "₹ {:.2f}"})
+        .apply(_pnl_style_col, subset=["P&L"], axis=0)
+    )
+    # Always update the existing table key so Streamlit swaps data without rebuilding the widget
+    st.session_state["paper_positions_last"] = df_pos.copy()
+    table_ph.dataframe(styler, hide_index=True, use_container_width=True, height=320, key="paper_positions_table")
+    total_color = "#2e7d32" if total_pnl > 0 else ("#d32f2f" if total_pnl < 0 else "inherit")
+    total_html = f"<span style='color:{total_color};'>Total Unrealized P&L: ₹ {total_pnl:,.2f}</span>"
+    total_ph.markdown(total_html, unsafe_allow_html=True)
+    # cache the latest non-empty snapshot to avoid blanking between refreshes
+    st.session_state["paper_positions_cache"] = {
+        "df": df_pos,
+        "total_html": total_html,
+    }
 
 
 def _weekly_plan_tab() -> None:
@@ -3939,7 +4016,16 @@ def _sidebar() -> None:
         disabled=agent_running,
         help="Stop the agent before switching modes." if agent_running else None,
     )
+    if st.session_state.get("trade_mode") == "paper":
+        st.sidebar.checkbox(
+            "Clear paper blotter on start",
+            value=st.session_state.get("clear_paper_blotter_on_start", False),
+            key="clear_paper_blotter_on_start",
+            disabled=agent_running,
+            help="If checked, starting the agent will wipe old paper trades. Leave unchecked to retain them across restarts.",
+        )
     strategy_options = [
+        ("Batman BKM (Monthly, zero-adjust)", "batman_bkm_monthly"),
         ("Monthly Strangle w/ Hedge", "monthly_strangle_with_weekly_hedge.py"),
         ("Batman Monthly (with hedges)", "batman"),
         # Paper-only experimental double-ratio version
@@ -3952,6 +4038,20 @@ def _sidebar() -> None:
             last_strategy_file = json.loads(LAST_STRATEGY_FILE.read_text()).get("strategy_file")
         except Exception:
             last_strategy_file = None
+    if last_strategy_file == "batman_v2_paper":
+        # Migrate legacy selection to the new BKM monthly strategy
+        last_strategy_file = "batman_bkm_monthly"
+        try:
+            LAST_STRATEGY_FILE.write_text(json.dumps({"strategy_file": last_strategy_file}, indent=2))
+        except Exception:
+            pass
+    # Migrate any in-memory session choice from legacy V2 to BKM
+    if st.session_state.get("strategy_choice", (None, None))[1] == "batman_v2_paper":
+        for opt in strategy_options:
+            if opt[1] == "batman_bkm_monthly":
+                st.session_state["strategy_choice"] = opt
+                st.session_state["strategy_file"] = opt[1]
+                break
     if last_strategy_file and "strategy_choice" not in st.session_state:
         for opt in strategy_options:
             if opt[1] == last_strategy_file:
@@ -3969,6 +4069,13 @@ def _sidebar() -> None:
     )
     # store selected file in session for env export
     choice = st.session_state.get("strategy_choice")
+    if choice and choice[1] == "batman_v2_paper":
+        # Map legacy selection to BKM before persisting
+        for opt in strategy_options:
+            if opt[1] == "batman_bkm_monthly":
+                st.session_state["strategy_choice"] = opt
+                choice = opt
+                break
     if choice:
         st.session_state["strategy_file"] = choice[1]
         try:
@@ -4138,8 +4245,9 @@ def main() -> None:
         elif active_page == PAGE_SETTINGS:
             _render_settings_page()
 
-    # gentle pause so the UI cadence feels steady with refresh slider
-    time.sleep(max(0.1, float(st.session_state.get("refresh_sec", 5))))
+    # gentle pause so the UI cadence feels steady with refresh slider; skip for paper P&L to keep it responsive
+    if active_page != PAGE_PAPER_PNL:
+        time.sleep(max(0.1, float(st.session_state.get("refresh_sec", 5))))
 
 def _load_recent_intents(limit: int = 10) -> List[Dict[str, Any]]:
     if not ORDER_INTENT_FILE.exists():

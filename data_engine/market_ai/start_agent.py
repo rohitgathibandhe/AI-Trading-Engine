@@ -84,8 +84,8 @@ FEATURE_FIELDS = [
 ]
 _LAST_ENV_LOG: Optional[datetime] = None
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    "lot_size": 75,
-    "nifty_lot_size": 75,
+    "lot_size": 65,
+    "nifty_lot_size": 65,
     "nifty_expiry_weekday": "Tuesday",
     "expiry_shift_if_holiday": True,
     "holiday_list": [],
@@ -114,7 +114,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "batman_v2_monthly_band_low": 0.2,
     "batman_v2_monthly_band_high": 0.8,
     "batman_v2_lots": 1,
-    "batman_v2_lot_size": 75,
+    "batman_v2_lot_size": 65,
     "batman_v2_capital": 500000.0,
     "batman_v2_max_loss_pct": -0.03,
     "batman_v2_max_both_delta": 0.45,
@@ -123,6 +123,25 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "batman_v2_mtm_naked_loss_x": 1.8,
     "batman_v2_roll_recovery_x": 0.5,
     "batman_v2_roll_hold_dte": 3,
+    # Batman BKM monthly defaults
+    "batman_bkm_base_distance": 400,
+    "batman_bkm_inner_step": 200,
+    "batman_bkm_outer_step": 800,
+    "batman_bkm_strike_rounding": 50,
+    "batman_bkm_lot_multiplier": 1,
+    "batman_bkm_max_credit_pct": 6.0,
+    "batman_bkm_credit_step": 100,
+    "batman_bkm_max_widen_iterations": 10,
+    "batman_bkm_balance_tolerance": 5000.0,
+    "batman_bkm_max_hedge_lots": 6,
+    "batman_bkm_tp_pct": 0.02,
+    "batman_bkm_sl_pct": 0.025,
+    "batman_bkm_entry_time": "15:16",
+    "batman_bkm_exit_time": "15:10",
+    "batman_bkm_enable_balance": True,
+    "batman_bkm_estimated_margin": 1_000_000.0,
+    # For paper runs, allow immediate entry (bypass schedule) if needed
+    "batman_bkm_force_entry": False,
     "gap_entry_threshold": 0.004,
     "iv_floor_percentile": 0.2,
     "short_lots": 1,
@@ -192,6 +211,7 @@ from market_ai.engine.feature_extractor import FeatureExtractor
 from market_ai.engine.regime_scorer import RegimeScorer
 from market_ai.engine.policy_engine import PolicyEngine
 from market_ai.engine.learning_manager import LearningManager
+from market_ai.modules.strategies.batman_bkm_monthly import BatmanBKMConfig, BatmanBKMStrategy
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -212,6 +232,13 @@ if LAST_STRATEGY_FILE.exists():
         SELECTED_STRATEGY_FILE = json.loads(LAST_STRATEGY_FILE.read_text()).get("strategy_file")
     except Exception:
         SELECTED_STRATEGY_FILE = None
+if SELECTED_STRATEGY_FILE == "batman_v2_paper":
+    # Migrate legacy selection to the new monthly Batman (BKM) strategy
+    SELECTED_STRATEGY_FILE = "batman_bkm_monthly"
+    try:
+        LAST_STRATEGY_FILE.write_text(json.dumps({"strategy_file": SELECTED_STRATEGY_FILE}, indent=2))
+    except Exception:
+        pass
 
 # Cache for daily candles to compute higher-timeframe filters
 _DAILY_CACHE: Dict[str, List[Dict[str, Any]]] = {}
@@ -404,6 +431,66 @@ def _mark_monthly_strangle_closed(expiry: str) -> None:
     entry = bucket.setdefault(expiry, {})
     entry["status"] = "CLOSED"
     entry["closed_at"] = _now_iso()
+    save_strategy_state(state)
+
+
+def _is_batman_blocked(expiry: str) -> bool:
+    state = load_strategy_state()
+    entry = state.get("BATMAN_V2", {}).get(expiry, {})
+    return entry.get("status") in {"OPEN", "CLOSED"}
+
+
+def _mark_batman_open(expiry: str) -> None:
+    state = load_strategy_state()
+    bucket = state.setdefault("BATMAN_V2", {})
+    bucket[expiry] = {"status": "OPEN", "opened_at": _now_iso()}
+    save_strategy_state(state)
+
+
+def _mark_batman_closed(expiry: str, reason: str = "") -> None:
+    state = load_strategy_state()
+    bucket = state.setdefault("BATMAN_V2", {})
+    entry = bucket.setdefault(expiry, {})
+    entry["status"] = "CLOSED"
+    entry["closed_at"] = _now_iso()
+    if reason:
+        entry["reason"] = reason
+    save_strategy_state(state)
+
+
+def _clear_batman_expiry(expiry: str) -> None:
+    state = load_strategy_state()
+    bucket = state.get("BATMAN_V2", {})
+    if expiry in bucket:
+        bucket.pop(expiry)
+        state["BATMAN_V2"] = bucket
+        save_strategy_state(state)
+
+
+def _is_bkm_blocked(expiry: str) -> bool:
+    state = load_strategy_state()
+    return state.get("BATMAN_BKM", {}).get(expiry, {}).get("status") in {"OPEN", "CLOSED"}
+
+
+def _mark_bkm_open(expiry: str, meta: Optional[Dict[str, Any]] = None) -> None:
+    state = load_strategy_state()
+    bucket = state.setdefault("BATMAN_BKM", {})
+    bucket[expiry] = {"status": "OPEN", "opened_at": _now_iso()}
+    if meta:
+        bucket[expiry].update(meta)
+    save_strategy_state(state)
+
+
+def _mark_bkm_closed(expiry: str, reason: str = "", pnl: Optional[float] = None) -> None:
+    state = load_strategy_state()
+    bucket = state.setdefault("BATMAN_BKM", {})
+    entry = bucket.setdefault(expiry, {})
+    entry["status"] = "CLOSED"
+    entry["closed_at"] = _now_iso()
+    if reason:
+        entry["reason"] = reason
+    if pnl is not None:
+        entry["pnl"] = pnl
     save_strategy_state(state)
 
 
@@ -627,6 +714,53 @@ def _log_trade_event(*, trade_mode: str, side: str, leg: OptionLeg, order_type: 
     }
     _append_csv_row(TRADE_BLOTTER_PATH, BLOTTER_FIELDS, entry)
     _update_blotter_summary(entry)
+
+
+def _log_batman_blotter(trade_mode: str, legs: list, action: str, use_last: bool = False) -> None:
+    """
+    Log Batman V2 legs into the blotter so the UI can display paper positions.
+    Action "OPEN" logs the leg direction; action "CLOSE" logs the opposite side.
+    Action "MTM" logs current LTP (last_price) for paper P&L visibility.
+    """
+    executed_flag = 0 if trade_mode == "paper" else 1
+    now_ts = datetime.now().isoformat()
+    for leg in legs or []:
+        try:
+            # Support both legacy BatmanV2 legs and new BKM legs
+            is_long = bool(getattr(leg, "is_long", False))
+            side = getattr(leg, "side", None)
+            side = side if side else ("BUY" if is_long else "SELL")
+            if action == "CLOSE":
+                side = "SELL" if side == "BUY" else "BUY"
+            price_val = getattr(leg, "entry_price", None)
+            if price_val is None:
+                price_val = getattr(leg, "entry", 0.0)
+            if action in {"CLOSE", "MTM"}:
+                price_val = getattr(leg, "last_price", None) or price_val
+            entry = {
+                "timestamp": now_ts,
+                "trade_mode": trade_mode,
+                "warn_only": 0,
+                "executed": executed_flag,
+                "side": side,
+                "order_type": "MARKET",
+                "exchange_seg": "NSE_FNO",
+                "product_type": "MARGIN",
+                "security_id": getattr(leg, "instrument_id", None)
+                or getattr(leg, "security_id", "")
+                or "",
+                "quantity": getattr(leg, "quantity", None) or getattr(leg, "qty", 0),
+                "price": float(price_val or 0.0),
+                "delta": getattr(leg, "delta", None),
+                "expiry": getattr(leg, "expiry", "") or "",
+                "strike": getattr(leg, "strike", ""),
+                "tag": "BATMAN_BKM" if getattr(leg, "option_type", None) else "BATMAN_V2",
+                "notes": action,
+            }
+            _append_csv_row(TRADE_BLOTTER_PATH, BLOTTER_FIELDS, entry)
+            _update_blotter_summary(entry)
+        except Exception:
+            continue
 
 
 def _log_feature_event(row: Dict[str, Any]) -> None:
@@ -1000,10 +1134,10 @@ def _map_positions(rows: list) -> List[OptionLeg]:
     return legs
 
 
-def _map_chain(chain_raw: Any, expiry, symbol: str) -> List[dict]:
+def _map_chain(chain_raw: Any, expiry, symbol: str, spot: float = 0.0) -> List[dict]:
     """
     Normalize a raw DHAN option chain response into a list of rows with:
-      expiry, option_type ("CE"/"PE"), strike, ltp, delta, security_id.
+      expiry, option_type ("CE"/"PE"), strike, ltp, delta, security_id, spot.
 
     Supports both legacy and v2 /v2/optionchain shapes by delegating to
     _coerce_chain_dict, which walks through 'data'/'oc'/etc.
@@ -1054,6 +1188,7 @@ def _map_chain(chain_raw: Any, expiry, symbol: str) -> List[dict]:
                     "strike": strike_f,
                     "ltp": ltp,
                     "delta": greeks.get("delta") or opt_data.get("delta"),
+                    "spot": spot,
                     "security_id": sec_id,
                 }
             )
@@ -1231,6 +1366,56 @@ def _fetch_expiry_with_settings(dw: DhanWrapper, settings: Dict[str, Any]):
     return parsed[-1]
 
 
+def _fetch_monthly_expiry(dw: DhanWrapper) -> Optional[dt_date]:
+    """
+    Pick the last available expiry in the nearest future month (approx monthly).
+    """
+    try:
+        expiries = dw.get_optionchain_expirylist("IDX_I", 13)
+    except AttributeError:
+        try:
+            expiries = dw.get_expiry_list(13, "IDX_I")
+        except Exception:
+            expiries = []
+    except Exception:
+        expiries = []
+
+    expiry_list: List[str] = []
+    if isinstance(expiries, list):
+        expiry_list = [str(e) for e in expiries]
+    elif isinstance(expiries, dict):
+        for key in ("Expiry", "expiry", "expiries", "data"):
+            val = expiries.get(key)
+            if isinstance(val, list):
+                expiry_list = [str(e) for e in val]
+                break
+    parsed: List[dt_date] = []
+    for raw in expiry_list:
+        clean = raw.split("T", 1)[0].split(" ", 1)[0].strip()
+        try:
+            parsed.append(datetime.fromisoformat(clean).date())
+        except Exception:
+            continue
+    if not parsed:
+        return None
+    today = datetime.now().date()
+    future = sorted(d for d in parsed if d >= today)
+    if not future:
+        return max(parsed)
+    first_month = (future[0].year, future[0].month)
+    month_candidates = [d for d in future if (d.year, d.month) == first_month]
+    if month_candidates:
+        return max(month_candidates)
+    return future[-1]
+
+
+def _last_friday_before(expiry: dt_date) -> dt_date:
+    probe = expiry
+    while probe.weekday() != 4:
+        probe -= timedelta(days=1)
+    return probe
+
+
 def _place_leg_order(dw: DhanWrapper, leg: OptionLeg, *, close: bool, trade_mode: str) -> None:
     side = _normalize_leg_side(leg.side)
     if close:
@@ -1397,6 +1582,7 @@ def main() -> None:
     _ensure_csv_headers(INTEL_LOG_PATH, ["timestamp", "prob_bull", "prob_bear", "prob_sideways", "regime", "strategy", "size_multiplier", "notes", "gap_pct", "vix", "vwap_distance"])
     _ensure_csv_headers(FEATURE_LOG_PATH, FEATURE_FIELDS)
     log.info("Regime-aware agent started (mode=%s)", trade_mode)
+    log.info("Selected strategy file=%s", SELECTED_STRATEGY_FILE)
     daily_trades = 0
     current_day = datetime.now().date()
     day_entries = 0
@@ -1415,6 +1601,8 @@ def main() -> None:
     batman_v2_notice_logged = False
     from market_ai.strategies import BatmanStrategy, BatmanConfig
     batman_v2: Optional[BatmanStrategy] = None
+    # Batman BKM (monthly) strategy
+    bkm_strategy: Optional[BatmanBKMStrategy] = None
 
     while True:
         try:
@@ -1436,70 +1624,201 @@ def main() -> None:
                 log.info("Weekend detected; market is closed. Sleeping for %ss.", poll_sec)
                 time.sleep(poll_sec)
                 continue
+            market, avg_volume, vwap, pivot = build_market_snapshot(dw, avg_volume_hint=avg_volume_hint)
+            # ── Batman BKM monthly branch ───────────────────────────────────
+            if SELECTED_STRATEGY_FILE == "batman_bkm_monthly":
+                if bkm_strategy is None:
+                    def _parse_time(val: str, fallback: time) -> time:
+                        try:
+                            hh, mm = str(val).split(":")
+                            return dtime(int(hh), int(mm))
+                        except Exception:
+                            return fallback
+                    cfg = BatmanBKMConfig(
+                        base_distance_points=int(settings.get("batman_bkm_base_distance", 400)),
+                        inner_step_points=int(settings.get("batman_bkm_inner_step", 200)),
+                        outer_step_points=int(settings.get("batman_bkm_outer_step", 800)),
+                        strike_rounding=int(settings.get("batman_bkm_strike_rounding", 50)),
+                        lot_size=int(settings.get("batman_v2_lot_size", settings.get("lot_size", 65))),
+                        lot_multiplier=int(settings.get("batman_bkm_lot_multiplier", 1)),
+                        max_credit_pct=float(settings.get("batman_bkm_max_credit_pct", 6.0)),
+                        credit_step_points=int(settings.get("batman_bkm_credit_step", 100)),
+                        max_widen_iterations=int(settings.get("batman_bkm_max_widen_iterations", 10)),
+                        balance_tolerance=float(settings.get("batman_bkm_balance_tolerance", 5000.0)),
+                        max_hedge_lots=int(settings.get("batman_bkm_max_hedge_lots", 6)),
+                        tp_pct=float(settings.get("batman_bkm_tp_pct", 0.02)),
+                        sl_pct=float(settings.get("batman_bkm_sl_pct", 0.025)),
+                        entry_time=_parse_time(settings.get("batman_bkm_entry_time", "15:16"), dtime(15, 16)),
+                        exit_time=_parse_time(settings.get("batman_bkm_exit_time", "15:10"), dtime(15, 10)),
+                        payoff_range=int(settings.get("batman_bkm_payoff_range", 2500)),
+                        payoff_step=int(settings.get("batman_bkm_payoff_step", 50)),
+                        enable_balance=bool(settings.get("batman_bkm_enable_balance", True)),
+                        estimated_margin=float(settings.get("batman_bkm_estimated_margin", 1_000_000.0)),
+                    )
+                    bkm_strategy = BatmanBKMStrategy(cfg)
+                expiry = _fetch_monthly_expiry(dw) or today
+                expiry_str = expiry.isoformat()
+                entry_day = _last_friday_before(expiry)
+                now_ist = _ist_now()
+                # In paper mode, always force entry unless explicitly overridden elsewhere.
+                force_entry = True if trade_mode == "paper" else bool(settings.get("batman_bkm_force_entry", False))
+                # Prevent multiple entries per expiry
+                if bkm_strategy.basket is None and not _is_bkm_blocked(expiry_str):
+                    log.info(
+                        "[BatmanBKM] loop spot=%.2f expiry=%s force_entry=%s now=%s entry_day=%s entry_time=%s",
+                        market.spot,
+                        expiry_str,
+                        force_entry,
+                        now_ist.isoformat(),
+                        entry_day,
+                        bkm_strategy.cfg.entry_time,
+                    )
+                    in_window = (
+                        now_ist.date() == entry_day
+                        and now_ist.time() >= bkm_strategy.cfg.entry_time
+                        and _is_india_market_open(now_ist)
+                    )
+                    if force_entry or in_window:
+                        if force_entry:
+                            log.info("[BatmanBKM] force_entry enabled (paper=%s)", trade_mode)
+                        elif not _is_india_market_open(now_ist):
+                            log.info("[BatmanBKM] market closed; skipping entry check")
+                            time.sleep(poll_sec)
+                            continue
+                        try:
+                            chain_raw = dw.get_option_chain(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, expiry.isoformat())
+                            chain = _map_chain(chain_raw, expiry, symbol="NIFTY", spot=market.spot)
+                        except Exception:
+                            log.exception("[BatmanBKM] failed to fetch option chain")
+                            time.sleep(poll_sec)
+                            continue
+                        basket, reason = bkm_strategy.maybe_enter(market.spot, chain, expiry)
+                        log.info("[BatmanBKM] attempt reason=%s expiry=%s", reason, expiry_str)
+                        if basket and reason == "ENTER":
+                            _mark_bkm_open(expiry_str, {"net_credit": basket.net_credit, "credit_pct": basket.credit_pct})
+                            try:
+                                _log_batman_blotter(trade_mode, basket.legs, "OPEN")
+                            except Exception:
+                                pass
+                elif bkm_strategy.basket:
+                    chain_raw = dw.get_option_chain(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, expiry.isoformat())
+                    chain = _map_chain(chain_raw, expiry, symbol="NIFTY", spot=market.spot)
+                    pnl = bkm_strategy.update_mtm(chain) or 0.0
+                    try:
+                        _log_batman_blotter(trade_mode, bkm_strategy.basket.legs, "MTM")
+                    except Exception:
+                        pass
+                    decision = bkm_strategy.maybe_exit(pnl, _ist_now())
+                    if decision:
+                        try:
+                            _log_batman_blotter(trade_mode, bkm_strategy.basket.legs, "CLOSE")
+                        except Exception:
+                            pass
+                        _mark_bkm_closed(expiry_str, decision, pnl)
+                        log.info("Batman BKM exited: %s pnl=%.2f", decision, pnl)
+                        bkm_strategy.basket = None
+                time.sleep(poll_sec)
+                continue
             if SELECTED_STRATEGY_FILE == "batman_v2_paper":
                 if batman_v2 is None:
                     bat_cfg = BatmanConfig(
                         target_delta=float(settings.get("batman_v2_target_delta", 0.22)),
-                        delta_band=(
-                            float(settings.get("batman_v2_delta_low", 0.20)),
-                            float(settings.get("batman_v2_delta_high", 0.25)),
-                        ),
-                        net_credit_required=bool(settings.get("batman_v2_net_credit_required", True)),
-                        max_entry_time=str(settings.get("batman_v2_max_entry_time", "10:30")),
-                        min_vix=float(settings.get("batman_v2_min_vix", 12.0)),
-                        max_gap_pct=float(settings.get("batman_v2_max_gap_pct", 1.0)),
+                        # Widen delta band in paper to ensure a pick
+                        delta_band=(0.05, 0.95),
+                        # Relax gates in paper mode
+                        net_credit_required=False,
+                        # Allow entry through end of session in paper mode
+                        max_entry_time="23:59",
+                        # Disable VIX gate in paper mode to allow entry
+                        min_vix=0.0,
+                        max_gap_pct=10.0,
                         monthly_center_band=(
-                            float(settings.get("batman_v2_monthly_band_low", 0.2)),
-                            float(settings.get("batman_v2_monthly_band_high", 0.8)),
+                            0.0,
+                            1.0,
                         ),
                         lots=int(settings.get("batman_v2_lots", 1)),
                         lot_size=int(settings.get("batman_v2_lot_size", settings.get("lot_size", 75))),
                         capital=float(settings.get("batman_v2_capital", 500000.0)),
-                        max_loss_pct=float(settings.get("batman_v2_max_loss_pct", -0.03)),
-                        max_both_side_delta=float(settings.get("batman_v2_max_both_delta", 0.45)),
-                        dte_exit=int(settings.get("batman_v2_dte_exit", 3)),
-                        be_buffer=float(settings.get("batman_v2_be_buffer", 50.0)),
-                        mtm_naked_loss_x=float(settings.get("batman_v2_mtm_naked_loss_x", 1.8)),
-                        roll_recovery_x=float(settings.get("batman_v2_roll_recovery_x", 0.5)),
-                        roll_hold_dte=int(settings.get("batman_v2_roll_hold_dte", 3)),
+                        tp_pct_deployed=float(settings.get("batman_v2_tp_pct_deployed", 0.025)),
+                        sl_pct_deployed=float(settings.get("batman_v2_sl_pct_deployed", 0.02)),
+                        time_exit_days=int(settings.get("batman_v2_time_exit_days", 2)),
+                        # Allow repeated paper entries so UI blotter reflects trades
+                        one_trade_per_expiry=False if trade_mode == "paper" else bool(settings.get("batman_v2_one_trade_per_expiry", True)),
                     )
                     batman_v2 = BatmanStrategy(bat_cfg)
+                    log.info("Batman V2 (paper) VIX gate disabled and entry window open till 23:59")
                 # Build a minimal feature set
                 daily_candles = _fetch_daily_candles(dw, days=40)
-                feats = _compute_monthly_filters(daily_candles, 0)
-                vix_val = feats.get("vix", 0.0)
+                spot = float(market.spot or 0.0)
+                if spot <= 0:
+                    log.info("Batman V2 (paper) entry blocked: spot unavailable")
+                    time.sleep(poll_sec)
+                    continue
+                feats = _compute_monthly_filters(daily_candles, spot)
+                vix_val = market.india_vix if market.india_vix not in (None, 0.0) else None
                 gap_pct = feats.get("gap_pct", 0.0)
-                monthly_pos = feats.get("monthly_range_frac", 0.5)
-                expiry = _fetch_expiry_with_settings(dw, settings)
+                monthly_pos = feats.get("monthly_range_frac")
+                try:
+                    if monthly_pos is not None:
+                        monthly_pos = max(0.0, min(1.0, float(monthly_pos)))
+                except Exception:
+                    monthly_pos = None
+                log.info("[BatmanV2] spot=%.2f vix=%s monthly_pos=%s", spot, vix_val, monthly_pos)
+                expiry = _fetch_monthly_expiry(dw) or _fetch_expiry_with_settings(dw, settings)
                 chain_raw = dw.get_option_chain(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, expiry.isoformat())
-                chain = _map_chain(chain_raw, expiry, symbol="NIFTY")
+                chain = _map_chain(chain_raw, expiry, symbol="NIFTY", spot=spot)
                 # Entry if none
                 if batman_v2.state is None or not batman_v2.state.is_active():
-                    entered = batman_v2.maybe_enter(
-                        as_of=now,
-                        spot=market.spot if 'market' in locals() else 0,
-                        expiry=expiry,
-                        vix=vix_val,
-                        gap_pct=gap_pct,
-                        monthly_range_pos=monthly_pos,
-                        chain=chain,
-                    )
+                    entered = None
+                    expiry_str = expiry.isoformat()
+                    # Clear prior state to allow immediate redeploy in paper
+                    if trade_mode == "paper":
+                        _clear_batman_expiry(expiry_str)
+                    vix_gate_enabled = batman_v2.cfg.min_vix is not None and batman_v2.cfg.min_vix > 0
+                    if vix_gate_enabled and vix_val is None:
+                        log.info("Batman V2 (paper) entry blocked: VIX_MISSING (min_vix=%.2f)", batman_v2.cfg.min_vix)
+                    else:
+                        entered = batman_v2.maybe_enter(
+                            as_of=now,
+                            spot=spot,
+                            expiry=expiry,
+                            vix=vix_val,
+                            gap_pct=gap_pct,
+                            monthly_range_pos=monthly_pos,
+                            chain=chain,
+                        )
                     if entered:
+                        if batman_v2.cfg.one_trade_per_expiry:
+                            batman_v2.entered_expiries.add(expiry)
+                        _mark_batman_open(expiry.isoformat())
+                        try:
+                            _log_batman_blotter(trade_mode, batman_v2.state.all_legs(), "OPEN")  # type: ignore[arg-type]
+                        except Exception:
+                            pass
                         log.info("Batman V2 (paper) entered: expiry=%s", expiry)
                 else:
                     # update tick
-                    batman_v2.on_tick(
+                    decision = batman_v2.on_tick(
                         as_of=now,
-                        spot=market.spot if 'market' in locals() else 0,
+                        spot=spot,
                         vix=vix_val,
                         adx=feats.get("adx", 0.0),
                         chain=chain,
                     )
+                    if trade_mode == "paper" and batman_v2.state and batman_v2.state.is_active():
+                        try:
+                            _log_batman_blotter(trade_mode, batman_v2.state.all_legs(), "MTM", use_last=True)  # type: ignore[arg-type]
+                        except Exception:
+                            pass
                     if batman_v2.state and not batman_v2.state.is_active():
+                        try:
+                            _log_batman_blotter(trade_mode, batman_v2.state.all_legs(), "CLOSE")  # type: ignore[arg-type]
+                        except Exception:
+                            pass
+                        _mark_batman_closed(expiry.isoformat(), decision or "EXIT")
                         log.info("Batman V2 (paper) exited.")
                 time.sleep(poll_sec)
                 continue
-            market, avg_volume, vwap, pivot = build_market_snapshot(dw, avg_volume_hint=avg_volume_hint)
             market_open = datetime.combine(market.now.date(), dtime(9, 15))
             if orb_config.enabled and orb_state.orb_levels is None:
                 levels = compute_orb_levels(market.candles_5m, market_open, orb_config)
@@ -1534,7 +1853,7 @@ def main() -> None:
             expiry_str = expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry)
             log.info("[OC request] underlying=%s expiry=%s trade_mode=%s", INDEX_SECURITY_ID, expiry_str, trade_mode)
             chain_raw = dw.get_option_chain(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, expiry_str)
-            chain = _map_chain(chain_raw, expiry, symbol="NIFTY")
+            chain = _map_chain(chain_raw, expiry, symbol="NIFTY", spot=market.spot)
             _update_leg_ltps_from_chain(legs, chain)
             basket_mtm = _compute_mtm(legs)
             day_pnl = basket_mtm  # single-basket approximation for open PnL; realized adds into MTM over time
