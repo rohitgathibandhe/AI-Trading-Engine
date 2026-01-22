@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Algo Agent Console</title>
+  <style>
+    :root {
+      --bg: #0b1224;
+      --panel: #0f172a;
+      --card: #101827;
+      --border: #1f2937;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --pos: #22c55e;
+      --neg: #ef4444;
+      --accent: #7c3aed;
+      --accent-2: #14b8a6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Inter", "Segoe UI", -apple-system, sans-serif;
+      background: radial-gradient(circle at 20% 20%, rgba(124,58,237,0.08), transparent 35%), radial-gradient(circle at 80% 0%, rgba(20,184,166,0.08), transparent 30%), var(--bg);
+      color: var(--text);
+    }
+    header {
+      padding: 14px 22px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: rgba(10, 16, 31, 0.9);
+      border-bottom: 1px solid var(--border);
+      backdrop-filter: blur(6px);
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: 0.5px; }
+    .logo { width: 12px; height: 12px; border-radius: 50%; background: linear-gradient(135deg, var(--accent), var(--accent-2)); box-shadow: 0 0 12px rgba(124,58,237,0.5); }
+    .pill {
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: #111827;
+      color: var(--muted);
+      font-size: 12px;
+      border: 1px solid var(--border);
+    }
+    .tabs { display: flex; gap: 8px; margin-top: 10px; }
+    .tab { padding: 6px 10px; border-radius: 10px; border: 1px solid var(--border); background:#0f172a; color: var(--muted); cursor:pointer; }
+    .tab.active { background: linear-gradient(135deg, rgba(124,58,237,0.25), rgba(20,184,166,0.25)); color: var(--text); }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+    main { padding: 20px; }
+    .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.35);
+    }
+    .card-header { display:flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 9px 8px; text-align: left; font-size: 13px; }
+    th { color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--border); }
+    tr:nth-child(odd) { background: rgba(255,255,255,0.02); }
+    .pos { color: var(--pos); font-weight: 700; }
+    .neg { color: var(--neg); font-weight: 700; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .val { font-size:24px; font-weight:800; }
+    .dot { width: 10px; height: 10px; border-radius: 999px; background: var(--neg); }
+    .dot.ok { background: var(--pos); box-shadow: 0 0 10px rgba(34,197,94,0.5); }
+    .chip { padding:4px 10px; border-radius:10px; background:#0f172a; border:1px solid var(--border); color:var(--muted); font-size:12px; }
+    pre { background: #0b1224; border:1px solid var(--border); border-radius: 8px; padding:10px; color: var(--muted); overflow:auto; max-height: 300px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <div class="brand">
+        <div class="logo"></div>
+        <div>Algo Agent Console</div>
+        <div class="pill" id="status-pill">Connecting…</div>
+      </div>
+      <div class="tabs">
+        <div class="tab active" data-tab="control">Control</div>
+        <div class="tab" data-tab="pnl">Paper P&L</div>
+        <div class="tab" data-tab="live">Live Trades</div>
+        <div class="tab" data-tab="state">Strategy State</div>
+        <div class="tab" data-tab="logs">Agent Logs</div>
+        <div class="tab" data-tab="settings">Settings</div>
+      </div>
+    </div>
+    <div class="chip" id="last-refresh">Updated: —</div>
+  </header>
+
+  <main>
+    <!-- Control -->
+    <section id="tab-control">
+      <div class="grid">
+        <div class="card">
+          <div class="card-header"><div style="font-weight:700;">Credentials</div></div>
+          <div class="muted">Dhan Client ID</div>
+          <input id="client-id" style="width:100%; padding:8px; border-radius:8px; border:1px solid var(--border); background:#0b1224; color:var(--text);" />
+          <div class="muted" style="margin-top:8px;">Dhan Access Token</div>
+          <input id="access-token" type="password" style="width:100%; padding:8px; border-radius:8px; border:1px solid var(--border); background:#0b1224; color:var(--text);" />
+          <button id="save-creds" style="margin-top:10px; background:var(--accent); color:white; border:none; padding:8px 12px; border-radius:8px; cursor:pointer;">Save Creds</button>
+          <div class="hint" id="creds-status">Not saved</div>
+        </div>
+        <div class="card">
+          <div class="card-header"><div style="font-weight:700;">Strategy & Mode</div></div>
+          <div class="muted">Strategy</div>
+          <select id="strategy-select" style="width:100%; padding:8px; border-radius:8px; border:1px solid var(--border); background:#0b1224; color:var(--text);">
+            <option value="batman_bkm_monthly">Batman BKM (Monthly)</option>
+            <option value="monthly_strangle_with_weekly_hedge.py">Monthly Strangle w/ Hedge</option>
+            <option value="batman">Batman Monthly (with hedges)</option>
+            <option value="batman_v2_paper">Batman V2 (paper)</option>
+          </select>
+          <div class="muted" style="margin-top:8px;">Trade Mode</div>
+          <select id="trade-mode" style="width:100%; padding:8px; border-radius:8px; border:1px solid var(--border); background:#0b1224; color:var(--text);">
+            <option value="paper">Paper</option>
+            <option value="live">Live</option>
+          </select>
+          <div class="flex" style="margin-top:12px; gap:10px;">
+            <button id="start-agent" style="background:var(--accent-2); color:white; border:none; padding:8px 12px; border-radius:8px; cursor:pointer;">Start Agent</button>
+            <button id="stop-agent" style="background:var(--neg); color:white; border:none; padding:8px 12px; border-radius:8px; cursor:pointer;">Stop Agent</button>
+          </div>
+          <div class="muted" id="agent-status" style="margin-top:8px;">Status: unknown</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Live Trades -->
+    <section id="tab-live" style="display:none;">
+      <div class="grid">
+        <div class="card">
+          <div class="card-header">
+            <div style="font-weight:700;">Live Positions</div>
+            <div class="chip" id="live-positions-count">0 legs</div>
+          </div>
+          <table id="live-legs-table">
+            <thead>
+              <tr>
+                <th>Side</th><th>Strike</th><th>Expiry</th><th>SecID</th><th>Qty</th><th>Entry</th><th>LTP</th><th>P&L</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- Paper P&L -->
+    <section id="tab-pnl" style="display:none;">
+      <div class="grid">
+        <div class="card">
+          <div class="card-header">
+            <div style="font-weight:700;">Paper P&L</div>
+            <div class="chip" id="expiry-tag">Expiry: —</div>
+          </div>
+          <div class="val" id="total-pnl">₹ 0.00</div>
+          <div class="muted">Total Unrealized</div>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <div class="dot" id="state-dot"></div>
+            <div id="state-text">State: —</div>
+          </div>
+          <div id="strategy-brief" class="muted"></div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:16px;">
+        <div class="card-header">
+          <div style="font-weight:700;">Open Legs</div>
+          <div class="chip" id="positions-count">0 legs</div>
+        </div>
+        <table id="legs-table">
+          <thead>
+            <tr>
+              <th>Side</th><th>Strike</th><th>Expiry</th><th>SecID</th><th>Qty</th><th>Entry</th><th>LTP</th><th>P&L</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="card" style="margin-top:16px;">
+        <div class="card-header">
+          <div style="font-weight:700;">Recent Blotter Rows</div>
+          <div class="muted">Tail of trade_blotter.csv (paper)</div>
+        </div>
+        <div id="blotter-tail" class="muted">Loading…</div>
+      </div>
+    </section>
+
+    <!-- Strategy State -->
+    <section id="tab-state" style="display:none;">
+      <div class="card">
+        <div class="card-header"><div style="font-weight:700;">Strategy State JSON</div></div>
+        <pre id="state-json">Loading…</pre>
+      </div>
+    </section>
+
+    <!-- Logs -->
+    <section id="tab-logs" style="display:none;">
+      <div class="card">
+        <div class="card-header">
+          <div style="font-weight:700;">Agent Logs</div>
+          <div class="muted">Tail</div>
+        </div>
+        <pre id="logs">Loading…</pre>
+      </div>
+    </section>
+
+    <!-- Settings -->
+    <section id="tab-settings" style="display:none;">
+      <div class="card">
+        <div class="card-header">
+          <div style="font-weight:700;">Settings</div>
+          <button id="save-settings" style="background:var(--accent); color:white; border:none; padding:6px 10px; border-radius:8px; cursor:pointer;">Save</button>
+        </div>
+        <textarea id="settings-editor" style="width:100%; min-height:260px; background:#0b1224; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:10px; font-family: monospace;"></textarea>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const fmtMoney = (v) => v === null || v === undefined ? "—" : "₹ " + Number(v).toFixed(2);
+    const fmtSign = (v) => v > 0 ? "+" + v.toFixed(2) : v.toFixed(2);
+
+    async function fetchJSON(url) {
+      const resp = await fetch(url + (url.includes("?") ? "&" : "?") + "_ts=" + Date.now());
+      if (!resp.ok) throw new Error(resp.statusText);
+      return await resp.json();
+    }
+
+    async function loadPnl() {
+      const data = await fetchJSON("/api/paper_positions");
+      document.getElementById("total-pnl").textContent = fmtMoney(data.total_pnl);
+      document.getElementById("last-refresh").textContent = "Updated: " + new Date().toLocaleTimeString();
+
+      const strategy = data.strategy_state || {};
+      const bkm = strategy.BATMAN_BKM || {};
+      const expKeys = Object.keys(bkm);
+      let status = "—";
+      if (expKeys.length) {
+        const exp = expKeys[0];
+        const st = bkm[exp].status || "?";
+        status = `BATMAN_BKM ${exp}: ${st}`;
+        document.getElementById("expiry-tag").textContent = `Expiry: ${exp}`;
+        document.getElementById("strategy-brief").textContent = JSON.stringify(bkm[exp], null, 2);
+      }
+      document.getElementById("state-text").textContent = "State: " + status;
+      const dot = document.getElementById("state-dot");
+      if (status.includes("OPEN")) dot.classList.add("ok"); else dot.classList.remove("ok");
+
+      const tbody = document.querySelector("#legs-table tbody");
+      tbody.innerHTML = "";
+      (data.positions || []).forEach((leg) => {
+        const tr = document.createElement("tr");
+        const pnlClass = leg.pnl > 0 ? "pos" : (leg.pnl < 0 ? "neg" : "");
+        tr.innerHTML = `
+          <td>${leg.side === "SELL" ? "S" : "B"}</td>
+          <td>${leg.strike}</td>
+          <td>${leg.expiry}</td>
+          <td>${leg.sec_id}</td>
+          <td>${leg.qty}</td>
+          <td>${fmtMoney(leg.entry)}</td>
+          <td>${fmtMoney(leg.ltp)}</td>
+          <td class="${pnlClass}">${fmtMoney(leg.pnl)}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+      document.getElementById("positions-count").textContent = `${(data.positions || []).length} legs`;
+
+      const tail = data.blotter_tail || [];
+      if (tail.length) {
+        const table = document.createElement("table");
+        table.style.width = "100%";
+        table.style.borderCollapse = "collapse";
+        table.innerHTML = `<thead><tr style="color: var(--muted); font-size:12px;">
+            <th>Time</th><th>Side</th><th>Strike</th><th>Qty</th><th>Price</th><th>Notes</th>
+          </tr></thead><tbody></tbody>`;
+        const tb = table.querySelector("tbody");
+        tail.slice(-30).forEach(r => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td>${r.timestamp || "—"}</td><td>${(r.side || "").slice(0,1)}</td><td>${r.strike || "—"}</td><td>${r.quantity || "—"}</td><td>${fmtMoney(r.price)}</td><td>${r.notes || ""}</td>`;
+          tb.appendChild(tr);
+        });
+        const wrap = document.getElementById("blotter-tail");
+        wrap.innerHTML = "";
+        wrap.appendChild(table);
+      } else {
+        document.getElementById("blotter-tail").textContent = "No blotter rows.";
+      }
+      document.getElementById("status-pill").textContent = "Live";
+    }
+
+    async function loadCreds() {
+      const data = await fetchJSON("/api/creds");
+      const creds = data.creds || {};
+      document.getElementById("client-id").value = creds.client_id || "";
+      document.getElementById("access-token").value = creds.access_token || "";
+      // Also hydrate from localStorage if server empty
+      if (!creds.client_id && localStorage.getItem("client_id")) {
+        document.getElementById("client-id").value = localStorage.getItem("client_id");
+      }
+      if (!creds.access_token && localStorage.getItem("access_token")) {
+        document.getElementById("access-token").value = localStorage.getItem("access_token");
+      }
+    }
+
+    async function loadStrategy() {
+      const data = await fetchJSON("/api/strategy");
+      const strat = data.strategy || {};
+      const settings = data.settings || {};
+      if (strat.strategy_file) {
+        document.getElementById("strategy-select").value = strat.strategy_file;
+      }
+      document.getElementById("trade-mode").value = settings.get?.trade_mode || settings.trade_mode || "paper";
+    }
+
+    async function saveCreds() {
+      const statusEl = document.getElementById("creds-status");
+      try {
+        const body = {
+          client_id: document.getElementById("client-id").value,
+          access_token: document.getElementById("access-token").value,
+        };
+        const resp = await fetch("/api/creds", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        const data = await resp.json();
+        if (!resp.ok || data.error) throw new Error(data.error || "save failed");
+        // cache locally for convenience
+        localStorage.setItem("client_id", body.client_id || "");
+        localStorage.setItem("access_token", body.access_token || "");
+        statusEl.textContent = "Saved at " + new Date().toLocaleTimeString();
+      } catch (e) {
+        statusEl.textContent = "Save failed";
+      }
+    }
+
+    async function saveStrategy() {
+      const body = {
+        strategy_file: document.getElementById("strategy-select").value,
+        settings: { trade_mode: document.getElementById("trade-mode").value },
+      };
+      const resp = await fetch("/api/strategy", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const data = await resp.json();
+      if (!resp.ok || data.error) throw new Error(data.error || "save strategy failed");
+    }
+
+    async function startAgent() {
+      const statusEl = document.getElementById("agent-status");
+      try {
+        await saveCreds();
+        await saveStrategy();
+        const body = { trade_mode: document.getElementById("trade-mode").value };
+        const resp = await fetch("/api/control/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        const data = await resp.json();
+        statusEl.textContent = data.ok ? `Running (pid ${data.pid})` : `Error: ${data.error || "failed"}`;
+      } catch (e) {
+        statusEl.textContent = "Start failed";
+      }
+    }
+
+    async function stopAgent() {
+      const resp = await fetch("/api/control/stop", { method: "POST" });
+      const data = await resp.json();
+      document.getElementById("agent-status").textContent = data.ok ? "Stopped" : `Error: ${data.error || "failed"}`;
+    }
+
+    async function refreshAgentStatus() {
+      const data = await fetchJSON("/api/control/status");
+      document.getElementById("agent-status").textContent = data.running ? `Running (pid ${data.pid})` : "Stopped";
+    }
+
+    async function loadState() {
+      const data = await fetchJSON("/api/strategy_state");
+      document.getElementById("state-json").textContent = JSON.stringify(data.strategy_state || {}, null, 2);
+    }
+
+    async function loadLogs() {
+      const data = await fetchJSON("/api/logs?tail=200");
+      document.getElementById("logs").textContent = (data.lines || []).join("");
+    }
+
+    async function loadLive() {
+      const data = await fetchJSON("/api/live_positions");
+      const tbody = document.querySelector("#live-legs-table tbody");
+      tbody.innerHTML = "";
+      (data.positions || []).forEach((leg) => {
+        const tr = document.createElement("tr");
+        const pnlClass = leg.pnl > 0 ? "pos" : (leg.pnl < 0 ? "neg" : "");
+        tr.innerHTML = `
+          <td>${leg.side === "SELL" ? "S" : "B"}</td>
+          <td>${leg.strike}</td>
+          <td>${leg.expiry}</td>
+          <td>${leg.sec_id}</td>
+          <td>${leg.qty}</td>
+          <td>${fmtMoney(leg.entry)}</td>
+          <td>${fmtMoney(leg.ltp)}</td>
+          <td class="${pnlClass}">${fmtMoney(leg.pnl)}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+      document.getElementById("live-positions-count").textContent = `${(data.positions || []).length} legs`;
+    }
+
+    async function loadSettings() {
+      const data = await fetchJSON("/api/settings");
+      document.getElementById("settings-editor").value = JSON.stringify(data.settings || {}, null, 2);
+    }
+
+    async function saveSettings() {
+      try {
+        const body = JSON.parse(document.getElementById("settings-editor").value || "{}");
+        const resp = await fetch("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        if (!resp.ok) throw new Error("Save failed");
+        document.getElementById("save-settings").textContent = "Saved";
+        setTimeout(() => document.getElementById("save-settings").textContent = "Save", 1500);
+      } catch (e) {
+        alert("Invalid JSON or save failed");
+      }
+    }
+
+    // Tabs
+    document.querySelectorAll(".tab").forEach(tab => {
+      tab.addEventListener("click", () => {
+        const t = tab.getAttribute("data-tab");
+        document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
+        tab.classList.add("active");
+        ["control","pnl","live","state","logs","settings"].forEach(id => {
+          const el = document.getElementById("tab-"+id);
+          if (el) el.style.display = (id === t) ? "" : "none";
+        });
+      });
+    });
+
+    document.getElementById("save-settings").addEventListener("click", saveSettings);
+    document.getElementById("save-creds").addEventListener("click", saveCreds);
+    document.getElementById("start-agent").addEventListener("click", startAgent);
+    document.getElementById("stop-agent").addEventListener("click", stopAgent);
+
+    // initial loads
+    loadPnl();
+    loadLive();
+    loadCreds();
+    loadStrategy();
+    refreshAgentStatus();
+    loadState();
+    loadLogs();
+    loadSettings();
+    setInterval(loadPnl, 5000);
+    setInterval(loadLive, 5000);
+    setInterval(loadLogs, 8000);
+    setInterval(refreshAgentStatus, 6000);
+  </script>
+</body>
+</html>

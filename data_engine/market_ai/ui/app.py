@@ -453,7 +453,6 @@ def _load_settings() -> Dict[str, Any]:
     return merged
 
 
-@st.cache_data(show_spinner=False, ttl=5)
 def _load_blotter() -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
     df: Optional[pd.DataFrame] = None
     summary: Dict[str, Any] = {}
@@ -495,7 +494,6 @@ def _reset_paper_blotter() -> None:
             pass
 
 
-@st.cache_data(show_spinner=False, ttl=5)
 def _load_feature_history(limit: int = 200) -> Optional[pd.DataFrame]:
     if not FEATURE_LOG_CSV.exists():
         return None
@@ -3527,7 +3525,14 @@ def _settings_tab() -> None:
 
 def _paper_pnl_tab() -> None:
     import pandas as pd
-    df, summary = _load_blotter()
+    df = None
+    summary: Dict[str, Any] = {}
+    try:
+        df, summary = _load_blotter()
+    except Exception as exc:
+        st.error(f"Failed to load blotter: {exc}")
+        df = None
+        summary = {}
 
     status = _load_entry_status()
     if status:
@@ -3672,6 +3677,24 @@ def _paper_pnl_tab() -> None:
     table_ph = st.session_state["paper_positions_container"]
     total_ph = st.session_state["paper_positions_total"]
     st.markdown("#### Open Positions (Paper)")
+    # Quick status + debug view so the tab never appears blank
+    try:
+        blotter_rows = 0 if df is None else len(df.index)
+    except Exception:
+        blotter_rows = 0
+    st.caption(f"Blotter rows (paper): {blotter_rows}")
+    with st.expander("Show latest blotter rows", expanded=False):
+        try:
+            raw_df = df if df is not None else None
+            if raw_df is None or raw_df.empty:
+                if BLOTTER_CSV.exists():
+                    raw_df = pd.read_csv(BLOTTER_CSV, low_memory=False)
+            if raw_df is not None and not raw_df.empty:
+                st.dataframe(raw_df.tail(30), use_container_width=True, height=260)
+            else:
+                st.caption("No blotter data available.")
+        except Exception as exc:
+            st.error(f"Blotter preview failed: {exc}")
     cached = st.session_state.get("paper_positions_cache")
     # If the cached read was empty, try a fresh uncached read to avoid transient blanks
     if (df is None or df.empty) and BLOTTER_CSV.exists():
@@ -3683,6 +3706,14 @@ def _paper_pnl_tab() -> None:
         except Exception:
             pass
     if df is None or df.empty:
+        # Try tail of the CSV to render something useful instead of a blank page
+        if BLOTTER_CSV.exists():
+            try:
+                tail_df = pd.read_csv(BLOTTER_CSV, low_memory=False).tail(50)
+                st.caption("Showing latest blotter rows (no aggregated positions yet):")
+                st.dataframe(tail_df, use_container_width=True, height=240)
+            except Exception:
+                pass
         if cached:
             st.caption("Showing last cached paper positions (no new data yet).")
             table_ph.dataframe(cached["df"], hide_index=True, use_container_width=True, height=320, key="paper_positions_table")

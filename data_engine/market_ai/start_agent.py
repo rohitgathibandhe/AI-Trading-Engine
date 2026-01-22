@@ -1656,7 +1656,11 @@ def main() -> None:
                         estimated_margin=float(settings.get("batman_bkm_estimated_margin", 1_000_000.0)),
                     )
                     bkm_strategy = BatmanBKMStrategy(cfg)
-                expiry = _fetch_monthly_expiry(dw) or today
+                # If we already have a basket, stick to its expiry for MTM/exit updates
+                if bkm_strategy.basket:
+                    expiry = bkm_strategy.basket.expiry
+                else:
+                    expiry = _fetch_monthly_expiry(dw) or today
                 expiry_str = expiry.isoformat()
                 entry_day = _last_friday_before(expiry)
                 now_ist = _ist_now()
