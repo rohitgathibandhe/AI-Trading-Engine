@@ -133,5 +133,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    os.environ.setdefault("STREAMLIT_ENV", "CLI")
     main()

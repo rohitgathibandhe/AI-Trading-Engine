@@ -249,6 +249,8 @@ def parse_option_chain_rows(oc_resp: Dict[str, Any]) -> List[Dict[str, Any]]:
                     leg.get("last_price"), leg.get("lastPrice"),
                     leg.get("ltp"), leg.get("LTP"),
                 )),
+                "security_id": leg.get("securityId") or leg.get("security_id") or leg.get("instrumentId"),
+                "symbol": leg.get("trading_symbol") or leg.get("tradingSymbol") or leg.get("symbol") or leg.get("instrument"),
                 "oi": _num(leg.get("oi") or leg.get("open_interest")),
                 "volume": _num(leg.get("volume")),
                 "implied_volatility": _num(_first(

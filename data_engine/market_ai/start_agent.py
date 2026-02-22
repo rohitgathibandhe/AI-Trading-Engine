@@ -41,6 +41,8 @@ TRADE_BLOTTER_PATH = STATE_DIR / "trade_blotter.csv"
 TRADE_BLOTTER_SUMMARY = STATE_DIR / "trade_blotter_summary.json"
 ENTRY_STATUS_FILE = STATE_DIR / "entry_criteria_status.json"
 STRATEGY_STATE_FILE = STATE_DIR / "strategy_state.json"
+LIVE_GATE_STATUS_FILE = STATE_DIR / "live_gate_status.json"
+LIVE_GATE_SESSIONS_FILE = STATE_DIR / "live_gate_sessions.jsonl"
 BLOTTER_FIELDS = [
     "timestamp",
     "trade_mode",
@@ -142,6 +144,20 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "batman_bkm_estimated_margin": 1_000_000.0,
     # For paper runs, allow immediate entry (bypass schedule) if needed
     "batman_bkm_force_entry": False,
+    # Batman BKM live rollout gate
+    "live_gate_enabled": True,
+    "live_probation_sessions": 10,
+    "live_probation_min_pass": 8,
+    "live_stage1_lot_multiplier": 1,
+    "live_stage2_lot_multiplier": 2,
+    "live_daily_loss_cap_abs": 5000.0,
+    "live_data_fail_zero_spot_count": 3,
+    "live_data_fail_zero_spot_window_sec": 120,
+    "live_data_fail_conn_count": 3,
+    "live_data_fail_conn_window_sec": 600,
+    "live_data_fail_action": "AUTO_FLATTEN_LOCK_DAY",
+    "live_allow_normal_carry": True,
+    "live_probation_cum_mtm_floor": -15000.0,
     "gap_entry_threshold": 0.004,
     "iv_floor_percentile": 0.2,
     "short_lots": 1,
@@ -212,6 +228,7 @@ from market_ai.engine.regime_scorer import RegimeScorer
 from market_ai.engine.policy_engine import PolicyEngine
 from market_ai.engine.learning_manager import LearningManager
 from market_ai.modules.strategies.batman_bkm_monthly import BatmanBKMConfig, BatmanBKMStrategy
+from market_ai.modules.agents.live_gate import LiveGate, LiveGateConfig
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -481,6 +498,15 @@ def _mark_bkm_open(expiry: str, meta: Optional[Dict[str, Any]] = None) -> None:
     save_strategy_state(state)
 
 
+def _clear_bkm_expiry(expiry: str) -> None:
+    state = load_strategy_state()
+    bucket = state.get("BATMAN_BKM", {})
+    if expiry in bucket:
+        bucket.pop(expiry, None)
+        state["BATMAN_BKM"] = bucket
+        save_strategy_state(state)
+
+
 def _mark_bkm_closed(expiry: str, reason: str = "", pnl: Optional[float] = None) -> None:
     state = load_strategy_state()
     bucket = state.setdefault("BATMAN_BKM", {})
@@ -492,6 +518,92 @@ def _mark_bkm_closed(expiry: str, reason: str = "", pnl: Optional[float] = None)
     if pnl is not None:
         entry["pnl"] = pnl
     save_strategy_state(state)
+
+
+def _rebuild_bkm_basket_from_blotter(expiry: datetime.date, trade_mode: str, cfg: "BatmanBKMConfig") -> Optional["BatmanBKMBasket"]:
+    """
+    On restart, reconstruct the BKM basket legs from the blotter so MTM can resume.
+    """
+    try:
+        import pandas as pd  # type: ignore
+    except Exception:
+        return None
+    if not TRADE_BLOTTER_PATH.exists():
+        return None
+    try:
+        df = pd.read_csv(TRADE_BLOTTER_PATH)
+    except Exception:
+        return None
+    if df.empty:
+        return None
+    try:
+        df = df[df.get("trade_mode").str.lower() == trade_mode]
+        df = df[df.get("expiry") == expiry.isoformat()]
+        df = df.sort_values("timestamp")
+    except Exception:
+        return None
+    if df.empty:
+        return None
+    legs = {}
+    for _, row in df.iterrows():
+        key = (str(row.get("security_id") or ""), str(row.get("strike") or ""))
+        side = str(row.get("side") or "").upper()
+        qty = int(row.get("quantity") or 0)
+        price = float(row.get("price") or 0.0)
+        notes = str(row.get("notes") or "").upper()
+        leg = legs.setdefault(
+            key,
+            {
+                "option_type": None,
+                "side": side,
+                "strike": float(row.get("strike") or 0.0),
+                "qty": 0,
+                "entry": None,
+                "ltp": None,
+                "security_id": str(row.get("security_id") or ""),
+            },
+        )
+        if notes == "OPEN" and leg["entry"] is None:
+            leg["entry"] = price
+            leg["qty"] = qty
+            # infer option type from SecID heuristic if present; otherwise leave None
+        if notes == "MTM":
+            leg["ltp"] = price
+            leg["qty"] = qty
+            leg["side"] = side
+    built_legs = []
+    from market_ai.modules.strategies.batman_bkm_monthly import Leg as BKMLeg, BatmanBKMBasket  # type: ignore
+    for leg in legs.values():
+        if leg["entry"] is None:
+            continue
+        built_legs.append(
+            BKMLeg(
+                option_type=leg.get("option_type") or "",  # left blank if unknown
+                side=leg.get("side") or "SELL",
+                strike=leg.get("strike") or 0.0,
+                qty=int(leg.get("qty") or 0),
+                entry=float(leg.get("entry") or 0.0),
+                ltp=leg.get("ltp"),
+                security_id=leg.get("security_id"),
+                expiry=expiry.isoformat(),
+            )
+        )
+    if not built_legs:
+        return None
+    net_credit = sum((1 if l.side == "SELL" else -1) * l.entry * l.qty for l in built_legs)
+    margin = float(cfg.estimated_margin)
+    credit_pct = (net_credit / margin) * 100 if margin else 0.0
+    basket = BatmanBKMBasket(
+        expiry=expiry,
+        legs=built_legs,
+        net_credit=net_credit,
+        margin_required=margin,
+        credit_pct=credit_pct,
+        entry_ts=_ist_now(),
+        hedge_qty_call=2 * cfg.lot_multiplier,
+        hedge_qty_put=2 * cfg.lot_multiplier,
+    )
+    return basket
 
 
 def _load_saved_creds() -> Dict[str, str]:
@@ -533,8 +645,30 @@ def _ensure_dhan_credentials() -> None:
         log.warning("DHAN credentials not found in env or %s; agent will fail to authenticate.", CREDS_FILE)
 
 
+def _startup_preflight(*, strategy_file: Optional[str], trade_mode_env: Optional[str]) -> str:
+    mode_raw = (trade_mode_env or "").strip().lower()
+    if mode_raw not in {"paper", "live"}:
+        raise RuntimeError("TRADE_MODE must be explicitly set to 'paper' or 'live'")
+    if strategy_file != "batman_bkm_monthly":
+        raise RuntimeError(
+            f"Live gate rollout requires strategy_file='batman_bkm_monthly', got: {strategy_file!r}"
+        )
+    if not CREDS_FILE.exists():
+        raise RuntimeError(f"Credentials file missing: {CREDS_FILE}")
+    creds = _load_saved_creds()
+    client_id = str(creds.get("client_id") or "").strip()
+    access_token = str(creds.get("access_token") or "").strip()
+    if not client_id or not access_token:
+        raise RuntimeError(f"Credentials incomplete in {CREDS_FILE}; client_id/access_token required")
+    return mode_raw
+
+
 def _load_agent_settings() -> Dict[str, Any]:
     path = os.getenv("AGENT_SETTINGS_JSON")
+    if not path:
+        default_path = STATE_DIR / "agent_settings.json"
+        if default_path.exists():
+            path = str(default_path)
     if not path:
         return dict(DEFAULT_SETTINGS)
     try:
@@ -557,6 +691,83 @@ def _load_agent_settings() -> Dict[str, Any]:
     except Exception as exc:
         log.warning("Failed to load agent settings from %s (%s); falling back to defaults", path, exc)
         return dict(DEFAULT_SETTINGS)
+
+
+def _coerce_option_type_from_bkm(leg: Any) -> OptionType:
+    raw = str(getattr(leg, "option_type", "") or "").upper()
+    if raw in {"PE", "PUT", "P"}:
+        return OptionType.PUT
+    return OptionType.CALL
+
+
+def _coerce_expiry_date(raw_expiry: Any) -> dt_date:
+    if isinstance(raw_expiry, dt_date):
+        return raw_expiry
+    try:
+        return datetime.fromisoformat(str(raw_expiry)).date()
+    except Exception:
+        return datetime.now().date()
+
+
+def _bkm_leg_to_option_leg(leg: Any) -> OptionLeg:
+    return OptionLeg(
+        symbol="NIFTY",
+        expiry=_coerce_expiry_date(getattr(leg, "expiry", None)),
+        strike=float(getattr(leg, "strike", 0.0) or 0.0),
+        option_type=_coerce_option_type_from_bkm(leg),
+        side=LegSide.SELL if str(getattr(leg, "side", "")).upper() == "SELL" else LegSide.BUY,
+        quantity=int(getattr(leg, "qty", 0) or 0),
+        entry_price=float(getattr(leg, "entry", 0.0) or 0.0),
+        security_id=str(getattr(leg, "security_id", "") or ""),
+        current_ltp=getattr(leg, "ltp", None),
+        strategy_type=StrategyType.NONE,
+    )
+
+
+def _flatten_bkm_basket(
+    *,
+    dw: DhanWrapper,
+    bkm_strategy: BatmanBKMStrategy,
+    trade_mode: str,
+    reason: str,
+) -> int:
+    basket = bkm_strategy.basket
+    if not basket:
+        return 0
+    option_legs: List[OptionLeg] = []
+    for raw_leg in basket.legs:
+        try:
+            option_legs.append(_bkm_leg_to_option_leg(raw_leg))
+        except Exception:
+            continue
+    for leg in option_legs:
+        _place_leg_order(dw, leg, close=True, trade_mode=trade_mode)
+    try:
+        _log_batman_blotter(trade_mode, basket.legs, "CLOSE")
+    except Exception:
+        pass
+    _mark_bkm_closed(basket.expiry.isoformat(), reason, basket.mtm())
+    bkm_strategy.basket = None
+    return len(option_legs)
+
+
+def _apply_live_gate_failsafe(
+    *,
+    live_gate: LiveGate,
+    reason: str,
+    dw: DhanWrapper,
+    bkm_strategy: Optional[BatmanBKMStrategy],
+    trade_mode: str,
+) -> int:
+    live_gate.trigger_failsafe(reason)
+    if not bkm_strategy or not bkm_strategy.basket:
+        return 0
+    return _flatten_bkm_basket(
+        dw=dw,
+        bkm_strategy=bkm_strategy,
+        trade_mode=trade_mode,
+        reason="DATA_FAILSAFE_LOCK",
+    )
 
 
 def _build_risk_config(settings: Dict[str, Any]) -> RiskConfig:
@@ -736,7 +947,8 @@ def _log_batman_blotter(trade_mode: str, legs: list, action: str, use_last: bool
             if price_val is None:
                 price_val = getattr(leg, "entry", 0.0)
             if action in {"CLOSE", "MTM"}:
-                price_val = getattr(leg, "last_price", None) or price_val
+                price_val = getattr(leg, "last_price", None) or getattr(leg, "ltp", None) or price_val
+            tag = "BATMAN_BKM" if hasattr(leg, "qty") else "BATMAN_V2"
             entry = {
                 "timestamp": now_ts,
                 "trade_mode": trade_mode,
@@ -754,7 +966,7 @@ def _log_batman_blotter(trade_mode: str, legs: list, action: str, use_last: bool
                 "delta": getattr(leg, "delta", None),
                 "expiry": getattr(leg, "expiry", "") or "",
                 "strike": getattr(leg, "strike", ""),
-                "tag": "BATMAN_BKM" if getattr(leg, "option_type", None) else "BATMAN_V2",
+                "tag": tag,
                 "notes": action,
             }
             _append_csv_row(TRADE_BLOTTER_PATH, BLOTTER_FIELDS, entry)
@@ -1570,6 +1782,27 @@ def main() -> None:
     _warm_scrip_master(force=False)
     _ensure_dhan_credentials()
     settings = _load_agent_settings()
+    selected_strategy_file = SELECTED_STRATEGY_FILE
+    trade_mode = _startup_preflight(
+        strategy_file=selected_strategy_file,
+        trade_mode_env=os.getenv("TRADE_MODE"),
+    )
+
+    # Enforce rollout policy for live mode.
+    if trade_mode == "live":
+        settings["max_intraday_loss"] = -abs(float(settings.get("live_daily_loss_cap_abs", 5000.0)))
+        settings["batman_bkm_force_entry"] = False
+        settings["allow_carry_forward"] = bool(settings.get("live_allow_normal_carry", True))
+
+    live_gate: Optional[LiveGate] = None
+    if trade_mode == "live" and bool(settings.get("live_gate_enabled", True)):
+        live_gate = LiveGate(
+            config=LiveGateConfig.from_settings(settings),
+            status_path=LIVE_GATE_STATUS_FILE,
+            sessions_path=LIVE_GATE_SESSIONS_FILE,
+            logger=log,
+        )
+
     dw = DhanWrapper(logger=logging.getLogger("dhan_wrapper"))
     _write_pid_file()
     lot_size = int(settings.get("lot_size", DEFAULT_SETTINGS["lot_size"]))
@@ -1577,14 +1810,20 @@ def main() -> None:
     risk = _build_risk_config(settings)
     smart_enabled = bool(settings.get("smart_selector_enabled", True))
     avg_volume_hint = float(settings.get("avg_5m_volume", 0.0))
-    trade_mode = os.getenv("TRADE_MODE", "live")
     _ensure_csv_headers(TRADE_BLOTTER_PATH, BLOTTER_FIELDS)
     _ensure_csv_headers(INTEL_LOG_PATH, ["timestamp", "prob_bull", "prob_bear", "prob_sideways", "regime", "strategy", "size_multiplier", "notes", "gap_pct", "vix", "vwap_distance"])
     _ensure_csv_headers(FEATURE_LOG_PATH, FEATURE_FIELDS)
+    if live_gate:
+        log.info(
+            "[LiveGate] enabled status=%s stage=%s lot=%s",
+            live_gate.snapshot().get("status"),
+            live_gate.snapshot().get("stage"),
+            live_gate.get_lot_multiplier(),
+        )
     log.info("Regime-aware agent started (mode=%s)", trade_mode)
-    log.info("Selected strategy file=%s", SELECTED_STRATEGY_FILE)
+    log.info("Selected strategy file=%s", selected_strategy_file)
     daily_trades = 0
-    current_day = datetime.now().date()
+    current_day = _ist_now().date()
     day_entries = 0
     day_legs = 0
     day_mode = "NORMAL"
@@ -1601,13 +1840,16 @@ def main() -> None:
     batman_v2_notice_logged = False
     from market_ai.strategies import BatmanStrategy, BatmanConfig
     batman_v2: Optional[BatmanStrategy] = None
-    # Batman BKM (monthly) strategy
     bkm_strategy: Optional[BatmanBKMStrategy] = None
 
     while True:
         try:
             now = datetime.now()
-            today = datetime.now().date()
+            now_ist = _ist_now()
+            if live_gate:
+                live_gate.on_tick(now_ist)
+            log.info("[Loop] tick start mode=%s strategy=%s", trade_mode, selected_strategy_file)
+            today = now_ist.date()
             if today != current_day:
                 current_day = today
                 daily_trades = 0
@@ -1620,27 +1862,119 @@ def main() -> None:
                 trail_floor = -1000.0
                 day_pnl = 0.0
             # Skip processing on weekends when the market is closed.
-            if now.weekday() >= 5:
+            if now_ist.weekday() >= 5:
                 log.info("Weekend detected; market is closed. Sleeping for %ss.", poll_sec)
                 time.sleep(poll_sec)
                 continue
-            market, avg_volume, vwap, pivot = build_market_snapshot(dw, avg_volume_hint=avg_volume_hint)
+            try:
+                market, avg_volume, vwap, pivot = build_market_snapshot(dw, avg_volume_hint=avg_volume_hint)
+            except Exception:
+                if trade_mode == "live" and selected_strategy_file == "batman_bkm_monthly" and live_gate:
+                    fail_when = _ist_now()
+                    triggered, fail_reason = live_gate.register_connection_failure(when=fail_when)
+                    if triggered and not live_gate.should_block_entries(fail_when):
+                        closed_legs = _apply_live_gate_failsafe(
+                            live_gate=live_gate,
+                            reason=fail_reason,
+                            dw=dw,
+                            bkm_strategy=bkm_strategy,
+                            trade_mode=trade_mode,
+                        )
+                        day_mode = "LOCKED_RED"
+                        log.error(
+                            "[LiveGate] FAILSAFE_TRIGGERED reason=%s source=market_snapshot closed_legs=%s",
+                            fail_reason,
+                            closed_legs,
+                        )
+                log.exception("[Loop] market snapshot fetch failed")
+                time.sleep(poll_sec)
+                continue
+            log.info("[Loop] snapshot spot=%.2f", market.spot)
             # ── Batman BKM monthly branch ───────────────────────────────────
-            if SELECTED_STRATEGY_FILE == "batman_bkm_monthly":
+            if selected_strategy_file == "batman_bkm_monthly":
+                live_bkm_gate_enabled = trade_mode == "live" and live_gate is not None
+
+                def _trigger_bkm_conn_failure(source: str) -> None:
+                    nonlocal day_mode
+                    if not live_bkm_gate_enabled or not live_gate:
+                        return
+                    fail_when = _ist_now()
+                    triggered, fail_reason = live_gate.register_connection_failure(when=fail_when)
+                    log.warning(
+                        "[LiveGate] conn_failure source=%s triggered=%s reason=%s",
+                        source,
+                        triggered,
+                        fail_reason or "",
+                    )
+                    if triggered and not live_gate.should_block_entries(fail_when):
+                        closed_legs = _apply_live_gate_failsafe(
+                            live_gate=live_gate,
+                            reason=fail_reason,
+                            dw=dw,
+                            bkm_strategy=bkm_strategy,
+                            trade_mode=trade_mode,
+                        )
+                        day_mode = "LOCKED_RED"
+                        log.error(
+                            "[LiveGate] FAILSAFE_TRIGGERED reason=%s source=%s closed_legs=%s",
+                            fail_reason,
+                            source,
+                            closed_legs,
+                        )
+
+                def _fetch_bkm_chain(target_expiry: dt_date) -> Optional[List[dict]]:
+                    expiry_iso = target_expiry.isoformat()
+                    try:
+                        chain_raw = dw.get_option_chain(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, expiry_iso)
+                    except Exception:
+                        log.exception("[BatmanBKM] failed to fetch option chain expiry=%s", expiry_iso)
+                        _trigger_bkm_conn_failure("option_chain_exception")
+                        return None
+                    chain_rows = _map_chain(chain_raw, target_expiry, symbol="NIFTY", spot=market.spot)
+                    if not chain_rows:
+                        log.warning("[BatmanBKM] unusable option chain payload expiry=%s", expiry_iso)
+                        _trigger_bkm_conn_failure("option_chain_unusable")
+                        return None
+                    return chain_rows
+
+                if live_bkm_gate_enabled and live_gate:
+                    spot_when = _ist_now()
+                    spot_triggered, spot_reason = live_gate.register_spot(market.spot, when=spot_when)
+                    if spot_triggered and not live_gate.should_block_entries(spot_when):
+                        closed_legs = _apply_live_gate_failsafe(
+                            live_gate=live_gate,
+                            reason=spot_reason,
+                            dw=dw,
+                            bkm_strategy=bkm_strategy,
+                            trade_mode=trade_mode,
+                        )
+                        day_mode = "LOCKED_RED"
+                        log.error(
+                            "[LiveGate] FAILSAFE_TRIGGERED reason=%s source=spot_zero spot=%s closed_legs=%s",
+                            spot_reason,
+                            market.spot,
+                            closed_legs,
+                        )
+
+                active_lot_multiplier = int(settings.get("batman_bkm_lot_multiplier", 1))
+                if live_bkm_gate_enabled and live_gate:
+                    active_lot_multiplier = live_gate.get_lot_multiplier()
+
                 if bkm_strategy is None:
-                    def _parse_time(val: str, fallback: time) -> time:
+                    def _parse_time(val: str, fallback: dtime) -> dtime:
                         try:
                             hh, mm = str(val).split(":")
                             return dtime(int(hh), int(mm))
                         except Exception:
                             return fallback
+
                     cfg = BatmanBKMConfig(
                         base_distance_points=int(settings.get("batman_bkm_base_distance", 400)),
                         inner_step_points=int(settings.get("batman_bkm_inner_step", 200)),
                         outer_step_points=int(settings.get("batman_bkm_outer_step", 800)),
                         strike_rounding=int(settings.get("batman_bkm_strike_rounding", 50)),
                         lot_size=int(settings.get("batman_v2_lot_size", settings.get("lot_size", 65))),
-                        lot_multiplier=int(settings.get("batman_bkm_lot_multiplier", 1)),
+                        lot_multiplier=active_lot_multiplier,
                         max_credit_pct=float(settings.get("batman_bkm_max_credit_pct", 6.0)),
                         credit_step_points=int(settings.get("batman_bkm_credit_step", 100)),
                         max_widen_iterations=int(settings.get("batman_bkm_max_widen_iterations", 10)),
@@ -1656,18 +1990,56 @@ def main() -> None:
                         estimated_margin=float(settings.get("batman_bkm_estimated_margin", 1_000_000.0)),
                     )
                     bkm_strategy = BatmanBKMStrategy(cfg)
+                elif bkm_strategy.basket is None and bkm_strategy.cfg.lot_multiplier != active_lot_multiplier:
+                    log.info(
+                        "[LiveGate] updating Batman BKM lot multiplier %s -> %s",
+                        bkm_strategy.cfg.lot_multiplier,
+                        active_lot_multiplier,
+                    )
+                    bkm_strategy.cfg.lot_multiplier = active_lot_multiplier
+                # Try to restore basket from blotter if it exists in state but not in memory
+                if bkm_strategy.basket is None and trade_mode == "paper":
+                    state = load_strategy_state().get("BATMAN_BKM", {})
+                    open_expiries = []
+                    for k, v in state.items():
+                        try:
+                            if v.get("status") == "OPEN":
+                                open_expiries.append(datetime.fromisoformat(k).date())
+                        except Exception:
+                            continue
+                    if open_expiries:
+                        target_exp = max(open_expiries)
+                        restored = _rebuild_bkm_basket_from_blotter(target_exp, trade_mode, bkm_strategy.cfg)
+                        if restored:
+                            bkm_strategy.basket = restored
+                            log.info("Restored Batman BKM basket from blotter for expiry=%s", target_exp.isoformat())
                 # If we already have a basket, stick to its expiry for MTM/exit updates
                 if bkm_strategy.basket:
                     expiry = bkm_strategy.basket.expiry
                 else:
                     expiry = _fetch_monthly_expiry(dw) or today
                 expiry_str = expiry.isoformat()
+                entries_locked = day_mode == "LOCKED_RED" or (
+                    live_bkm_gate_enabled and live_gate and live_gate.should_block_entries(now_ist)
+                )
+                if bkm_strategy.basket is None and _is_bkm_blocked(expiry_str):
+                    blotter_empty = (not TRADE_BLOTTER_PATH.exists()) or TRADE_BLOTTER_PATH.stat().st_size == 0
+                    if trade_mode == "paper" and blotter_empty:
+                        log.warning("[BatmanBKM] clearing stale state for expiry=%s (no blotter rows)", expiry_str)
+                        _clear_bkm_expiry(expiry_str)
                 entry_day = _last_friday_before(expiry)
-                now_ist = _ist_now()
                 # In paper mode, always force entry unless explicitly overridden elsewhere.
                 force_entry = True if trade_mode == "paper" else bool(settings.get("batman_bkm_force_entry", False))
                 # Prevent multiple entries per expiry
-                if bkm_strategy.basket is None and not _is_bkm_blocked(expiry_str):
+                if bkm_strategy.basket is None and entries_locked:
+                    lock_payload = live_gate.snapshot() if (live_bkm_gate_enabled and live_gate) else {}
+                    log.warning(
+                        "[BatmanBKM] entry blocked day_mode=%s status=%s locked_for_date=%s",
+                        day_mode,
+                        lock_payload.get("status"),
+                        lock_payload.get("locked_for_date"),
+                    )
+                elif bkm_strategy.basket is None and not _is_bkm_blocked(expiry_str):
                     log.info(
                         "[BatmanBKM] loop spot=%.2f expiry=%s force_entry=%s now=%s entry_day=%s entry_time=%s",
                         market.spot,
@@ -1689,41 +2061,70 @@ def main() -> None:
                             log.info("[BatmanBKM] market closed; skipping entry check")
                             time.sleep(poll_sec)
                             continue
-                        try:
-                            chain_raw = dw.get_option_chain(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, expiry.isoformat())
-                            chain = _map_chain(chain_raw, expiry, symbol="NIFTY", spot=market.spot)
-                        except Exception:
-                            log.exception("[BatmanBKM] failed to fetch option chain")
+                        chain = _fetch_bkm_chain(expiry)
+                        if not chain:
                             time.sleep(poll_sec)
                             continue
                         basket, reason = bkm_strategy.maybe_enter(market.spot, chain, expiry)
                         log.info("[BatmanBKM] attempt reason=%s expiry=%s", reason, expiry_str)
                         if basket and reason == "ENTER":
+                            if trade_mode == "live":
+                                for raw_leg in basket.legs:
+                                    _place_leg_order(
+                                        dw,
+                                        _bkm_leg_to_option_leg(raw_leg),
+                                        close=False,
+                                        trade_mode=trade_mode,
+                                    )
                             _mark_bkm_open(expiry_str, {"net_credit": basket.net_credit, "credit_pct": basket.credit_pct})
                             try:
                                 _log_batman_blotter(trade_mode, basket.legs, "OPEN")
                             except Exception:
                                 pass
+                            if live_bkm_gate_enabled and live_gate:
+                                live_gate.note_live_event(mtm=basket.mtm(), when=_ist_now())
                 elif bkm_strategy.basket:
-                    chain_raw = dw.get_option_chain(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, expiry.isoformat())
-                    chain = _map_chain(chain_raw, expiry, symbol="NIFTY", spot=market.spot)
+                    chain = _fetch_bkm_chain(expiry)
+                    if not chain:
+                        time.sleep(poll_sec)
+                        continue
                     pnl = bkm_strategy.update_mtm(chain) or 0.0
+                    if live_bkm_gate_enabled and live_gate:
+                        live_gate.note_live_event(mtm=pnl, when=_ist_now())
                     try:
                         _log_batman_blotter(trade_mode, bkm_strategy.basket.legs, "MTM")
                     except Exception:
                         pass
+                    if day_mode != "LOCKED_RED" and pnl <= risk.daily_max_loss:
+                        day_mode = "LOCKED_RED"
+                        if live_bkm_gate_enabled and live_gate:
+                            live_gate.mark_daily_lock("DAILY_LOCK_RED", when=_ist_now())
+                        closed_legs = _flatten_bkm_basket(
+                            dw=dw,
+                            bkm_strategy=bkm_strategy,
+                            trade_mode=trade_mode,
+                            reason="DAILY_LOCK_RED",
+                        )
+                        log.warning(
+                            "[BatmanBKM] daily loss cap triggered pnl=%.2f cap=%.2f closed_legs=%s",
+                            pnl,
+                            risk.daily_max_loss,
+                            closed_legs,
+                        )
+                        time.sleep(poll_sec)
+                        continue
                     decision = bkm_strategy.maybe_exit(pnl, _ist_now())
                     if decision:
-                        try:
-                            _log_batman_blotter(trade_mode, bkm_strategy.basket.legs, "CLOSE")
-                        except Exception:
-                            pass
-                        _mark_bkm_closed(expiry_str, decision, pnl)
-                        log.info("Batman BKM exited: %s pnl=%.2f", decision, pnl)
-                        bkm_strategy.basket = None
+                        closed_legs = _flatten_bkm_basket(
+                            dw=dw,
+                            bkm_strategy=bkm_strategy,
+                            trade_mode=trade_mode,
+                            reason=decision,
+                        )
+                        log.info("Batman BKM exited: %s pnl=%.2f closed_legs=%s", decision, pnl, closed_legs)
                 time.sleep(poll_sec)
                 continue
-            if SELECTED_STRATEGY_FILE == "batman_v2_paper":
+            if selected_strategy_file == "batman_v2_paper":
                 if batman_v2 is None:
                     bat_cfg = BatmanConfig(
                         target_delta=float(settings.get("batman_v2_target_delta", 0.22)),
@@ -1910,7 +2311,7 @@ def main() -> None:
                         )
 
             # Branch: Monthly Strangle w/ Hedge uses rule-based manager
-            if SELECTED_STRATEGY_FILE == "monthly_strangle_with_weekly_hedge.py":
+            if selected_strategy_file == "monthly_strangle_with_weekly_hedge.py":
                 cfg = MonthlyStrangleConfig()
                 filters_cfg = _build_monthly_filters_config(settings)
                 daily_candles = _fetch_daily_candles(dw, days=40)
@@ -2195,8 +2596,11 @@ def main() -> None:
                     _place_leg_order(dw, leg, close=True, trade_mode=trade_mode)
                     day_legs += 1
         except Exception as exc:
+            if trade_mode == "live" and selected_strategy_file == "batman_bkm_monthly" and live_gate:
+                live_gate.mark_loop_error("AGENT_LOOP_ERROR", when=_ist_now())
             log.exception("Agent loop error: %s", exc)
         time.sleep(poll_sec)
+
 
 if __name__ == "__main__":
     main()

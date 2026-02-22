@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Dhan wrapper (robust funds + LTP parsing, bulk LTP, and live positions).
-No Streamlit dependencies.
+No UI framework dependencies.
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ __all__ = [
 # Import Dhan SDK safely
 # ---------------------------
 # Ensure local checkout is on sys.path so the vendored dhan_sdk works even when
-# PYTHONPATH was not exported (common when launching via Streamlit/UI).
+# PYTHONPATH was not exported (common when launching from local tools/UI).
 HERE = Path(__file__).resolve()
 ROOT = HERE.parents[2]          # repo root
 DATA_ENGINE_DIR = HERE.parents[1]  # .../data_engine
@@ -373,7 +373,7 @@ class DhanWrapper:
 
     def _load_creds_from_state(self) -> None:
         """
-        Ensure env creds align with state/creds.json (used by Streamlit UI).
+        Ensure env creds align with state/creds.json (used by local control UIs).
         Helps when code is run outside start_agent.
         """
         # state directory lives at data_engine/market_ai/state
@@ -407,7 +407,7 @@ class DhanWrapper:
         http_pool: Optional[dict] = None,
         disable_ssl: bool = False,
     ):
-        # Align env with UI-saved creds before reading
+        # Align env with saved creds before reading
         self._load_creds_from_state()
         self.client_id: str = (dhan_client_id or os.getenv("DHAN_CLIENT_ID", "")).strip()
         self.access_token: str = (access_token or os.getenv("DHAN_ACCESS_TOKEN", "")).strip()

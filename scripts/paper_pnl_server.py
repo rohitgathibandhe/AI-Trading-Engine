@@ -16,12 +16,19 @@ import argparse
 import csv
 import json
 import os
+import sys
 from datetime import datetime
+import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import subprocess
 import signal
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
 
 ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = ROOT / "data_engine" / "market_ai" / "state"
@@ -29,12 +36,18 @@ AGENT_LOG = STATE_DIR / "agent.log"
 BLOTTER_CSV = STATE_DIR / "trade_blotter.csv"
 STRATEGY_STATE = STATE_DIR / "strategy_state.json"
 SETTINGS_JSON = STATE_DIR / "agent_settings.json"
+LIVE_GATE_STATUS_JSON = STATE_DIR / "live_gate_status.json"
+LIVE_GATE_SESSIONS_JSONL = STATE_DIR / "live_gate_sessions.jsonl"
 CREDS_FILE = STATE_DIR / "creds.json"
 LAST_STRATEGY_FILE = STATE_DIR / "last_strategy.json"
 PID_FILE = STATE_DIR / "agent.pid"
 AGENT_ENTRY = ROOT / "data_engine" / "market_ai" / "start_agent.py"
 # New unified frontend location
 STATIC_DIR = ROOT / "web" / "app"
+INDEX_SECURITY_ID = int(os.getenv("MARKET_AI_INDEX_SECURITY_ID", "13"))
+INDEX_EXCHANGE_SEG = os.getenv("MARKET_AI_INDEX_EXCHANGE_SEG", "IDX_I")
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
 
 
 def _parse_float(val: Any, default: float = 0.0) -> float:
@@ -51,21 +64,116 @@ def _parse_int(val: Any, default: int = 0) -> int:
         return default
 
 
+def _build_chain_map(expiry: str) -> Dict[str, Any]:
+    """
+    Fetch option chain for the index and return:
+      - map: sec_id -> {option_type, symbol, strike, ltp}
+      - spot: underlying spot from chain response
+    Cached per expiry to reduce load.
+    """
+    if not expiry:
+        return {"map": {}, "spot": None}
+    now = time.time()
+    cached = _CHAIN_CACHE.get(expiry)
+    if cached and now - cached.get("ts", 0) < 60:
+        return cached
+    try:
+        from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
+        creds = _json_read(CREDS_FILE)
+        cid = (creds.get("client_id") or "").strip()
+        tok = (creds.get("access_token") or "").strip()
+        if cid and tok:
+            os.environ["DHAN_CLIENT_ID"] = cid
+            os.environ["DHAN_ACCESS_TOKEN"] = tok
+        dw = DhanWrapper(logger=None)
+        expiry_date = expiry
+        resp = dw.get_option_chain(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, expiry_date)
+        if resp is None or not resp:
+            # try to at least get spot
+            spot_only = _parse_float(dw.get_ltp_once(INDEX_EXCHANGE_SEG, INDEX_SECURITY_ID), None) if hasattr(dw, "get_ltp_once") else None
+            return {"map": {}, "spot": spot_only, "ts": time.time()}
+    except Exception as exc:
+        print(f"[chain_map] fetch failed: {exc}")
+        return {"map": {}, "spot": None}
+
+    def _first(d, *keys):
+        for k in keys:
+            if isinstance(d, dict) and k in d:
+                return d[k]
+        return None
+
+    data = resp.get("data") if isinstance(resp, dict) else {}
+    oc = data.get("oc") if isinstance(data, dict) else None
+    if oc is None and isinstance(resp, dict) and isinstance(resp.get("oc"), dict):
+        oc = resp["oc"]
+    spot = None
+    if isinstance(data, dict):
+        spot = _parse_float(_first(data, "last_price", "underlying_value", "underlyingValue", "underlying_price"), None)
+    if spot is None:
+        try:
+            from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
+            dw = DhanWrapper(logger=None)
+            spot = _parse_float(dw.get_ltp_once(INDEX_EXCHANGE_SEG, INDEX_SECURITY_ID), None) if hasattr(dw, "get_ltp_once") else None
+        except Exception:
+            pass
+
+    chain_map: Dict[str, Dict[str, Any]] = {}
+    if isinstance(oc, dict):
+        for strike_key, node in oc.items():
+            for field, opt_type in (("ce", "CE"), ("pe", "PE")):
+                leg = node.get(field) or {}
+                sec_id = _first(leg, "securityId", "security_id", "instrumentId", "instrument_id")
+                if not sec_id:
+                    continue
+                sec_id_str = str(int(float(sec_id)))
+                symbol = _first(leg, "trading_symbol", "tradingSymbol", "symbol", "instrument")
+                last_price = _parse_float(_first(leg, "last_price", "lastPrice", "ltp", "LTP"), None)
+                chain_map[sec_id_str] = {
+                    "option_type": opt_type,
+                    "symbol": symbol,
+                    "strike": _parse_float(strike_key, None),
+                    "ltp": last_price,
+                }
+    else:
+        print("[chain_map] oc missing; using spot only")
+    out = {"map": chain_map, "spot": spot, "ts": now}
+    _CHAIN_CACHE[expiry] = out
+    return out
+
+# Simple in-memory cache to avoid hammering marketfeed
+_LTP_CACHE: Dict[Tuple[str, str], Tuple[float, float]] = {}  # (seg,sid) -> (ltp, ts)
+_LAST_LTP_FETCH_TS: float = 0.0
+_NEXT_LTP_ALLOWED_TS: float = 0.0
+_CHAIN_CACHE: Dict[str, Dict[str, Any]] = {}  # expiry -> {"map": {sec_id: {...}}, "spot": float, "ts": float}
+
+
 def load_positions(blotter_path: Path, mode: str = "paper") -> Dict[str, Any]:
     """
     Aggregate OPEN + latest MTM rows into per-leg positions and total P&L.
+    Also derives closed legs (realized) when notes == CLOSE.
+    When mode==live, enrich missing LTPs via Dhan marketfeed for sec_ids present.
     """
     legs: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    closed: List[Dict[str, Any]] = []
     latest_expiry: Optional[str] = None
     mode = (mode or "").lower()
 
     if not blotter_path.exists():
-        return {"positions": [], "total_pnl": 0.0, "as_of": datetime.now().isoformat(), "blotter_tail": []}
+        return {
+            "positions": [],
+            "closed": [],
+            "total_pnl": 0.0,
+            "realized_pnl": 0.0,
+            "as_of": datetime.now().isoformat(),
+            "blotter_tail": [],
+            "margin_available": None,
+            "margin_used": None,
+        }
 
     tail_rows: List[Dict[str, Any]] = []
     with blotter_path.open(newline="") as f:
         reader = csv.DictReader(f)
-        rows = list(reader)
+        rows = sorted(list(reader), key=lambda r: r.get("timestamp", ""))
         tail_rows = rows[-30:] if len(rows) > 30 else rows
 
     # determine latest expiry in selected mode rows
@@ -75,6 +183,74 @@ def load_positions(blotter_path: Path, mode: str = "paper") -> Dict[str, Any]:
         exp = row.get("expiry") or ""
         if exp and (latest_expiry is None or exp > latest_expiry):
             latest_expiry = exp
+
+    chain_map: Dict[str, Any] = {}
+    spot_val: Optional[float] = None
+    if latest_expiry:
+        cm = _build_chain_map(latest_expiry)
+        chain_map = cm.get("map") or {}
+        spot_val = cm.get("spot")
+
+    # Collect sec_ids to bulk fetch LTPs
+    ltp_lookup: Dict[Tuple[str, str], float] = {}
+    ltp_status = "skip"
+    pairs: Dict[str, list[int]] = {}
+    for row in rows:
+        if (row.get("trade_mode") or "").lower() != mode:
+            continue
+        seg = str(row.get("exchange_seg") or "NSE_FNO")
+        try:
+            sid = int(float(row.get("security_id") or 0))
+        except Exception:
+            continue
+        if sid:
+            pairs.setdefault(seg, []).append(sid)
+    if pairs:
+        # dedupe sec_ids per segment to avoid API 400 on duplicates
+        for seg, ids in pairs.items():
+            pairs[seg] = sorted(list({int(i) for i in ids}))
+        try:
+            import requests
+            creds = _json_read(CREDS_FILE)
+            headers = {
+                "client-id": (creds.get("client_id") or "").strip(),
+                "access-token": (creds.get("access_token") or "").strip(),
+            }
+            if not headers["client-id"] or not headers["access-token"]:
+                ltp_status = "no-creds"
+                raise RuntimeError("client_id/access_token missing")
+
+            # Rate-limit with backoff to avoid 429
+            global _LAST_LTP_FETCH_TS, _NEXT_LTP_ALLOWED_TS
+            now_ts = time.time()
+            if now_ts < _NEXT_LTP_ALLOWED_TS or (now_ts - _LAST_LTP_FETCH_TS) < 4:
+                ltp_status = "cached"
+            else:
+                base = os.getenv("DHAN_API_BASE", "https://api.dhan.co").rstrip("/")
+                resp = requests.post(f"{base}/v2/marketfeed/ltp", headers=headers, json=pairs, timeout=8)
+                if resp.status_code == 429:
+                    # back off 10s on throttle
+                    _NEXT_LTP_ALLOWED_TS = now_ts + 10
+                    ltp_status = "throttled:429 (cache)"
+                elif resp.status_code >= 400:
+                    ltp_status = f"http{resp.status_code}: {resp.text[:120]}"
+                    raise RuntimeError(f"marketfeed {resp.status_code}")
+                else:
+                    data = resp.json().get("data", {})
+                    for seg, sec_map in data.items():
+                        if isinstance(sec_map, dict):
+                            for sid, payload in sec_map.items():
+                                ltp = payload.get("last_price") if isinstance(payload, dict) else None
+                                if ltp is not None:
+                                    key = (seg, str(sid))
+                                    ltp_lookup[key] = float(ltp)
+                                    _LTP_CACHE[key] = (float(ltp), now_ts)
+                    _LAST_LTP_FETCH_TS = now_ts
+                    ltp_status = "ok"
+        except Exception as exc:
+            # If creds missing or HTTP errors, mark status but continue with stale/cache prices.
+            ltp_status = f"error: {exc}"
+            print(f"[ltp_enrich] failed: {exc}")
 
     for row in rows:
         if (row.get("trade_mode") or "").lower() != mode:
@@ -100,6 +276,8 @@ def load_positions(blotter_path: Path, mode: str = "paper") -> Dict[str, Any]:
                 "strike": strike,
                 "expiry": exp,
                 "sec_id": sec_id,
+                "option_type": None,
+                "symbol": None,
             },
         )
 
@@ -117,6 +295,65 @@ def load_positions(blotter_path: Path, mode: str = "paper") -> Dict[str, Any]:
             leg["ltp"] = price
             leg["qty"] = qty if side == "SELL" else -qty
             leg["side"] = "SELL" if leg["qty"] > 0 else "BUY"
+        elif notes == "CLOSE":
+            # Realized P&L for the quantity closed
+            entry_px = leg.get("entry")
+            if entry_px is None:
+                continue
+            close_side = "SELL" if side == "SELL" else "BUY"
+            close_qty = qty
+            pnl = (entry_px - price) * close_qty if close_side == "SELL" else (price - entry_px) * close_qty
+            closed.append(
+                {
+                    "side": close_side,
+                    "strike": strike,
+                    "expiry": exp,
+                    "sec_id": sec_id,
+                    "qty": close_qty,
+                    "entry": entry_px,
+                    "exit": price,
+                    "pnl": pnl,
+                    "timestamp": row.get("timestamp"),
+                }
+            )
+
+    # Enrich LTP where blotter lacks MTM rows (both paper and live)
+    if ltp_lookup or _LTP_CACHE:
+        for key, leg in legs.items():
+            seg = next((r.get("exchange_seg") for r in rows if (r.get("security_id") or "") == leg.get("sec_id")), "NSE_FNO")
+            cache_key = (seg, str(leg.get("sec_id")))
+            ltp = ltp_lookup.get(cache_key)
+            if ltp is None:
+                cached = _LTP_CACHE.get(cache_key)
+                if cached:
+                    ltp = cached[0]
+            if ltp is not None:
+                leg["ltp"] = ltp
+            # enrich option_type/symbol from chain map
+            if not leg.get("option_type"):
+                cm = chain_map.get(str(leg.get("sec_id")))
+                if cm:
+                    leg["option_type"] = cm.get("option_type")
+                    leg["symbol"] = cm.get("symbol")
+        # If still missing option_type, infer by comparing to median strike
+    strikes_f = []
+    for leg in legs.values():
+        try:
+            strikes_f.append(float(leg.get("strike")))
+        except Exception:
+            continue
+    atm_guess = None
+    if strikes_f:
+        strikes_f.sort()
+        atm_guess = strikes_f[len(strikes_f)//2]
+    for leg in legs.values():
+        if not leg.get("option_type"):
+            try:
+                ref = spot_val if spot_val is not None else atm_guess
+                if ref is not None and leg.get("strike") is not None:
+                    leg["option_type"] = "CE" if float(leg["strike"]) >= float(ref) else "PE"
+            except Exception:
+                continue
 
     positions: List[Dict[str, Any]] = []
     total_pnl = 0.0
@@ -150,9 +387,319 @@ def load_positions(blotter_path: Path, mode: str = "paper") -> Dict[str, Any]:
     return {
         "positions": positions,
         "total_pnl": total_pnl,
+        "closed": closed,
+        "realized_pnl": sum(c.get("pnl", 0.0) for c in closed),
         "as_of": datetime.now().isoformat(),
         "blotter_tail": tail_rows,
+        "margin_available": None,
+        "margin_used": None,
+        "ltp_status": ltp_status,
+        "spot": spot_val,
     }
+
+
+def _load_broker_live_positions() -> Dict[str, Any]:
+    """Fetch positions from Dhan with LTP and P&L and funds. Derive closed legs from netted zero qty."""
+    try:
+        from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
+    except Exception as exc:
+        print(f"[live_fallback] unable to import DhanWrapper: {exc}")
+        return {"positions": [], "total_pnl": 0.0, "source": "none"}
+
+    creds = _json_read(CREDS_FILE)
+    cid = (creds.get("client_id") or "").strip()
+    tok = (creds.get("access_token") or "").strip()
+    if cid and tok:
+        os.environ["DHAN_CLIENT_ID"] = cid
+        os.environ["DHAN_ACCESS_TOKEN"] = tok
+    positions_full: List[Dict[str, Any]] = []
+    try:
+        dw = DhanWrapper(logger=None)
+        # Prefer live positions with LTP if available
+        try:
+            raw = dw.get_positions_live_with_ltp()  # type: ignore[attr-defined]
+        except Exception:
+            raw = dw.get_positions_raw()  # type: ignore[attr-defined]
+        funds = dw.get_funds()
+        # Also pull full positions via REST to get netQty==0 legs
+        try:
+            import requests
+            headers = {"client-id": cid, "access-token": tok}
+            base = os.getenv("DHAN_API_BASE", "https://api.dhan.co").rstrip("/")
+            resp = requests.get(f"{base}/v2/positions", headers=headers, timeout=10)
+            resp.raise_for_status()
+            positions_full = resp.json()
+        except Exception as exc:
+            print(f"[live_positions_full] fetch failed: {exc}")
+    except Exception as exc:
+        print(f"[live_fallback] get_positions_raw failed: {exc}")
+        return {"positions": [], "total_pnl": 0.0, "source": "none", "margin_available": None, "margin_used": None}
+
+    positions: List[Dict[str, Any]] = []
+    closed: List[Dict[str, Any]] = []
+    seg_map: Dict[str, list[int]] = {}
+
+    for row in raw or []:
+        seg = str(row.get("exchangeSegment") or row.get("exchange_seg") or "NSE_FNO")
+        buy_qty = _parse_int(row.get("buyQty") or row.get("buy_qty") or row.get("buy_quantity"), 0)
+        sell_qty = _parse_int(row.get("sellQty") or row.get("sell_qty") or row.get("sell_quantity"), 0)
+        net_calc = sell_qty - buy_qty  # positive => net short
+        net_qty = _parse_int(row.get("netQty") or row.get("net_qty"), net_calc)
+        # prefer computed net_calc to avoid sign ambiguity
+        net = net_calc if net_calc != 0 else net_qty
+        qty = abs(net)
+        side = "SELL" if net > 0 else "BUY"
+        buy_avg = _parse_float(
+            row.get("buyAvg")
+            or row.get("buy_avg")
+            or row.get("averageBuyPrice")
+            or row.get("avgBuyPrice"),
+            0.0,
+        )
+        sell_avg = _parse_float(
+            row.get("sellAvg")
+            or row.get("sell_avg")
+            or row.get("averageSellPrice")
+            or row.get("avgSellPrice"),
+            0.0,
+        )
+        entry = sell_avg if side == "SELL" else buy_avg
+        ltp = _parse_float(row.get("ltp") or row.get("LTP") or row.get("last_price") or row.get("lastPrice"), entry)
+        expiry = row.get("expiryDate") or row.get("expiry") or ""
+        strike = row.get("tradingSymbol") or row.get("symbol") or row.get("strikePrice") or row.get("strike") or ""
+        sec_id = row.get("securityId") or row.get("security_id") or row.get("instrumentId") or ""
+        if sec_id:
+            seg_map.setdefault(seg, []).append(int(sec_id))
+        if net != 0:
+            positions.append(
+                {
+                    "side": side,
+                    "strike": strike,
+                    "expiry": expiry,
+                    "sec_id": sec_id,
+                    "qty": qty,
+                    "entry": entry,
+                    "ltp": ltp,
+                }
+            )
+        else:
+            # closed leg today or still in book; compute realized from buy/sell avgs
+            if buy_qty > 0 and sell_qty > 0:
+                pnl_real = (sell_avg - buy_avg) * min(buy_qty, sell_qty)
+                closed.append(
+                    {
+                        "side": "FLAT",
+                        "strike": strike,
+                        "expiry": expiry,
+                        "sec_id": sec_id,
+                        "qty": min(buy_qty, sell_qty),
+                        "entry": buy_avg,
+                        "exit": sell_avg,
+                        "pnl": pnl_real,
+                        "timestamp": row.get("updateTime") or row.get("createTime") or "",
+                    }
+                )
+
+    # Enrich LTP via marketfeed and recompute P&L
+    try:
+        import requests
+        if seg_map:
+            headers = {"client-id": cid, "access-token": tok}
+            base = os.getenv("DHAN_API_BASE", "https://api.dhan.co").rstrip("/")
+            resp = requests.post(f"{base}/v2/marketfeed/ltp", headers=headers, json=seg_map, timeout=8)
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            for pos in positions:
+                seg = next(iter(seg_map.keys())) if len(seg_map) == 1 else "NSE_FNO"
+                sid = pos.get("sec_id")
+                ltp = data.get(seg, {}).get(str(sid), {}).get("last_price") if isinstance(data.get(seg, {}), dict) else None
+                if ltp is not None:
+                    pos["ltp"] = float(ltp)
+    except Exception as exc:
+        print(f"[live_ltp_fallback] failed: {exc}")
+
+    total_pnl = 0.0
+    for pos in positions:
+        entry = pos.get("entry") or 0.0
+        ltp = pos.get("ltp") or entry
+        qty = pos.get("qty") or 0
+        if pos.get("side") == "SELL":
+            pos["pnl"] = (entry - ltp) * qty
+        else:
+            pos["pnl"] = (ltp - entry) * qty
+        total_pnl += pos["pnl"]
+
+    # Add closed legs from positions_full (netQty == 0) – only if there was activity today (day buys/sells)
+    for row in positions_full or []:
+        net_qty = _parse_int(row.get("netQty") or row.get("net_quantity") or 0, 0)
+        if net_qty != 0:
+            continue
+        day_activity = _parse_int(row.get("dayBuyQty") or row.get("dayBuyQty") or 0, 0) + _parse_int(row.get("daySellQty") or row.get("daySellQty") or 0, 0)
+        if day_activity == 0:
+            continue
+        exch = str(row.get("exchangeSegment") or "").upper()
+        if "FNO" not in exch and "IDX" not in exch and "DER" not in exch:
+            continue
+        sec_id = row.get("securityId") or row.get("security_id") or ""
+        symbol = row.get("tradingSymbol") or row.get("symbol") or ""
+        expiry = row.get("drvExpiryDate") or row.get("expiryDate") or ""
+        buy_avg = _parse_float(row.get("buyAvg") or row.get("buy_avg"), None)
+        sell_avg = _parse_float(row.get("sellAvg") or row.get("sell_avg"), None)
+        buy_qty = _parse_int(row.get("buyQty") or row.get("buy_qty") or 0, 0)
+        sell_qty = _parse_int(row.get("sellQty") or row.get("sell_qty") or 0, 0)
+        realized = _parse_float(row.get("realizedProfit") or row.get("realized_profit") or 0.0, 0.0)
+        closed.append(
+            {
+                "side": "FLAT",
+                "strike": symbol,
+                "expiry": expiry,
+                "sec_id": sec_id,
+                "qty": min(buy_qty, sell_qty) if buy_qty and sell_qty else (sell_qty or buy_qty),
+                "entry": buy_avg,
+                "exit": sell_avg,
+                "pnl": realized,
+                "timestamp": "",
+            }
+        )
+
+    # Deduplicate closed rows (sec_id, strike); prefer FLAT over SELL, prefer non-empty expiry and entry/exit
+    # Sort closed to prefer rows with expiry, entry, FLAT
+    closed.sort(key=lambda c: (
+        c.get("expiry") not in (None, "", "0001-01-01"),
+        c.get("entry") is not None and c.get("exit") is not None,
+        c.get("side") == "FLAT"
+    ), reverse=True)
+    dedup = {}
+    for c in closed:
+        key = (str(c.get("sec_id")), c.get("strike"))
+        if key in dedup:
+            continue
+        else:
+            dedup[key] = c
+    closed = list(dedup.values())
+    # Prefer FLAT rows; drop SELL placeholders
+    closed = [c for c in closed if c.get("side") == "FLAT"]
+    # Prefer entries with non-empty expiry
+    non_empty_exp = [c for c in closed if c.get("expiry") not in (None, "", "0001-01-01")]
+    if non_empty_exp:
+        closed = non_empty_exp
+
+    return {
+        "positions": positions,
+        "closed": closed,
+        "total_pnl": total_pnl,
+        "as_of": datetime.now().isoformat(),
+        "blotter_tail": [],
+        "source": "broker",
+        "margin_available": funds.get("available") if 'funds' in locals() else None,
+        "margin_used": funds.get("utilized") if 'funds' in locals() else None,
+    }
+
+
+def _load_broker_trades_today() -> List[Dict[str, Any]]:
+    """
+    Pull today's executed orders directly from Dhan /v2/orders.
+    Compute realized P&L by netting buys vs sells per security; emit a row when the position is flattened, using full history.
+    Filter to F&O-style (derivative) trades so cash-equity intraday noise doesn't appear in closed options.
+    """
+    creds = _json_read(CREDS_FILE)
+    cid = (creds.get("client_id") or "").strip()
+    tok = (creds.get("access_token") or "").strip()
+    if not cid or not tok:
+        return []
+    headers = {"client-id": cid, "access-token": tok}
+    try:
+        import requests
+        base = os.getenv("DHAN_API_BASE", "https://api.dhan.co").rstrip("/")
+        resp = requests.get(f"{base}/v2/orders", headers=headers, timeout=10)
+        resp.raise_for_status()
+        rows = resp.json()
+    except Exception as exc:
+        print(f"[live_orders] failed to fetch orders: {exc}")
+        return []
+    today = datetime.now().date().isoformat()
+    # sort by timestamp for FIFO
+    try:
+        rows = sorted(rows, key=lambda r: r.get("createTime") or r.get("updateTime") or "")
+    except Exception:
+        pass
+
+    per_sec_state = {}  # sec_id -> {"qty": signed, "buy_qty": int, "sell_qty": int, "buy_cost": float, "sell_cost": float, "symbol": str, "expiry": str, "ts": str}
+    closed_rows: List[Dict[str, Any]] = []
+
+    for row in rows or []:
+        if str(row.get("orderStatus") or "").upper() != "TRADED":
+            continue
+        qty = _parse_int(row.get("filledQty") or row.get("quantity"), 0)
+        if qty == 0:
+            continue
+        exch = str(row.get("exchangeSegment") or row.get("exchange_segment") or "").upper()
+        # keep only derivatives / F&O style; skip pure EQ
+        if not (exch.endswith("FNO") or exch.endswith("DER") or "IDX" in exch or row.get("drvExpiryDate", "") not in ("", "0001-01-01")):
+            continue
+        side = "SELL" if str(row.get("transactionType") or "").upper() == "SELL" else "BUY"
+        price = _parse_float(row.get("averageTradedPrice") or row.get("price"), 0.0)
+        sec_id = row.get("securityId") or ""
+        symbol = row.get("tradingSymbol") or row.get("securityId") or ""
+        expiry = row.get("drvExpiryDate") or ""
+        ts = row.get("createTime") or row.get("updateTime") or ""
+        state = per_sec_state.setdefault(sec_id, {"qty": 0, "buy_qty": 0, "sell_qty": 0, "buy_cost": 0.0, "sell_cost": 0.0, "symbol": symbol, "expiry": expiry, "ts": ts})
+        multiplier = 100.0 if exch == "MCX_COMM" else 1.0
+
+        if side == "BUY":
+            state["qty"] += qty
+            state["buy_qty"] += qty
+            state["buy_cost"] += price * qty
+        else:
+            state["qty"] -= qty
+            state["sell_qty"] += qty
+            state["sell_cost"] += price * qty
+
+        # Emit realized P&L when position flat AFTER this trade; show only if flatten date is today
+        if state["qty"] == 0 and state["buy_qty"] and state["sell_qty"]:
+            buy_avg = state["buy_cost"] / state["buy_qty"]
+            sell_avg = state["sell_cost"] / state["sell_qty"]
+            realized = (sell_avg - buy_avg) * min(state["buy_qty"], state["sell_qty"]) * multiplier
+            close_date = str(ts).split(" ")[0]
+            if close_date == today:
+                closed_rows.append(
+                    {
+                        "side": "FLAT",
+                        "strike": state["symbol"],
+                        "expiry": state["expiry"],
+                        "sec_id": sec_id,
+                        "qty": min(state["buy_qty"], state["sell_qty"]),
+                        "entry": buy_avg,
+                        "exit": sell_avg,
+                        "pnl": realized,
+                        "timestamp": ts,
+                    }
+                )
+            state["buy_qty"] = state["sell_qty"] = 0
+            state["buy_cost"] = state["sell_cost"] = 0.0
+
+    # Also surface exits that have sells today but no corresponding buys in the feed (older entries).
+    for sec_id, st in per_sec_state.items():
+        if st["sell_qty"] > 0 and st["buy_qty"] == 0:
+            closed_rows.append(
+                {
+                    "side": "SELL",
+                    "strike": st["symbol"],
+                    "expiry": st["expiry"],
+                    "sec_id": sec_id,
+                    "qty": st["sell_qty"],
+                    "entry": None,
+                    "exit": st["sell_cost"] / st["sell_qty"] if st["sell_qty"] else None,
+                    "pnl": None,
+                    "timestamp": st["ts"],
+                }
+            )
+
+    return closed_rows
+
+    return closed_rows
+
+    return closed_rows
 
 
 def _json_read(path: Path) -> Dict[str, Any]:
@@ -166,6 +713,50 @@ def _json_read(path: Path) -> Dict[str, Any]:
 
 def _json_write(path: Path, data: Dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2))
+
+
+def _ist_now() -> datetime:
+    tz = ZoneInfo("Asia/Kolkata") if ZoneInfo else None
+    return datetime.now(tz) if tz else datetime.now()
+
+
+def _default_live_gate_status(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = settings or _json_read(SETTINGS_JSON)
+    stage1_lot = max(1, _parse_int(cfg.get("live_stage1_lot_multiplier"), 1))
+    now = _ist_now()
+    return {
+        "status": "PROBATION",
+        "stage": "S1",
+        "lot_multiplier_active": stage1_lot,
+        "sessions_total": 0,
+        "sessions_pass": 0,
+        "sessions_fail": 0,
+        "cum_mtm": 0.0,
+        "current_session_date": now.date().isoformat(),
+        "last_fail_reason": None,
+        "locked_for_date": None,
+        "updated_at": now.isoformat(timespec="seconds"),
+        "hard_lock": False,
+        "consecutive_failures": 0,
+    }
+
+
+def _load_live_gate_status() -> Dict[str, Any]:
+    payload = _json_read(LIVE_GATE_STATUS_JSON)
+    if not payload or not isinstance(payload, dict):
+        return _default_live_gate_status()
+    return payload
+
+
+def _reset_live_gate_status() -> Dict[str, Any]:
+    status = _default_live_gate_status()
+    LIVE_GATE_STATUS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    _json_write(LIVE_GATE_STATUS_JSON, status)
+    try:
+        LIVE_GATE_SESSIONS_JSONL.write_text("")
+    except Exception:
+        pass
+    return status
 
 
 def _is_process_alive(pid: int) -> bool:
@@ -275,6 +866,59 @@ class PaperHandler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return
+        if self.path.startswith("/api/live_gate/reset"):
+            try:
+                status = _reset_live_gate_status()
+                self._send_json({"ok": True, "live_gate": status})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/paper/close_all"):
+            try:
+                # Close all open paper legs by writing CLOSE rows at current LTP
+                payload = load_positions(BLOTTER_CSV, mode="paper")
+                legs = payload.get("positions", [])
+                if not legs:
+                    self._send_json({"ok": True, "closed": 0})
+                    return
+                now_ts = datetime.now().isoformat()
+                rows_to_append = []
+                for leg in legs:
+                    side_close = "BUY" if leg.get("side") == "SELL" else "SELL"
+                    qty = leg.get("qty") or 0
+                    if qty == 0:
+                        continue
+                    rows_to_append.append({
+                        "timestamp": now_ts,
+                        "trade_mode": "paper",
+                        "warn_only": "0",
+                        "executed": "1",
+                        "side": side_close,
+                        "order_type": "MARKET",
+                        "exchange_seg": "NSE_FNO",
+                        "product_type": "MARGIN",
+                        "security_id": leg.get("sec_id"),
+                        "quantity": qty,
+                        "price": leg.get("ltp") if leg.get("ltp") is not None else leg.get("entry") or 0.0,
+                        "delta": "",
+                        "expiry": leg.get("expiry"),
+                        "strike": leg.get("strike"),
+                        "tag": "MANUAL_CLOSE",
+                        "notes": "CLOSE",
+                    })
+                # append to blotter
+                header = ["timestamp","trade_mode","warn_only","executed","side","order_type","exchange_seg","product_type","security_id","quantity","price","delta","expiry","strike","tag","notes"]
+                exists = BLOTTER_CSV.exists()
+                with BLOTTER_CSV.open("a", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=header)
+                    if not exists:
+                        writer.writeheader()
+                    for r in rows_to_append:
+                        writer.writerow(r)
+                self._send_json({"ok": True, "closed": len(rows_to_append)})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
         return super().do_POST()
 
     def do_GET(self) -> None:  # type: ignore[override]
@@ -294,6 +938,41 @@ class PaperHandler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/live_positions"):
             try:
                 payload = load_positions(BLOTTER_CSV, mode="live")
+                broker_payload = _load_broker_live_positions()
+                if not payload.get("positions") and broker_payload:
+                    payload = broker_payload
+                else:
+                    # merge closed from broker into existing payload
+                    if broker_payload and broker_payload.get("closed"):
+                        closed = payload.get("closed", []) or []
+                        closed.extend(broker_payload.get("closed", []))
+                        payload["closed"] = closed
+    # Also surface today's broker executions as closed rows (legacy)
+                try:
+                    trades = _load_broker_trades_today()
+                    if trades:
+                        closed = payload.get("closed", []) or []
+                        closed.extend(trades)
+                        # de-dupe prefer rows with expiry and entry
+                        closed.sort(key=lambda c: (
+                            c.get("expiry") not in (None, "", "0001-01-01"),
+                            c.get("entry") is not None and c.get("exit") is not None,
+                            c.get("side") == "FLAT"
+                        ), reverse=True)
+                        dedup = {}
+                        for c in closed:
+                            key = (str(c.get("sec_id")), c.get("strike"))
+                            if key in dedup:
+                                continue
+                            dedup[key] = c
+                        cleaned = list(dedup.values())
+                        cleaned = [c for c in cleaned if c.get("side") == "FLAT"]
+                        non_empty = [c for c in cleaned if c.get("expiry") not in (None, "", "0001-01-01")]
+                        if non_empty:
+                            cleaned = non_empty
+                        payload["closed"] = cleaned
+                except Exception:
+                    pass
                 self._send_json(payload)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
@@ -327,12 +1006,30 @@ class PaperHandler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return
+        if self.path.startswith("/api/live_gate/status"):
+            try:
+                self._send_json(_load_live_gate_status())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
         if self.path.startswith("/api/control/status"):
             try:
                 pid_data = _json_read(PID_FILE)
                 pid = int(pid_data.get("pid", 0)) if pid_data else 0
                 running = pid and _is_process_alive(pid)
-                self._send_json({"running": bool(running), "pid": pid})
+                gate = _load_live_gate_status()
+                self._send_json(
+                    {
+                        "running": bool(running),
+                        "pid": pid,
+                        "live_gate_status": gate.get("status"),
+                        "live_gate_stage": gate.get("stage"),
+                        "locked_for_date": gate.get("locked_for_date"),
+                        "sessions_total": _parse_int(gate.get("sessions_total"), 0),
+                        "sessions_pass": _parse_int(gate.get("sessions_pass"), 0),
+                        "sessions_fail": _parse_int(gate.get("sessions_fail"), 0),
+                    }
+                )
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return

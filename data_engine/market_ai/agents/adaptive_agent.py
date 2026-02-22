@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Adaptive Agent — polls UI commands and reacts.
+Adaptive Agent — polls control commands and reacts.
 
 Drop this at:
 data_engine/market_ai/agents/adaptive_agent.py
 
-The Streamlit UI can communicate with the agent by appending JSON
+The web console can communicate with the agent by appending JSON
 commands to: data_engine/market_ai/runtime/ui_commands.jsonl
 
 Each line is a JSON object like:

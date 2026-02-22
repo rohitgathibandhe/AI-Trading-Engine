@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Algo Agent Console</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     :root {
       --bg: #0b1224;
@@ -65,10 +66,18 @@
     .neg { color: var(--neg); font-weight: 700; }
     .muted { color: var(--muted); font-size: 12px; }
     .val { font-size:24px; font-weight:800; }
+    .val.pos { color: var(--pos); }
+    .val.neg { color: var(--neg); }
     .dot { width: 10px; height: 10px; border-radius: 999px; background: var(--neg); }
     .dot.ok { background: var(--pos); box-shadow: 0 0 10px rgba(34,197,94,0.5); }
     .chip { padding:4px 10px; border-radius:10px; background:#0f172a; border:1px solid var(--border); color:var(--muted); font-size:12px; }
     pre { background: #0b1224; border:1px solid var(--border); border-radius: 8px; padding:10px; color: var(--muted); overflow:auto; max-height: 300px; }
+    .summary-bar { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
+    .summary-card { flex:1 1 180px; background:#0f172a; border:1px solid var(--border); border-radius:12px; padding:10px 12px; box-shadow:0 12px 32px rgba(0,0,0,0.35); }
+    .summary-title { color:var(--muted); font-size:12px; font-weight:600; }
+    .summary-value { font-size:20px; font-weight:800; margin-top:3px; }
+    .summary-sub { color:var(--muted); font-size:11px; }
+    .total-row { font-weight:800; border-top:1px solid var(--border); }
   </style>
 </head>
 <body>
@@ -129,63 +138,139 @@
 
     <!-- Live Trades -->
     <section id="tab-live" style="display:none;">
-      <div class="grid">
-        <div class="card">
-          <div class="card-header">
-            <div style="font-weight:700;">Live Positions</div>
-            <div class="chip" id="live-positions-count">0 legs</div>
-          </div>
-          <table id="live-legs-table">
-            <thead>
-              <tr>
-                <th>Side</th><th>Strike</th><th>Expiry</th><th>SecID</th><th>Qty</th><th>Entry</th><th>LTP</th><th>P&L</th>
-              </tr>
-            </thead>
-            <tbody></tbody>
-          </table>
+      <div class="summary-bar">
+        <div class="summary-card">
+          <div class="summary-title">Live P&L</div>
+          <div class="summary-value" id="live-pnl-total">₹ 0.00</div>
+          <div class="summary-sub">Open positions MTM</div>
         </div>
+        <div class="summary-card">
+          <div class="summary-title">Open Positions</div>
+          <div class="summary-value" id="live-open-count">0</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-title">Closed Positions</div>
+          <div class="summary-value" id="live-closed-count">0</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-title">Margin Available</div>
+          <div class="summary-value" id="live-margin-avail">—</div>
+          <div class="summary-sub">Margin Used: <span id="live-margin-used">—</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div style="font-weight:700;">Live Positions</div>
+          <div>
+            <span class="chip" id="live-positions-count">0 legs</span>
+            <span class="chip" id="live-positions-pnl">Total P&L: ₹ 0.00</span>
+          </div>
+        </div>
+        <table id="live-legs-table">
+          <thead>
+            <tr>
+              <th>Side</th><th>Strike</th><th>Expiry</th><th>SecID</th><th>Qty</th><th>Entry</th><th>LTP</th><th>P&L</th><th>Change%</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+          <tfoot>
+            <tr class="total-row"><td colspan="8">Total</td><td id="live-open-totalcell">₹ 0.00</td></tr>
+          </tfoot>
+        </table>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="card-header">
+          <div style="font-weight:700;">Closed Today</div>
+          <div>
+            <span class="chip" id="live-closed-pnl">Closed P&L: ₹ 0.00</span>
+          </div>
+        </div>
+        <table id="live-closed-table">
+          <thead>
+            <tr>
+              <th>Side</th><th>Strike</th><th>Expiry</th><th>SecID</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Time</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+          <tfoot>
+            <tr class="total-row"><td colspan="7">Total</td><td id="live-closed-totalcell">₹ 0.00</td><td></td></tr>
+          </tfoot>
+        </table>
       </div>
     </section>
 
     <!-- Paper P&L -->
     <section id="tab-pnl" style="display:none;">
-      <div class="grid">
-        <div class="card">
-          <div class="card-header">
-            <div style="font-weight:700;">Paper P&L</div>
-            <div class="chip" id="expiry-tag">Expiry: —</div>
-          </div>
-          <div class="val" id="total-pnl">₹ 0.00</div>
-          <div class="muted">Total Unrealized</div>
+      <div class="summary-bar">
+        <div class="summary-card">
+          <div class="summary-title">Paper P&L</div>
+          <div class="summary-value" id="total-pnl">₹ 0.00</div>
+          <div class="summary-sub">Open positions MTM</div>
         </div>
-        <div class="card">
-          <div class="card-header">
-            <div class="dot" id="state-dot"></div>
-            <div id="state-text">State: —</div>
-          </div>
-          <div id="strategy-brief" class="muted"></div>
+        <div class="summary-card">
+          <div class="summary-title">Open Positions</div>
+          <div class="summary-value" id="paper-open-count">0</div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-title">Closed Positions</div>
+          <div class="summary-value" id="paper-closed-count">0 legs</div>
+          <div class="summary-sub">Expiry: <span id="expiry-tag">—</span></div>
+        </div>
+        <div class="summary-card">
+          <div class="summary-title">Status</div>
+          <div class="summary-value" id="state-text">State: —</div>
+          <div class="summary-sub"><span class="chip" id="paper-ltp-chip">LTP feed: —</span></div>
         </div>
       </div>
+
       <div class="card" style="margin-top:16px;">
         <div class="card-header">
-          <div style="font-weight:700;">Open Legs</div>
-          <div class="chip" id="positions-count">0 legs</div>
+          <div style="font-weight:700;">Paper Positions</div>
+          <div>
+            <span class="chip" id="positions-count">0 legs</span>
+            <span class="chip" id="paper-positions-pnl">Total P&L: ₹ 0.00</span>
+            <button id="paper-close-all" style="margin-left:8px; background:var(--neg); color:white; border:none; padding:6px 10px; border-radius:8px; cursor:pointer;">Close Trades</button>
+          </div>
         </div>
         <table id="legs-table">
           <thead>
             <tr>
-              <th>Side</th><th>Strike</th><th>Expiry</th><th>SecID</th><th>Qty</th><th>Entry</th><th>LTP</th><th>P&L</th>
+              <th>Side</th><th>Type</th><th>Strike</th><th>Expiry</th><th>SecID</th><th>Qty</th><th>Entry</th><th>LTP</th><th>P&L</th><th>Change%</th>
             </tr>
           </thead>
           <tbody></tbody>
+          <tfoot>
+            <tr class="total-row"><td colspan="9">Total</td><td id="paper-open-totalcell">₹ 0.00</td></tr>
+          </tfoot>
         </table>
       </div>
-      <div class="card" style="margin-top:16px;">
+
+      <div class="card" style="margin-top:12px;">
         <div class="card-header">
-          <div style="font-weight:700;">Recent Blotter Rows</div>
-          <div class="muted">Tail of trade_blotter.csv (paper)</div>
+          <div style="font-weight:700;">Payoff</div>
+          <div class="chip" id="payoff-spot">Spot: —</div>
         </div>
-        <div id="blotter-tail" class="muted">Loading…</div>
+        <div style="height:220px;"><canvas id="payoff-chart" height="200"></canvas></div>
+        <div class="grid" style="margin-top:8px; grid-template-columns: repeat(auto-fit,minmax(140px,1fr));">
+          <div class="summary-card" style="padding:8px 10px;">
+            <div class="summary-title">Max Profit</div>
+            <div class="summary-value" id="payoff-maxp">—</div>
+          </div>
+          <div class="summary-card" style="padding:8px 10px;">
+            <div class="summary-title">Max Loss</div>
+            <div class="summary-value" id="payoff-maxl">—</div>
+          </div>
+          <div class="summary-card" style="padding:8px 10px;">
+            <div class="summary-title">Breakevens</div>
+            <div class="summary-value" id="payoff-be">—</div>
+          </div>
+          <div class="summary-card" style="padding:8px 10px;">
+            <div class="summary-title">RR</div>
+            <div class="summary-value" id="payoff-rr">—</div>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -221,8 +306,119 @@
   </main>
 
   <script>
+    const payoffCtx = {};
     const fmtMoney = (v) => v === null || v === undefined ? "—" : "₹ " + Number(v).toFixed(2);
     const fmtSign = (v) => v > 0 ? "+" + v.toFixed(2) : v.toFixed(2);
+    const payoffChart = { chart: null };
+
+    function setStatus(text, ok=true) {
+      const pill = document.getElementById("status-pill");
+      if (!pill) return;
+      pill.textContent = text;
+      pill.style.background = ok ? "#111827" : "#3b0d0d";
+      pill.style.color = ok ? "var(--text)" : "var(--neg)";
+    }
+
+    async function closePaperTrades() {
+        const btn = document.getElementById("paper-close-all");
+        if (btn) btn.disabled = true;
+        try {
+            await fetch("/api/paper/close_all", { method: "POST" });
+            await loadPnl();
+        } catch (e) {
+            console.error("close trades failed", e);
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    function buildPayoff(legs, spot) {
+      if (!legs || !legs.length) return null;
+      const xs = [];
+      const start = spot ? spot - 2000 : 20000;
+      const end = spot ? spot + 2000 : 30000;
+      const step = 50;
+      for (let x = start; x <= end; x += step) xs.push(x);
+      const expiryY = xs.map(x => {
+        let pnl = 0;
+        legs.forEach(l => {
+          const type = (l.option_type || "").toUpperCase();
+          const side = l.side === "SELL" ? -1 : 1;
+          const qty = l.qty || 0;
+          const premium = l.entry || 0;
+          let intrinsic = 0;
+          if (type === "CE") intrinsic = Math.max(0, x - Number(l.strike));
+          else if (type === "PE") intrinsic = Math.max(0, Number(l.strike) - x);
+          const legPnl = (intrinsic - premium) * qty * side;
+          pnl += legPnl;
+        });
+        return pnl;
+      });
+      const maxP = Math.max(...expiryY);
+      const minP = Math.min(...expiryY);
+      // breakevens
+      const bes = [];
+      for (let i = 1; i < xs.length; i++) {
+        if ((expiryY[i - 1] <= 0 && expiryY[i] >= 0) || (expiryY[i - 1] >= 0 && expiryY[i] <= 0)) {
+          bes.push(xs[i].toFixed(0));
+        }
+      }
+      return { xs, expiryY, maxP, minP, bes };
+    }
+
+    function renderPayoffChart(data) {
+      const ctx = document.getElementById("payoff-chart").getContext("2d");
+      if (payoffChart.chart) {
+        payoffChart.chart.data.labels = data.xs;
+        payoffChart.chart.data.datasets[0].data = data.expiryY;
+        payoffChart.chart.update();
+        return;
+      }
+      payoffChart.chart = new Chart(ctx, {
+        type: "line",
+        data: {
+          labels: data.xs,
+          datasets: [
+            {
+              label: "Expiry",
+              data: data.expiryY,
+              borderColor: "rgba(20,184,166,0.9)",
+              tension: 0.25,
+              pointRadius: 0,
+              fill: false,
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { display: true, title: { display: true, text: "Spot" }, ticks: { maxTicksLimit: 8 } },
+            y: { display: true, title: { display: true, text: "P/L" } },
+          },
+        },
+      });
+    }
+
+    function upsertRows(tbodySelector, rows, keyFn, renderFn) {
+      const tbody = document.querySelector(tbodySelector);
+      const existing = new Map(Array.from(tbody.querySelectorAll("tr[data-key]")).map(r => [r.dataset.key, r]));
+      const nextKeys = new Set();
+      rows.forEach(row => {
+        const key = keyFn(row);
+        nextKeys.add(key);
+        let tr = existing.get(key);
+        if (!tr) {
+          tr = document.createElement("tr");
+          tr.dataset.key = key;
+          tbody.appendChild(tr);
+        }
+        renderFn(row, tr);
+      });
+      existing.forEach((tr, key) => {
+        if (!nextKeys.has(key)) tr.remove();
+      });
+    }
 
     async function fetchJSON(url) {
       const resp = await fetch(url + (url.includes("?") ? "&" : "?") + "_ts=" + Date.now());
@@ -230,10 +426,28 @@
       return await resp.json();
     }
 
+    const inflight = { control: false, pnl: false, live: false, state: false, logs: false, settings: false };
+    const loadedTabs = new Set();
+    const TABS = ["control", "pnl", "live", "state", "logs", "settings"];
+    let activeTab = "control";
+
     async function loadPnl() {
-      const data = await fetchJSON("/api/paper_positions");
-      document.getElementById("total-pnl").textContent = fmtMoney(data.total_pnl);
+      if (inflight.pnl) return;
+      inflight.pnl = true;
+      try {
+        const data = await fetchJSON("/api/paper_positions");
+      const pnlEl = document.getElementById("total-pnl");
+      pnlEl.textContent = fmtMoney(data.total_pnl);
+      pnlEl.classList.toggle("pos", data.total_pnl > 0);
+      pnlEl.classList.toggle("neg", data.total_pnl < 0);
       document.getElementById("last-refresh").textContent = "Updated: " + new Date().toLocaleTimeString();
+      const ltpChip = document.getElementById("paper-ltp-chip");
+      if (ltpChip) {
+        const status = (data.ltp_status || "").toLowerCase();
+        const ok = status.startsWith("ok") || status.startsWith("cached") || status.startsWith("throttled");
+        ltpChip.textContent = "LTP feed: " + (data.ltp_status || "—");
+        ltpChip.style.color = ok ? "var(--pos)" : "var(--neg)";
+      }
 
       const strategy = data.strategy_state || {};
       const bkm = strategy.BATMAN_BKM || {};
@@ -243,31 +457,58 @@
         const exp = expKeys[0];
         const st = bkm[exp].status || "?";
         status = `BATMAN_BKM ${exp}: ${st}`;
-        document.getElementById("expiry-tag").textContent = `Expiry: ${exp}`;
-        document.getElementById("strategy-brief").textContent = JSON.stringify(bkm[exp], null, 2);
+        const expEl = document.getElementById("expiry-tag");
+        if (expEl) expEl.textContent = `Expiry: ${exp}`;
+        const briefEl = document.getElementById("strategy-brief");
+        if (briefEl) briefEl.textContent = JSON.stringify(bkm[exp], null, 2);
       }
-      document.getElementById("state-text").textContent = "State: " + status;
+      document.getElementById("state-text").textContent = status;
       const dot = document.getElementById("state-dot");
-      if (status.includes("OPEN")) dot.classList.add("ok"); else dot.classList.remove("ok");
+      if (dot) {
+        if (status.includes("OPEN")) dot.classList.add("ok"); else dot.classList.remove("ok");
+      }
 
-      const tbody = document.querySelector("#legs-table tbody");
-      tbody.innerHTML = "";
-      (data.positions || []).forEach((leg) => {
-        const tr = document.createElement("tr");
-        const pnlClass = leg.pnl > 0 ? "pos" : (leg.pnl < 0 ? "neg" : "");
-        tr.innerHTML = `
-          <td>${leg.side === "SELL" ? "S" : "B"}</td>
-          <td>${leg.strike}</td>
-          <td>${leg.expiry}</td>
-          <td>${leg.sec_id}</td>
-          <td>${leg.qty}</td>
-          <td>${fmtMoney(leg.entry)}</td>
-          <td>${fmtMoney(leg.ltp)}</td>
-          <td class="${pnlClass}">${fmtMoney(leg.pnl)}</td>
-        `;
-        tbody.appendChild(tr);
-      });
+      let openTotal = 0.0;
+      upsertRows(
+        "#legs-table tbody",
+        data.positions || [],
+        (leg) => `${leg.sec_id}-${leg.strike}-${leg.side}`,
+        (leg, tr) => {
+          const pnlClass = leg.pnl > 0 ? "pos" : (leg.pnl < 0 ? "neg" : "");
+          openTotal += leg.pnl || 0;
+          const change = leg.entry ? ((leg.ltp - leg.entry) / leg.entry * 100) : null;
+          tr.innerHTML = `
+            <td>${leg.side === "SELL" ? "S" : "B"}</td>
+            <td>${leg.option_type || ""}</td>
+            <td>${leg.strike}</td>
+            <td>${leg.expiry}</td>
+            <td>${leg.sec_id}</td>
+            <td>${leg.qty}</td>
+            <td>${fmtMoney(leg.entry)}</td>
+            <td>${fmtMoney(leg.ltp)}</td>
+            <td class="${pnlClass}">${fmtMoney(leg.pnl)}</td>
+            <td class="${pnlClass}">${change !== null ? change.toFixed(2) + '%' : '—'}</td>
+          `;
+        }
+      );
       document.getElementById("positions-count").textContent = `${(data.positions || []).length} legs`;
+      document.getElementById("paper-open-count").textContent = (data.positions || []).length;
+      document.getElementById("paper-positions-pnl").textContent = `Total P&L: ${fmtMoney(openTotal)}`;
+      document.getElementById("paper-open-totalcell").textContent = fmtMoney(openTotal);
+      document.getElementById("total-pnl").textContent = fmtMoney(openTotal);
+      document.getElementById("total-pnl").classList.toggle("pos", openTotal > 0);
+      document.getElementById("total-pnl").classList.toggle("neg", openTotal < 0);
+
+      // Payoff chart
+      const payoff = buildPayoff(data.positions || [], data.spot || null);
+      if (payoff) {
+        renderPayoffChart(payoff);
+        document.getElementById("payoff-maxp").textContent = fmtMoney(payoff.maxP);
+        document.getElementById("payoff-maxl").textContent = fmtMoney(payoff.minP);
+        document.getElementById("payoff-be").textContent = payoff.bes.length ? payoff.bes.join(", ") : "—";
+        document.getElementById("payoff-rr").textContent = payoff.minP !== 0 ? (Math.abs(payoff.maxP / payoff.minP)).toFixed(2) : "—";
+        document.getElementById("payoff-spot").textContent = "Spot: " + (data.spot ? data.spot.toFixed(2) : "—");
+      }
 
       const tail = data.blotter_tail || [];
       if (tail.length) {
@@ -289,7 +530,13 @@
       } else {
         document.getElementById("blotter-tail").textContent = "No blotter rows.";
       }
-      document.getElementById("status-pill").textContent = "Live";
+        document.getElementById("status-pill").textContent = "Live";
+        setStatus("Connected", true);
+      } catch (e) {
+        setStatus("Error", false);
+      } finally {
+        inflight.pnl = false;
+      }
     }
 
     async function loadCreds() {
@@ -347,6 +594,8 @@
 
     async function startAgent() {
       const statusEl = document.getElementById("agent-status");
+      const btn = document.getElementById("start-agent");
+      if (btn) { btn.disabled = true; btn.textContent = "Starting…"; }
       try {
         await saveCreds();
         await saveStrategy();
@@ -356,13 +605,23 @@
         statusEl.textContent = data.ok ? `Running (pid ${data.pid})` : `Error: ${data.error || "failed"}`;
       } catch (e) {
         statusEl.textContent = "Start failed";
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = "Start Agent"; }
       }
     }
 
     async function stopAgent() {
-      const resp = await fetch("/api/control/stop", { method: "POST" });
-      const data = await resp.json();
-      document.getElementById("agent-status").textContent = data.ok ? "Stopped" : `Error: ${data.error || "failed"}`;
+      const btn = document.getElementById("stop-agent");
+      if (btn) { btn.disabled = true; btn.textContent = "Stopping…"; }
+      try {
+        const resp = await fetch("/api/control/stop", { method: "POST" });
+        const data = await resp.json();
+        document.getElementById("agent-status").textContent = data.ok ? "Stopped" : `Error: ${data.error || "failed"}`;
+      } catch (e) {
+        document.getElementById("agent-status").textContent = "Stop failed";
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = "Stop Agent"; }
+      }
     }
 
     async function refreshAgentStatus() {
@@ -371,40 +630,108 @@
     }
 
     async function loadState() {
-      const data = await fetchJSON("/api/strategy_state");
-      document.getElementById("state-json").textContent = JSON.stringify(data.strategy_state || {}, null, 2);
+      if (inflight.state) return;
+      inflight.state = true;
+      try {
+        const data = await fetchJSON("/api/strategy_state");
+        document.getElementById("state-json").textContent = JSON.stringify(data.strategy_state || {}, null, 2);
+      } finally {
+        inflight.state = false;
+      }
     }
 
     async function loadLogs() {
-      const data = await fetchJSON("/api/logs?tail=200");
-      document.getElementById("logs").textContent = (data.lines || []).join("");
+      if (inflight.logs) return;
+      inflight.logs = true;
+      try {
+        const data = await fetchJSON("/api/logs?tail=200");
+        document.getElementById("logs").textContent = (data.lines || []).join("");
+      } finally {
+        inflight.logs = false;
+      }
     }
 
     async function loadLive() {
-      const data = await fetchJSON("/api/live_positions");
-      const tbody = document.querySelector("#live-legs-table tbody");
-      tbody.innerHTML = "";
-      (data.positions || []).forEach((leg) => {
-        const tr = document.createElement("tr");
-        const pnlClass = leg.pnl > 0 ? "pos" : (leg.pnl < 0 ? "neg" : "");
-        tr.innerHTML = `
-          <td>${leg.side === "SELL" ? "S" : "B"}</td>
-          <td>${leg.strike}</td>
-          <td>${leg.expiry}</td>
-          <td>${leg.sec_id}</td>
-          <td>${leg.qty}</td>
-          <td>${fmtMoney(leg.entry)}</td>
-          <td>${fmtMoney(leg.ltp)}</td>
-          <td class="${pnlClass}">${fmtMoney(leg.pnl)}</td>
-        `;
-        tbody.appendChild(tr);
-      });
+      if (inflight.live) return;
+      inflight.live = true;
+      try {
+        const data = await fetchJSON("/api/live_positions");
+      let openTotal = 0.0;
+      upsertRows(
+        "#live-legs-table tbody",
+        data.positions || [],
+        (leg) => `${leg.sec_id}-${leg.strike}-${leg.side}`,
+        (leg, tr) => {
+          const pnlClass = leg.pnl > 0 ? "pos" : (leg.pnl < 0 ? "neg" : "");
+          openTotal += leg.pnl || 0;
+          tr.innerHTML = `
+            <td>${leg.side === "SELL" ? "S" : "B"}</td>
+            <td>${leg.strike}</td>
+            <td>${leg.expiry}</td>
+            <td>${leg.sec_id}</td>
+            <td>${leg.qty}</td>
+            <td>${fmtMoney(leg.entry)}</td>
+            <td>${fmtMoney(leg.ltp)}</td>
+            <td class="${pnlClass}">${fmtMoney(leg.pnl)}</td>
+            <td class="${pnlClass}">${leg.entry ? ((leg.ltp - leg.entry) / leg.entry * 100).toFixed(2) + '%' : '—'}</td>
+          `;
+        }
+      );
       document.getElementById("live-positions-count").textContent = `${(data.positions || []).length} legs`;
+      document.getElementById("live-positions-pnl").textContent = `Total P&L: ${fmtMoney(openTotal)}`;
+      document.getElementById("live-open-totalcell").textContent = fmtMoney(openTotal);
+
+      let closedTotal = 0.0;
+      upsertRows(
+        "#live-closed-table tbody",
+        data.closed || [],
+        (leg) => `${leg.sec_id}-${leg.timestamp}-${leg.exit}`,
+        (leg, tr) => {
+          const pnlClass = leg.pnl > 0 ? "pos" : (leg.pnl < 0 ? "neg" : "");
+          const ts = leg.timestamp ? new Date(leg.timestamp).toLocaleTimeString() : "—";
+          closedTotal += leg.pnl || 0;
+          tr.innerHTML = `
+            <td>${leg.side === "SELL" ? "S" : "B"}</td>
+            <td>${leg.strike}</td>
+            <td>${leg.expiry || "—"}</td>
+            <td>${leg.sec_id}</td>
+            <td>${leg.qty}</td>
+            <td>${fmtMoney(leg.entry)}</td>
+            <td>${fmtMoney(leg.exit)}</td>
+            <td class="${pnlClass}">${fmtMoney(leg.pnl)}</td>
+            <td>${ts}</td>
+          `;
+        }
+      );
+      document.getElementById("live-closed-count").textContent = `${(data.closed || []).length} legs`;
+      document.getElementById("live-closed-pnl").textContent = `Closed P&L: ${fmtMoney(closedTotal)}`;
+      document.getElementById("live-closed-totalcell").textContent = fmtMoney(closedTotal);
+
+      // Summary: show MTM inclusive of closed + open
+      const combined = openTotal + closedTotal;
+      document.getElementById("live-pnl-total").textContent = fmtMoney(combined);
+      document.getElementById("live-pnl-total").classList.toggle("pos", combined > 0);
+      document.getElementById("live-pnl-total").classList.toggle("neg", combined < 0);
+      document.getElementById("live-open-count").textContent = (data.positions || []).length;
+      document.getElementById("live-margin-avail").textContent = data.margin_available ? fmtMoney(data.margin_available) : "—";
+        document.getElementById("live-margin-used").textContent = data.margin_used ? fmtMoney(data.margin_used) : "—";
+        setStatus("Connected", true);
+      } catch (e) {
+        setStatus("Error", false);
+      } finally {
+        inflight.live = false;
+      }
     }
 
     async function loadSettings() {
-      const data = await fetchJSON("/api/settings");
-      document.getElementById("settings-editor").value = JSON.stringify(data.settings || {}, null, 2);
+      if (inflight.settings) return;
+      inflight.settings = true;
+      try {
+        const data = await fetchJSON("/api/settings");
+        document.getElementById("settings-editor").value = JSON.stringify(data.settings || {}, null, 2);
+      } finally {
+        inflight.settings = false;
+      }
     }
 
     async function saveSettings() {
@@ -419,16 +746,52 @@
       }
     }
 
+    async function loadControl() {
+      if (inflight.control) return;
+      inflight.control = true;
+      try {
+        await Promise.all([
+          loadCreds(),
+          loadStrategy(),
+          refreshAgentStatus(),
+        ]);
+      } finally {
+        inflight.control = false;
+      }
+    }
+
+    async function loadTabData(tab, force = false) {
+      if (!tab) return;
+      if (!force && loadedTabs.has(tab)) return;
+      if (tab === "control") {
+        await loadControl();
+      } else if (tab === "pnl") {
+        await loadPnl();
+      } else if (tab === "live") {
+        await loadLive();
+      } else if (tab === "state") {
+        await loadState();
+      } else if (tab === "logs") {
+        await loadLogs();
+      } else if (tab === "settings") {
+        await loadSettings();
+      }
+      loadedTabs.add(tab);
+    }
+
     // Tabs
     document.querySelectorAll(".tab").forEach(tab => {
       tab.addEventListener("click", () => {
         const t = tab.getAttribute("data-tab");
+        if (!t) return;
+        activeTab = t;
         document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
         tab.classList.add("active");
-        ["control","pnl","live","state","logs","settings"].forEach(id => {
+        TABS.forEach(id => {
           const el = document.getElementById("tab-"+id);
           if (el) el.style.display = (id === t) ? "" : "none";
         });
+        loadTabData(activeTab, true).catch(() => setStatus("Error", false));
       });
     });
 
@@ -436,20 +799,40 @@
     document.getElementById("save-creds").addEventListener("click", saveCreds);
     document.getElementById("start-agent").addEventListener("click", startAgent);
     document.getElementById("stop-agent").addEventListener("click", stopAgent);
+    document.getElementById("paper-close-all").addEventListener("click", closePaperTrades);
 
-    // initial loads
-    loadPnl();
-    loadLive();
-    loadCreds();
-    loadStrategy();
-    refreshAgentStatus();
-    loadState();
-    loadLogs();
-    loadSettings();
-    setInterval(loadPnl, 5000);
-    setInterval(loadLive, 5000);
-    setInterval(loadLogs, 8000);
-    setInterval(refreshAgentStatus, 6000);
+    function pageVisible() {
+      return document.visibilityState === "visible";
+    }
+
+    // Initial load: hydrate control tab quickly; lazy-load the rest on demand.
+    loadTabData(activeTab, true).catch(() => setStatus("Error", false));
+
+    // Refresh only what is visible/active to reduce UI and API load.
+    setInterval(() => {
+      if (!pageVisible()) return;
+      if (activeTab === "pnl") {
+        loadPnl().catch(() => {});
+      } else if (activeTab === "live") {
+        loadLive().catch(() => {});
+      } else if (activeTab === "state") {
+        loadState().catch(() => {});
+      }
+    }, 4000);
+    setInterval(() => {
+      if (!pageVisible()) return;
+      if (activeTab === "logs") loadLogs().catch(() => {});
+    }, 8000);
+    setInterval(() => {
+      if (!pageVisible()) return;
+      refreshAgentStatus().catch(() => {});
+    }, 6000);
+
+    document.addEventListener("visibilitychange", () => {
+      if (!pageVisible()) return;
+      refreshAgentStatus().catch(() => {});
+      loadTabData(activeTab, true).catch(() => {});
+    });
   </script>
 </body>
 </html>
