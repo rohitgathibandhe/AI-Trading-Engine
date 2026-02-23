@@ -38,6 +38,8 @@ STRATEGY_STATE = STATE_DIR / "strategy_state.json"
 SETTINGS_JSON = STATE_DIR / "agent_settings.json"
 LIVE_GATE_STATUS_JSON = STATE_DIR / "live_gate_status.json"
 LIVE_GATE_SESSIONS_JSONL = STATE_DIR / "live_gate_sessions.jsonl"
+BATMAN_BKM_TUNING_ADVICE_JSON = STATE_DIR / "batman_bkm_tuning_advice.json"
+BATMAN_BKM_TUNING_HISTORY_JSONL = STATE_DIR / "batman_bkm_tuning_history.jsonl"
 CREDS_FILE = STATE_DIR / "creds.json"
 LAST_STRATEGY_FILE = STATE_DIR / "last_strategy.json"
 PID_FILE = STATE_DIR / "agent.pid"
@@ -48,6 +50,13 @@ INDEX_SECURITY_ID = int(os.getenv("MARKET_AI_INDEX_SECURITY_ID", "13"))
 INDEX_EXCHANGE_SEG = os.getenv("MARKET_AI_INDEX_EXCHANGE_SEG", "IDX_I")
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
+
+from data_engine.market_ai.modules.agents.batman_bkm_tuning_advisor import (  # type: ignore
+    TuningPaths as BatmanBKMTuningPaths,
+    apply_proposal as apply_batman_bkm_tuning_proposal,
+    load_or_refresh_advice as load_or_refresh_batman_bkm_tuning_advice,
+    refresh_advice as refresh_batman_bkm_tuning_advice,
+)
 
 
 def _parse_float(val: Any, default: float = 0.0) -> float:
@@ -767,6 +776,35 @@ def _is_process_alive(pid: int) -> bool:
         return False
 
 
+def _batman_bkm_tuning_paths() -> BatmanBKMTuningPaths:
+    return BatmanBKMTuningPaths(
+        settings_path=SETTINGS_JSON,
+        strategy_state_path=STRATEGY_STATE,
+        live_gate_status_path=LIVE_GATE_STATUS_JSON,
+        live_gate_sessions_path=LIVE_GATE_SESSIONS_JSONL,
+        advice_path=BATMAN_BKM_TUNING_ADVICE_JSON,
+        history_path=BATMAN_BKM_TUNING_HISTORY_JSONL,
+    )
+
+
+def _load_batman_bkm_tuning_advice() -> Dict[str, Any]:
+    return load_or_refresh_batman_bkm_tuning_advice(_batman_bkm_tuning_paths())
+
+
+def _refresh_batman_bkm_tuning_advice() -> Dict[str, Any]:
+    return refresh_batman_bkm_tuning_advice(_batman_bkm_tuning_paths())
+
+
+def _apply_batman_bkm_tuning_proposal_with_safety(proposal_id: str) -> Dict[str, Any]:
+    pid_data = _json_read(PID_FILE)
+    pid = int(pid_data.get("pid", 0)) if pid_data else 0
+    trade_mode = str(pid_data.get("trade_mode") or "").lower()
+    if pid and trade_mode == "live":
+        # Prefer safety over liveness detection ambiguity: a live-mode pid file is enough to block.
+        raise RuntimeError("Refusing to apply tuning while agent PID file indicates live mode. Stop agent first.")
+    return apply_batman_bkm_tuning_proposal(paths=_batman_bkm_tuning_paths(), proposal_id=proposal_id)
+
+
 class PaperHandler(SimpleHTTPRequestHandler):
     def _send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
         body = json.dumps(payload, default=str).encode("utf-8")
@@ -821,6 +859,29 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 settings.update(data.get("settings", {}))
                 _json_write(SETTINGS_JSON, settings)
                 self._send_json({"ok": True, "strategy": data})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/tuning/batman_bkm/refresh"):
+            try:
+                report = _refresh_batman_bkm_tuning_advice()
+                self._send_json({"ok": True, "advice": report})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/tuning/batman_bkm/apply"):
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+                proposal_id = str(data.get("proposal_id") or "").strip()
+                approve = bool(data.get("approve", False))
+                if not approve:
+                    raise RuntimeError("Manual approval required: set approve=true")
+                if not proposal_id:
+                    raise RuntimeError("proposal_id is required")
+                result = _apply_batman_bkm_tuning_proposal_with_safety(proposal_id)
+                self._send_json(result)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return
@@ -1006,6 +1067,12 @@ class PaperHandler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return
+        if self.path.startswith("/api/tuning/batman_bkm/advice"):
+            try:
+                self._send_json(_load_batman_bkm_tuning_advice())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
         if self.path.startswith("/api/live_gate/status"):
             try:
                 self._send_json(_load_live_gate_status())
@@ -1018,6 +1085,13 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 pid = int(pid_data.get("pid", 0)) if pid_data else 0
                 running = pid and _is_process_alive(pid)
                 gate = _load_live_gate_status()
+                advice = _json_read(BATMAN_BKM_TUNING_ADVICE_JSON)
+                proposal_count = 0
+                if isinstance(advice, dict):
+                    try:
+                        proposal_count = len(advice.get("proposals") or [])
+                    except Exception:
+                        proposal_count = 0
                 self._send_json(
                     {
                         "running": bool(running),
@@ -1028,6 +1102,8 @@ class PaperHandler(SimpleHTTPRequestHandler):
                         "sessions_total": _parse_int(gate.get("sessions_total"), 0),
                         "sessions_pass": _parse_int(gate.get("sessions_pass"), 0),
                         "sessions_fail": _parse_int(gate.get("sessions_fail"), 0),
+                        "batman_bkm_tuning_proposals_pending": proposal_count,
+                        "batman_bkm_tuning_last_generated_at": advice.get("generated_at") if isinstance(advice, dict) else None,
                     }
                 )
             except Exception as exc:
