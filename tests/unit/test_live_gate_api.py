@@ -67,6 +67,12 @@ def _configure_temp_state(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(server, "STRATEGY_STATE", state_dir / "strategy_state.json")
     monkeypatch.setattr(server, "LIVE_GATE_STATUS_JSON", state_dir / "live_gate_status.json")
     monkeypatch.setattr(server, "LIVE_GATE_SESSIONS_JSONL", state_dir / "live_gate_sessions.jsonl")
+    monkeypatch.setattr(server, "POSITION_RECONCILE_STATUS_JSON", state_dir / "position_reconcile_status.json")
+    monkeypatch.setattr(server, "EXECUTION_RECOVERY_STATUS_JSON", state_dir / "execution_recovery_status.json")
+    monkeypatch.setattr(server, "EXECUTION_JOURNAL_JSONL", state_dir / "execution_journal.jsonl")
+    monkeypatch.setattr(server, "AGENT_HEARTBEAT_JSON", state_dir / "agent_heartbeat.json")
+    monkeypatch.setattr(server, "AGENT_ALERTS_JSONL", state_dir / "agent_alerts.jsonl")
+    monkeypatch.setattr(server, "TELEGRAM_ALERT_STATUS_JSON", state_dir / "telegram_alert_status.json")
     monkeypatch.setattr(server, "BATMAN_BKM_TUNING_ADVICE_JSON", state_dir / "batman_bkm_tuning_advice.json")
     monkeypatch.setattr(server, "BATMAN_BKM_TUNING_HISTORY_JSONL", state_dir / "batman_bkm_tuning_history.jsonl")
     monkeypatch.setattr(server, "PID_FILE", state_dir / "agent.pid")
@@ -146,6 +152,162 @@ def test_control_status_includes_live_gate_summary(monkeypatch, tmp_path: Path) 
     assert payload["sessions_total"] == 6
     assert payload["sessions_pass"] == 4
     assert payload["sessions_fail"] == 2
+    assert payload["reconcile_status"] in {"OK", "LOCKED"}
+    assert payload["execution_recovery_status"] in {"OK", "LOCKED"}
+    assert payload["watchdog_status"] in {"MISSING", "OK", "STALE", "INVALID"}
+    assert "alerts_recent_count" in payload
+    assert "telegram_alerts_enabled" in payload
+    assert "telegram_alerts_configured" in payload
+
+
+def test_reconcile_status_and_reset(monkeypatch, tmp_path: Path) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    state_dir = tmp_path / "state"
+    reconcile_path = state_dir / "position_reconcile_status.json"
+    reconcile_path.write_text(
+        json.dumps(
+            {
+                "status": "LOCKED",
+                "hard_lock": True,
+                "current_session_date": "2026-01-15",
+                "locked_for_date": None,
+                "mismatch_streak": 3,
+                "last_mismatch_reason": "BROKER_LOCAL_POSITION_MISMATCH",
+                "last_diff_summary": {"extra": {"x": 1}},
+            }
+        )
+    )
+    code, payload = _run_get("/api/reconcile/status")
+    assert code == 200
+    assert payload["status"] == "LOCKED"
+    assert payload["hard_lock"] is True
+
+    code, payload = _run_post("/api/reconcile/reset", payload={})
+    assert code == 200
+    assert payload["ok"] is True
+    assert payload["reconcile"]["status"] == "OK"
+    assert payload["reconcile"]["hard_lock"] is False
+
+
+def test_execution_recovery_status_and_reset(monkeypatch, tmp_path: Path) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    state_dir = tmp_path / "state"
+    exec_path = state_dir / "execution_recovery_status.json"
+    exec_path.write_text(
+        json.dumps(
+            {
+                "status": "LOCKED",
+                "hard_lock": True,
+                "current_session_date": "2026-01-15",
+                "locked_for_date": None,
+                "last_reason": "EXEC_JOURNAL_FAILED_OP",
+                "last_details": {"count": 1},
+            }
+        )
+    )
+    code, payload = _run_get("/api/execution_recovery/status")
+    assert code == 200
+    assert payload["status"] == "LOCKED"
+    assert payload["hard_lock"] is True
+
+    code, payload = _run_post("/api/execution_recovery/reset", payload={})
+    assert code == 200
+    assert payload["ok"] is True
+    assert payload["execution_recovery"]["status"] == "OK"
+    assert payload["execution_recovery"]["hard_lock"] is False
+
+
+def test_health_endpoint_reports_ok_and_stale(monkeypatch, tmp_path: Path) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    state_dir = tmp_path / "state"
+    settings = json.loads((state_dir / "agent_settings.json").read_text())
+    settings["ops_watchdog_stale_after_sec"] = 10
+    (state_dir / "agent_settings.json").write_text(json.dumps(settings, indent=2))
+    (state_dir / "agent_heartbeat.json").write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-01-15T10:00:00+05:30",
+                "status": "RUNNING",
+                "phase": "loop_start",
+                "trade_mode": "live",
+            }
+        )
+    )
+
+    import types
+
+    class _FixedDateTime:
+        @staticmethod
+        def now(tz=None):
+            if tz is None:
+                return server.datetime(2026, 1, 15, 10, 0, 5)
+            return server.datetime(2026, 1, 15, 10, 0, 5, tzinfo=tz)
+
+    # monkeypatch server helper module imported function instead of datetime class internals
+    from data_engine.market_ai.modules.agents import ops_monitor as opsm  # type: ignore
+
+    monkeypatch.setattr(opsm, "_now_ist", lambda: server.datetime(2026, 1, 15, 10, 0, 5, tzinfo=server.ZoneInfo("Asia/Kolkata") if server.ZoneInfo else None))
+    code, payload = _run_get("/api/health")
+    assert code == 200
+    assert payload["status"] == "OK"
+    assert payload["age_sec"] == 5.0
+
+    monkeypatch.setattr(opsm, "_now_ist", lambda: server.datetime(2026, 1, 15, 10, 0, 25, tzinfo=server.ZoneInfo("Asia/Kolkata") if server.ZoneInfo else None))
+    code, payload = _run_get("/api/health")
+    assert code == 200
+    assert payload["status"] == "STALE"
+
+
+def test_alerts_endpoint_and_clear(monkeypatch, tmp_path: Path) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    alerts_path = tmp_path / "state" / "agent_alerts.jsonl"
+    alerts_path.write_text(
+        json.dumps({"timestamp": "2026-01-15T10:00:00+05:30", "severity": "ERROR", "code": "X1", "message": "m1"}) + "\n"
+        + json.dumps({"timestamp": "2026-01-15T10:00:10+05:30", "severity": "CRITICAL", "code": "X2", "message": "m2"}) + "\n"
+    )
+
+    code, payload = _run_get("/api/alerts?tail=1")
+    assert code == 200
+    assert payload["count"] == 1
+    assert payload["alerts"][0]["code"] == "X2"
+
+    code, payload = _run_post("/api/alerts/clear", payload={})
+    assert code == 200
+    assert payload["ok"] is True
+    assert alerts_path.read_text() == ""
+
+
+def test_telegram_alert_status_and_test_endpoint(monkeypatch, tmp_path: Path) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    state_dir = tmp_path / "state"
+    (state_dir / "telegram_alert_status.json").write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "configured": False,
+                "min_severity": "CRITICAL",
+                "live_only": True,
+                "last_sent_at": None,
+                "last_error": None,
+            }
+        )
+    )
+
+    code, payload = _run_get("/api/alerts/telegram/status")
+    assert code == 200
+    assert payload["enabled"] is True
+    assert payload["configured"] is False
+
+    monkeypatch.setattr(
+        server,
+        "_send_telegram_test_message",
+        lambda text=None: {"ok": True, "sent_at": "2026-01-15T10:00:00+05:30", "chat_id_masked": "12***34", "text": text},
+    )
+    code, payload = _run_post("/api/alerts/telegram/test", payload={"text": "ping"})
+    assert code == 200
+    assert payload["ok"] is True
+    assert payload["telegram"]["ok"] is True
+    assert payload["telegram"]["chat_id_masked"] == "12***34"
 
 
 def test_tuning_advice_refresh_and_get(monkeypatch, tmp_path: Path) -> None:

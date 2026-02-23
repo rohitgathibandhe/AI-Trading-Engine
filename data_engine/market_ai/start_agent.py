@@ -43,6 +43,12 @@ ENTRY_STATUS_FILE = STATE_DIR / "entry_criteria_status.json"
 STRATEGY_STATE_FILE = STATE_DIR / "strategy_state.json"
 LIVE_GATE_STATUS_FILE = STATE_DIR / "live_gate_status.json"
 LIVE_GATE_SESSIONS_FILE = STATE_DIR / "live_gate_sessions.jsonl"
+POSITION_RECONCILE_STATUS_FILE = STATE_DIR / "position_reconcile_status.json"
+EXECUTION_JOURNAL_FILE = STATE_DIR / "execution_journal.jsonl"
+EXECUTION_RECOVERY_STATUS_FILE = STATE_DIR / "execution_recovery_status.json"
+AGENT_HEARTBEAT_FILE = STATE_DIR / "agent_heartbeat.json"
+AGENT_ALERTS_FILE = STATE_DIR / "agent_alerts.jsonl"
+TELEGRAM_ALERT_STATUS_FILE = STATE_DIR / "telegram_alert_status.json"
 BLOTTER_FIELDS = [
     "timestamp",
     "trade_mode",
@@ -158,6 +164,31 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "live_data_fail_action": "AUTO_FLATTEN_LOCK_DAY",
     "live_allow_normal_carry": True,
     "live_probation_cum_mtm_floor": -15000.0,
+    "live_reconcile_enabled": True,
+    "live_reconcile_grace_sec": 30,
+    "live_reconcile_mismatch_confirm_count": 2,
+    "live_reconcile_hard_lock": True,
+    "live_exec_recovery_enabled": True,
+    "live_exec_recovery_hard_lock": True,
+    "live_exec_recovery_lookback_days": 45,
+    "live_order_verify_enabled": True,
+    "live_order_fill_wait_sec": 20,
+    "live_order_fill_poll_sec": 2.0,
+    "live_order_retry_count": 2,
+    "live_order_settle_delay_sec": 1.0,
+    "live_order_verify_positions": True,
+    "ops_heartbeat_interval_sec": 10.0,
+    "ops_watchdog_stale_after_sec": 45.0,
+    "ops_alert_dedupe_sec": 60.0,
+    "telegram_alerts_enabled": False,
+    "telegram_alert_min_severity": "CRITICAL",
+    "telegram_alert_live_only": True,
+    "telegram_alert_poll_interval_sec": 5.0,
+    "telegram_alert_timeout_sec": 10.0,
+    "telegram_alert_max_batch": 5,
+    "telegram_alert_max_message_chars": 3000,
+    "telegram_alert_failure_backoff_sec": 30.0,
+    "telegram_alert_disable_link_preview": True,
     "gap_entry_threshold": 0.004,
     "iv_floor_percentile": 0.2,
     "short_lots": 1,
@@ -229,6 +260,23 @@ from market_ai.engine.policy_engine import PolicyEngine
 from market_ai.engine.learning_manager import LearningManager
 from market_ai.modules.strategies.batman_bkm_monthly import BatmanBKMConfig, BatmanBKMStrategy
 from market_ai.modules.agents.live_gate import LiveGate, LiveGateConfig
+from market_ai.modules.agents.position_reconciler import PositionReconciler, PositionReconcilerConfig
+from market_ai.modules.agents.live_order_executor import LiveOrderExecutor, LiveOrderExecutorConfig
+from market_ai.modules.agents.execution_recovery_guard import (
+    ExecutionJournal,
+    ExecutionRecoveryGuard,
+    ExecutionRecoveryConfig,
+)
+from market_ai.modules.agents.ops_monitor import (
+    AgentHeartbeat,
+    HeartbeatConfig,
+    AlertJournal,
+    AlertConfig,
+)
+from market_ai.modules.agents.telegram_alerts import (
+    TelegramAlertForwarder,
+    TelegramAlertConfig,
+)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -724,31 +772,350 @@ def _bkm_leg_to_option_leg(leg: Any) -> OptionLeg:
     )
 
 
+def _bkm_leg_match_key(leg: OptionLeg) -> Tuple[str, float, str]:
+    expiry = leg.expiry.isoformat() if hasattr(leg.expiry, "isoformat") else str(leg.expiry)
+    strike = float(leg.strike or 0.0)
+    opt = leg.option_type.value if hasattr(leg.option_type, "value") else str(leg.option_type)
+    return (expiry, strike, str(opt).upper())
+
+
+def _bkm_option_leg_to_journal_dict(leg: OptionLeg) -> Dict[str, Any]:
+    opt = leg.option_type.value if hasattr(leg.option_type, "value") else str(leg.option_type)
+    side = leg.side.value if hasattr(leg.side, "value") else str(leg.side)
+    return {
+        "expiry": leg.expiry.isoformat() if hasattr(leg.expiry, "isoformat") else str(leg.expiry),
+        "strike": float(leg.strike or 0.0),
+        "option_type": str(opt).upper(),
+        "side": str(side).upper(),
+        "quantity": int(leg.quantity or 0),
+        "entry_price": float(getattr(leg, "entry_price", 0.0) or 0.0),
+        "security_id": str(getattr(leg, "security_id", "") or ""),
+    }
+
+
+def _bkm_journal_event(
+    *,
+    journal: Optional[ExecutionJournal],
+    event_type: str,
+    op_id: Optional[str],
+    expiry: str,
+    payload: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not journal:
+        return
+    row: Dict[str, Any] = {
+        "strategy": "BATMAN_BKM",
+        "expiry": expiry,
+    }
+    if op_id:
+        row["op_id"] = op_id
+    if payload:
+        row.update(payload)
+    journal.record(event_type, row, when=_ist_now())
+
+
+def _build_bkm_basket_from_journal_snapshot(snapshot: Dict[str, Any], cfg: "BatmanBKMConfig") -> Optional["BatmanBKMBasket"]:
+    if not isinstance(snapshot, dict):
+        return None
+    expiry_raw = snapshot.get("expiry")
+    if not expiry_raw:
+        return None
+    try:
+        expiry = datetime.fromisoformat(str(expiry_raw)).date()
+    except Exception:
+        return None
+    legs_payload = snapshot.get("legs")
+    if not isinstance(legs_payload, list) or not legs_payload:
+        return None
+    from market_ai.modules.strategies.batman_bkm_monthly import Leg as BKMLeg, BatmanBKMBasket  # type: ignore
+
+    built_legs = []
+    for item in legs_payload:
+        if not isinstance(item, dict):
+            continue
+        opt = str(item.get("option_type") or "").upper()
+        if opt == "CALL":
+            opt = "CE"
+        elif opt == "PUT":
+            opt = "PE"
+        side = str(item.get("side") or "SELL").upper()
+        try:
+            strike = float(item.get("strike") or 0.0)
+            qty = int(float(item.get("quantity") or item.get("qty") or 0))
+            entry_price = float(item.get("entry_price") or item.get("entry") or 0.0)
+        except Exception:
+            continue
+        built_legs.append(
+            BKMLeg(
+                option_type=opt or "CE",
+                side=side if side in {"BUY", "SELL"} else "SELL",
+                strike=strike,
+                qty=qty,
+                entry=entry_price,
+                ltp=item.get("ltp"),
+                security_id=str(item.get("security_id") or ""),
+                expiry=expiry.isoformat(),
+            )
+        )
+    if not built_legs:
+        return None
+    meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), dict) else {}
+    net_credit = meta.get("net_credit")
+    margin_required = meta.get("margin_required")
+    credit_pct = meta.get("credit_pct")
+    try:
+        net_credit_f = float(net_credit) if net_credit is not None else sum(
+            (1 if str(l.side).upper() == "SELL" else -1) * float(l.entry) * int(l.qty) for l in built_legs
+        )
+    except Exception:
+        net_credit_f = 0.0
+    try:
+        margin_f = float(margin_required) if margin_required is not None else float(cfg.estimated_margin)
+    except Exception:
+        margin_f = float(cfg.estimated_margin)
+    try:
+        credit_pct_f = float(credit_pct) if credit_pct is not None else ((net_credit_f / margin_f) * 100.0 if margin_f else 0.0)
+    except Exception:
+        credit_pct_f = 0.0
+    return BatmanBKMBasket(
+        expiry=expiry,
+        legs=built_legs,
+        net_credit=net_credit_f,
+        margin_required=margin_f,
+        credit_pct=credit_pct_f,
+        entry_ts=_ist_now(),
+        hedge_qty_call=2 * cfg.lot_multiplier,
+        hedge_qty_put=2 * cfg.lot_multiplier,
+    )
+
+
+def _rollback_bkm_partial_open(
+    *,
+    dw: DhanWrapper,
+    planned_legs: List[OptionLeg],
+    live_order_executor: Optional[LiveOrderExecutor],
+) -> Dict[str, Any]:
+    if not planned_legs:
+        return {"ok": True, "submitted_close_legs": 0, "errors": []}
+    try:
+        broker_positions_raw = dw.get_positions_raw()
+        broker_legs = _map_positions(broker_positions_raw)
+    except Exception as exc:
+        log.exception("[BatmanBKM] rollback failed to fetch broker positions")
+        return {"ok": False, "submitted_close_legs": 0, "errors": [f"positions_fetch_failed:{exc}"]}
+
+    target_keys = {_bkm_leg_match_key(leg) for leg in planned_legs}
+    to_close = [leg for leg in broker_legs if _bkm_leg_match_key(leg) in target_keys]
+    if not to_close:
+        return {"ok": True, "submitted_close_legs": 0, "errors": []}
+
+    errors: List[Dict[str, Any]] = []
+    submitted_close_legs = 0
+    for broker_leg in to_close:
+        close_res = _place_leg_order(
+            dw,
+            broker_leg,
+            close=True,
+            trade_mode="live",
+            live_order_executor=live_order_executor,
+        )
+        if bool(close_res.get("ok")):
+            submitted_close_legs += 1
+        else:
+            errors.append(
+                {
+                    "strike": broker_leg.strike,
+                    "opt": broker_leg.option_type.value if hasattr(broker_leg.option_type, "value") else str(broker_leg.option_type),
+                    "qty": broker_leg.quantity,
+                    "error": close_res,
+                }
+            )
+    return {"ok": len(errors) == 0, "submitted_close_legs": submitted_close_legs, "errors": errors}
+
+
+def _execute_bkm_open_live(
+    *,
+    dw: DhanWrapper,
+    basket: Any,
+    live_order_executor: Optional[LiveOrderExecutor],
+    execution_journal: Optional[ExecutionJournal] = None,
+) -> Dict[str, Any]:
+    option_legs: List[OptionLeg] = []
+    for raw_leg in getattr(basket, "legs", []) or []:
+        try:
+            option_legs.append(_bkm_leg_to_option_leg(raw_leg))
+        except Exception:
+            continue
+    if not option_legs:
+        return {"ok": False, "opened_legs": 0, "planned_legs": 0, "error": "no_option_legs"}
+    expiry_str = basket.expiry.isoformat() if hasattr(basket, "expiry") else ""
+    op_id = f"BKMOPEN-{int(time.time() * 1000)}"
+    _bkm_journal_event(
+        journal=execution_journal,
+        event_type="BKM_OPEN_BEGIN",
+        op_id=op_id,
+        expiry=expiry_str,
+        payload={
+            "legs": [_bkm_option_leg_to_journal_dict(leg) for leg in option_legs],
+            "meta": {
+                "net_credit": float(getattr(basket, "net_credit", 0.0) or 0.0),
+                "margin_required": float(getattr(basket, "margin_required", 0.0) or 0.0),
+                "credit_pct": float(getattr(basket, "credit_pct", 0.0) or 0.0),
+            },
+        },
+    )
+
+    opened_legs = 0
+    errors: List[Dict[str, Any]] = []
+    for leg in option_legs:
+        open_res = _place_leg_order(
+            dw,
+            leg,
+            close=False,
+            trade_mode="live",
+            live_order_executor=live_order_executor,
+        )
+        if bool(open_res.get("ok")):
+            opened_legs += 1
+            continue
+        errors.append(
+            {
+                "strike": leg.strike,
+                "opt": leg.option_type.value if hasattr(leg.option_type, "value") else str(leg.option_type),
+                "qty": leg.quantity,
+                "error": open_res,
+            }
+        )
+        break
+
+    rollback: Dict[str, Any] = {"ok": True, "submitted_close_legs": 0, "errors": []}
+    if errors:
+        rollback = _rollback_bkm_partial_open(
+            dw=dw,
+            planned_legs=option_legs,
+            live_order_executor=live_order_executor,
+        )
+    out = {
+        "ok": len(errors) == 0,
+        "opened_legs": opened_legs,
+        "planned_legs": len(option_legs),
+        "errors": errors,
+        "rollback": rollback,
+        "op_id": op_id,
+    }
+    if out["ok"]:
+        _bkm_journal_event(
+            journal=execution_journal,
+            event_type="BKM_OPEN_SUCCESS",
+            op_id=op_id,
+            expiry=expiry_str,
+            payload={
+                "legs": [_bkm_option_leg_to_journal_dict(leg) for leg in option_legs],
+                "meta": {
+                    "net_credit": float(getattr(basket, "net_credit", 0.0) or 0.0),
+                    "margin_required": float(getattr(basket, "margin_required", 0.0) or 0.0),
+                    "credit_pct": float(getattr(basket, "credit_pct", 0.0) or 0.0),
+                },
+                "details": {"opened_legs": opened_legs, "planned_legs": len(option_legs)},
+            },
+        )
+    else:
+        _bkm_journal_event(
+            journal=execution_journal,
+            event_type="BKM_OPEN_FAIL",
+            op_id=op_id,
+            expiry=expiry_str,
+            payload={"details": out},
+        )
+    return out
+
+
 def _flatten_bkm_basket(
     *,
     dw: DhanWrapper,
     bkm_strategy: BatmanBKMStrategy,
     trade_mode: str,
     reason: str,
-) -> int:
+    live_order_executor: Optional[LiveOrderExecutor] = None,
+    execution_journal: Optional[ExecutionJournal] = None,
+) -> Dict[str, Any]:
     basket = bkm_strategy.basket
     if not basket:
-        return 0
+        return {"ok": True, "closed_legs": 0, "planned_legs": 0, "errors": []}
+    expiry_str = basket.expiry.isoformat() if hasattr(basket, "expiry") else ""
+    op_id = f"BKMCLOSE-{int(time.time() * 1000)}"
     option_legs: List[OptionLeg] = []
     for raw_leg in basket.legs:
         try:
             option_legs.append(_bkm_leg_to_option_leg(raw_leg))
         except Exception:
             continue
+    _bkm_journal_event(
+        journal=execution_journal,
+        event_type="BKM_CLOSE_BEGIN",
+        op_id=op_id,
+        expiry=expiry_str,
+        payload={
+            "reason": reason,
+            "legs": [_bkm_option_leg_to_journal_dict(leg) for leg in option_legs],
+        },
+    )
+    errors: List[Dict[str, Any]] = []
+    closed_ok = 0
     for leg in option_legs:
-        _place_leg_order(dw, leg, close=True, trade_mode=trade_mode)
+        close_res = _place_leg_order(
+            dw,
+            leg,
+            close=True,
+            trade_mode=trade_mode,
+            live_order_executor=live_order_executor if trade_mode == "live" else None,
+        )
+        if bool(close_res.get("ok")):
+            closed_ok += 1
+            continue
+        errors.append(
+            {
+                "strike": leg.strike,
+                "opt": leg.option_type.value if hasattr(leg.option_type, "value") else str(leg.option_type),
+                "qty": leg.quantity,
+                "error": close_res,
+            }
+        )
+    if errors:
+        log.error(
+            "[BatmanBKM] close verification failed reason=%s closed_ok=%s planned=%s errors=%s",
+            reason,
+            closed_ok,
+            len(option_legs),
+            errors,
+        )
+        out = {"ok": False, "closed_legs": closed_ok, "planned_legs": len(option_legs), "errors": errors, "op_id": op_id}
+        _bkm_journal_event(
+            journal=execution_journal,
+            event_type="BKM_CLOSE_FAIL",
+            op_id=op_id,
+            expiry=expiry_str,
+            payload={"reason": reason, "details": out},
+        )
+        return out
     try:
         _log_batman_blotter(trade_mode, basket.legs, "CLOSE")
     except Exception:
         pass
     _mark_bkm_closed(basket.expiry.isoformat(), reason, basket.mtm())
+    _bkm_journal_event(
+        journal=execution_journal,
+        event_type="BKM_CLOSE_SUCCESS",
+        op_id=op_id,
+        expiry=expiry_str,
+        payload={
+            "reason": reason,
+            "legs": [_bkm_option_leg_to_journal_dict(leg) for leg in option_legs],
+            "details": {"closed_legs": len(option_legs), "planned_legs": len(option_legs)},
+        },
+    )
     bkm_strategy.basket = None
-    return len(option_legs)
+    return {"ok": True, "closed_legs": len(option_legs), "planned_legs": len(option_legs), "errors": [], "op_id": op_id}
 
 
 def _apply_live_gate_failsafe(
@@ -758,16 +1125,21 @@ def _apply_live_gate_failsafe(
     dw: DhanWrapper,
     bkm_strategy: Optional[BatmanBKMStrategy],
     trade_mode: str,
+    live_order_executor: Optional[LiveOrderExecutor] = None,
+    execution_journal: Optional[ExecutionJournal] = None,
 ) -> int:
     live_gate.trigger_failsafe(reason)
     if not bkm_strategy or not bkm_strategy.basket:
         return 0
-    return _flatten_bkm_basket(
+    flatten_res = _flatten_bkm_basket(
         dw=dw,
         bkm_strategy=bkm_strategy,
         trade_mode=trade_mode,
         reason="DATA_FAILSAFE_LOCK",
+        live_order_executor=live_order_executor,
+        execution_journal=execution_journal,
     )
+    return int(flatten_res.get("closed_legs", 0))
 
 
 def _build_risk_config(settings: Dict[str, Any]) -> RiskConfig:
@@ -1628,7 +2000,14 @@ def _last_friday_before(expiry: dt_date) -> dt_date:
     return probe
 
 
-def _place_leg_order(dw: DhanWrapper, leg: OptionLeg, *, close: bool, trade_mode: str) -> None:
+def _place_leg_order(
+    dw: DhanWrapper,
+    leg: OptionLeg,
+    *,
+    close: bool,
+    trade_mode: str,
+    live_order_executor: Optional[LiveOrderExecutor] = None,
+) -> Dict[str, Any]:
     side = _normalize_leg_side(leg.side)
     if close:
         order_side = LegSide.BUY if side == LegSide.SELL else LegSide.SELL
@@ -1637,11 +2016,11 @@ def _place_leg_order(dw: DhanWrapper, leg: OptionLeg, *, close: bool, trade_mode
     if trade_mode == "paper":
         # Paper: do not hit broker; log a synthetic blotter row once.
         _log_trade_event(trade_mode=trade_mode, side=order_side.value, leg=leg, order_type="MARKET", notes="paper")
-        return
+        return {"ok": True, "verified": True, "paper": True, "order_side": order_side.value}
     security_id = _ensure_leg_security_id(leg, leg.symbol, leg.expiry)
     if not security_id:
         log.error("Skipping leg order due to missing security_id (strike=%s opt=%s)", leg.strike, leg.option_type)
-        return
+        return {"ok": False, "verified": False, "error": "missing_security_id", "order_side": order_side.value}
     log.info(
         "Placing %s order sec_id=%s strike=%s opt=%s qty=%s expiry=%s",
         order_side.value,
@@ -1651,6 +2030,48 @@ def _place_leg_order(dw: DhanWrapper, leg: OptionLeg, *, close: bool, trade_mode
         leg.quantity,
         leg.expiry,
     )
+    if trade_mode == "live" and live_order_executor:
+        exec_result = live_order_executor.place_and_verify(
+            dw=dw,
+            side=order_side.value,
+            exchange_seg="NSE_FNO",
+            security_id=int(security_id),
+            quantity=int(leg.quantity),
+            product_type="MARGIN",
+            order_type="MARKET",
+            client_order_prefix="BKMCL" if close else "BKMOP",
+        )
+        if not bool(exec_result.get("ok")):
+            log.error(
+                "[ExecGuard] order verify failed side=%s sec_id=%s qty=%s remaining=%s err=%s",
+                order_side.value,
+                security_id,
+                leg.quantity,
+                exec_result.get("remaining_qty"),
+                exec_result.get("error"),
+            )
+            return {
+                "ok": False,
+                "verified": bool(exec_result.get("verified")),
+                "order_side": order_side.value,
+                "security_id": int(security_id),
+                "result": exec_result,
+            }
+        _log_trade_event(
+            trade_mode=trade_mode,
+            side=order_side.value,
+            leg=leg,
+            order_type="MARKET",
+            notes="verified" if bool(exec_result.get("verified")) else "",
+        )
+        return {
+            "ok": True,
+            "verified": bool(exec_result.get("verified")),
+            "order_side": order_side.value,
+            "security_id": int(security_id),
+            "result": exec_result,
+        }
+
     dw.place_order(
         side=order_side.value,
         exchange_seg="NSE_FNO",
@@ -1660,6 +2081,7 @@ def _place_leg_order(dw: DhanWrapper, leg: OptionLeg, *, close: bool, trade_mode
         order_type="MARKET",
     )
     _log_trade_event(trade_mode=trade_mode, side=order_side.value, leg=leg, order_type="MARKET")
+    return {"ok": True, "verified": False, "order_side": order_side.value, "security_id": int(security_id)}
 
 
 def _cached_intraday_for_day(dw: DhanWrapper, trade_day: dt_date, interval: int = INTRADAY_INTERVAL_MIN) -> List[dict]:
@@ -1787,6 +2209,81 @@ def main() -> None:
         strategy_file=selected_strategy_file,
         trade_mode_env=os.getenv("TRADE_MODE"),
     )
+    agent_heartbeat = AgentHeartbeat(
+        path=AGENT_HEARTBEAT_FILE,
+        config=HeartbeatConfig.from_settings(settings),
+        logger=log,
+    )
+    alert_journal = AlertJournal(
+        path=AGENT_ALERTS_FILE,
+        config=AlertConfig.from_settings(settings),
+        logger=log,
+    )
+    telegram_forwarder = TelegramAlertForwarder(
+        config=TelegramAlertConfig.from_settings(settings),
+        alerts_path=AGENT_ALERTS_FILE,
+        status_path=TELEGRAM_ALERT_STATUS_FILE,
+        logger=log,
+    )
+
+    def _ops_alert(
+        severity: str,
+        code: str,
+        message: str,
+        *,
+        details: Optional[Dict[str, Any]] = None,
+        dedupe_key: Optional[str] = None,
+        force: bool = False,
+    ) -> None:
+        try:
+            alert_journal.emit(
+                severity=severity,
+                code=code,
+                message=message,
+                details=details,
+                source="start_agent",
+                when=_ist_now(),
+                dedupe_key=dedupe_key,
+                force=force,
+            )
+        except Exception:
+            pass
+
+    def _heartbeat(
+        *,
+        force: bool = False,
+        status: str = "RUNNING",
+        phase: str = "loop",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "status": status,
+            "phase": phase,
+            "pid": os.getpid(),
+            "trade_mode": trade_mode,
+            "strategy_file": selected_strategy_file,
+        }
+        if extra:
+            payload.update(extra)
+        try:
+            agent_heartbeat.beat(payload, when=_ist_now(), force=force)
+        except Exception:
+            pass
+
+    def _telegram_pump(*, force: bool = False) -> None:
+        try:
+            out = telegram_forwarder.process_pending(
+                creds=_load_saved_creds(),
+                trade_mode=trade_mode,
+                strategy_file=selected_strategy_file,
+                force=force,
+                when=_ist_now(),
+            )
+            if out.get("reason") in {"SEND_FAILED"}:
+                log.warning("[TelegramAlerts] send failed: %s", out.get("error"))
+        except Exception as exc:
+            # Never let notifier failures affect trading loop.
+            log.warning("[TelegramAlerts] pump error: %s", exc)
 
     # Enforce rollout policy for live mode.
     if trade_mode == "live":
@@ -1802,9 +2299,91 @@ def main() -> None:
             sessions_path=LIVE_GATE_SESSIONS_FILE,
             logger=log,
         )
+    position_reconciler: Optional[PositionReconciler] = None
+    if trade_mode == "live" and bool(settings.get("live_reconcile_enabled", True)):
+        position_reconciler = PositionReconciler(
+            config=PositionReconcilerConfig.from_settings(settings),
+            status_path=POSITION_RECONCILE_STATUS_FILE,
+            logger=log,
+        )
+    live_order_executor: Optional[LiveOrderExecutor] = None
+    if trade_mode == "live" and selected_strategy_file == "batman_bkm_monthly":
+        live_order_executor = LiveOrderExecutor(
+            config=LiveOrderExecutorConfig.from_settings(settings),
+            logger=log,
+        )
+    execution_journal: Optional[ExecutionJournal] = None
+    execution_recovery_guard: Optional[ExecutionRecoveryGuard] = None
+    if trade_mode == "live" and selected_strategy_file == "batman_bkm_monthly":
+        execution_journal = ExecutionJournal(journal_path=EXECUTION_JOURNAL_FILE, logger=log)
+        if bool(settings.get("live_exec_recovery_enabled", True)):
+            execution_recovery_guard = ExecutionRecoveryGuard(
+                config=ExecutionRecoveryConfig.from_settings(settings),
+                status_path=EXECUTION_RECOVERY_STATUS_FILE,
+                logger=log,
+            )
 
     dw = DhanWrapper(logger=logging.getLogger("dhan_wrapper"))
+    startup_resume_bkm_snapshot: Optional[Dict[str, Any]] = None
+    if trade_mode == "live" and selected_strategy_file == "batman_bkm_monthly" and execution_recovery_guard and execution_journal:
+        startup_now = _ist_now()
+        try:
+            broker_positions_raw = dw.get_positions_raw()
+            broker_legs_startup = _map_positions(broker_positions_raw)
+        except Exception as exc:
+            recovery_snap = execution_recovery_guard.lock(
+                "EXEC_RECOVERY_STARTUP_BROKER_FETCH_FAIL",
+                details={"error": str(exc)},
+                when=startup_now,
+            )
+            log.error("[ExecRecovery] startup broker positions fetch failed; locking entries: %s", recovery_snap)
+            _ops_alert(
+                "CRITICAL",
+                "EXEC_RECOVERY_STARTUP_BROKER_FETCH_FAIL",
+                "Startup broker position fetch failed; live entries locked.",
+                details={"error": str(exc)},
+                force=True,
+            )
+            broker_legs_startup = []
+        else:
+            local_bkm_state = load_strategy_state().get("BATMAN_BKM", {})
+            journal_summary = execution_journal.analyze_bkm(
+                lookback_days=int(settings.get("live_exec_recovery_lookback_days", 45)),
+                when=startup_now,
+            )
+            recovery_out = execution_recovery_guard.evaluate_startup(
+                local_bkm_state=local_bkm_state if isinstance(local_bkm_state, dict) else {},
+                broker_legs=broker_legs_startup,
+                journal_summary=journal_summary,
+                when=startup_now,
+            )
+            if recovery_out.get("ok"):
+                active_baskets = recovery_out.get("active_baskets") or {}
+                if isinstance(active_baskets, dict) and len(active_baskets) == 1:
+                    startup_resume_bkm_snapshot = next(iter(active_baskets.values()))
+                log.info(
+                    "[ExecRecovery] startup check ok reason=%s active_baskets=%s",
+                    recovery_out.get("reason"),
+                    list(active_baskets.keys()) if isinstance(active_baskets, dict) else [],
+                )
+            else:
+                log.error(
+                    "[ExecRecovery] startup check locked reason=%s details=%s",
+                    recovery_out.get("reason"),
+                    recovery_out.get("details"),
+                )
+                _ops_alert(
+                    "CRITICAL",
+                    str(recovery_out.get("reason") or "EXEC_RECOVERY_STARTUP_LOCK"),
+                    "Execution recovery startup validation locked live entries.",
+                    details={"details": recovery_out.get("details")},
+                    force=True,
+                )
+                if live_gate:
+                    live_gate.mark_loop_error("EXEC_RECOVERY_STARTUP_LOCK", when=startup_now)
     _write_pid_file()
+    _heartbeat(force=True, status="STARTING", phase="startup_post_pid")
+    _telegram_pump(force=True)
     lot_size = int(settings.get("lot_size", DEFAULT_SETTINGS["lot_size"]))
     selector = StrategySelector(symbol="NIFTY", lot_size=lot_size)
     risk = _build_risk_config(settings)
@@ -1820,13 +2399,62 @@ def main() -> None:
             live_gate.snapshot().get("stage"),
             live_gate.get_lot_multiplier(),
         )
+    if position_reconciler:
+        log.info(
+            "[Reconcile] enabled status=%s hard_lock=%s grace_sec=%s confirm=%s",
+            position_reconciler.snapshot().get("status"),
+            position_reconciler.snapshot().get("hard_lock"),
+            int(settings.get("live_reconcile_grace_sec", 30)),
+            int(settings.get("live_reconcile_mismatch_confirm_count", 2)),
+        )
+    if live_order_executor:
+        log.info(
+            "[ExecGuard] enabled=%s fill_wait=%ss poll=%ss retries=%s verify_positions=%s",
+            bool(settings.get("live_order_verify_enabled", True)),
+            int(settings.get("live_order_fill_wait_sec", 20)),
+            float(settings.get("live_order_fill_poll_sec", 2.0)),
+            int(settings.get("live_order_retry_count", 2)),
+            bool(settings.get("live_order_verify_positions", True)),
+        )
+    if execution_recovery_guard:
+        log.info(
+            "[ExecRecovery] enabled status=%s hard_lock=%s lookback_days=%s",
+            execution_recovery_guard.snapshot().get("status"),
+            execution_recovery_guard.snapshot().get("hard_lock"),
+            int(settings.get("live_exec_recovery_lookback_days", 45)),
+        )
+    log.info(
+        "[OpsMonitor] heartbeat_interval=%ss watchdog_stale_after=%ss alert_dedupe=%ss",
+        float(settings.get("ops_heartbeat_interval_sec", 10.0)),
+        float(settings.get("ops_watchdog_stale_after_sec", 45.0)),
+        float(settings.get("ops_alert_dedupe_sec", 60.0)),
+    )
+    log.info(
+        "[TelegramAlerts] enabled=%s min_severity=%s live_only=%s",
+        bool(settings.get("telegram_alerts_enabled", False)),
+        str(settings.get("telegram_alert_min_severity", "CRITICAL")).upper(),
+        bool(settings.get("telegram_alert_live_only", True)),
+    )
     log.info("Regime-aware agent started (mode=%s)", trade_mode)
     log.info("Selected strategy file=%s", selected_strategy_file)
     daily_trades = 0
     current_day = _ist_now().date()
     day_entries = 0
     day_legs = 0
-    day_mode = "NORMAL"
+    startup_exec_locked = bool(execution_recovery_guard and execution_recovery_guard.should_block_entries(_ist_now()))
+    day_mode = "LOCKED_RED" if startup_exec_locked else "NORMAL"
+    _heartbeat(
+        force=True,
+        status="RUNNING",
+        phase="startup_ready",
+        extra={
+            "day_mode": day_mode,
+            "live_gate_status": live_gate.snapshot().get("status") if live_gate else None,
+            "reconcile_status": position_reconciler.snapshot().get("status") if position_reconciler else None,
+            "execution_recovery_status": execution_recovery_guard.snapshot().get("status") if execution_recovery_guard else None,
+        },
+    )
+    _telegram_pump(force=True)
     orb_config = ORBConfig()
     orb_state = ORBState()
     basket_peak_mtm = 0.0
@@ -1841,13 +2469,31 @@ def main() -> None:
     from market_ai.strategies import BatmanStrategy, BatmanConfig
     batman_v2: Optional[BatmanStrategy] = None
     bkm_strategy: Optional[BatmanBKMStrategy] = None
+    loop_seq = 0
 
     while True:
         try:
+            loop_seq += 1
             now = datetime.now()
             now_ist = _ist_now()
             if live_gate:
                 live_gate.on_tick(now_ist)
+            if position_reconciler:
+                position_reconciler.on_tick(now_ist)
+            if execution_recovery_guard:
+                execution_recovery_guard.on_tick(now_ist)
+            _telegram_pump()
+            _heartbeat(
+                phase="loop_start",
+                extra={
+                    "loop_seq": loop_seq,
+                    "now_ist": now_ist.isoformat(timespec="seconds"),
+                    "day_mode": day_mode,
+                    "live_gate_status": live_gate.snapshot().get("status") if live_gate else None,
+                    "reconcile_status": position_reconciler.snapshot().get("status") if position_reconciler else None,
+                    "execution_recovery_status": execution_recovery_guard.snapshot().get("status") if execution_recovery_guard else None,
+                },
+            )
             log.info("[Loop] tick start mode=%s strategy=%s", trade_mode, selected_strategy_file)
             today = now_ist.date()
             if today != current_day:
@@ -1864,6 +2510,7 @@ def main() -> None:
             # Skip processing on weekends when the market is closed.
             if now_ist.weekday() >= 5:
                 log.info("Weekend detected; market is closed. Sleeping for %ss.", poll_sec)
+                _heartbeat(phase="weekend_sleep", extra={"loop_seq": loop_seq, "day_mode": day_mode})
                 time.sleep(poll_sec)
                 continue
             try:
@@ -1879,20 +2526,62 @@ def main() -> None:
                             dw=dw,
                             bkm_strategy=bkm_strategy,
                             trade_mode=trade_mode,
+                            live_order_executor=live_order_executor,
+                            execution_journal=execution_journal,
                         )
+                        if closed_legs > 0 and position_reconciler:
+                            position_reconciler.defer_checks(
+                                seconds=int(settings.get("live_reconcile_grace_sec", 30)),
+                                reason="DATA_FAILSAFE_CLOSE_SUBMITTED",
+                                when=_ist_now(),
+                            )
                         day_mode = "LOCKED_RED"
                         log.error(
                             "[LiveGate] FAILSAFE_TRIGGERED reason=%s source=market_snapshot closed_legs=%s",
                             fail_reason,
                             closed_legs,
                         )
+                        _ops_alert(
+                            "CRITICAL",
+                            "LIVEGATE_FAILSAFE_TRIGGERED",
+                            "LiveGate fail-safe triggered from market snapshot failure.",
+                            details={"reason": fail_reason, "source": "market_snapshot", "closed_legs": closed_legs},
+                            dedupe_key="LIVEGATE_FAILSAFE_TRIGGERED",
+                        )
                 log.exception("[Loop] market snapshot fetch failed")
+                _ops_alert(
+                    "ERROR",
+                    "MARKET_SNAPSHOT_FETCH_FAIL",
+                    "Market snapshot fetch failed in agent loop.",
+                    details={"loop_seq": loop_seq, "strategy_file": selected_strategy_file},
+                    dedupe_key="MARKET_SNAPSHOT_FETCH_FAIL",
+                )
+                _heartbeat(
+                    force=True,
+                    status="DEGRADED",
+                    phase="market_snapshot_error",
+                    extra={"loop_seq": loop_seq, "day_mode": day_mode},
+                )
                 time.sleep(poll_sec)
                 continue
             log.info("[Loop] snapshot spot=%.2f", market.spot)
+            _heartbeat(
+                phase="market_snapshot_ok",
+                extra={"loop_seq": loop_seq, "spot": float(market.spot or 0.0), "day_mode": day_mode},
+            )
             # ── Batman BKM monthly branch ───────────────────────────────────
             if selected_strategy_file == "batman_bkm_monthly":
                 live_bkm_gate_enabled = trade_mode == "live" and live_gate is not None
+                live_bkm_reconcile_enabled = trade_mode == "live" and position_reconciler is not None
+
+                def _defer_reconcile_checks(reason: str) -> None:
+                    if not live_bkm_reconcile_enabled or not position_reconciler:
+                        return
+                    position_reconciler.defer_checks(
+                        seconds=int(settings.get("live_reconcile_grace_sec", 30)),
+                        reason=reason,
+                        when=_ist_now(),
+                    )
 
                 def _trigger_bkm_conn_failure(source: str) -> None:
                     nonlocal day_mode
@@ -1913,13 +2602,24 @@ def main() -> None:
                             dw=dw,
                             bkm_strategy=bkm_strategy,
                             trade_mode=trade_mode,
+                            live_order_executor=live_order_executor,
+                            execution_journal=execution_journal,
                         )
+                        if closed_legs > 0:
+                            _defer_reconcile_checks("DATA_FAILSAFE_CLOSE_SUBMITTED")
                         day_mode = "LOCKED_RED"
                         log.error(
                             "[LiveGate] FAILSAFE_TRIGGERED reason=%s source=%s closed_legs=%s",
                             fail_reason,
                             source,
                             closed_legs,
+                        )
+                        _ops_alert(
+                            "CRITICAL",
+                            "LIVEGATE_FAILSAFE_TRIGGERED",
+                            "LiveGate fail-safe triggered from connection failure.",
+                            details={"reason": fail_reason, "source": source, "closed_legs": closed_legs},
+                            dedupe_key="LIVEGATE_FAILSAFE_TRIGGERED",
                         )
 
                 def _fetch_bkm_chain(target_expiry: dt_date) -> Optional[List[dict]]:
@@ -1947,13 +2647,24 @@ def main() -> None:
                             dw=dw,
                             bkm_strategy=bkm_strategy,
                             trade_mode=trade_mode,
+                            live_order_executor=live_order_executor,
+                            execution_journal=execution_journal,
                         )
+                        if closed_legs > 0:
+                            _defer_reconcile_checks("DATA_FAILSAFE_CLOSE_SUBMITTED")
                         day_mode = "LOCKED_RED"
                         log.error(
                             "[LiveGate] FAILSAFE_TRIGGERED reason=%s source=spot_zero spot=%s closed_legs=%s",
                             spot_reason,
                             market.spot,
                             closed_legs,
+                        )
+                        _ops_alert(
+                            "CRITICAL",
+                            "LIVEGATE_FAILSAFE_TRIGGERED",
+                            "LiveGate fail-safe triggered from zero/invalid spot feed.",
+                            details={"reason": spot_reason, "source": "spot_zero", "spot": market.spot, "closed_legs": closed_legs},
+                            dedupe_key="LIVEGATE_FAILSAFE_TRIGGERED",
                         )
 
                 active_lot_multiplier = int(settings.get("batman_bkm_lot_multiplier", 1))
@@ -1997,7 +2708,21 @@ def main() -> None:
                         active_lot_multiplier,
                     )
                     bkm_strategy.cfg.lot_multiplier = active_lot_multiplier
-                # Try to restore basket from blotter if it exists in state but not in memory
+                # Try to restore basket from execution journal (live) or blotter (paper)
+                if (
+                    bkm_strategy.basket is None
+                    and trade_mode == "live"
+                    and startup_resume_bkm_snapshot
+                    and not (execution_recovery_guard and execution_recovery_guard.should_block_entries(now_ist))
+                ):
+                    restored = _build_bkm_basket_from_journal_snapshot(startup_resume_bkm_snapshot, bkm_strategy.cfg)
+                    if restored:
+                        bkm_strategy.basket = restored
+                        log.info(
+                            "[ExecRecovery] restored Batman BKM basket from execution journal expiry=%s",
+                            restored.expiry.isoformat(),
+                        )
+                    startup_resume_bkm_snapshot = None
                 if bkm_strategy.basket is None and trade_mode == "paper":
                     state = load_strategy_state().get("BATMAN_BKM", {})
                     open_expiries = []
@@ -2019,8 +2744,65 @@ def main() -> None:
                 else:
                     expiry = _fetch_monthly_expiry(dw) or today
                 expiry_str = expiry.isoformat()
+                if live_bkm_reconcile_enabled and position_reconciler:
+                    try:
+                        broker_positions_raw = dw.get_positions_raw()
+                        broker_legs_all = _map_positions(broker_positions_raw)
+                    except Exception:
+                        log.exception("[Reconcile] broker positions fetch failed")
+                        _trigger_bkm_conn_failure("positions_fetch_exception")
+                        time.sleep(poll_sec)
+                        continue
+                    expected_bkm_legs: List[OptionLeg] = []
+                    if bkm_strategy and bkm_strategy.basket:
+                        for raw_leg in bkm_strategy.basket.legs:
+                            try:
+                                expected_bkm_legs.append(_bkm_leg_to_option_leg(raw_leg))
+                            except Exception:
+                                continue
+                        broker_legs = [leg for leg in broker_legs_all if getattr(leg, "expiry", None) == expiry]
+                    else:
+                        broker_legs = broker_legs_all
+                    reconcile_out = position_reconciler.evaluate(
+                        expected_legs=expected_bkm_legs,
+                        broker_legs=broker_legs,
+                        when=now_ist,
+                    )
+                    if reconcile_out.get("skipped"):
+                        log.info("[Reconcile] skipped: %s", reconcile_out.get("reason"))
+                    elif not reconcile_out.get("ok"):
+                        if reconcile_out.get("locked"):
+                            day_mode = "LOCKED_RED"
+                            if live_bkm_gate_enabled and live_gate:
+                                live_gate.mark_loop_error("POSITION_RECONCILE_MISMATCH", when=_ist_now())
+                            log.error(
+                                "[Reconcile] MISMATCH_LOCKED streak=%s diff=%s",
+                                reconcile_out.get("mismatch_streak"),
+                                reconcile_out.get("diff"),
+                            )
+                            _ops_alert(
+                                "CRITICAL",
+                                "POSITION_RECONCILE_MISMATCH_LOCKED",
+                                "Broker/local position reconciliation locked trading.",
+                                details={
+                                    "mismatch_streak": reconcile_out.get("mismatch_streak"),
+                                    "diff": reconcile_out.get("diff"),
+                                },
+                                dedupe_key="POSITION_RECONCILE_MISMATCH_LOCKED",
+                            )
+                            time.sleep(poll_sec)
+                            continue
+                        log.warning(
+                            "[Reconcile] mismatch_detected streak=%s diff=%s",
+                            reconcile_out.get("mismatch_streak"),
+                            reconcile_out.get("diff"),
+                        )
                 entries_locked = day_mode == "LOCKED_RED" or (
                     live_bkm_gate_enabled and live_gate and live_gate.should_block_entries(now_ist)
+                ) or (
+                    live_bkm_reconcile_enabled and position_reconciler and position_reconciler.should_block_entries(now_ist)
+                ) or (
+                    trade_mode == "live" and execution_recovery_guard and execution_recovery_guard.should_block_entries(now_ist)
                 )
                 if bkm_strategy.basket is None and _is_bkm_blocked(expiry_str):
                     blotter_empty = (not TRADE_BLOTTER_PATH.exists()) or TRADE_BLOTTER_PATH.stat().st_size == 0
@@ -2033,11 +2815,17 @@ def main() -> None:
                 # Prevent multiple entries per expiry
                 if bkm_strategy.basket is None and entries_locked:
                     lock_payload = live_gate.snapshot() if (live_bkm_gate_enabled and live_gate) else {}
+                    reconcile_payload = position_reconciler.snapshot() if (live_bkm_reconcile_enabled and position_reconciler) else {}
+                    exec_recovery_payload = execution_recovery_guard.snapshot() if (trade_mode == "live" and execution_recovery_guard) else {}
                     log.warning(
-                        "[BatmanBKM] entry blocked day_mode=%s status=%s locked_for_date=%s",
+                        "[BatmanBKM] entry blocked day_mode=%s live_gate_status=%s live_gate_locked_for=%s reconcile_status=%s reconcile_hard_lock=%s exec_recovery_status=%s exec_recovery_hard_lock=%s",
                         day_mode,
                         lock_payload.get("status"),
                         lock_payload.get("locked_for_date"),
+                        reconcile_payload.get("status"),
+                        reconcile_payload.get("hard_lock"),
+                        exec_recovery_payload.get("status"),
+                        exec_recovery_payload.get("hard_lock"),
                     )
                 elif bkm_strategy.basket is None and not _is_bkm_blocked(expiry_str):
                     log.info(
@@ -2069,13 +2857,50 @@ def main() -> None:
                         log.info("[BatmanBKM] attempt reason=%s expiry=%s", reason, expiry_str)
                         if basket and reason == "ENTER":
                             if trade_mode == "live":
-                                for raw_leg in basket.legs:
-                                    _place_leg_order(
-                                        dw,
-                                        _bkm_leg_to_option_leg(raw_leg),
-                                        close=False,
-                                        trade_mode=trade_mode,
+                                open_exec = _execute_bkm_open_live(
+                                    dw=dw,
+                                    basket=basket,
+                                    live_order_executor=live_order_executor,
+                                    execution_journal=execution_journal,
+                                )
+                                if not bool(open_exec.get("ok")):
+                                    day_mode = "LOCKED_RED"
+                                    if live_bkm_gate_enabled and live_gate:
+                                        live_gate.mark_loop_error("ORDER_EXECUTION_OPEN_FAIL", when=_ist_now())
+                                    if execution_recovery_guard:
+                                        execution_recovery_guard.lock(
+                                            "ORDER_EXECUTION_OPEN_FAIL",
+                                            details={"open_exec": open_exec},
+                                            when=_ist_now(),
+                                        )
+                                    rollback = open_exec.get("rollback") or {}
+                                    rollback_closed = int(rollback.get("submitted_close_legs", 0) or 0)
+                                    if rollback_closed > 0:
+                                        _defer_reconcile_checks("BKM_OPEN_ROLLBACK_SUBMITTED")
+                                    log.error(
+                                        "[BatmanBKM] live open failed opened=%s planned=%s rollback_closed=%s errors=%s rollback_errors=%s",
+                                        open_exec.get("opened_legs"),
+                                        open_exec.get("planned_legs"),
+                                        rollback_closed,
+                                        open_exec.get("errors"),
+                                        rollback.get("errors"),
                                     )
+                                    _ops_alert(
+                                        "CRITICAL",
+                                        "ORDER_EXECUTION_OPEN_FAIL",
+                                        "Batman BKM live OPEN execution failed; rollback attempted and entries locked.",
+                                        details={
+                                            "opened_legs": open_exec.get("opened_legs"),
+                                            "planned_legs": open_exec.get("planned_legs"),
+                                            "rollback_closed": rollback_closed,
+                                            "errors": open_exec.get("errors"),
+                                            "rollback_errors": rollback.get("errors"),
+                                        },
+                                        dedupe_key="ORDER_EXECUTION_OPEN_FAIL",
+                                    )
+                                    time.sleep(poll_sec)
+                                    continue
+                                _defer_reconcile_checks("BKM_OPEN_SUBMITTED")
                             _mark_bkm_open(expiry_str, {"net_credit": basket.net_credit, "credit_pct": basket.credit_pct})
                             try:
                                 _log_batman_blotter(trade_mode, basket.legs, "OPEN")
@@ -2099,12 +2924,34 @@ def main() -> None:
                         day_mode = "LOCKED_RED"
                         if live_bkm_gate_enabled and live_gate:
                             live_gate.mark_daily_lock("DAILY_LOCK_RED", when=_ist_now())
-                        closed_legs = _flatten_bkm_basket(
+                        flatten_res = _flatten_bkm_basket(
                             dw=dw,
                             bkm_strategy=bkm_strategy,
                             trade_mode=trade_mode,
                             reason="DAILY_LOCK_RED",
+                            live_order_executor=live_order_executor if trade_mode == "live" else None,
+                            execution_journal=execution_journal if trade_mode == "live" else None,
                         )
+                        closed_legs = int(flatten_res.get("closed_legs", 0))
+                        if trade_mode == "live" and not bool(flatten_res.get("ok")):
+                            if live_bkm_gate_enabled and live_gate:
+                                live_gate.mark_loop_error("ORDER_EXECUTION_CLOSE_FAIL", when=_ist_now())
+                            if execution_recovery_guard:
+                                execution_recovery_guard.lock(
+                                    "ORDER_EXECUTION_CLOSE_FAIL",
+                                    details={"flatten_res": flatten_res, "reason": "DAILY_LOCK_RED"},
+                                    when=_ist_now(),
+                                )
+                            log.error("[BatmanBKM] daily-lock close failed: %s", flatten_res)
+                            _ops_alert(
+                                "CRITICAL",
+                                "ORDER_EXECUTION_CLOSE_FAIL",
+                                "Batman BKM daily-lock close execution failed; entries locked.",
+                                details={"reason": "DAILY_LOCK_RED", "flatten_res": flatten_res},
+                                dedupe_key="ORDER_EXECUTION_CLOSE_FAIL",
+                            )
+                        if closed_legs > 0:
+                            _defer_reconcile_checks("BKM_CLOSE_SUBMITTED_DAILY_LOCK")
                         log.warning(
                             "[BatmanBKM] daily loss cap triggered pnl=%.2f cap=%.2f closed_legs=%s",
                             pnl,
@@ -2115,12 +2962,39 @@ def main() -> None:
                         continue
                     decision = bkm_strategy.maybe_exit(pnl, _ist_now())
                     if decision:
-                        closed_legs = _flatten_bkm_basket(
+                        flatten_res = _flatten_bkm_basket(
                             dw=dw,
                             bkm_strategy=bkm_strategy,
                             trade_mode=trade_mode,
                             reason=decision,
+                            live_order_executor=live_order_executor if trade_mode == "live" else None,
+                            execution_journal=execution_journal if trade_mode == "live" else None,
                         )
+                        closed_legs = int(flatten_res.get("closed_legs", 0))
+                        if trade_mode == "live" and not bool(flatten_res.get("ok")):
+                            day_mode = "LOCKED_RED"
+                            if live_bkm_gate_enabled and live_gate:
+                                live_gate.mark_loop_error("ORDER_EXECUTION_CLOSE_FAIL", when=_ist_now())
+                            if execution_recovery_guard:
+                                execution_recovery_guard.lock(
+                                    "ORDER_EXECUTION_CLOSE_FAIL",
+                                    details={"flatten_res": flatten_res, "reason": decision},
+                                    when=_ist_now(),
+                                )
+                            if closed_legs > 0:
+                                _defer_reconcile_checks("BKM_CLOSE_PARTIAL_SUBMITTED_EXIT")
+                            log.error("[BatmanBKM] exit close failed; locking day: %s", flatten_res)
+                            _ops_alert(
+                                "CRITICAL",
+                                "ORDER_EXECUTION_CLOSE_FAIL",
+                                "Batman BKM exit close execution failed; entries locked.",
+                                details={"reason": decision, "flatten_res": flatten_res},
+                                dedupe_key="ORDER_EXECUTION_CLOSE_FAIL",
+                            )
+                            time.sleep(poll_sec)
+                            continue
+                        if closed_legs > 0:
+                            _defer_reconcile_checks("BKM_CLOSE_SUBMITTED_EXIT")
                         log.info("Batman BKM exited: %s pnl=%.2f closed_legs=%s", decision, pnl, closed_legs)
                 time.sleep(poll_sec)
                 continue
@@ -2598,6 +3472,19 @@ def main() -> None:
         except Exception as exc:
             if trade_mode == "live" and selected_strategy_file == "batman_bkm_monthly" and live_gate:
                 live_gate.mark_loop_error("AGENT_LOOP_ERROR", when=_ist_now())
+            _ops_alert(
+                "CRITICAL",
+                "AGENT_LOOP_ERROR",
+                "Unhandled agent loop exception.",
+                details={"error": str(exc), "loop_seq": loop_seq, "strategy_file": selected_strategy_file},
+                dedupe_key="AGENT_LOOP_ERROR",
+            )
+            _heartbeat(
+                force=True,
+                status="ERROR",
+                phase="loop_exception",
+                extra={"loop_seq": loop_seq, "error": str(exc), "day_mode": day_mode},
+            )
             log.exception("Agent loop error: %s", exc)
         time.sleep(poll_sec)
 

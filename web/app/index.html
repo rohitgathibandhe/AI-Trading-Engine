@@ -510,25 +510,28 @@
         document.getElementById("payoff-spot").textContent = "Spot: " + (data.spot ? data.spot.toFixed(2) : "—");
       }
 
-      const tail = data.blotter_tail || [];
-      if (tail.length) {
-        const table = document.createElement("table");
-        table.style.width = "100%";
-        table.style.borderCollapse = "collapse";
-        table.innerHTML = `<thead><tr style="color: var(--muted); font-size:12px;">
-            <th>Time</th><th>Side</th><th>Strike</th><th>Qty</th><th>Price</th><th>Notes</th>
-          </tr></thead><tbody></tbody>`;
-        const tb = table.querySelector("tbody");
-        tail.slice(-30).forEach(r => {
-          const tr = document.createElement("tr");
-          tr.innerHTML = `<td>${r.timestamp || "—"}</td><td>${(r.side || "").slice(0,1)}</td><td>${r.strike || "—"}</td><td>${r.quantity || "—"}</td><td>${fmtMoney(r.price)}</td><td>${r.notes || ""}</td>`;
-          tb.appendChild(tr);
-        });
-        const wrap = document.getElementById("blotter-tail");
-        wrap.innerHTML = "";
-        wrap.appendChild(table);
-      } else {
-        document.getElementById("blotter-tail").textContent = "No blotter rows.";
+      // Optional blotter-tail widget may not exist in all UI variants.
+      const blotterTailEl = document.getElementById("blotter-tail");
+      if (blotterTailEl) {
+        const tail = data.blotter_tail || [];
+        if (tail.length) {
+          const table = document.createElement("table");
+          table.style.width = "100%";
+          table.style.borderCollapse = "collapse";
+          table.innerHTML = `<thead><tr style="color: var(--muted); font-size:12px;">
+              <th>Time</th><th>Side</th><th>Strike</th><th>Qty</th><th>Price</th><th>Notes</th>
+            </tr></thead><tbody></tbody>`;
+          const tb = table.querySelector("tbody");
+          tail.slice(-30).forEach(r => {
+            const tr = document.createElement("tr");
+            tr.innerHTML = `<td>${r.timestamp || "—"}</td><td>${(r.side || "").slice(0,1)}</td><td>${r.strike || "—"}</td><td>${r.quantity || "—"}</td><td>${fmtMoney(r.price)}</td><td>${r.notes || ""}</td>`;
+            tb.appendChild(tr);
+          });
+          blotterTailEl.innerHTML = "";
+          blotterTailEl.appendChild(table);
+        } else {
+          blotterTailEl.textContent = "No blotter rows.";
+        }
       }
         document.getElementById("status-pill").textContent = "Live";
         setStatus("Connected", true);

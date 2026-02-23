@@ -38,6 +38,12 @@ STRATEGY_STATE = STATE_DIR / "strategy_state.json"
 SETTINGS_JSON = STATE_DIR / "agent_settings.json"
 LIVE_GATE_STATUS_JSON = STATE_DIR / "live_gate_status.json"
 LIVE_GATE_SESSIONS_JSONL = STATE_DIR / "live_gate_sessions.jsonl"
+POSITION_RECONCILE_STATUS_JSON = STATE_DIR / "position_reconcile_status.json"
+EXECUTION_RECOVERY_STATUS_JSON = STATE_DIR / "execution_recovery_status.json"
+EXECUTION_JOURNAL_JSONL = STATE_DIR / "execution_journal.jsonl"
+AGENT_HEARTBEAT_JSON = STATE_DIR / "agent_heartbeat.json"
+AGENT_ALERTS_JSONL = STATE_DIR / "agent_alerts.jsonl"
+TELEGRAM_ALERT_STATUS_JSON = STATE_DIR / "telegram_alert_status.json"
 BATMAN_BKM_TUNING_ADVICE_JSON = STATE_DIR / "batman_bkm_tuning_advice.json"
 BATMAN_BKM_TUNING_HISTORY_JSONL = STATE_DIR / "batman_bkm_tuning_history.jsonl"
 CREDS_FILE = STATE_DIR / "creds.json"
@@ -56,6 +62,23 @@ from data_engine.market_ai.modules.agents.batman_bkm_tuning_advisor import (  # 
     apply_proposal as apply_batman_bkm_tuning_proposal,
     load_or_refresh_advice as load_or_refresh_batman_bkm_tuning_advice,
     refresh_advice as refresh_batman_bkm_tuning_advice,
+)
+from data_engine.market_ai.modules.agents.position_reconciler import (  # type: ignore
+    PositionReconciler,
+    PositionReconcilerConfig,
+)
+from data_engine.market_ai.modules.agents.execution_recovery_guard import (  # type: ignore
+    ExecutionRecoveryGuard,
+    ExecutionRecoveryConfig,
+)
+from data_engine.market_ai.modules.agents.ops_monitor import (  # type: ignore
+    compute_watchdog_status,
+    AlertJournal,
+    AlertConfig,
+)
+from data_engine.market_ai.modules.agents.telegram_alerts import (  # type: ignore
+    TelegramAlertForwarder,
+    TelegramAlertConfig,
 )
 
 
@@ -768,6 +791,106 @@ def _reset_live_gate_status() -> Dict[str, Any]:
     return status
 
 
+def _default_reconcile_status() -> Dict[str, Any]:
+    rec = PositionReconciler(
+        config=PositionReconcilerConfig(),
+        status_path=POSITION_RECONCILE_STATUS_JSON,
+        logger=None,
+    )
+    return rec.snapshot()
+
+
+def _load_reconcile_status() -> Dict[str, Any]:
+    if not POSITION_RECONCILE_STATUS_JSON.exists():
+        return _default_reconcile_status()
+    payload = _json_read(POSITION_RECONCILE_STATUS_JSON)
+    return payload if isinstance(payload, dict) and payload else _default_reconcile_status()
+
+
+def _reset_reconcile_status() -> Dict[str, Any]:
+    rec = PositionReconciler(
+        config=PositionReconcilerConfig(),
+        status_path=POSITION_RECONCILE_STATUS_JSON,
+        logger=None,
+    )
+    return rec.reset()
+
+
+def _default_execution_recovery_status() -> Dict[str, Any]:
+    guard = ExecutionRecoveryGuard(
+        config=ExecutionRecoveryConfig(),
+        status_path=EXECUTION_RECOVERY_STATUS_JSON,
+        logger=None,
+    )
+    return guard.snapshot()
+
+
+def _load_execution_recovery_status() -> Dict[str, Any]:
+    if not EXECUTION_RECOVERY_STATUS_JSON.exists():
+        return _default_execution_recovery_status()
+    payload = _json_read(EXECUTION_RECOVERY_STATUS_JSON)
+    return payload if isinstance(payload, dict) and payload else _default_execution_recovery_status()
+
+
+def _reset_execution_recovery_status() -> Dict[str, Any]:
+    guard = ExecutionRecoveryGuard(
+        config=ExecutionRecoveryConfig(),
+        status_path=EXECUTION_RECOVERY_STATUS_JSON,
+        logger=None,
+    )
+    return guard.reset()
+
+
+def _load_agent_heartbeat() -> Dict[str, Any]:
+    payload = _json_read(AGENT_HEARTBEAT_JSON)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _watchdog_health_status() -> Dict[str, Any]:
+    settings = _json_read(SETTINGS_JSON)
+    stale_after = _parse_float(settings.get("ops_watchdog_stale_after_sec"), 45.0) if isinstance(settings, dict) else 45.0
+    hb = _load_agent_heartbeat()
+    return compute_watchdog_status(heartbeat_payload=hb, stale_after_sec=stale_after)
+
+
+def _load_alerts_tail(limit: int = 100) -> List[Dict[str, Any]]:
+    journal = AlertJournal(path=AGENT_ALERTS_JSONL, config=AlertConfig(), logger=None)
+    return journal.tail(limit=max(0, int(limit)))
+
+
+def _clear_alerts() -> None:
+    journal = AlertJournal(path=AGENT_ALERTS_JSONL, config=AlertConfig(), logger=None)
+    journal.clear()
+
+
+def _telegram_alert_forwarder() -> TelegramAlertForwarder:
+    settings = _json_read(SETTINGS_JSON)
+    cfg = TelegramAlertConfig.from_settings(settings if isinstance(settings, dict) else {})
+    return TelegramAlertForwarder(
+        config=cfg,
+        alerts_path=AGENT_ALERTS_JSONL,
+        status_path=TELEGRAM_ALERT_STATUS_JSON,
+        logger=None,
+    )
+
+
+def _default_telegram_alert_status() -> Dict[str, Any]:
+    return _telegram_alert_forwarder().snapshot()
+
+
+def _load_telegram_alert_status() -> Dict[str, Any]:
+    if not TELEGRAM_ALERT_STATUS_JSON.exists():
+        return _default_telegram_alert_status()
+    payload = _json_read(TELEGRAM_ALERT_STATUS_JSON)
+    return payload if isinstance(payload, dict) and payload else _default_telegram_alert_status()
+
+
+def _send_telegram_test_message(text: Optional[str] = None) -> Dict[str, Any]:
+    forwarder = _telegram_alert_forwarder()
+    creds = _json_read(CREDS_FILE)
+    return forwarder.send_test_message(creds=creds if isinstance(creds, dict) else {}, text=text)
+
+
 def _is_process_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -934,6 +1057,38 @@ class PaperHandler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return
+        if self.path.startswith("/api/reconcile/reset"):
+            try:
+                status = _reset_reconcile_status()
+                self._send_json({"ok": True, "reconcile": status})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/execution_recovery/reset"):
+            try:
+                status = _reset_execution_recovery_status()
+                self._send_json({"ok": True, "execution_recovery": status})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/alerts/clear"):
+            try:
+                _clear_alerts()
+                self._send_json({"ok": True})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/alerts/telegram/test"):
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+                text = str(data.get("text") or "").strip() or None
+                out = _send_telegram_test_message(text=text)
+                self._send_json({"ok": True, "telegram": out})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
         if self.path.startswith("/api/paper/close_all"):
             try:
                 # Close all open paper legs by writing CLOSE rows at current LTP
@@ -1079,12 +1234,57 @@ class PaperHandler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return
+        if self.path.startswith("/api/reconcile/status"):
+            try:
+                self._send_json(_load_reconcile_status())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/execution_recovery/status"):
+            try:
+                self._send_json(_load_execution_recovery_status())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/health"):
+            try:
+                self._send_json(_watchdog_health_status())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/alerts/telegram/status"):
+            try:
+                self._send_json(_load_telegram_alert_status())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/alerts"):
+            try:
+                tail = 100
+                try:
+                    from urllib.parse import urlparse, parse_qs
+
+                    qs = parse_qs(urlparse(self.path).query)
+                    if "tail" in qs:
+                        tail = int(qs["tail"][0])
+                except Exception:
+                    pass
+                alerts = _load_alerts_tail(limit=tail)
+                self._send_json({"alerts": alerts, "count": len(alerts)})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
         if self.path.startswith("/api/control/status"):
             try:
                 pid_data = _json_read(PID_FILE)
                 pid = int(pid_data.get("pid", 0)) if pid_data else 0
                 running = pid and _is_process_alive(pid)
                 gate = _load_live_gate_status()
+                reconcile = _load_reconcile_status()
+                exec_recovery = _load_execution_recovery_status()
+                watchdog = _watchdog_health_status()
+                alerts = _load_alerts_tail(limit=50)
+                telegram_status = _load_telegram_alert_status()
                 advice = _json_read(BATMAN_BKM_TUNING_ADVICE_JSON)
                 proposal_count = 0
                 if isinstance(advice, dict):
@@ -1092,16 +1292,34 @@ class PaperHandler(SimpleHTTPRequestHandler):
                         proposal_count = len(advice.get("proposals") or [])
                     except Exception:
                         proposal_count = 0
+                last_alert = alerts[-1] if alerts else {}
                 self._send_json(
                     {
                         "running": bool(running),
                         "pid": pid,
+                        "watchdog_status": watchdog.get("status"),
+                        "heartbeat_age_sec": watchdog.get("age_sec"),
+                        "last_heartbeat_at": watchdog.get("last_heartbeat_at"),
                         "live_gate_status": gate.get("status"),
                         "live_gate_stage": gate.get("stage"),
                         "locked_for_date": gate.get("locked_for_date"),
                         "sessions_total": _parse_int(gate.get("sessions_total"), 0),
                         "sessions_pass": _parse_int(gate.get("sessions_pass"), 0),
                         "sessions_fail": _parse_int(gate.get("sessions_fail"), 0),
+                        "reconcile_status": reconcile.get("status"),
+                        "reconcile_hard_lock": bool(reconcile.get("hard_lock", False)),
+                        "reconcile_mismatch_streak": _parse_int(reconcile.get("mismatch_streak"), 0),
+                        "reconcile_last_mismatch_reason": reconcile.get("last_mismatch_reason"),
+                        "execution_recovery_status": exec_recovery.get("status"),
+                        "execution_recovery_hard_lock": bool(exec_recovery.get("hard_lock", False)),
+                        "execution_recovery_last_reason": exec_recovery.get("last_reason"),
+                        "alerts_recent_count": len(alerts),
+                        "last_alert_severity": last_alert.get("severity"),
+                        "last_alert_code": last_alert.get("code"),
+                        "telegram_alerts_enabled": bool(telegram_status.get("enabled", False)),
+                        "telegram_alerts_configured": bool(telegram_status.get("configured", False)),
+                        "telegram_alerts_last_sent_at": telegram_status.get("last_sent_at"),
+                        "telegram_alerts_last_error": telegram_status.get("last_error"),
                         "batman_bkm_tuning_proposals_pending": proposal_count,
                         "batman_bkm_tuning_last_generated_at": advice.get("generated_at") if isinstance(advice, dict) else None,
                     }

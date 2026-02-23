@@ -15,13 +15,24 @@ Behind the scenes it is the same class used by ``start_agent.py`` and the UI.
 
 from __future__ import annotations
 
-from market_ai.agents.adaptive_agent import (  # re-export canonical agent
-    AdaptiveAgent,
-    AgentConfig,
-    AgentState,
-    PaperBroker,
-    DEFAULT_VIRTUAL_CASH,
-)
+try:
+    # Preferred when ``market_ai`` is installed as a top-level package.
+    from market_ai.agents.adaptive_agent import (  # type: ignore
+        AdaptiveAgent,
+        AgentConfig,
+        AgentState,
+        PaperBroker,
+        DEFAULT_VIRTUAL_CASH,
+    )
+except ModuleNotFoundError:
+    # Fallback for local repo execution where imports are rooted at ``data_engine``.
+    from data_engine.market_ai.agents.adaptive_agent import (  # type: ignore
+        AdaptiveAgent,
+        AgentConfig,
+        AgentState,
+        PaperBroker,
+        DEFAULT_VIRTUAL_CASH,
+    )
 
 __all__ = [
     "AdaptiveAgent",
