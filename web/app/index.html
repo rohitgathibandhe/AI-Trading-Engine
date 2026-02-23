@@ -110,7 +110,15 @@
           <input id="client-id" style="width:100%; padding:8px; border-radius:8px; border:1px solid var(--border); background:#0b1224; color:var(--text);" />
           <div class="muted" style="margin-top:8px;">Dhan Access Token</div>
           <input id="access-token" type="password" style="width:100%; padding:8px; border-radius:8px; border:1px solid var(--border); background:#0b1224; color:var(--text);" />
-          <button id="save-creds" style="margin-top:10px; background:var(--accent); color:white; border:none; padding:8px 12px; border-radius:8px; cursor:pointer;">Save Creds</button>
+          <div class="muted" style="margin-top:8px;">Telegram Bot Token</div>
+          <input id="telegram-bot-token" type="password" placeholder="BotFather token" style="width:100%; padding:8px; border-radius:8px; border:1px solid var(--border); background:#0b1224; color:var(--text);" />
+          <div class="muted" style="margin-top:8px;">Telegram Chat ID</div>
+          <input id="telegram-chat-id" placeholder="e.g. 1679285980" style="width:100%; padding:8px; border-radius:8px; border:1px solid var(--border); background:#0b1224; color:var(--text);" />
+          <div class="hint">All credentials are saved together in one place (server creds store).</div>
+          <div style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;">
+            <button id="save-creds" style="background:var(--accent); color:white; border:none; padding:8px 12px; border-radius:8px; cursor:pointer;">Save Creds</button>
+            <button id="test-telegram" style="background:#0f172a; color:var(--text); border:1px solid var(--border); padding:8px 12px; border-radius:8px; cursor:pointer;">Test Telegram</button>
+          </div>
           <div class="hint" id="creds-status">Not saved</div>
         </div>
         <div class="card">
@@ -547,6 +555,8 @@
       const creds = data.creds || {};
       document.getElementById("client-id").value = creds.client_id || "";
       document.getElementById("access-token").value = creds.access_token || "";
+      document.getElementById("telegram-bot-token").value = creds.telegram_bot_token || creds.telegram_token || "";
+      document.getElementById("telegram-chat-id").value = creds.telegram_chat_id || "";
       // Also hydrate from localStorage if server empty
       if (!creds.client_id && localStorage.getItem("client_id")) {
         document.getElementById("client-id").value = localStorage.getItem("client_id");
@@ -572,6 +582,8 @@
         const body = {
           client_id: document.getElementById("client-id").value,
           access_token: document.getElementById("access-token").value,
+          telegram_bot_token: document.getElementById("telegram-bot-token").value,
+          telegram_chat_id: document.getElementById("telegram-chat-id").value,
         };
         const resp = await fetch("/api/creds", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
         const data = await resp.json();
@@ -582,6 +594,26 @@
         statusEl.textContent = "Saved at " + new Date().toLocaleTimeString();
       } catch (e) {
         statusEl.textContent = "Save failed";
+      }
+    }
+
+    async function testTelegram() {
+      const statusEl = document.getElementById("creds-status");
+      const btn = document.getElementById("test-telegram");
+      if (btn) { btn.disabled = true; btn.textContent = "Testing…"; }
+      try {
+        // Persist current form values first so the server test uses them.
+        await saveCreds();
+        const resp = await fetch("/api/alerts/telegram/test", { method: "POST" });
+        const data = await resp.json();
+        if (!resp.ok || data.error || !data.ok || !data.telegram?.ok) {
+          throw new Error(data.error || data.telegram?.error || "telegram test failed");
+        }
+        statusEl.textContent = "Telegram test sent at " + new Date().toLocaleTimeString();
+      } catch (e) {
+        statusEl.textContent = "Telegram test failed";
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = "Test Telegram"; }
       }
     }
 
@@ -800,6 +832,7 @@
 
     document.getElementById("save-settings").addEventListener("click", saveSettings);
     document.getElementById("save-creds").addEventListener("click", saveCreds);
+    document.getElementById("test-telegram").addEventListener("click", testTelegram);
     document.getElementById("start-agent").addEventListener("click", startAgent);
     document.getElementById("stop-agent").addEventListener("click", stopAgent);
     document.getElementById("paper-close-all").addEventListener("click", closePaperTrades);
