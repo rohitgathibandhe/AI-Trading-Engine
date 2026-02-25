@@ -16,6 +16,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 from datetime import datetime
 import time
@@ -936,6 +937,279 @@ def _safe_autocleanup_bkm_after_stop() -> Dict[str, Any]:
         return out
 
 
+def _parse_bkm_pos_identity(pos: Dict[str, Any]) -> Tuple[Optional[str], Optional[float], Optional[str]]:
+    symbol = str(pos.get("strike") or "").strip()
+    expiry_raw = str(pos.get("expiry") or "").strip()
+
+    expiry_iso: Optional[str] = None
+    for fmt in (None, "%Y-%m-%d", "%d-%m-%Y", "%d-%b-%Y", "%d %b %Y", "%d %B %Y"):
+        try:
+            if fmt is None:
+                expiry_iso = datetime.fromisoformat(expiry_raw).date().isoformat()
+            else:
+                expiry_iso = datetime.strptime(expiry_raw, fmt).date().isoformat()
+            break
+        except Exception:
+            continue
+
+    strike_val: Optional[float] = None
+    opt_val: Optional[str] = None
+    try:
+        strike_val = float(symbol)
+    except Exception:
+        strike_val = None
+    m = re.search(r"(?P<strike>\d+(?:\.\d+)?)\s*(?P<opt>CE|PE|CALL|PUT)\b", symbol.upper())
+    if m:
+        try:
+            strike_val = float(m.group("strike"))
+        except Exception:
+            pass
+        opt_raw = str(m.group("opt") or "").upper()
+        if opt_raw == "CALL":
+            opt_raw = "CE"
+        if opt_raw == "PUT":
+            opt_raw = "PE"
+        opt_val = opt_raw
+
+    if not opt_val:
+        sym_u = symbol.upper()
+        if " CALL" in sym_u:
+            opt_val = "CE"
+        elif " PUT" in sym_u:
+            opt_val = "PE"
+        elif sym_u.endswith(" CE"):
+            opt_val = "CE"
+        elif sym_u.endswith(" PE"):
+            opt_val = "PE"
+
+    return expiry_iso, strike_val, opt_val
+
+
+def _build_importable_bkm_from_broker_positions(positions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Validate and normalize a live broker basket into BKM journal/local-state payload.
+    Returns: {"ok": bool, "imported": bool, ...}
+    """
+    if not isinstance(positions, list):
+        return {"ok": False, "imported": False, "error": "invalid_broker_positions_payload"}
+    if not positions:
+        return {"ok": True, "imported": False, "reason": "NO_BROKER_OPEN_POSITIONS"}
+
+    legs: List[Dict[str, Any]] = []
+    parse_errors: List[str] = []
+    for i, pos in enumerate(positions):
+        if not isinstance(pos, dict):
+            continue
+        expiry_iso, strike_val, opt_val = _parse_bkm_pos_identity(pos)
+        side = str(pos.get("side") or "").upper()
+        qty = _parse_int(pos.get("qty"), 0)
+        entry = _parse_float(pos.get("entry"), 0.0)
+        sec_id = str(pos.get("sec_id") or "").strip()
+        if side not in {"BUY", "SELL"} or qty <= 0 or strike_val is None or not opt_val or not expiry_iso:
+            parse_errors.append(
+                f"idx={i}: side={side} qty={qty} strike={strike_val} opt={opt_val} expiry={expiry_iso} raw={pos.get('strike')}"
+            )
+            continue
+        legs.append(
+            {
+                "expiry": expiry_iso,
+                "strike": float(strike_val),
+                "option_type": opt_val,
+                "side": side,
+                "quantity": int(qty),
+                "entry_price": float(entry or 0.0),
+                "security_id": sec_id,
+            }
+        )
+
+    if len(legs) != len(positions):
+        return {"ok": False, "imported": False, "error": "BROKER_LEG_PARSE_FAILED", "details": {"parse_errors": parse_errors[:10]}}
+
+    expiries = sorted({str(l["expiry"]) for l in legs})
+    if len(expiries) != 1:
+        return {"ok": False, "imported": False, "error": "MULTI_EXPIRY_OPEN_POSITIONS", "details": {"expiries": expiries}}
+    expiry = expiries[0]
+
+    # Focus on an exact 6-leg BKM basket.
+    if len(legs) != 6:
+        return {
+            "ok": False,
+            "imported": False,
+            "error": "NOT_BKM_LEG_COUNT",
+            "details": {"open_positions": len(legs), "expected": 6},
+        }
+
+    by_opt: Dict[str, List[Dict[str, Any]]] = {"CE": [], "PE": []}
+    for leg in legs:
+        opt = str(leg.get("option_type") or "").upper()
+        if opt not in by_opt:
+            return {"ok": False, "imported": False, "error": "UNSUPPORTED_OPTION_TYPE", "details": {"option_type": opt}}
+        by_opt[opt].append(leg)
+    if len(by_opt["CE"]) != 3 or len(by_opt["PE"]) != 3:
+        return {
+            "ok": False,
+            "imported": False,
+            "error": "NOT_BKM_CE_PE_SPLIT",
+            "details": {"ce_count": len(by_opt["CE"]), "pe_count": len(by_opt["PE"])},
+        }
+
+    def _validate_side(opt: str, side_legs: List[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any]]:
+        legs_sorted = sorted(side_legs, key=lambda x: float(x.get("strike") or 0.0))
+        strikes = [float(l["strike"]) for l in legs_sorted]
+        if len(set(round(s, 4) for s in strikes)) != 3:
+            return False, {"reason": "duplicate_strikes", "opt": opt, "strikes": strikes}
+        side_pattern = [str(l.get("side") or "").upper() for l in legs_sorted]
+        if side_pattern != ["BUY", "SELL", "BUY"]:
+            return False, {"reason": "invalid_side_pattern", "opt": opt, "pattern": side_pattern, "strikes": strikes}
+        buy_qtys = [int(l.get("quantity") or 0) for l in legs_sorted if str(l.get("side") or "").upper() == "BUY"]
+        sell_qtys = [int(l.get("quantity") or 0) for l in legs_sorted if str(l.get("side") or "").upper() == "SELL"]
+        if len(buy_qtys) != 2 or len(sell_qtys) != 1:
+            return False, {"reason": "invalid_qty_split", "opt": opt}
+        q_long = min(buy_qtys)
+        q_hedge = max(buy_qtys)
+        q_short = sell_qtys[0]
+        if q_long <= 0 or q_short != 3 * q_long:
+            return False, {"reason": "invalid_short_ratio", "opt": opt, "q_long": q_long, "q_short": q_short}
+        if q_hedge < q_long or (q_hedge % q_long) != 0:
+            return False, {"reason": "invalid_hedge_ratio", "opt": opt, "q_long": q_long, "q_hedge": q_hedge}
+        return True, {
+            "opt": opt,
+            "sorted_legs": legs_sorted,
+            "q_long": q_long,
+            "q_short": q_short,
+            "q_hedge": q_hedge,
+        }
+
+    ok_ce, ce_info = _validate_side("CE", by_opt["CE"])
+    ok_pe, pe_info = _validate_side("PE", by_opt["PE"])
+    if not ok_ce or not ok_pe:
+        return {"ok": False, "imported": False, "error": "NOT_BKM_PATTERN", "details": {"ce": ce_info, "pe": pe_info}}
+    if int(ce_info.get("q_long", 0)) != int(pe_info.get("q_long", 0)):
+        return {
+            "ok": False,
+            "imported": False,
+            "error": "BKM_PRIMARY_QTY_MISMATCH",
+            "details": {"ce_q_long": ce_info.get("q_long"), "pe_q_long": pe_info.get("q_long")},
+        }
+
+    # Preserve canonical BKM order expected by logs/tools: PE buy/sell/buy, then CE buy/sell/buy.
+    pe_sorted = ce_sorted = []  # type: ignore[assignment]
+    pe_sorted = pe_info["sorted_legs"]  # low->high => BUY,SELL,BUY (PE hedge,sell,buy)
+    ce_sorted = ce_info["sorted_legs"]  # low->high => BUY,SELL,BUY
+    # Reorder PE to buy near ATM first, sell middle, hedge far (high->mid->low).
+    pe_ordered = [pe_sorted[2], pe_sorted[1], pe_sorted[0]]
+    ce_ordered = [ce_sorted[0], ce_sorted[1], ce_sorted[2]]
+    ordered_legs = pe_ordered + ce_ordered
+
+    net_credit = 0.0
+    for leg in ordered_legs:
+        sign = 1.0 if str(leg.get("side") or "").upper() == "SELL" else -1.0
+        net_credit += sign * float(leg.get("entry_price") or 0.0) * int(leg.get("quantity") or 0)
+
+    settings = _json_read(SETTINGS_JSON)
+    est_margin = _parse_float((settings or {}).get("batman_bkm_estimated_margin"), 1_000_000.0)
+    credit_pct = (net_credit / est_margin) * 100.0 if est_margin > 0 else 0.0
+
+    meta = {
+        "net_credit": net_credit,
+        "margin_required": est_margin,
+        "credit_pct": credit_pct,
+        "imported_from_broker": True,
+    }
+    return {
+        "ok": True,
+        "imported": True,
+        "expiry": expiry,
+        "legs": ordered_legs,
+        "meta": meta,
+        "q_long": int(ce_info["q_long"]),
+        "ce_hedge_qty": int(ce_info["q_hedge"]),
+        "pe_hedge_qty": int(pe_info["q_hedge"]),
+    }
+
+
+def _import_live_bkm_from_broker() -> Dict[str, Any]:
+    # Refuse while agent is running to avoid in-memory/runtime divergence.
+    pid_data = _json_read(PID_FILE)
+    pid = int(pid_data.get("pid", 0)) if pid_data else 0
+    if pid and _is_process_alive(pid):
+        return {"ok": False, "imported": False, "error": "AGENT_RUNNING_STOP_FIRST", "pid": pid}
+
+    broker_payload = _load_broker_live_positions()
+    if str(broker_payload.get("source") or "") != "broker":
+        return {"ok": False, "imported": False, "error": "BROKER_CHECK_UNAVAILABLE"}
+    positions = broker_payload.get("positions") if isinstance(broker_payload, dict) else []
+    normalized = _build_importable_bkm_from_broker_positions(positions if isinstance(positions, list) else [])
+    if not bool(normalized.get("ok")) or not bool(normalized.get("imported")):
+        return normalized
+
+    expiry = str(normalized.get("expiry") or "")
+    legs = normalized.get("legs") if isinstance(normalized.get("legs"), list) else []
+    meta = normalized.get("meta") if isinstance(normalized.get("meta"), dict) else {}
+    now = _ist_now().isoformat(timespec="seconds")
+
+    # Close any previously active BKM basket in journal so analyze_bkm() sees exactly one active basket.
+    settings = _json_read(SETTINGS_JSON)
+    lookback_days = max(1, _parse_int((settings or {}).get("live_exec_recovery_lookback_days"), 45))
+    journal = ExecutionJournal(journal_path=EXECUTION_JOURNAL_JSONL, logger=None)
+    summary = journal.analyze_bkm(lookback_days=lookback_days)
+    active_baskets = summary.get("active_baskets") if isinstance(summary, dict) else {}
+    for active_expiry, active_meta in (active_baskets or {}).items():
+        payload: Dict[str, Any] = {
+            "strategy": "BATMAN_BKM",
+            "expiry": str(active_expiry),
+            "op_id": f"IMPORTCLOSE-{int(time.time())}",
+            "details": {"manual_reconcile": True, "reason": "import_live_bkm_replace_active"},
+        }
+        if isinstance(active_meta, dict):
+            if isinstance(active_meta.get("legs"), list):
+                payload["legs"] = active_meta["legs"]
+            if isinstance(active_meta.get("meta"), dict):
+                payload["meta"] = active_meta["meta"]
+        journal.record("BKM_CLOSE_SUCCESS", payload, when=_ist_now())
+
+    journal.record(
+        "BKM_OPEN_SUCCESS",
+        {
+            "strategy": "BATMAN_BKM",
+            "expiry": expiry,
+            "op_id": f"BKMIMPORT-{int(time.time() * 1000)}",
+            "legs": legs,
+            "meta": meta,
+            "details": {"opened_legs": len(legs), "planned_legs": len(legs), "imported_from_broker": True},
+        },
+        when=_ist_now(),
+    )
+
+    local_state = _json_read(STRATEGY_STATE)
+    if not isinstance(local_state, dict):
+        local_state = {}
+    if not isinstance(local_state.get("BATMAN_V2"), dict):
+        local_state["BATMAN_V2"] = {}
+    local_state["BATMAN_BKM"] = {
+        expiry: {
+            "status": "OPEN",
+            "opened_at": now,
+            "net_credit": float(meta.get("net_credit") or 0.0),
+            "credit_pct": float(meta.get("credit_pct") or 0.0),
+            "imported_from_broker": True,
+        }
+    }
+    _json_write(STRATEGY_STATE, local_state)
+
+    rec_status = _reset_reconcile_status()
+    exec_status = _reset_execution_recovery_status()
+    return {
+        "ok": True,
+        "imported": True,
+        "expiry": expiry,
+        "legs": len(legs),
+        "meta": meta,
+        "reconcile_status": rec_status.get("status"),
+        "execution_recovery_status": exec_status.get("status"),
+    }
+
+
 def _load_agent_heartbeat() -> Dict[str, Any]:
     payload = _json_read(AGENT_HEARTBEAT_JSON)
     return payload if isinstance(payload, dict) else {}
@@ -1004,6 +1278,22 @@ def _start_agent_process(trade_mode: str) -> Dict[str, Any]:
                 return {"ok": False, "error": "agent already running", "pid": pid}
         except Exception:
             pass
+    auto_import_result: Optional[Dict[str, Any]] = None
+    if trade_mode == "live":
+        try:
+            last_strategy = _json_read(LAST_STRATEGY_FILE)
+            strategy_file = str((last_strategy or {}).get("strategy_file") or "batman_bkm_monthly").strip()
+        except Exception:
+            strategy_file = "batman_bkm_monthly"
+        if strategy_file == "batman_bkm_monthly":
+            auto_import_result = _import_live_bkm_from_broker()
+            # Fail-safe: if we cannot verify/import live broker state, do not start and risk locking/orphan behavior.
+            if not bool(auto_import_result.get("ok")):
+                return {
+                    "ok": False,
+                    "error": str(auto_import_result.get("error") or "LIVE_BKM_AUTO_IMPORT_FAILED"),
+                    "auto_import": auto_import_result,
+                }
     env = os.environ.copy()
     env["TRADE_MODE"] = trade_mode
     pybin = sys.executable or "python3"
@@ -1016,7 +1306,10 @@ def _start_agent_process(trade_mode: str) -> Dict[str, Any]:
     )
     pid_payload = {"pid": proc.pid, "trade_mode": trade_mode, "started_at": datetime.now().isoformat()}
     _json_write(PID_FILE, pid_payload)
-    return {"ok": True, "pid": proc.pid, "trade_mode": trade_mode}
+    out = {"ok": True, "pid": proc.pid, "trade_mode": trade_mode}
+    if auto_import_result is not None:
+        out["auto_import"] = auto_import_result
+    return out
 
 
 def _stop_agent_process(*, auto_cleanup_bkm: bool = True, graceful_wait_sec: float = 5.0) -> Dict[str, Any]:
@@ -1149,6 +1442,14 @@ class PaperHandler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return
+        if self.path.startswith("/api/bkm/import_live"):
+            try:
+                result = _import_live_bkm_from_broker()
+                status = 200 if bool(result.get("ok")) else 409
+                self._send_json(result, status=status)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
         if self.path.startswith("/api/control/restart"):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -1164,7 +1465,14 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 if not bool(start_res.get("ok")):
                     self._send_json({"ok": False, "error": start_res.get("error") or "restart start failed", "stop": stop_res, "start": start_res}, status=500)
                     return
-                self._send_json({"ok": True, "pid": start_res.get("pid"), "trade_mode": trade_mode, "stop": stop_res})
+                self._send_json({
+                    "ok": True,
+                    "pid": start_res.get("pid"),
+                    "trade_mode": trade_mode,
+                    "stop": stop_res,
+                    "start": start_res,
+                    "auto_import": start_res.get("auto_import"),
+                })
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return
