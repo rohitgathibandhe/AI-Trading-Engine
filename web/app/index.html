@@ -137,6 +137,7 @@
           </select>
           <div class="flex" style="margin-top:12px; gap:10px;">
             <button id="start-agent" style="background:var(--accent-2); color:white; border:none; padding:8px 12px; border-radius:8px; cursor:pointer;">Start Agent</button>
+            <button id="restart-agent" style="background:#b45309; color:white; border:none; padding:8px 12px; border-radius:8px; cursor:pointer;">Restart Agent</button>
             <button id="stop-agent" style="background:var(--neg); color:white; border:none; padding:8px 12px; border-radius:8px; cursor:pointer;">Stop Agent</button>
           </div>
           <div class="muted" id="agent-status" style="margin-top:8px;">Status: unknown</div>
@@ -649,13 +650,54 @@
       const btn = document.getElementById("stop-agent");
       if (btn) { btn.disabled = true; btn.textContent = "Stopping…"; }
       try {
-        const resp = await fetch("/api/control/stop", { method: "POST" });
+        const resp = await fetch("/api/control/stop", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ auto_cleanup_bkm: true }),
+        });
         const data = await resp.json();
-        document.getElementById("agent-status").textContent = data.ok ? "Stopped" : `Error: ${data.error || "failed"}`;
+        if (data.ok) {
+          const cleanup = data.cleanup || {};
+          const cleanupMsg = cleanup.performed ? " (auto-cleaned)" : (cleanup.reason ? ` (${cleanup.reason})` : "");
+          document.getElementById("agent-status").textContent = `Stopped${cleanupMsg}`;
+        } else {
+          document.getElementById("agent-status").textContent = `Error: ${data.error || "failed"}`;
+        }
       } catch (e) {
         document.getElementById("agent-status").textContent = "Stop failed";
       } finally {
         if (btn) { btn.disabled = false; btn.textContent = "Stop Agent"; }
+      }
+    }
+
+    async function restartAgent() {
+      const btn = document.getElementById("restart-agent");
+      if (btn) { btn.disabled = true; btn.textContent = "Restarting…"; }
+      try {
+        await saveCreds();
+        await saveStrategy();
+        const body = {
+          trade_mode: document.getElementById("trade-mode").value,
+          auto_cleanup_bkm: true,
+        };
+        const resp = await fetch("/api/control/restart", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+        if (data.ok) {
+          const stop = data.stop || {};
+          const cleanup = stop.cleanup || {};
+          const cleanupMsg = cleanup.performed ? " + cleaned" : (cleanup.reason ? ` + ${cleanup.reason}` : "");
+          document.getElementById("agent-status").textContent = `Running (pid ${data.pid})${cleanupMsg}`;
+        } else {
+          document.getElementById("agent-status").textContent = `Restart failed: ${data.error || "failed"}`;
+        }
+      } catch (e) {
+        document.getElementById("agent-status").textContent = "Restart failed";
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = "Restart Agent"; }
       }
     }
 
@@ -834,6 +876,7 @@
     document.getElementById("save-creds").addEventListener("click", saveCreds);
     document.getElementById("test-telegram").addEventListener("click", testTelegram);
     document.getElementById("start-agent").addEventListener("click", startAgent);
+    document.getElementById("restart-agent").addEventListener("click", restartAgent);
     document.getElementById("stop-agent").addEventListener("click", stopAgent);
     document.getElementById("paper-close-all").addEventListener("click", closePaperTrades);
 

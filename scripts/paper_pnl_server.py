@@ -70,6 +70,7 @@ from data_engine.market_ai.modules.agents.position_reconciler import (  # type: 
 from data_engine.market_ai.modules.agents.execution_recovery_guard import (  # type: ignore
     ExecutionRecoveryGuard,
     ExecutionRecoveryConfig,
+    ExecutionJournal,
 )
 from data_engine.market_ai.modules.agents.ops_monitor import (  # type: ignore
     compute_watchdog_status,
@@ -841,6 +842,100 @@ def _reset_execution_recovery_status() -> Dict[str, Any]:
     return guard.reset()
 
 
+def _safe_autocleanup_bkm_after_stop() -> Dict[str, Any]:
+    """
+    Safely clean stale Batman BKM local/journal state after operator stop.
+
+    Cleanup runs only when broker positions are confirmed flat. This prevents
+    orphaning live positions by blindly clearing local state.
+    """
+    out: Dict[str, Any] = {
+        "attempted": True,
+        "performed": False,
+        "reason": None,
+        "local_open_expiries": [],
+        "journal_active_expiries": [],
+        "broker_open_count": None,
+    }
+    try:
+        local_state = _json_read(STRATEGY_STATE)
+        bkm_state = local_state.get("BATMAN_BKM") if isinstance(local_state, dict) else {}
+        local_open_expiries = sorted(
+            str(exp)
+            for exp, meta in (bkm_state or {}).items()
+            if isinstance(meta, dict) and str(meta.get("status") or "").upper() == "OPEN"
+        )
+        out["local_open_expiries"] = local_open_expiries
+
+        settings = _json_read(SETTINGS_JSON)
+        lookback_days = max(1, _parse_int(settings.get("live_exec_recovery_lookback_days"), 45)) if isinstance(settings, dict) else 45
+        journal = ExecutionJournal(journal_path=EXECUTION_JOURNAL_JSONL, logger=None)
+        journal_summary = journal.analyze_bkm(lookback_days=lookback_days)
+        active_baskets = journal_summary.get("active_baskets") if isinstance(journal_summary, dict) else {}
+        journal_active_expiries = sorted(str(k) for k in (active_baskets or {}).keys())
+        out["journal_active_expiries"] = journal_active_expiries
+
+        if not local_open_expiries and not journal_active_expiries:
+            out["reason"] = "NO_OPEN_BKM_STATE"
+            return out
+
+        broker_payload = _load_broker_live_positions()
+        if str(broker_payload.get("source") or "") != "broker":
+            out["reason"] = "BROKER_CHECK_UNAVAILABLE"
+            return out
+        broker_positions = broker_payload.get("positions") if isinstance(broker_payload, dict) else []
+        broker_positions = broker_positions if isinstance(broker_positions, list) else []
+        out["broker_open_count"] = len(broker_positions)
+        if broker_positions:
+            out["reason"] = "BROKER_NOT_FLAT"
+            return out
+
+        ts = _ist_now()
+        union_expiries = sorted(set(local_open_expiries) | set(journal_active_expiries))
+        for expiry in union_expiries:
+            active_meta = (active_baskets or {}).get(expiry, {}) if isinstance(active_baskets, dict) else {}
+            payload = {
+                "strategy": "BATMAN_BKM",
+                "expiry": expiry,
+                "op_id": f"AUTOCLEAN-{int(ts.timestamp())}",
+                "details": {
+                    "manual_reconcile": True,
+                    "reason": "auto_cleanup_on_control_stop",
+                },
+            }
+            if isinstance(active_meta, dict):
+                legs = active_meta.get("legs")
+                meta = active_meta.get("meta")
+                if isinstance(legs, list):
+                    payload["legs"] = legs
+                if isinstance(meta, dict):
+                    payload["meta"] = meta
+            journal.record("BKM_CLOSE_SUCCESS", payload=payload, when=ts)
+
+        if isinstance(local_state, dict):
+            local_state["BATMAN_BKM"] = {}
+            _json_write(STRATEGY_STATE, local_state)
+        else:
+            _json_write(STRATEGY_STATE, {"BATMAN_V2": {}, "BATMAN_BKM": {}})
+
+        rec_status = _reset_reconcile_status()
+        exec_status = _reset_execution_recovery_status()
+        out.update(
+            {
+                "performed": True,
+                "reason": "CLEANED_BKM_STATE",
+                "cleaned_expiries": union_expiries,
+                "reconcile_status": rec_status.get("status"),
+                "execution_recovery_status": exec_status.get("status"),
+            }
+        )
+        return out
+    except Exception as exc:
+        out["reason"] = "AUTO_CLEANUP_ERROR"
+        out["error"] = str(exc)
+        return out
+
+
 def _load_agent_heartbeat() -> Dict[str, Any]:
     payload = _json_read(AGENT_HEARTBEAT_JSON)
     return payload if isinstance(payload, dict) else {}
@@ -897,6 +992,52 @@ def _is_process_alive(pid: int) -> bool:
         return True
     except Exception:
         return False
+
+
+def _start_agent_process(trade_mode: str) -> Dict[str, Any]:
+    trade_mode = str(trade_mode or "paper").strip().lower() or "paper"
+    if PID_FILE.exists():
+        try:
+            pid_data = json.loads(PID_FILE.read_text())
+            pid = int(pid_data.get("pid", 0))
+            if pid and _is_process_alive(pid):
+                return {"ok": False, "error": "agent already running", "pid": pid}
+        except Exception:
+            pass
+    env = os.environ.copy()
+    env["TRADE_MODE"] = trade_mode
+    pybin = sys.executable or "python3"
+    proc = subprocess.Popen(
+        [pybin, str(AGENT_ENTRY)],
+        cwd=str(ROOT),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+    pid_payload = {"pid": proc.pid, "trade_mode": trade_mode, "started_at": datetime.now().isoformat()}
+    _json_write(PID_FILE, pid_payload)
+    return {"ok": True, "pid": proc.pid, "trade_mode": trade_mode}
+
+
+def _stop_agent_process(*, auto_cleanup_bkm: bool = True, graceful_wait_sec: float = 5.0) -> Dict[str, Any]:
+    pid_data = _json_read(PID_FILE)
+    pid = int(pid_data.get("pid", 0)) if pid_data else 0
+    still_running = False
+    if pid and _is_process_alive(pid):
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.time() + max(0.0, float(graceful_wait_sec))
+        while time.time() < deadline:
+            if not _is_process_alive(pid):
+                break
+            time.sleep(0.2)
+        still_running = _is_process_alive(pid)
+    _json_write(PID_FILE, {})
+    cleanup: Dict[str, Any] = {"attempted": False, "performed": False, "reason": "AUTO_CLEANUP_DISABLED_OR_SKIPPED"}
+    if auto_cleanup_bkm and not still_running:
+        cleanup = _safe_autocleanup_bkm_after_stop()
+    elif auto_cleanup_bkm and still_running:
+        cleanup = {"attempted": False, "performed": False, "reason": "AGENT_STILL_RUNNING"}
+    return {"ok": True, "pid": pid, "agent_still_running": still_running, "cleanup": cleanup}
 
 
 def _batman_bkm_tuning_paths() -> BatmanBKMTuningPaths:
@@ -1008,45 +1149,45 @@ class PaperHandler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return
+        if self.path.startswith("/api/control/restart"):
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+                trade_mode = str(data.get("trade_mode", "paper"))
+                auto_cleanup = bool(data.get("auto_cleanup_bkm", True))
+                stop_res = _stop_agent_process(auto_cleanup_bkm=auto_cleanup)
+                if bool(stop_res.get("agent_still_running")):
+                    self._send_json({"ok": False, "error": "agent still running after stop request", "stop": stop_res}, status=409)
+                    return
+                start_res = _start_agent_process(trade_mode=trade_mode)
+                if not bool(start_res.get("ok")):
+                    self._send_json({"ok": False, "error": start_res.get("error") or "restart start failed", "stop": stop_res, "start": start_res}, status=500)
+                    return
+                self._send_json({"ok": True, "pid": start_res.get("pid"), "trade_mode": trade_mode, "stop": stop_res})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
         if self.path.startswith("/api/control/start"):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 raw = self.rfile.read(length) if length > 0 else b"{}"
                 data = json.loads(raw.decode("utf-8"))
                 trade_mode = str(data.get("trade_mode", "paper"))
-                # prevent double-start
-                if PID_FILE.exists():
-                    try:
-                        pid_data = json.loads(PID_FILE.read_text())
-                        pid = int(pid_data.get("pid", 0))
-                        if pid and _is_process_alive(pid):
-                            self._send_json({"ok": False, "error": "agent already running", "pid": pid})
-                            return
-                    except Exception:
-                        pass
-                env = os.environ.copy()
-                env["TRADE_MODE"] = trade_mode
-                proc = subprocess.Popen(
-                    ["python3", str(AGENT_ENTRY)],
-                    cwd=str(ROOT),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    env=env,
-                )
-                pid_payload = {"pid": proc.pid, "trade_mode": trade_mode, "started_at": datetime.now().isoformat()}
-                _json_write(PID_FILE, pid_payload)
-                self._send_json({"ok": True, "pid": proc.pid})
+                res = _start_agent_process(trade_mode=trade_mode)
+                status = 200 if bool(res.get("ok")) else 409
+                self._send_json(res, status=status)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return
         if self.path.startswith("/api/control/stop"):
             try:
-                pid_data = _json_read(PID_FILE)
-                pid = int(pid_data.get("pid", 0)) if pid_data else 0
-                if pid and _is_process_alive(pid):
-                    os.kill(pid, signal.SIGTERM)
-                _json_write(PID_FILE, {})
-                self._send_json({"ok": True})
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+                auto_cleanup = bool(data.get("auto_cleanup_bkm", True))
+                res = _stop_agent_process(auto_cleanup_bkm=auto_cleanup)
+                self._send_json(res)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return

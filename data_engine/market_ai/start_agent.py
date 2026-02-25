@@ -150,6 +150,16 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "batman_bkm_estimated_margin": 1_000_000.0,
     # For paper runs, allow immediate entry (bypass schedule) if needed
     "batman_bkm_force_entry": False,
+    # Batman BKM live catch-up / entry planning safeguards
+    "batman_bkm_catchup_not_before": "09:30",
+    "batman_bkm_pretrade_snapshot_count": 3,
+    "batman_bkm_pretrade_snapshot_gap_sec": 2.0,
+    "batman_bkm_pretrade_max_spot_span_points": 120.0,
+    "batman_bkm_pretrade_max_credit_span_pct": 0.40,
+    "batman_bkm_pretrade_require_signature_stable": True,
+    "batman_bkm_pretrade_enforce_delta_limit": False,
+    "batman_bkm_pretrade_max_net_delta_abs": 5000.0,
+    "batman_bkm_monitor_log_interval_sec": 20.0,
     # Batman BKM live rollout gate
     "live_gate_enabled": True,
     "live_probation_sessions": 10,
@@ -1993,6 +2003,68 @@ def _fetch_monthly_expiry(dw: DhanWrapper) -> Optional[dt_date]:
     return future[-1]
 
 
+def _fetch_bkm_monthly_roll_plan(dw: DhanWrapper) -> Tuple[Optional[dt_date], Optional[dt_date]]:
+    """
+    Batman BKM monthly roll plan:
+    - anchor expiry = nearest monthly expiry (current monthly cycle)
+    - target expiry = next monthly expiry after anchor (series to trade)
+
+    Example on Feb monthly cycle:
+      anchor = 2026-02-24
+      target = 2026-03-31
+      planned entry day = last Friday before anchor (2026-02-20)
+    """
+    try:
+        expiries = dw.get_optionchain_expirylist("IDX_I", 13)
+    except AttributeError:
+        try:
+            expiries = dw.get_expiry_list(13, "IDX_I")
+        except Exception:
+            expiries = []
+    except Exception:
+        expiries = []
+
+    expiry_list: List[str] = []
+    if isinstance(expiries, list):
+        expiry_list = [str(e) for e in expiries]
+    elif isinstance(expiries, dict):
+        for key in ("Expiry", "expiry", "expiries", "data"):
+            val = expiries.get(key)
+            if isinstance(val, list):
+                expiry_list = [str(e) for e in val]
+                break
+
+    parsed: List[dt_date] = []
+    for raw in expiry_list:
+        clean = str(raw).split("T", 1)[0].split(" ", 1)[0].strip()
+        try:
+            parsed.append(datetime.fromisoformat(clean).date())
+        except Exception:
+            continue
+    if not parsed:
+        return None, None
+
+    today = datetime.now().date()
+    future = sorted(set(d for d in parsed if d >= today))
+    if not future:
+        future = sorted(set(parsed))
+        if not future:
+            return None, None
+
+    month_last: List[dt_date] = []
+    bucket: Dict[Tuple[int, int], List[dt_date]] = {}
+    for d in future:
+        bucket.setdefault((d.year, d.month), []).append(d)
+    for ym in sorted(bucket.keys()):
+        month_last.append(max(bucket[ym]))
+
+    if not month_last:
+        return None, None
+    anchor = month_last[0]
+    target = month_last[1] if len(month_last) > 1 else anchor
+    return anchor, target
+
+
 def _last_friday_before(expiry: dt_date) -> dt_date:
     probe = expiry
     while probe.weekday() != 4:
@@ -2470,6 +2542,7 @@ def main() -> None:
     batman_v2: Optional[BatmanStrategy] = None
     bkm_strategy: Optional[BatmanBKMStrategy] = None
     loop_seq = 0
+    bkm_last_monitor_log_at: Optional[datetime] = None
 
     while True:
         try:
@@ -2622,7 +2695,7 @@ def main() -> None:
                             dedupe_key="LIVEGATE_FAILSAFE_TRIGGERED",
                         )
 
-                def _fetch_bkm_chain(target_expiry: dt_date) -> Optional[List[dict]]:
+                def _fetch_bkm_chain(target_expiry: dt_date, *, spot_hint: Optional[float] = None) -> Optional[List[dict]]:
                     expiry_iso = target_expiry.isoformat()
                     try:
                         chain_raw = dw.get_option_chain(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, expiry_iso)
@@ -2630,7 +2703,8 @@ def main() -> None:
                         log.exception("[BatmanBKM] failed to fetch option chain expiry=%s", expiry_iso)
                         _trigger_bkm_conn_failure("option_chain_exception")
                         return None
-                    chain_rows = _map_chain(chain_raw, target_expiry, symbol="NIFTY", spot=market.spot)
+                    chain_spot = float(market.spot if spot_hint is None else (spot_hint or 0.0))
+                    chain_rows = _map_chain(chain_raw, target_expiry, symbol="NIFTY", spot=chain_spot)
                     if not chain_rows:
                         log.warning("[BatmanBKM] unusable option chain payload expiry=%s", expiry_iso)
                         _trigger_bkm_conn_failure("option_chain_unusable")
@@ -2739,10 +2813,13 @@ def main() -> None:
                             bkm_strategy.basket = restored
                             log.info("Restored Batman BKM basket from blotter for expiry=%s", target_exp.isoformat())
                 # If we already have a basket, stick to its expiry for MTM/exit updates
+                roll_anchor_expiry: Optional[dt_date] = None
                 if bkm_strategy.basket:
                     expiry = bkm_strategy.basket.expiry
+                    roll_anchor_expiry = expiry
                 else:
-                    expiry = _fetch_monthly_expiry(dw) or today
+                    roll_anchor_expiry, roll_target_expiry = _fetch_bkm_monthly_roll_plan(dw)
+                    expiry = roll_target_expiry or roll_anchor_expiry or today
                 expiry_str = expiry.isoformat()
                 if live_bkm_reconcile_enabled and position_reconciler:
                     try:
@@ -2809,7 +2886,8 @@ def main() -> None:
                     if trade_mode == "paper" and blotter_empty:
                         log.warning("[BatmanBKM] clearing stale state for expiry=%s (no blotter rows)", expiry_str)
                         _clear_bkm_expiry(expiry_str)
-                entry_day = _last_friday_before(expiry)
+                entry_anchor_expiry = roll_anchor_expiry or expiry
+                entry_day = _last_friday_before(entry_anchor_expiry)
                 # In paper mode, always force entry unless explicitly overridden elsewhere.
                 force_entry = True if trade_mode == "paper" else bool(settings.get("batman_bkm_force_entry", False))
                 # Prevent multiple entries per expiry
@@ -2829,31 +2907,248 @@ def main() -> None:
                     )
                 elif bkm_strategy.basket is None and not _is_bkm_blocked(expiry_str):
                     log.info(
-                        "[BatmanBKM] loop spot=%.2f expiry=%s force_entry=%s now=%s entry_day=%s entry_time=%s",
+                        "[BatmanBKM] loop spot=%.2f expiry=%s roll_anchor=%s force_entry=%s now=%s entry_day=%s entry_time=%s",
                         market.spot,
                         expiry_str,
+                        entry_anchor_expiry.isoformat() if entry_anchor_expiry else None,
                         force_entry,
                         now_ist.isoformat(),
                         entry_day,
                         bkm_strategy.cfg.entry_time,
                     )
-                    in_window = (
+                    market_open_now = _is_india_market_open(now_ist)
+                    scheduled_window = (
                         now_ist.date() == entry_day
                         and now_ist.time() >= bkm_strategy.cfg.entry_time
-                        and _is_india_market_open(now_ist)
+                        and market_open_now
                     )
+                    catchup_window = (
+                        now_ist.date() > entry_day
+                        and now_ist.date() <= entry_anchor_expiry
+                        and market_open_now
+                    )
+                    in_window = scheduled_window or catchup_window
                     if force_entry or in_window:
+                        catchup_not_before = _parse_time(
+                            settings.get("batman_bkm_catchup_not_before", "09:30"),
+                            dtime(9, 30),
+                        )
                         if force_entry:
                             log.info("[BatmanBKM] force_entry enabled (paper=%s)", trade_mode)
-                        elif not _is_india_market_open(now_ist):
+                        elif not market_open_now:
                             log.info("[BatmanBKM] market closed; skipping entry check")
                             time.sleep(poll_sec)
                             continue
-                        chain = _fetch_bkm_chain(expiry)
-                        if not chain:
+                        elif catchup_window and now_ist.time() < catchup_not_before:
+                            log.info(
+                                "[BatmanBKM] catch-up cooldown active target_expiry=%s now=%s not_before=%s",
+                                expiry_str,
+                                now_ist.time().isoformat(timespec="seconds"),
+                                catchup_not_before.isoformat(timespec="minutes"),
+                            )
                             time.sleep(poll_sec)
                             continue
-                        basket, reason = bkm_strategy.maybe_enter(market.spot, chain, expiry)
+                        elif catchup_window:
+                            log.info(
+                                "[BatmanBKM] catch-up entry window active target_expiry=%s anchor_expiry=%s planned_entry_day=%s",
+                                expiry_str,
+                                entry_anchor_expiry.isoformat() if entry_anchor_expiry else None,
+                                entry_day.isoformat(),
+                            )
+                        chain: Optional[List[dict]] = None
+                        entry_spot = float(market.spot or 0.0)
+                        planner_snapshots = 1
+                        planner_summary: Dict[str, Any] = {}
+                        if trade_mode == "live":
+                            planner_snapshots = max(1, int(settings.get("batman_bkm_pretrade_snapshot_count", 3)))
+                            planner_gap_sec = max(0.0, float(settings.get("batman_bkm_pretrade_snapshot_gap_sec", 2.0)))
+                            planner_max_spot_span = max(0.0, float(settings.get("batman_bkm_pretrade_max_spot_span_points", 120.0)))
+                            planner_max_credit_span = max(0.0, float(settings.get("batman_bkm_pretrade_max_credit_span_pct", 0.40)))
+                            planner_require_sig = bool(settings.get("batman_bkm_pretrade_require_signature_stable", True))
+                            planner_enforce_delta = bool(settings.get("batman_bkm_pretrade_enforce_delta_limit", False))
+                            planner_delta_limit = abs(float(settings.get("batman_bkm_pretrade_max_net_delta_abs", 5000.0)))
+                            snap_spots: List[float] = []
+                            snap_credit_pcts: List[float] = []
+                            snap_signatures: List[Any] = []
+                            snap_net_deltas: List[float] = []
+                            snap_reasons: List[str] = []
+                            planner_block_reason: Optional[str] = None
+                            latest_plan_chain: Optional[List[dict]] = None
+                            latest_plan_spot = entry_spot
+                            latest_plan_basket = None
+                            for snap_idx in range(planner_snapshots):
+                                if snap_idx == 0:
+                                    snap_market = market
+                                else:
+                                    if planner_gap_sec > 0:
+                                        time.sleep(planner_gap_sec)
+                                    try:
+                                        snap_market, _, _, _ = build_market_snapshot(dw, avg_volume_hint=avg_volume_hint)
+                                    except Exception:
+                                        log.exception(
+                                            "[BatmanBKM] pretrade snapshot fetch failed i=%s/%s",
+                                            snap_idx + 1,
+                                            planner_snapshots,
+                                        )
+                                        _trigger_bkm_conn_failure("pretrade_market_snapshot_exception")
+                                        planner_block_reason = "PRETRADE_MARKET_SNAPSHOT_FAIL"
+                                        break
+                                snap_spot = float(getattr(snap_market, "spot", 0.0) or 0.0)
+                                if snap_spot <= 0:
+                                    planner_block_reason = "PRETRADE_SPOT_INVALID"
+                                    break
+                                snap_chain = _fetch_bkm_chain(expiry, spot_hint=snap_spot)
+                                if not snap_chain:
+                                    planner_block_reason = "PRETRADE_BAD_QUOTES"
+                                    break
+                                probe = BatmanBKMStrategy(bkm_strategy.cfg)
+                                plan_basket, plan_reason = probe.maybe_enter(snap_spot, snap_chain, expiry)
+                                snap_reasons.append(plan_reason)
+                                if not plan_basket or plan_reason != "ENTER":
+                                    planner_block_reason = f"PRETRADE_{plan_reason}"
+                                    break
+                                try:
+                                    plan_sig = tuple(sorted(
+                                        (
+                                            str(getattr(l, "option_type", "")),
+                                            str(getattr(l, "side", "")),
+                                            float(getattr(l, "strike", 0.0) or 0.0),
+                                            int(getattr(l, "qty", 0) or 0),
+                                        )
+                                        for l in plan_basket.legs
+                                    ))
+                                except Exception:
+                                    plan_sig = ()
+                                delta_lookup: Dict[Tuple[str, float], float] = {}
+                                for row in snap_chain:
+                                    try:
+                                        opt = str(row.get("option_type") or "").upper()
+                                        strike = float(row.get("strike") or 0.0)
+                                        delta_val = row.get("delta")
+                                        if not opt or strike == 0 or delta_val in (None, ""):
+                                            continue
+                                        delta_lookup[(opt, strike)] = float(delta_val)
+                                    except Exception:
+                                        continue
+                                net_delta_acc = 0.0
+                                missing_delta = False
+                                for l in plan_basket.legs:
+                                    try:
+                                        opt = str(getattr(l, "option_type", "")).upper()
+                                        side = str(getattr(l, "side", "")).upper()
+                                        strike = float(getattr(l, "strike", 0.0) or 0.0)
+                                        qty = int(getattr(l, "qty", 0) or 0)
+                                        dlt = delta_lookup.get((opt, strike))
+                                        if dlt is None:
+                                            missing_delta = True
+                                            continue
+                                        sign = 1.0 if side == "BUY" else -1.0
+                                        net_delta_acc += sign * dlt * qty
+                                    except Exception:
+                                        missing_delta = True
+                                net_delta_val = None if missing_delta else net_delta_acc
+
+                                max_up = None
+                                max_down = None
+                                loss_skew_abs = None
+                                try:
+                                    ce_buys = [float(l.strike) for l in plan_basket.legs if str(l.option_type).upper() == "CE" and str(l.side).upper() == "BUY"]
+                                    pe_buys = [float(l.strike) for l in plan_basket.legs if str(l.option_type).upper() == "PE" and str(l.side).upper() == "BUY"]
+                                    if ce_buys and pe_buys:
+                                        atm_guess = (min(ce_buys) + max(pe_buys)) / 2.0
+                                        max_up, max_down = probe._max_losses(plan_basket.legs, atm_guess)  # type: ignore[attr-defined]
+                                        loss_skew_abs = abs(abs(max_up) - abs(max_down))
+                                except Exception:
+                                    pass
+
+                                snap_spots.append(snap_spot)
+                                snap_credit_pcts.append(float(plan_basket.credit_pct))
+                                snap_signatures.append(plan_sig)
+                                if net_delta_val is not None:
+                                    snap_net_deltas.append(float(net_delta_val))
+                                latest_plan_chain = snap_chain
+                                latest_plan_spot = snap_spot
+                                latest_plan_basket = plan_basket
+                                planner_summary = {
+                                    "credit_pct": float(plan_basket.credit_pct),
+                                    "net_credit": float(plan_basket.net_credit),
+                                    "net_delta": net_delta_val,
+                                    "max_up_loss": max_up,
+                                    "max_down_loss": max_down,
+                                    "loss_skew_abs": loss_skew_abs,
+                                    "snapshots": planner_snapshots,
+                                }
+
+                            if planner_block_reason is None:
+                                spot_span = (max(snap_spots) - min(snap_spots)) if snap_spots else 0.0
+                                credit_span = (max(snap_credit_pcts) - min(snap_credit_pcts)) if snap_credit_pcts else 0.0
+                                sig_stable = (len({sig for sig in snap_signatures}) <= 1) if snap_signatures else False
+                                planner_summary.update(
+                                    {
+                                        "spot_span": float(spot_span),
+                                        "credit_span_pct": float(credit_span),
+                                        "signature_stable": bool(sig_stable),
+                                        "spot_first": float(snap_spots[0]) if snap_spots else None,
+                                        "spot_last": float(snap_spots[-1]) if snap_spots else None,
+                                    }
+                                )
+                                if planner_require_sig and not sig_stable:
+                                    planner_block_reason = "PRETRADE_SIGNATURE_DRIFT"
+                                elif spot_span > planner_max_spot_span:
+                                    planner_block_reason = "PRETRADE_SPOT_UNSTABLE"
+                                elif credit_span > planner_max_credit_span:
+                                    planner_block_reason = "PRETRADE_CREDIT_UNSTABLE"
+                                elif (
+                                    planner_enforce_delta
+                                    and planner_summary.get("net_delta") is not None
+                                    and abs(float(planner_summary.get("net_delta") or 0.0)) > planner_delta_limit
+                                ):
+                                    planner_block_reason = "PRETRADE_DELTA_SKEW"
+                                log.info(
+                                    "[BatmanBKM] pretrade plan expiry=%s anchor=%s snapshots=%s spot_span=%.2f credit_span_pct=%.3f sig_stable=%s net_delta=%s loss_skew_abs=%s net_credit=%.2f credit_pct=%.3f",
+                                    expiry_str,
+                                    entry_anchor_expiry.isoformat() if entry_anchor_expiry else None,
+                                    planner_snapshots,
+                                    float(planner_summary.get('spot_span') or 0.0),
+                                    float(planner_summary.get('credit_span_pct') or 0.0),
+                                    planner_summary.get("signature_stable"),
+                                    "NA" if planner_summary.get("net_delta") is None else f"{float(planner_summary.get('net_delta')):.2f}",
+                                    "NA" if planner_summary.get("loss_skew_abs") is None else f"{float(planner_summary.get('loss_skew_abs')):.2f}",
+                                    float(planner_summary.get("net_credit") or 0.0),
+                                    float(planner_summary.get("credit_pct") or 0.0),
+                                )
+                            if planner_block_reason:
+                                log.warning(
+                                    "[BatmanBKM] pretrade blocked reason=%s expiry=%s anchor=%s snapshots=%s spots=%s credit_pcts=%s reasons=%s",
+                                    planner_block_reason,
+                                    expiry_str,
+                                    entry_anchor_expiry.isoformat() if entry_anchor_expiry else None,
+                                    planner_snapshots,
+                                    [round(v, 2) for v in snap_spots],
+                                    [round(v, 3) for v in snap_credit_pcts],
+                                    snap_reasons,
+                                )
+                                _heartbeat(
+                                    phase="bkm_pretrade_blocked",
+                                    extra={
+                                        "day_mode": day_mode,
+                                        "bkm_pretrade_block_reason": planner_block_reason,
+                                        "bkm_pretrade_expiry": expiry_str,
+                                    },
+                                )
+                                time.sleep(poll_sec)
+                                continue
+                            chain = latest_plan_chain
+                            entry_spot = latest_plan_spot
+                            if chain is None or latest_plan_basket is None:
+                                time.sleep(poll_sec)
+                                continue
+                        else:
+                            chain = _fetch_bkm_chain(expiry)
+                            if not chain:
+                                time.sleep(poll_sec)
+                                continue
+                        basket, reason = bkm_strategy.maybe_enter(entry_spot, chain, expiry)
                         log.info("[BatmanBKM] attempt reason=%s expiry=%s", reason, expiry_str)
                         if basket and reason == "ENTER":
                             if trade_mode == "live":
@@ -2916,6 +3211,36 @@ def main() -> None:
                     pnl = bkm_strategy.update_mtm(chain) or 0.0
                     if live_bkm_gate_enabled and live_gate:
                         live_gate.note_live_event(mtm=pnl, when=_ist_now())
+                    monitor_every = max(5.0, float(settings.get("batman_bkm_monitor_log_interval_sec", 20.0)))
+                    if (
+                        bkm_last_monitor_log_at is None
+                        or (now_ist - bkm_last_monitor_log_at).total_seconds() >= monitor_every
+                    ):
+                        bkm_last_monitor_log_at = now_ist
+                        basket_ref = bkm_strategy.basket
+                        tp_val = (bkm_strategy.cfg.tp_pct * float(getattr(basket_ref, "margin_required", 0.0) or 0.0)) if basket_ref else 0.0
+                        sl_val = -(bkm_strategy.cfg.sl_pct * float(getattr(basket_ref, "margin_required", 0.0) or 0.0)) if basket_ref else 0.0
+                        log.info(
+                            "[BatmanBKM] monitor expiry=%s spot=%.2f pnl=%.2f tp=%.2f sl=%.2f net_credit=%.2f credit_pct=%.3f day_mode=%s",
+                            basket_ref.expiry.isoformat() if basket_ref else expiry_str,
+                            float(market.spot or 0.0),
+                            float(pnl),
+                            float(tp_val),
+                            float(sl_val),
+                            float(getattr(basket_ref, "net_credit", 0.0) or 0.0) if basket_ref else 0.0,
+                            float(getattr(basket_ref, "credit_pct", 0.0) or 0.0) if basket_ref else 0.0,
+                            day_mode,
+                        )
+                        _heartbeat(
+                            phase="bkm_monitor",
+                            extra={
+                                "day_mode": day_mode,
+                                "bkm_open_expiry": basket_ref.expiry.isoformat() if basket_ref else expiry_str,
+                                "bkm_pnl": float(pnl),
+                                "bkm_tp": float(tp_val),
+                                "bkm_sl": float(sl_val),
+                            },
+                        )
                     try:
                         _log_batman_blotter(trade_mode, bkm_strategy.basket.legs, "MTM")
                     except Exception:
