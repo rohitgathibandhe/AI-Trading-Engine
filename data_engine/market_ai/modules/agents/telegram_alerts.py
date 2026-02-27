@@ -246,15 +246,33 @@ class TelegramAlertForwarder:
         details.setdefault("trade_mode", trade_mode)
         if strategy_file:
             details.setdefault("strategy_file", strategy_file)
+        agent_action = str(details.get("agent_action") or "").strip()
+        trade_impact = str(details.get("trade_impact") or "").strip()
+        what_you_should_do = str(details.get("what_you_should_do") or "").strip()
+        plain_reason = str(details.get("plain_reason") or "").strip()
         details_str = json.dumps(details, default=str, separators=(",", ":"), ensure_ascii=True)
         max_chars = max(256, int(self.config.max_message_chars))
-        base = (
-            f"[{severity}] {code}\n"
-            f"{message}\n"
-            f"time: {ts}\n"
-            f"source: {source}\n"
-            f"details: {details_str}"
-        )
+        if agent_action or trade_impact or what_you_should_do or plain_reason:
+            lines = [f"[{severity}] {code}", message]
+            if agent_action:
+                lines.append(f"Agent action: {agent_action}")
+            if trade_impact:
+                lines.append(f"Trade impact: {trade_impact}")
+            if plain_reason:
+                lines.append(f"Why: {plain_reason}")
+            if what_you_should_do:
+                lines.append(f"What you should do: {what_you_should_do}")
+            lines.append(f"time: {ts}")
+            lines.append(f"source: {source}")
+            base = "\n".join(lines)
+        else:
+            base = (
+                f"[{severity}] {code}\n"
+                f"{message}\n"
+                f"time: {ts}\n"
+                f"source: {source}\n"
+                f"details: {details_str}"
+            )
         if len(base) <= max_chars:
             return base
         # Keep header + truncate details
@@ -406,3 +424,36 @@ class TelegramAlertForwarder:
         self._persist_state()
         return {"ok": True, "sent_at": self.state.last_sent_at, "chat_id_masked": self.state.chat_id_masked}
 
+    def send_direct_message(
+        self,
+        *,
+        creds: Dict[str, Any],
+        text: str,
+        code: str = "TELEGRAM_DIRECT",
+        trade_mode: str = "live",
+        when: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        now = when or _now_ist()
+        self._sync_config_state()
+        token, chat_id = self._extract_creds(creds if isinstance(creds, dict) else {})
+        if not self.config.enabled:
+            self._persist_state()
+            return {"ok": False, "reason": "DISABLED"}
+        if not token or not chat_id:
+            self._persist_state()
+            return {"ok": False, "reason": "NOT_CONFIGURED"}
+        if self.config.live_only and str(trade_mode).lower() != "live":
+            self._persist_state()
+            return {"ok": False, "reason": "LIVE_ONLY_SKIP"}
+        if self._in_backoff(now):
+            self._persist_state()
+            return {"ok": False, "reason": "BACKOFF"}
+        try:
+            self._send_message(token=token, chat_id=chat_id, text=str(text or ""))
+        except Exception as exc:
+            self._record_send_failure(now=now, err=str(exc))
+            self._persist_state()
+            return {"ok": False, "reason": "SEND_FAILED", "error": str(exc)}
+        self._record_send_success(now=now, code=str(code or "TELEGRAM_DIRECT"))
+        self._persist_state()
+        return {"ok": True, "sent_at": self.state.last_sent_at, "chat_id_masked": self.state.chat_id_masked}

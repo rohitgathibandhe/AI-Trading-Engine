@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import traceback
 from datetime import datetime
 import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -45,6 +46,11 @@ EXECUTION_JOURNAL_JSONL = STATE_DIR / "execution_journal.jsonl"
 AGENT_HEARTBEAT_JSON = STATE_DIR / "agent_heartbeat.json"
 AGENT_ALERTS_JSONL = STATE_DIR / "agent_alerts.jsonl"
 TELEGRAM_ALERT_STATUS_JSON = STATE_DIR / "telegram_alert_status.json"
+BATMAN_BKM_AI_STATUS_JSON = STATE_DIR / "batman_bkm_ai_status.json"
+BATMAN_BKM_AI_EVENTS_JSONL = STATE_DIR / "batman_bkm_ai_events.jsonl"
+BATMAN_BKM_AI_PROTECT_STATUS_JSON = STATE_DIR / "batman_bkm_ai_protect_status.json"
+BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_JSON = STATE_DIR / "batman_bkm_ai_protect_clear_request.json"
+INTRADAY_AI_ADVISOR_STATUS_JSON = STATE_DIR / "intraday_ai_advisor_status.json"
 BATMAN_BKM_TUNING_ADVICE_JSON = STATE_DIR / "batman_bkm_tuning_advice.json"
 BATMAN_BKM_TUNING_HISTORY_JSONL = STATE_DIR / "batman_bkm_tuning_history.jsonl"
 CREDS_FILE = STATE_DIR / "creds.json"
@@ -465,13 +471,23 @@ def _load_broker_live_positions() -> Dict[str, Any]:
             positions_full = resp.json()
         except Exception as exc:
             print(f"[live_positions_full] fetch failed: {exc}")
-    except Exception as exc:
+    except BaseException as exc:
+        if isinstance(exc, KeyboardInterrupt):
+            raise
         print(f"[live_fallback] get_positions_raw failed: {exc}")
         return {"positions": [], "total_pnl": 0.0, "source": "none", "margin_available": None, "margin_used": None}
 
     positions: List[Dict[str, Any]] = []
     closed: List[Dict[str, Any]] = []
     seg_map: Dict[str, list[int]] = {}
+    full_by_sid: Dict[str, Dict[str, Any]] = {}
+    for fr in positions_full or []:
+        if not isinstance(fr, dict):
+            continue
+        sid = fr.get("securityId") or fr.get("security_id") or fr.get("instrumentId") or ""
+        sid_s = str(sid).strip()
+        if sid_s:
+            full_by_sid[sid_s] = fr
 
     for row in raw or []:
         seg = str(row.get("exchangeSegment") or row.get("exchange_seg") or "NSE_FNO")
@@ -499,11 +515,37 @@ def _load_broker_live_positions() -> Dict[str, Any]:
         )
         entry = sell_avg if side == "SELL" else buy_avg
         ltp = _parse_float(row.get("ltp") or row.get("LTP") or row.get("last_price") or row.get("lastPrice"), entry)
-        expiry = row.get("expiryDate") or row.get("expiry") or ""
-        strike = row.get("tradingSymbol") or row.get("symbol") or row.get("strikePrice") or row.get("strike") or ""
         sec_id = row.get("securityId") or row.get("security_id") or row.get("instrumentId") or ""
+        full_row = full_by_sid.get(str(sec_id).strip(), {})
+        expiry = (
+            row.get("drvExpiryDate")
+            or row.get("expiryDate")
+            or row.get("expiry")
+            or row.get("drv_expiry_date")
+            or (full_row.get("drvExpiryDate") if isinstance(full_row, dict) else None)
+            or (full_row.get("expiryDate") if isinstance(full_row, dict) else None)
+            or (full_row.get("expiry") if isinstance(full_row, dict) else None)
+            or ""
+        )
+        strike = (
+            row.get("tradingSymbol")
+            or row.get("trading_symbol")
+            or row.get("displayName")
+            or row.get("display_name")
+            or row.get("symbol")
+            or row.get("strikePrice")
+            or row.get("strike")
+            or (full_row.get("tradingSymbol") if isinstance(full_row, dict) else None)
+            or (full_row.get("symbol") if isinstance(full_row, dict) else None)
+            or (full_row.get("displayName") if isinstance(full_row, dict) else None)
+            or (full_row.get("strikePrice") if isinstance(full_row, dict) else None)
+            or ""
+        )
         if sec_id:
-            seg_map.setdefault(seg, []).append(int(sec_id))
+            try:
+                seg_map.setdefault(seg, []).append(int(sec_id))
+            except Exception:
+                pass
         if net != 0:
             positions.append(
                 {
@@ -843,6 +885,140 @@ def _reset_execution_recovery_status() -> Dict[str, Any]:
     return guard.reset()
 
 
+def _default_bkm_ai_status() -> Dict[str, Any]:
+    now = _ist_now()
+    return {
+        "status": "IDLE",
+        "mode": "ADVISOR",
+        "action": "HOLD",
+        "severity": "INFO",
+        "score": 0.0,
+        "confidence": 0.0,
+        "reasons": [],
+        "market_context": {},
+        "plan": {},
+        "current_session_date": now.date().isoformat(),
+        "updated_at": now.isoformat(timespec="seconds"),
+    }
+
+
+def _load_bkm_ai_status() -> Dict[str, Any]:
+    if not BATMAN_BKM_AI_STATUS_JSON.exists():
+        return _default_bkm_ai_status()
+    payload = _json_read(BATMAN_BKM_AI_STATUS_JSON)
+    return payload if isinstance(payload, dict) and payload else _default_bkm_ai_status()
+
+
+def _default_bkm_ai_protect_status() -> Dict[str, Any]:
+    now = _ist_now()
+    return {
+        "status": "UNLOCKED",
+        "active": False,
+        "protection_enabled": True,
+        "session_date": now.date().isoformat(),
+        "reason": None,
+        "source_action": None,
+        "score": None,
+        "expiry": None,
+        "updated_at": now.isoformat(timespec="seconds"),
+        "last_transition_at": now.isoformat(timespec="seconds"),
+    }
+
+
+def _load_bkm_ai_protect_status() -> Dict[str, Any]:
+    payload = _json_read(BATMAN_BKM_AI_PROTECT_STATUS_JSON)
+    if not payload or not isinstance(payload, dict):
+        return _default_bkm_ai_protect_status()
+    out = _default_bkm_ai_protect_status()
+    out.update(payload)
+    out["active"] = bool(out.get("active", False))
+    out["protection_enabled"] = bool(out.get("protection_enabled", True))
+    out["status"] = "LOCKED" if out["active"] else "UNLOCKED"
+    return out
+
+
+def _default_intraday_ai_status() -> Dict[str, Any]:
+    now = _ist_now()
+    return {
+        "status": "IDLE",
+        "signal": "NO_TRADE",
+        "priority": "INFO",
+        "strategy": None,
+        "expiry": None,
+        "spot": None,
+        "market_bias": "NEUTRAL",
+        "trend_confidence": 0.0,
+        "signal_conflict_score": 0.0,
+        "pcr_unbalanced": False,
+        "pcr_unbalanced_side": "NEUTRAL",
+        "volatility_regime": "UNKNOWN",
+        "breakout_confirmation": "NONE",
+        "has_open_bkm": False,
+        "recommendation": {},
+        "reasons": [],
+        "current_session_date": now.date().isoformat(),
+        "updated_at": now.isoformat(timespec="seconds"),
+    }
+
+
+def _load_intraday_ai_status() -> Dict[str, Any]:
+    if not INTRADAY_AI_ADVISOR_STATUS_JSON.exists():
+        return _default_intraday_ai_status()
+    payload = _json_read(INTRADAY_AI_ADVISOR_STATUS_JSON)
+    return payload if isinstance(payload, dict) and payload else _default_intraday_ai_status()
+
+
+def _clear_bkm_ai_protect_lock(*, source: str = "manual_ui", note: str = "") -> Dict[str, Any]:
+    now = _ist_now()
+    before = _load_bkm_ai_protect_status()
+    cleared = _default_bkm_ai_protect_status()
+    cleared["protection_enabled"] = bool(before.get("protection_enabled", True))
+    cleared["session_date"] = now.date().isoformat()
+    cleared["updated_at"] = now.isoformat(timespec="seconds")
+    cleared["last_transition_at"] = now.isoformat(timespec="seconds")
+    BATMAN_BKM_AI_PROTECT_STATUS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    _json_write(BATMAN_BKM_AI_PROTECT_STATUS_JSON, cleared)
+    _json_write(
+        BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_JSON,
+        {
+            "requested_at": now.isoformat(timespec="seconds"),
+            "source": str(source or "manual_ui"),
+            "note": str(note or ""),
+        },
+    )
+    return {"ok": True, "before": before, "after": _load_bkm_ai_protect_status(), "signal_sent": True}
+
+
+def _set_bkm_ai_protection_enabled(*, enabled: bool, source: str = "manual_ui", note: str = "") -> Dict[str, Any]:
+    now = _ist_now()
+    before = _load_bkm_ai_protect_status()
+    after = dict(before)
+    after["session_date"] = now.date().isoformat()
+    after["protection_enabled"] = bool(enabled)
+    if not enabled:
+        after["active"] = False
+        after["status"] = "UNLOCKED"
+        after["reason"] = None
+        after["source_action"] = None
+        after["score"] = None
+        after["expiry"] = None
+    after["updated_at"] = now.isoformat(timespec="seconds")
+    after["last_transition_at"] = now.isoformat(timespec="seconds")
+    BATMAN_BKM_AI_PROTECT_STATUS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    _json_write(BATMAN_BKM_AI_PROTECT_STATUS_JSON, after)
+    _json_write(
+        BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_JSON,
+        {
+            "requested_at": now.isoformat(timespec="seconds"),
+            "source": str(source or "manual_ui"),
+            "note": str(note or ""),
+            "operation": "set_protection_enabled",
+            "protection_enabled": bool(enabled),
+        },
+    )
+    return {"ok": True, "before": before, "after": _load_bkm_ai_protect_status(), "signal_sent": True}
+
+
 def _safe_autocleanup_bkm_after_stop() -> Dict[str, Any]:
     """
     Safely clean stale Batman BKM local/journal state after operator stop.
@@ -939,6 +1115,13 @@ def _safe_autocleanup_bkm_after_stop() -> Dict[str, Any]:
 
 def _parse_bkm_pos_identity(pos: Dict[str, Any]) -> Tuple[Optional[str], Optional[float], Optional[str]]:
     symbol = str(pos.get("strike") or "").strip()
+    # Dhan symbols can arrive as NIFTY-Mar2026-24500-PE; normalize separators for parsing.
+    symbol = (
+        symbol.replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u2212", "-")
+        .replace("_", "-")
+    )
     expiry_raw = str(pos.get("expiry") or "").strip()
 
     expiry_iso: Optional[str] = None
@@ -958,7 +1141,7 @@ def _parse_bkm_pos_identity(pos: Dict[str, Any]) -> Tuple[Optional[str], Optiona
         strike_val = float(symbol)
     except Exception:
         strike_val = None
-    m = re.search(r"(?P<strike>\d+(?:\.\d+)?)\s*(?P<opt>CE|PE|CALL|PUT)\b", symbol.upper())
+    m = re.search(r"(?P<strike>\d+(?:\.\d+)?)[\s\-_/]*(?P<opt>CE|PE|CALL|PUT)\b", symbol.upper())
     if m:
         try:
             strike_val = float(m.group("strike"))
@@ -1268,6 +1451,16 @@ def _is_process_alive(pid: int) -> bool:
         return False
 
 
+def _api_error_payload(exc: BaseException, *, code: str) -> Dict[str, Any]:
+    tb = traceback.format_exc(limit=12)
+    return {
+        "ok": False,
+        "error": code,
+        "detail": f"{type(exc).__name__}: {exc}",
+        "traceback": tb.splitlines()[-12:],
+    }
+
+
 def _start_agent_process(trade_mode: str) -> Dict[str, Any]:
     trade_mode = str(trade_mode or "paper").strip().lower() or "paper"
     if PID_FILE.exists():
@@ -1286,7 +1479,12 @@ def _start_agent_process(trade_mode: str) -> Dict[str, Any]:
         except Exception:
             strategy_file = "batman_bkm_monthly"
         if strategy_file == "batman_bkm_monthly":
-            auto_import_result = _import_live_bkm_from_broker()
+            try:
+                auto_import_result = _import_live_bkm_from_broker()
+            except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                auto_import_result = _api_error_payload(exc, code="LIVE_BKM_AUTO_IMPORT_CRASH")
             # Fail-safe: if we cannot verify/import live broker state, do not start and risk locking/orphan behavior.
             if not bool(auto_import_result.get("ok")):
                 return {
@@ -1447,8 +1645,42 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 result = _import_live_bkm_from_broker()
                 status = 200 if bool(result.get("ok")) else 409
                 self._send_json(result, status=status)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=500)
+            except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                self._send_json(_api_error_payload(exc, code="BKM_IMPORT_LIVE_HANDLER_CRASH"), status=500)
+            return
+        if self.path.startswith("/api/bkm/ai_protect/clear"):
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+                result = _clear_bkm_ai_protect_lock(
+                    source=str((data or {}).get("source") or "manual_ui"),
+                    note=str((data or {}).get("note") or ""),
+                )
+                self._send_json(result)
+            except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                self._send_json(_api_error_payload(exc, code="BKM_AI_PROTECT_CLEAR_HANDLER_CRASH"), status=500)
+            return
+        if self.path.startswith("/api/bkm/ai_protect/set"):
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+                enabled = bool((data or {}).get("enabled", True))
+                result = _set_bkm_ai_protection_enabled(
+                    enabled=enabled,
+                    source=str((data or {}).get("source") or "manual_ui"),
+                    note=str((data or {}).get("note") or ""),
+                )
+                self._send_json(result)
+            except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                self._send_json(_api_error_payload(exc, code="BKM_AI_PROTECT_SET_HANDLER_CRASH"), status=500)
             return
         if self.path.startswith("/api/control/restart"):
             try:
@@ -1473,8 +1705,10 @@ class PaperHandler(SimpleHTTPRequestHandler):
                     "start": start_res,
                     "auto_import": start_res.get("auto_import"),
                 })
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=500)
+            except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                self._send_json(_api_error_payload(exc, code="CONTROL_RESTART_HANDLER_CRASH"), status=500)
             return
         if self.path.startswith("/api/control/start"):
             try:
@@ -1485,8 +1719,10 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 res = _start_agent_process(trade_mode=trade_mode)
                 status = 200 if bool(res.get("ok")) else 409
                 self._send_json(res, status=status)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=500)
+            except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                self._send_json(_api_error_payload(exc, code="CONTROL_START_HANDLER_CRASH"), status=500)
             return
         if self.path.startswith("/api/control/stop"):
             try:
@@ -1602,12 +1838,26 @@ class PaperHandler(SimpleHTTPRequestHandler):
             return
         if self.path.startswith("/api/live_positions"):
             try:
-                payload = load_positions(BLOTTER_CSV, mode="live")
+                local_payload = load_positions(BLOTTER_CSV, mode="live")
+                payload = local_payload
                 broker_payload = _load_broker_live_positions()
-                if not payload.get("positions") and broker_payload:
+                # In live mode, broker open positions are the source of truth when available.
+                # Local blotter/journal can lag or be stale after manual intervention/imports.
+                if isinstance(broker_payload, dict) and str(broker_payload.get("source") or "") == "broker":
+                    payload = {
+                        "positions": broker_payload.get("positions", []) or [],
+                        "closed": broker_payload.get("closed", []) or [],
+                        "total_pnl": broker_payload.get("total_pnl", 0.0) or 0.0,
+                        "as_of": broker_payload.get("as_of"),
+                        "blotter_tail": local_payload.get("blotter_tail", []) if isinstance(local_payload, dict) else [],
+                        "source": "broker",
+                        "margin_available": broker_payload.get("margin_available"),
+                        "margin_used": broker_payload.get("margin_used"),
+                    }
+                elif not payload.get("positions") and broker_payload:
                     payload = broker_payload
                 else:
-                    # merge closed from broker into existing payload
+                    # Broker unavailable: keep local payload. If broker closed rows exist from partial payload, merge them.
                     if broker_payload and broker_payload.get("closed"):
                         closed = payload.get("closed", []) or []
                         closed.extend(broker_payload.get("closed", []))
@@ -1731,6 +1981,29 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 gate = _load_live_gate_status()
                 reconcile = _load_reconcile_status()
                 exec_recovery = _load_execution_recovery_status()
+                bkm_ai = _load_bkm_ai_status()
+                intraday_ai = _load_intraday_ai_status()
+                bkm_ai_plan = bkm_ai.get("plan") if isinstance(bkm_ai.get("plan"), dict) else {}
+                bkm_ai_ctx = bkm_ai.get("market_context") if isinstance(bkm_ai.get("market_context"), dict) else {}
+                bkm_ai_structure = bkm_ai_ctx.get("structure") if isinstance(bkm_ai_ctx.get("structure"), dict) else {}
+                bkm_ai_protect = _load_bkm_ai_protect_status()
+                intraday_ai_rec = intraday_ai.get("recommendation") if isinstance(intraday_ai.get("recommendation"), dict) else {}
+                today_ist = _ist_now().date().isoformat()
+                ai_mode_name = str(bkm_ai.get("mode") or "ADVISOR").upper()
+                ai_mode_protect = ai_mode_name in {"AUTO_PROTECT", "PROTECTIVE"}
+                protect_active = bool(
+                    ai_mode_protect
+                    and
+                    bkm_ai_protect.get("protection_enabled", True)
+                    and
+                    bkm_ai_protect.get("active", False)
+                    and str(bkm_ai_protect.get("session_date") or "") == today_ist
+                )
+                protect_enabled = (
+                    bool(bkm_ai_protect.get("protection_enabled", True))
+                    if str(bkm_ai_protect.get("session_date") or "") == today_ist
+                    else True
+                )
                 watchdog = _watchdog_health_status()
                 alerts = _load_alerts_tail(limit=50)
                 telegram_status = _load_telegram_alert_status()
@@ -1762,6 +2035,54 @@ class PaperHandler(SimpleHTTPRequestHandler):
                         "execution_recovery_status": exec_recovery.get("status"),
                         "execution_recovery_hard_lock": bool(exec_recovery.get("hard_lock", False)),
                         "execution_recovery_last_reason": exec_recovery.get("last_reason"),
+                        "bkm_ai_status": bkm_ai.get("status"),
+                        "bkm_ai_mode": bkm_ai.get("mode"),
+                        "bkm_ai_action": bkm_ai.get("action"),
+                        "bkm_ai_severity": bkm_ai.get("severity"),
+                        "bkm_ai_score": _parse_float(bkm_ai.get("score"), 0.0),
+                        "bkm_ai_confidence": _parse_float(bkm_ai.get("confidence"), 0.0),
+                        "bkm_ai_reasons": bkm_ai.get("reasons") if isinstance(bkm_ai.get("reasons"), list) else [],
+                        "bkm_ai_basket_expiry": bkm_ai.get("basket_expiry"),
+                        "bkm_ai_market_bias": bkm_ai.get("market_bias"),
+                        "bkm_ai_position_risk_side": bkm_ai.get("position_risk_side"),
+                        "bkm_ai_trend_confidence": _parse_float(
+                            (bkm_ai_structure.get("trend_confidence") if isinstance(bkm_ai_structure, dict) else None),
+                            None,
+                        ),
+                        "bkm_ai_signal_conflict_score": _parse_float(
+                            (bkm_ai_structure.get("signal_conflict_score") if isinstance(bkm_ai_structure, dict) else None),
+                            None,
+                        ),
+                        "bkm_ai_intraday_support": (
+                            (bkm_ai_structure.get("intraday_support") or {}).get("level")
+                            if isinstance(bkm_ai_structure.get("intraday_support"), dict)
+                            else None
+                        ),
+                        "bkm_ai_intraday_resistance": (
+                            (bkm_ai_structure.get("intraday_resistance") or {}).get("level")
+                            if isinstance(bkm_ai_structure.get("intraday_resistance"), dict)
+                            else None
+                        ),
+                        "bkm_ai_weekly_support": bkm_ai_structure.get("weekly_support") if isinstance(bkm_ai_structure, dict) else None,
+                        "bkm_ai_weekly_resistance": bkm_ai_structure.get("weekly_resistance") if isinstance(bkm_ai_structure, dict) else None,
+                        "bkm_ai_entry_lock_active": (bool(bkm_ai_plan.get("entry_lock_active", False)) and protect_enabled) or protect_active,
+                        "bkm_ai_protection_enabled": protect_enabled,
+                        "bkm_ai_protect_lock_active": protect_active,
+                        "bkm_ai_protect_lock_reason": bkm_ai_protect.get("reason") if protect_active else None,
+                        "bkm_ai_protect_lock_updated_at": bkm_ai_protect.get("updated_at") if protect_active else None,
+                        "bkm_ai_plan_next_course": bkm_ai_plan.get("next_course"),
+                        "bkm_ai_updated_at": bkm_ai.get("updated_at"),
+                        "intraday_ai_status": intraday_ai.get("status"),
+                        "intraday_ai_signal": intraday_ai.get("signal"),
+                        "intraday_ai_priority": intraday_ai.get("priority"),
+                        "intraday_ai_strategy": intraday_ai.get("strategy"),
+                        "intraday_ai_market_bias": intraday_ai.get("market_bias"),
+                        "intraday_ai_trend_confidence": _parse_float(intraday_ai.get("trend_confidence"), None),
+                        "intraday_ai_signal_conflict_score": _parse_float(intraday_ai.get("signal_conflict_score"), None),
+                        "intraday_ai_expiry": intraday_ai.get("expiry"),
+                        "intraday_ai_updated_at": intraday_ai.get("updated_at"),
+                        "intraday_ai_headline": intraday_ai_rec.get("headline"),
+                        "intraday_ai_what_to_enter": intraday_ai_rec.get("what_to_enter"),
                         "alerts_recent_count": len(alerts),
                         "last_alert_severity": last_alert.get("severity"),
                         "last_alert_code": last_alert.get("code"),
@@ -1773,6 +2094,18 @@ class PaperHandler(SimpleHTTPRequestHandler):
                         "batman_bkm_tuning_last_generated_at": advice.get("generated_at") if isinstance(advice, dict) else None,
                     }
                 )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/bkm/ai_status"):
+            try:
+                self._send_json({"ok": True, "ai": _load_bkm_ai_status(), "protective_lock": _load_bkm_ai_protect_status()})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/intraday_ai/status"):
+            try:
+                self._send_json({"ok": True, "advisor": _load_intraday_ai_status()})
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return

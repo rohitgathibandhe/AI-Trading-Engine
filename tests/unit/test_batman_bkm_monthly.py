@@ -26,8 +26,16 @@ def test_strike_builder():
 def test_widening_stops_after_iterations():
     cfg = BatmanBKMConfig(max_credit_pct=1.0, estimated_margin=1.0, max_widen_iterations=1, base_distance_points=400)
     strat = BatmanBKMStrategy(cfg)
-    strikes = [19650, 19850, 20450, 20650, 21450]
-    chain = _stub_chain(strikes, price=100.0)
+    # Include all strikes required for base distance (400) and one widened pass (+100).
+    strikes = [
+        18650, 19450, 19650, 20450, 20650, 21450,  # base 400 structure
+        18550, 19350, 19550, 20550, 20750, 21550,  # widened (+100) structure
+    ]
+    chain = _stub_chain(strikes, price=20.0)
+    # Force very high credit: make short strikes expensive and long/hedge strikes cheap.
+    short_strikes = {19450, 20650, 19350, 20750}
+    for row in chain:
+        row["ltp"] = 220.0 if row["strike"] in short_strikes else 10.0
     basket, reason = strat.maybe_enter(20050, chain, date(2026, 1, 27))
     assert basket is None
     assert reason == "CREDIT_TOO_HIGH_AFTER_WIDEN"

@@ -78,6 +78,57 @@
     .summary-value { font-size:20px; font-weight:800; margin-top:3px; }
     .summary-sub { color:var(--muted); font-size:11px; }
     .total-row { font-weight:800; border-top:1px solid var(--border); }
+    .action-btn {
+      border: 1px solid rgba(255,255,255,0.08);
+      color: #fff;
+      padding: 7px 12px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 12px;
+      letter-spacing: 0.2px;
+      transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease, background 120ms ease;
+      box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+      white-space: nowrap;
+    }
+    .action-btn:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 22px rgba(0,0,0,0.35);
+    }
+    .action-btn:disabled {
+      cursor: not-allowed;
+      opacity: 0.7;
+      transform: none;
+      box-shadow: none;
+    }
+    .action-btn.ai-protect-on {
+      background: linear-gradient(135deg, rgba(20,184,166,0.95), rgba(6,95,70,0.95));
+      border-color: rgba(45,212,191,0.35);
+    }
+    .action-btn.ai-protect-off {
+      background: linear-gradient(135deg, rgba(245,158,11,0.95), rgba(180,83,9,0.95));
+      border-color: rgba(251,191,36,0.35);
+      color: #1f1300;
+    }
+    .meter-block { margin-top: 6px; }
+    .meter-row { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:4px; }
+    .meter-label { color: var(--muted); font-size: 11px; }
+    .meter-value { color: var(--text); font-size: 11px; font-weight: 700; }
+    .meter-track {
+      width: 100%;
+      height: 7px;
+      border-radius: 999px;
+      background: #0b1224;
+      border: 1px solid var(--border);
+      overflow: hidden;
+    }
+    .meter-fill {
+      height: 100%;
+      width: 0%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, rgba(34,197,94,0.9), rgba(20,184,166,0.9));
+      transition: width 180ms ease, background 180ms ease;
+    }
   </style>
 </head>
 <body>
@@ -164,6 +215,69 @@
           <div class="summary-title">Margin Available</div>
           <div class="summary-value" id="live-margin-avail">—</div>
           <div class="summary-sub">Margin Used: <span id="live-margin-used">—</span></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:12px;">
+        <div class="card-header">
+          <div style="font-weight:700;">AI Trade Insight (Batman BKM)</div>
+          <div>
+            <button id="bkm-ai-clear-lock" class="action-btn ai-protect-on" style="margin-right:8px;">Disable AI Entry Protection (Today)</button>
+            <span class="chip" id="bkm-ai-chip-action">AI: —</span>
+            <span class="chip" id="bkm-ai-chip-bias">Bias: —</span>
+          </div>
+        </div>
+        <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));">
+          <div class="summary-card" style="padding:8px 10px;">
+            <div class="summary-title">What Agent Plans</div>
+            <div class="summary-value" id="bkm-ai-next-course" style="font-size:16px;">—</div>
+            <div class="summary-sub" id="bkm-ai-meta">Mode: — | Risk side: —</div>
+          </div>
+          <div class="summary-card" style="padding:8px 10px;">
+            <div class="summary-title">Signal Summary</div>
+            <div class="summary-sub" id="bkm-ai-signals">—</div>
+            <div class="summary-sub" id="bkm-ai-trend">Trend: —</div>
+            <div class="summary-sub" id="bkm-ai-oi">OI/PCR: —</div>
+            <div class="summary-sub" id="bkm-ai-structure">Structure: —</div>
+            <div class="summary-sub" id="bkm-ai-confidence">Confidence: —</div>
+          </div>
+          <div class="summary-card" style="padding:8px 10px;">
+            <div class="summary-title">Risk & Guardrails</div>
+            <div class="summary-sub" id="bkm-ai-risk">Score: —</div>
+            <div class="summary-sub" id="bkm-ai-lock">Entry lock: —</div>
+            <div class="summary-sub" id="bkm-ai-updated">Updated: —</div>
+          </div>
+          <div class="summary-card" style="padding:8px 10px;">
+            <div class="summary-title">AI Confidence</div>
+            <div class="summary-sub" id="bkm-ai-confidence-headline">Trend confidence: —</div>
+            <div class="meter-block">
+              <div class="meter-row">
+                <span class="meter-label">Trend Confidence</span>
+                <span class="meter-value" id="bkm-ai-trend-meter-value">—</span>
+              </div>
+              <div class="meter-track"><div class="meter-fill" id="bkm-ai-trend-meter-fill"></div></div>
+            </div>
+            <div class="meter-block">
+              <div class="meter-row">
+                <span class="meter-label">Signal Conflict</span>
+                <span class="meter-value" id="bkm-ai-conflict-meter-value">—</span>
+              </div>
+              <div class="meter-track"><div class="meter-fill" id="bkm-ai-conflict-meter-fill"></div></div>
+            </div>
+            <div class="summary-sub" id="bkm-ai-sr-distance">Support/Resistance distance: —</div>
+            <div class="summary-sub" id="bkm-ai-conflict-reasons">Signal conflict reasons: —</div>
+          </div>
+          <div class="summary-card" style="padding:8px 10px;">
+            <div class="summary-title">Intraday Sell Advisor (Phase A)</div>
+            <div class="summary-value" id="intraday-ai-headline" style="font-size:16px;">No signal yet</div>
+            <div class="summary-sub" id="intraday-ai-meta">Signal: — | Strategy: — | Bias: —</div>
+            <div class="summary-sub" id="intraday-ai-what">What to enter: —</div>
+            <div class="summary-sub" id="intraday-ai-sl">SL: —</div>
+            <div class="summary-sub" id="intraday-ai-tp">TP: —</div>
+            <div class="summary-sub" id="intraday-ai-hold">Hold: —</div>
+            <div class="summary-sub" id="intraday-ai-why">Why: —</div>
+            <div class="summary-sub" id="intraday-ai-updated">Updated: —</div>
+          </div>
         </div>
       </div>
 
@@ -687,9 +801,313 @@
       }
     }
 
+    function _setBkmAiProtectButtonState(enabled) {
+      const btn = document.getElementById("bkm-ai-clear-lock");
+      if (!btn) return;
+      const isEnabled = enabled !== false;
+      btn.dataset.protectEnabled = isEnabled ? "true" : "false";
+      btn.textContent = isEnabled ? "Disable AI Entry Protection (Today)" : "Enable AI Entry Protection";
+      btn.classList.remove("ai-protect-on", "ai-protect-off");
+      btn.classList.add(isEnabled ? "ai-protect-on" : "ai-protect-off");
+      btn.title = isEnabled
+        ? "Temporarily disable AI entry protection for today (monitoring continues)"
+        : "Re-enable AI entry protection so AI can lock new entries when risk increases";
+    }
+
+    async function toggleBkmAiProtection() {
+      const btn = document.getElementById("bkm-ai-clear-lock");
+      const currentEnabled = !(btn && btn.dataset && btn.dataset.protectEnabled === "false");
+      const nextEnabled = !currentEnabled;
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = nextEnabled ? "Enabling…" : "Disabling…";
+      }
+      try {
+        const resp = await fetch("/api/bkm/ai_protect/set", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            enabled: nextEnabled,
+            source: "manual_ui",
+            note: nextEnabled ? "operator_enabled_ai_entry_protection" : "operator_disabled_ai_entry_protection",
+          }),
+        });
+        const data = await resp.json();
+        if (!resp.ok || data.error) throw new Error(data.error || "AI protection toggle failed");
+        const after = (data && data.after && typeof data.after === "object") ? data.after : {};
+        const enabledNow = !(after.protection_enabled === false);
+        _setBkmAiProtectButtonState(enabledNow);
+        document.getElementById("agent-status").textContent = enabledNow
+          ? "AI entry protection enabled"
+          : "AI entry protection disabled for today";
+        await Promise.allSettled([refreshAgentStatus(), loadLive()]);
+      } catch (e) {
+        document.getElementById("agent-status").textContent = "AI entry protection toggle failed";
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          if (!btn.dataset.protectEnabled) btn.dataset.protectEnabled = "true";
+          _setBkmAiProtectButtonState(btn.dataset.protectEnabled !== "false");
+        }
+      }
+    }
+
     async function refreshAgentStatus() {
       const data = await fetchJSON("/api/control/status");
-      document.getElementById("agent-status").textContent = data.running ? `Running (pid ${data.pid})` : "Stopped";
+      if (!data.running) {
+        document.getElementById("agent-status").textContent = "Stopped";
+        return;
+      }
+      const aiAction = data.bkm_ai_action || null;
+      const aiScore = Number.isFinite(Number(data.bkm_ai_score)) ? Number(data.bkm_ai_score).toFixed(1) : null;
+      const aiSev = data.bkm_ai_severity || null;
+      const aiLock = !!data.bkm_ai_entry_lock_active;
+      const aiSuffix = aiAction ? ` | AI: ${aiAction}${aiScore ? ` (${aiScore})` : ""}${aiSev ? ` ${aiSev}` : ""}${aiLock ? " [ENTRY LOCK]" : ""}` : "";
+      document.getElementById("agent-status").textContent = `Running (pid ${data.pid})${aiSuffix}`;
+    }
+
+    function _fmtNum(v, digits = 2) {
+      const n = Number(v);
+      return Number.isFinite(n) ? n.toFixed(digits) : "—";
+    }
+
+    function _fmtPtsFromSpot(level, spot) {
+      const l = Number(level);
+      const s = Number(spot);
+      if (!Number.isFinite(l) || !Number.isFinite(s) || s <= 0) return "—";
+      const diff = l - s;
+      if (Math.abs(diff) < 0.5) return "at spot";
+      return `${Math.abs(diff).toFixed(0)} pts ${diff > 0 ? "above" : "below"}`;
+    }
+
+    function _buildAiConflictReasons({ structure, trend, signalSummary, marketBias }) {
+      const reasons = [];
+      const votes = (structure && typeof structure.votes === "object") ? structure.votes : {};
+      const trendVote = Number(votes.trend || 0);
+      const pcrVote = Number(votes.pcr || 0);
+      const oiVote = Number(votes.oi_build || 0);
+      const breakoutVote = Number(votes.breakout || 0);
+      const weeklyVote = Number(votes.weekly || 0);
+      const conflictScore = Number(structure && structure.signal_conflict_score);
+
+      if (Number.isFinite(conflictScore) && conflictScore >= 60) {
+        reasons.push("Signals are conflicting strongly, so AI confidence is reduced.");
+      } else if (Number.isFinite(conflictScore) && conflictScore <= 20) {
+        reasons.push("Signals are mostly aligned, so trend confidence is higher.");
+      }
+
+      if (trendVote !== 0 && pcrVote !== 0 && trendVote !== pcrVote) {
+        reasons.push("Price trend and PCR are pointing in opposite directions.");
+      }
+      if (trendVote !== 0 && oiVote !== 0 && trendVote !== oiVote) {
+        reasons.push("Price trend and option-chain OI build-up are not aligned.");
+      }
+      if (breakoutVote !== 0 && trendVote !== 0 && breakoutVote !== trendVote) {
+        reasons.push("Breakout signal does not confirm the current trend bias.");
+      }
+      if (weeklyVote !== 0 && trendVote !== 0 && weeklyVote !== trendVote) {
+        reasons.push("Weekly structure is different from intraday trend.");
+      }
+
+      if (signalSummary && signalSummary.pcr_unbalanced === true) {
+        const side = String(signalSummary.pcr_unbalanced_side || "NEUTRAL").toLowerCase();
+        if (side !== "neutral") {
+          reasons.push(`PCR is strongly ${side}, which can accelerate one-sided moves.`);
+        }
+      }
+
+      if (!reasons.length) {
+        reasons.push(`AI sees a ${String(marketBias || "neutral").toLowerCase()} environment with no major signal conflict.`);
+      }
+      return reasons.slice(0, 2);
+    }
+
+    function _setAiMeter(fillId, valueId, percent, scheme = "trend") {
+      const fill = document.getElementById(fillId);
+      const label = document.getElementById(valueId);
+      const p = Number(percent);
+      const clamped = Number.isFinite(p) ? Math.max(0, Math.min(100, p)) : null;
+      if (label) label.textContent = (clamped === null) ? "—" : `${Math.round(clamped)}%`;
+      if (!fill) return;
+      if (clamped === null) {
+        fill.style.width = "0%";
+        fill.style.background = "linear-gradient(90deg, rgba(75,85,99,0.9), rgba(55,65,81,0.9))";
+        return;
+      }
+      fill.style.width = `${clamped}%`;
+      let colorMode = "amber";
+      if (scheme === "trend") {
+        if (clamped >= 75) colorMode = "green";
+        else if (clamped >= 45) colorMode = "amber";
+        else colorMode = "red";
+      } else { // conflict: lower is better
+        if (clamped <= 25) colorMode = "green";
+        else if (clamped <= 55) colorMode = "amber";
+        else colorMode = "red";
+      }
+      if (colorMode === "green") {
+        fill.style.background = "linear-gradient(90deg, rgba(34,197,94,0.95), rgba(20,184,166,0.95))";
+      } else if (colorMode === "amber") {
+        fill.style.background = "linear-gradient(90deg, rgba(245,158,11,0.95), rgba(251,191,36,0.95))";
+      } else {
+        fill.style.background = "linear-gradient(90deg, rgba(239,68,68,0.95), rgba(251,113,133,0.95))";
+      }
+    }
+
+    function renderBkmAI(aiWrap) {
+      const ai = (aiWrap && aiWrap.ai) ? aiWrap.ai : (aiWrap || {});
+      const protect = (aiWrap && typeof aiWrap.protective_lock === "object" && aiWrap.protective_lock) ? aiWrap.protective_lock : {};
+      const plan = (ai && typeof ai.plan === "object" && ai.plan) ? ai.plan : {};
+      const ctx = (ai && typeof ai.market_context === "object" && ai.market_context) ? ai.market_context : {};
+      const trend = (ctx && typeof ctx.trend === "object" && ctx.trend) ? ctx.trend : {};
+      const oc = (ctx && typeof ctx.option_chain === "object" && ctx.option_chain) ? ctx.option_chain : {};
+      const structure = (ctx && typeof ctx.structure === "object" && ctx.structure) ? ctx.structure : {};
+      const signalSummary = (plan && typeof plan.signal_summary === "object" && plan.signal_summary) ? plan.signal_summary : {};
+      const srPlan = (plan && typeof plan.support_resistance === "object" && plan.support_resistance) ? plan.support_resistance : {};
+      const action = ai.action || "—";
+      const severity = ai.severity || "INFO";
+      const score = Number.isFinite(Number(ai.score)) ? Number(ai.score).toFixed(1) : "—";
+      const confidence = Number.isFinite(Number(ai.confidence)) ? Math.round(Number(ai.confidence) * 100) + "%" : "—";
+      const marketBias = ai.market_bias || plan.market_bias || "NEUTRAL";
+      const riskSide = ai.position_risk_side || plan.position_risk_side || "—";
+      const nextCourse = plan.next_course || "No plan available.";
+      const protectMode = ["AUTO_PROTECT", "PROTECTIVE"].includes(String(ai.mode || plan.mode || "").toUpperCase());
+      const protectionEnabled = !(protect && protect.protection_enabled === false);
+      const entryLock = !!plan.entry_lock_active || (protectMode && !!protect.active);
+      const lockReason = plan.entry_lock_reason || protect.reason || null;
+      const pcrNear = (oc.pcr_near_atm !== undefined && oc.pcr_near_atm !== null) ? _fmtNum(oc.pcr_near_atm, 3) : "—";
+      const pcrTotal = (oc.pcr_total !== undefined && oc.pcr_total !== null) ? _fmtNum(oc.pcr_total, 3) : "—";
+      const tf5 = (trend.timeframes && trend.timeframes["5"]) ? trend.timeframes["5"] : {};
+      const tf15 = (trend.timeframes && trend.timeframes["15"]) ? trend.timeframes["15"] : {};
+      const tf60 = (trend.timeframes && trend.timeframes["60"]) ? trend.timeframes["60"] : {};
+      const callWallAbove = (oc && typeof oc.call_wall_above === "object" && oc.call_wall_above) ? oc.call_wall_above : {};
+      const putWallBelow = (oc && typeof oc.put_wall_below === "object" && oc.put_wall_below) ? oc.put_wall_below : {};
+      const intradaySupport = (srPlan && typeof srPlan.intraday_support === "object" && srPlan.intraday_support)
+        ? srPlan.intraday_support : ((structure && typeof structure.intraday_support === "object") ? structure.intraday_support : {});
+      const intradayResistance = (srPlan && typeof srPlan.intraday_resistance === "object" && srPlan.intraday_resistance)
+        ? srPlan.intraday_resistance : ((structure && typeof structure.intraday_resistance === "object") ? structure.intraday_resistance : {});
+      const weeklySupport = (srPlan.weekly_support ?? structure.weekly_support ?? null);
+      const weeklyResistance = (srPlan.weekly_resistance ?? structure.weekly_resistance ?? null);
+      const trendConfidenceScore = (signalSummary.trend_confidence ?? structure.trend_confidence ?? null);
+      const signalConflictScore = (signalSummary.signal_conflict_score ?? structure.signal_conflict_score ?? null);
+      const pcrUnbalanced = (signalSummary.pcr_unbalanced === true) || (structure.pcr_unbalanced === true);
+      const pcrUnbalancedSide = signalSummary.pcr_unbalanced_side || structure.pcr_unbalanced_side || "NEUTRAL";
+      const currentSpot = (ai.spot !== undefined && ai.spot !== null) ? Number(ai.spot) : (oc.spot !== undefined ? Number(oc.spot) : NaN);
+
+      const actionChip = document.getElementById("bkm-ai-chip-action");
+      const biasChip = document.getElementById("bkm-ai-chip-bias");
+      actionChip.textContent = `AI: ${action} (${score})`;
+      actionChip.style.color = severity === "CRITICAL" ? "var(--neg)" : (severity === "WARN" ? "#f59e0b" : "var(--muted)");
+      biasChip.textContent = `Bias: ${marketBias}`;
+
+      document.getElementById("bkm-ai-next-course").textContent = nextCourse;
+      const modeLabel = ai.mode || plan.mode || "—";
+      const protectSuffix = (protectMode && protect.active) ? ` | Session lock: ${protect.session_date || "today"}` : "";
+      const protectCtl = ` | AI entry protection: ${protectionEnabled ? "ON" : "OFF (today)"}`;
+      document.getElementById("bkm-ai-meta").textContent = `Mode: ${modeLabel} | Risk side: ${riskSide}${protectCtl}${protectSuffix}`;
+      document.getElementById("bkm-ai-signals").textContent =
+        `Bullish: ${signalSummary.bullish_signals ?? "—"} | Bearish: ${signalSummary.bearish_signals ?? "—"} | OI build: ${signalSummary.oi_build_bias || "—"}`;
+      document.getElementById("bkm-ai-trend").textContent =
+        `Trend: ${trend.bias || "—"} (${_fmtNum(trend.bias_score, 2)}) | Vol: ${trend.volatility_regime || "—"} | Breakout: ${trend.breakout_confirmation || "—"} | 5m:${tf5.pattern || "—"} 15m:${tf15.pattern || "—"} 1h:${tf60.pattern || "—"}`;
+      document.getElementById("bkm-ai-oi").textContent =
+        `PCR near: ${pcrNear} | PCR total: ${pcrTotal} | Call wall: ${callWallAbove.distance_from_spot ?? "—"} | Put wall: ${putWallBelow.distance_from_spot ?? "—"}`;
+      const idaySupTxt = (intradaySupport && intradaySupport.level != null) ? `${_fmtNum(intradaySupport.level, 0)} (${intradaySupport.source || "price"})` : "—";
+      const idayResTxt = (intradayResistance && intradayResistance.level != null) ? `${_fmtNum(intradayResistance.level, 0)} (${intradayResistance.source || "price"})` : "—";
+      const wkSupTxt = (weeklySupport !== null && weeklySupport !== undefined) ? _fmtNum(weeklySupport, 0) : "—";
+      const wkResTxt = (weeklyResistance !== null && weeklyResistance !== undefined) ? _fmtNum(weeklyResistance, 0) : "—";
+      document.getElementById("bkm-ai-structure").textContent =
+        `Intraday S/R: ${idaySupTxt} / ${idayResTxt} | Weekly S/R: ${wkSupTxt} / ${wkResTxt}`;
+      const trendConfPct = (trendConfidenceScore !== null && trendConfidenceScore !== undefined)
+        ? `${Math.round(Number(trendConfidenceScore) * 100)}%` : "—";
+      const conflictPct = (signalConflictScore !== null && signalConflictScore !== undefined)
+        ? `${Math.round(Number(signalConflictScore))}%` : "—";
+      const trendConfNum = (trendConfidenceScore !== null && trendConfidenceScore !== undefined) ? (Number(trendConfidenceScore) * 100) : null;
+      const conflictNumRaw = (signalConflictScore !== null && signalConflictScore !== undefined) ? Number(signalConflictScore) : null;
+      document.getElementById("bkm-ai-confidence").textContent =
+        `Trend confidence: ${trendConfPct} | Signal conflict: ${conflictPct}${pcrUnbalanced ? ` | PCR unbalanced: ${pcrUnbalancedSide}` : ""}`;
+      document.getElementById("bkm-ai-risk").textContent =
+        `Score: ${score} | Severity: ${severity} | Confidence: ${confidence}`;
+      document.getElementById("bkm-ai-lock").textContent =
+        `Entry lock: ${entryLock ? "ON" : "OFF"}${lockReason ? ` (${lockReason})` : ""}`;
+      document.getElementById("bkm-ai-lock").style.color = entryLock ? "var(--neg)" : "var(--muted)";
+      document.getElementById("bkm-ai-updated").textContent = `Updated: ${ai.updated_at || "—"}`;
+
+      const confHeadline = document.getElementById("bkm-ai-confidence-headline");
+      const srDistanceEl = document.getElementById("bkm-ai-sr-distance");
+      const conflictEl = document.getElementById("bkm-ai-conflict-reasons");
+      if (confHeadline) {
+        const domBias = signalSummary.dominant_signal_bias || structure.dominant_signal_bias || marketBias || "NEUTRAL";
+        confHeadline.textContent = `Trend confidence: ${trendConfPct} | Dominant bias: ${domBias} | Conflict: ${conflictPct}`;
+      }
+      if (srDistanceEl) {
+        const iSupLevel = (intradaySupport && intradaySupport.level != null) ? intradaySupport.level : null;
+        const iResLevel = (intradayResistance && intradayResistance.level != null) ? intradayResistance.level : null;
+        const wSupLevel = (weeklySupport !== null && weeklySupport !== undefined) ? weeklySupport : null;
+        const wResLevel = (weeklyResistance !== null && weeklyResistance !== undefined) ? weeklyResistance : null;
+        srDistanceEl.textContent =
+          `Intraday S: ${iSupLevel != null ? _fmtPtsFromSpot(iSupLevel, currentSpot) : "—"} | Intraday R: ${iResLevel != null ? _fmtPtsFromSpot(iResLevel, currentSpot) : "—"} | Weekly S/R: ${wSupLevel != null ? _fmtPtsFromSpot(wSupLevel, currentSpot) : "—"} / ${wResLevel != null ? _fmtPtsFromSpot(wResLevel, currentSpot) : "—"}`;
+      }
+      if (conflictEl) {
+        const conflictReasons = _buildAiConflictReasons({
+          structure,
+          trend,
+          signalSummary,
+          marketBias,
+        });
+        conflictEl.textContent = `Signal conflict reasons: ${conflictReasons.join(" ")}`;
+        const conflictNum = Number(signalConflictScore);
+        conflictEl.style.color = Number.isFinite(conflictNum) && conflictNum >= 60 ? "#f59e0b" : "var(--muted)";
+      }
+      _setAiMeter("bkm-ai-trend-meter-fill", "bkm-ai-trend-meter-value", trendConfNum, "trend");
+      _setAiMeter("bkm-ai-conflict-meter-fill", "bkm-ai-conflict-meter-value", conflictNumRaw, "conflict");
+
+      _setBkmAiProtectButtonState(protectionEnabled);
+    }
+
+    function renderIntradayAdvisor(wrap) {
+      const adv = (wrap && wrap.advisor) ? wrap.advisor : (wrap || {});
+      const rec = (adv && typeof adv.recommendation === "object" && adv.recommendation) ? adv.recommendation : {};
+      const signal = String(adv.signal || "NO_TRADE").toUpperCase();
+      const strategy = adv.strategy || rec.strategy_label || "—";
+      const bias = adv.market_bias || "NEUTRAL";
+      const conflict = (adv.signal_conflict_score !== undefined && adv.signal_conflict_score !== null)
+        ? `${Math.round(Number(adv.signal_conflict_score))}%`
+        : "—";
+      const trendConf = (adv.trend_confidence !== undefined && adv.trend_confidence !== null)
+        ? `${Math.round(Number(adv.trend_confidence) * 100)}%`
+        : "—";
+      const headline = rec.headline || rec.signal_text || "No signal yet";
+      const whatToEnter = rec.what_to_enter || "—";
+      const slText = (rec.sl && rec.sl.text) ? rec.sl.text : (rec.sl_text || "—");
+      const tpText = (rec.tp && rec.tp.text) ? rec.tp.text : (rec.tp_text || "—");
+      const holdText = (rec.hold && rec.hold.text) ? rec.hold.text : (rec.hold_text || "—");
+      const whyList = Array.isArray(rec.why) ? rec.why : [];
+      const whyText = whyList.length ? whyList.slice(0, 2).join(" ") : ((Array.isArray(adv.reasons) && adv.reasons.length) ? adv.reasons.slice(0, 2).join(", ") : "—");
+
+      const headlineEl = document.getElementById("intraday-ai-headline");
+      const metaEl = document.getElementById("intraday-ai-meta");
+      const whatEl = document.getElementById("intraday-ai-what");
+      const slEl = document.getElementById("intraday-ai-sl");
+      const tpEl = document.getElementById("intraday-ai-tp");
+      const holdEl = document.getElementById("intraday-ai-hold");
+      const whyEl = document.getElementById("intraday-ai-why");
+      const updatedEl = document.getElementById("intraday-ai-updated");
+
+      if (headlineEl) {
+        headlineEl.textContent = headline;
+        if (signal === "ENTER_NOW") headlineEl.style.color = "var(--pos)";
+        else if (signal === "WAIT") headlineEl.style.color = "#f59e0b";
+        else headlineEl.style.color = "var(--muted)";
+      }
+      if (metaEl) {
+        metaEl.textContent = `Signal: ${signal} | Strategy: ${strategy} | Bias: ${bias} | Trend: ${trendConf} | Conflict: ${conflict}`;
+      }
+      if (whatEl) whatEl.textContent = `What to enter: ${whatToEnter}`;
+      if (slEl) slEl.textContent = `${slText.startsWith("SL:") ? slText : `SL: ${slText}`}`;
+      if (tpEl) tpEl.textContent = `${tpText.startsWith("TP:") ? tpText : `TP: ${tpText}`}`;
+      if (holdEl) holdEl.textContent = `${holdText.startsWith("Hold") ? holdText : `Hold: ${holdText}`}`;
+      if (whyEl) whyEl.textContent = `Why: ${whyText}`;
+      if (updatedEl) updatedEl.textContent = `Updated: ${adv.updated_at || "—"}`;
     }
 
     async function loadState() {
@@ -718,7 +1136,13 @@
       if (inflight.live) return;
       inflight.live = true;
       try {
-        const data = await fetchJSON("/api/live_positions");
+        const [data, aiData, intradayAiData] = await Promise.all([
+          fetchJSON("/api/live_positions"),
+          fetchJSON("/api/bkm/ai_status").catch(() => ({ ok: false, ai: {} })),
+          fetchJSON("/api/intraday_ai/status").catch(() => ({ ok: false, advisor: {} })),
+        ]);
+      renderBkmAI(aiData);
+      renderIntradayAdvisor(intradayAiData);
       let openTotal = 0.0;
       upsertRows(
         "#live-legs-table tbody",
@@ -770,11 +1194,10 @@
       document.getElementById("live-closed-pnl").textContent = `Closed P&L: ${fmtMoney(closedTotal)}`;
       document.getElementById("live-closed-totalcell").textContent = fmtMoney(closedTotal);
 
-      // Summary: show MTM inclusive of closed + open
-      const combined = openTotal + closedTotal;
-      document.getElementById("live-pnl-total").textContent = fmtMoney(combined);
-      document.getElementById("live-pnl-total").classList.toggle("pos", combined > 0);
-      document.getElementById("live-pnl-total").classList.toggle("neg", combined < 0);
+      // Summary card is labeled "Open positions MTM", so keep it aligned to open legs only.
+      document.getElementById("live-pnl-total").textContent = fmtMoney(openTotal);
+      document.getElementById("live-pnl-total").classList.toggle("pos", openTotal > 0);
+      document.getElementById("live-pnl-total").classList.toggle("neg", openTotal < 0);
       document.getElementById("live-open-count").textContent = (data.positions || []).length;
       document.getElementById("live-margin-avail").textContent = data.margin_available ? fmtMoney(data.margin_available) : "—";
         document.getElementById("live-margin-used").textContent = data.margin_used ? fmtMoney(data.margin_used) : "—";
@@ -863,6 +1286,7 @@
     document.getElementById("test-telegram").addEventListener("click", testTelegram);
     document.getElementById("start-agent").addEventListener("click", startAgent);
     document.getElementById("stop-agent").addEventListener("click", stopAgent);
+    document.getElementById("bkm-ai-clear-lock").addEventListener("click", toggleBkmAiProtection);
     document.getElementById("paper-close-all").addEventListener("click", closePaperTrades);
 
     function pageVisible() {

@@ -49,6 +49,11 @@ EXECUTION_RECOVERY_STATUS_FILE = STATE_DIR / "execution_recovery_status.json"
 AGENT_HEARTBEAT_FILE = STATE_DIR / "agent_heartbeat.json"
 AGENT_ALERTS_FILE = STATE_DIR / "agent_alerts.jsonl"
 TELEGRAM_ALERT_STATUS_FILE = STATE_DIR / "telegram_alert_status.json"
+BATMAN_BKM_AI_STATUS_FILE = STATE_DIR / "batman_bkm_ai_status.json"
+BATMAN_BKM_AI_EVENTS_FILE = STATE_DIR / "batman_bkm_ai_events.jsonl"
+BATMAN_BKM_AI_PROTECT_STATUS_FILE = STATE_DIR / "batman_bkm_ai_protect_status.json"
+BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_FILE = STATE_DIR / "batman_bkm_ai_protect_clear_request.json"
+INTRADAY_AI_ADVISOR_STATUS_FILE = STATE_DIR / "intraday_ai_advisor_status.json"
 BLOTTER_FIELDS = [
     "timestamp",
     "trade_mode",
@@ -160,6 +165,61 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "batman_bkm_pretrade_enforce_delta_limit": False,
     "batman_bkm_pretrade_max_net_delta_abs": 5000.0,
     "batman_bkm_monitor_log_interval_sec": 20.0,
+    "batman_bkm_market_closed_park_enabled": True,
+    "batman_bkm_park_log_interval_sec": 300.0,
+    # Batman BKM AI trade management advisor (monitor/recommend only by default)
+    "batman_bkm_ai_enabled": True,
+    "batman_bkm_ai_mode": "ADVISOR",
+    "batman_bkm_ai_sample_window_sec": 600.0,
+    "batman_bkm_ai_open_grace_sec": 180.0,
+    "batman_bkm_ai_near_short_buffer_points": 200.0,
+    "batman_bkm_ai_velocity_warn_pts_per_min": 90.0,
+    "batman_bkm_ai_warn_score": 30.0,
+    "batman_bkm_ai_reduce_score": 55.0,
+    "batman_bkm_ai_flatten_score": 80.0,
+    "batman_bkm_ai_loss_ratio_warn": 0.50,
+    "batman_bkm_ai_loss_ratio_critical": 0.90,
+    "batman_bkm_ai_drawdown_ratio_warn": 0.60,
+    "batman_bkm_ai_drawdown_ratio_critical": 0.90,
+    "batman_bkm_ai_event_emit_min_interval_sec": 30.0,
+    "batman_bkm_ai_context_refresh_sec": 60.0,
+    "batman_bkm_ai_near_atm_oi_band_points": 500.0,
+    "batman_bkm_ai_pcr_bullish_threshold": 1.15,
+    "batman_bkm_ai_pcr_bearish_threshold": 0.85,
+    "batman_bkm_ai_trend_bias_threshold": 0.35,
+    "batman_bkm_ai_context_risk_score_cap": 20.0,
+    "batman_bkm_ai_protective_lock_min_action": "REDUCE_RISK",
+    "batman_bkm_ai_protective_watch_escalates_alert": True,
+    "batman_bkm_ai_protect_auto_unlock_enabled": True,
+    "batman_bkm_ai_protect_auto_unlock_stable_sec": 1200.0,
+    "batman_bkm_ai_protect_auto_unlock_max_score": 18.0,
+    "batman_bkm_ai_protect_auto_unlock_require_action": "HOLD",
+    "batman_bkm_ai_protect_auto_unlock_market_hours_only": True,
+    "batman_bkm_ai_protect_auto_unlock_require_clean_system": True,
+    # Intraday option-selling advisor (Phase A: advisory-only)
+    "intraday_ai_enabled": True,
+    "intraday_ai_refresh_sec": 60.0,
+    "intraday_ai_market_open_time": "09:15",
+    "intraday_ai_entry_not_before": "09:25",
+    "intraday_ai_last_new_entry_time": "14:20",
+    "intraday_ai_max_hold_till": "15:05",
+    "intraday_ai_allow_parallel_with_bkm": False,
+    "intraday_ai_no_trade_conflict_threshold": 60.0,
+    "intraday_ai_directional_max_conflict": 50.0,
+    "intraday_ai_range_max_conflict": 35.0,
+    "intraday_ai_directional_min_trend_confidence": 0.62,
+    "intraday_ai_range_max_trend_confidence": 0.58,
+    "intraday_ai_min_sr_distance_points": 160.0,
+    "intraday_ai_sr_safety_buffer_points": 80.0,
+    "intraday_ai_fallback_otm_buffer_points": 220.0,
+    "intraday_ai_spread_width_points_low_vol": 150,
+    "intraday_ai_spread_width_points_normal_vol": 200,
+    "intraday_ai_spread_width_points_high_vol": 250,
+    "intraday_ai_ic_target_capture_pct": 0.30,
+    "intraday_ai_spread_target_capture_pct": 0.40,
+    "intraday_ai_ic_stop_credit_multiple": 1.8,
+    "intraday_ai_spread_stop_credit_multiple": 1.6,
+    "intraday_ai_min_credit_per_set_rs": 500.0,
     # Batman BKM live rollout gate
     "live_gate_enabled": True,
     "live_probation_sessions": 10,
@@ -199,6 +259,14 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "telegram_alert_max_message_chars": 3000,
     "telegram_alert_failure_backoff_sec": 30.0,
     "telegram_alert_disable_link_preview": True,
+    "telegram_trade_summary_enabled": True,
+    "telegram_trade_summary_interval_sec": 900.0,
+    "telegram_trade_summary_market_hours_only": True,
+    "telegram_market_close_summary_enabled": True,
+    "telegram_market_close_summary_not_before": "15:32",
+    "telegram_ai_lock_change_enabled": True,
+    "telegram_intraday_signal_enabled": True,
+    "telegram_intraday_signal_market_hours_only": True,
     "gap_entry_threshold": 0.004,
     "iv_floor_percentile": 0.2,
     "short_lots": 1,
@@ -286,6 +354,14 @@ from market_ai.modules.agents.ops_monitor import (
 from market_ai.modules.agents.telegram_alerts import (
     TelegramAlertForwarder,
     TelegramAlertConfig,
+)
+from market_ai.modules.agents.batman_bkm_ai_manager import (
+    BatmanBKMAIManager,
+    BatmanBKMAIConfig,
+)
+from market_ai.modules.agents.intraday_option_selling_advisor import (
+    IntradayOptionSellingAdvisor,
+    IntradayOptionSellingAdvisorConfig,
 )
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -1533,6 +1609,134 @@ def _is_india_market_open(now: Optional[datetime] = None) -> bool:
     return start <= current.time() <= end
 
 
+def _default_bkm_ai_protect_status(now: Optional[datetime] = None) -> Dict[str, Any]:
+    ts = now or _ist_now()
+    return {
+        "status": "UNLOCKED",
+        "active": False,
+        "protection_enabled": True,
+        "session_date": ts.date().isoformat(),
+        "reason": None,
+        "source_action": None,
+        "score": None,
+        "expiry": None,
+        "updated_at": ts.isoformat(timespec="seconds"),
+        "last_transition_at": ts.isoformat(timespec="seconds"),
+    }
+
+
+def _load_bkm_ai_protect_status(now: Optional[datetime] = None) -> Dict[str, Any]:
+    default = _default_bkm_ai_protect_status(now)
+    try:
+        if not BATMAN_BKM_AI_PROTECT_STATUS_FILE.exists():
+            return default
+        payload = json.loads(BATMAN_BKM_AI_PROTECT_STATUS_FILE.read_text())
+        if not isinstance(payload, dict):
+            return default
+        out = dict(default)
+        out.update(payload)
+        out["active"] = bool(out.get("active", False))
+        out["protection_enabled"] = bool(out.get("protection_enabled", True))
+        out["status"] = "LOCKED" if out["active"] else "UNLOCKED"
+        return out
+    except Exception:
+        return default
+
+
+def _save_bkm_ai_protect_status(payload: Dict[str, Any]) -> None:
+    try:
+        BATMAN_BKM_AI_PROTECT_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        BATMAN_BKM_AI_PROTECT_STATUS_FILE.write_text(json.dumps(payload, indent=2, default=str))
+    except Exception:
+        log.exception("[BatmanBKM-AI] failed to persist protect status")
+
+
+def _set_bkm_ai_protect_lock(
+    *,
+    active: bool,
+    now: Optional[datetime] = None,
+    reason: Optional[str] = None,
+    source_action: Optional[str] = None,
+    score: Optional[float] = None,
+    expiry: Optional[str] = None,
+    protection_enabled: Optional[bool] = None,
+) -> Dict[str, Any]:
+    ts = now or _ist_now()
+    existing = _load_bkm_ai_protect_status(ts)
+    session_date = ts.date().isoformat()
+    changed = bool(existing.get("active")) != bool(active) or str(existing.get("session_date") or "") != session_date
+    payload = {
+        "status": "LOCKED" if active else "UNLOCKED",
+        "active": bool(active),
+        "protection_enabled": bool(existing.get("protection_enabled", True) if protection_enabled is None else protection_enabled),
+        "session_date": session_date,
+        "reason": reason if active else None,
+        "source_action": source_action if active else None,
+        "score": (None if score is None else round(float(score), 2)),
+        "expiry": expiry if active else None,
+        "updated_at": ts.isoformat(timespec="seconds"),
+        "last_transition_at": (ts.isoformat(timespec="seconds") if changed else existing.get("last_transition_at") or ts.isoformat(timespec="seconds")),
+    }
+    _save_bkm_ai_protect_status(payload)
+    return payload
+
+
+def _set_bkm_ai_protect_enabled(
+    *,
+    enabled: bool,
+    now: Optional[datetime] = None,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    ts = now or _ist_now()
+    existing = _load_bkm_ai_protect_status(ts)
+    # Disabling protection also clears any active entry lock immediately for the session.
+    active = bool(existing.get("active", False)) if enabled else False
+    payload = _set_bkm_ai_protect_lock(
+        active=active,
+        now=ts,
+        reason=(existing.get("reason") if active else None),
+        source_action=(existing.get("source_action") if active else None),
+        score=existing.get("score"),
+        expiry=existing.get("expiry"),
+        protection_enabled=bool(enabled),
+    )
+    payload["protection_note"] = str(note or "")
+    _save_bkm_ai_protect_status(payload)
+    return payload
+
+
+def _restore_bkm_ai_protect_lock_for_session(now: Optional[datetime] = None) -> Dict[str, Any]:
+    ts = now or _ist_now()
+    payload = _load_bkm_ai_protect_status(ts)
+    if str(payload.get("session_date") or "") != ts.date().isoformat():
+        # Session rollover: automatically clear previous-day protective lock.
+        payload = _set_bkm_ai_protect_lock(active=False, now=ts, protection_enabled=True)
+    return payload
+
+
+def _consume_bkm_ai_protect_clear_request() -> Optional[Dict[str, Any]]:
+    try:
+        if not BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_FILE.exists():
+            return None
+        raw = BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_FILE.read_text()
+        payload = json.loads(raw) if raw else {}
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+    try:
+        BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_FILE.unlink(missing_ok=True)  # type: ignore[arg-type]
+    except TypeError:
+        try:
+            if BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_FILE.exists():
+                BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_FILE.unlink()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return payload or {}
+
+
 def _looks_like_chain_dict(obj: Any) -> bool:
     if not isinstance(obj, dict):
         return False
@@ -1731,7 +1935,8 @@ def _map_positions(rows: list) -> List[OptionLeg]:
 def _map_chain(chain_raw: Any, expiry, symbol: str, spot: float = 0.0) -> List[dict]:
     """
     Normalize a raw DHAN option chain response into a list of rows with:
-      expiry, option_type ("CE"/"PE"), strike, ltp, delta, security_id, spot.
+      expiry, option_type ("CE"/"PE"), strike, ltp, delta, security_id, spot,
+      oi, oi_change, volume.
 
     Supports both legacy and v2 /v2/optionchain shapes by delegating to
     _coerce_chain_dict, which walks through 'data'/'oc'/etc.
@@ -1742,6 +1947,16 @@ def _map_chain(chain_raw: Any, expiry, symbol: str, spot: float = 0.0) -> List[d
         return rows
 
     expiry_str = expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry)
+
+    def _as_float(*values: Any) -> Optional[float]:
+        for v in values:
+            if v in (None, "", "-", "--"):
+                continue
+            try:
+                return float(v)
+            except Exception:
+                continue
+        return None
 
     for strike, legs in chain_dict.items():
         if not isinstance(legs, dict):
@@ -1774,6 +1989,26 @@ def _map_chain(chain_raw: Any, expiry, symbol: str, spot: float = 0.0) -> List[d
                 or opt_data.get("LTP")
                 or opt_data.get("close")
             )
+            oi = _as_float(
+                opt_data.get("oi"),
+                opt_data.get("open_interest"),
+                opt_data.get("openInterest"),
+                opt_data.get("OI"),
+            )
+            oi_change = _as_float(
+                opt_data.get("oi_change"),
+                opt_data.get("oiChange"),
+                opt_data.get("open_interest_change"),
+                opt_data.get("changeInOpenInterest"),
+                opt_data.get("changeinOpenInterest"),
+                opt_data.get("change_in_oi"),
+            )
+            volume = _as_float(
+                opt_data.get("volume"),
+                opt_data.get("Volume"),
+                opt_data.get("tradeVolume"),
+                opt_data.get("totalTradedVolume"),
+            )
 
             rows.append(
                 {
@@ -1784,6 +2019,9 @@ def _map_chain(chain_raw: Any, expiry, symbol: str, spot: float = 0.0) -> List[d
                     "delta": greeks.get("delta") or opt_data.get("delta"),
                     "spot": spot,
                     "security_id": sec_id,
+                    "oi": oi,
+                    "oi_change": oi_change,
+                    "volume": volume,
                 }
             )
     return rows
@@ -1815,6 +2053,572 @@ def _update_leg_ltps_from_chain(legs: List[OptionLeg], chain_rows: List[dict]) -
                 leg.current_ltp = ltp
         except Exception:
             continue
+
+
+def _classify_trend_from_candles(candles: List[dict], *, interval_min: int) -> Dict[str, Any]:
+    rows = [c for c in (candles or []) if c]
+    rows = sorted(rows, key=lambda c: c.get("timestamp") or datetime.min)
+    closes = [float(c.get("close") or 0.0) for c in rows if c.get("close") not in (None, "")]
+    highs = [float(c.get("high") or c.get("close") or 0.0) for c in rows if c.get("high") is not None or c.get("close") is not None]
+    lows = [float(c.get("low") or c.get("close") or 0.0) for c in rows if c.get("low") is not None or c.get("close") is not None]
+    vols = [float(c.get("volume") or 0.0) for c in rows if c.get("volume") not in (None, "")]
+    if len(closes) < 2:
+        return {
+            "interval_min": interval_min,
+            "trend": "UNKNOWN",
+            "pattern": "UNKNOWN",
+            "bars": len(closes),
+            "change_points": None,
+            "change_pct": None,
+            "range_points": None,
+            "close_position_in_range": None,
+            "dir_score": 0.0,
+            "support": None,
+            "resistance": None,
+            "distance_to_support": None,
+            "distance_to_resistance": None,
+            "atr_like_points": None,
+            "atr_like_pct": None,
+            "volatility_regime": "UNKNOWN",
+            "breakout_dir": "NONE",
+            "breakout_confirmed": False,
+        }
+
+    lookback = min(len(closes), 12 if interval_min <= 5 else (10 if interval_min <= 15 else 8))
+    window = closes[-lookback:]
+    window_vols = vols[-lookback:] if vols else []
+    first_close = float(window[0])
+    last_close = float(window[-1])
+    change_points = last_close - first_close
+    change_pct = (change_points / max(1.0, abs(first_close))) * 100.0
+    window_high = max(highs[-lookback:]) if highs else max(window)
+    window_low = min(lows[-lookback:]) if lows else min(window)
+    range_points = max(0.0, float(window_high - window_low))
+    close_pos = None
+    if range_points > 0:
+        close_pos = (last_close - window_low) / range_points
+
+    # Simple support/resistance and range-position features.
+    support = round(float(window_low), 2)
+    resistance = round(float(window_high), 2)
+    dist_support = max(0.0, float(last_close - window_low))
+    dist_resistance = max(0.0, float(window_high - last_close))
+
+    # ATR-like volatility proxy from average bar range in the lookback window.
+    bar_ranges: List[float] = []
+    for candle in rows[-lookback:]:
+        try:
+            h = float(candle.get("high") or candle.get("close") or 0.0)
+            l = float(candle.get("low") or candle.get("close") or 0.0)
+            bar_ranges.append(max(0.0, h - l))
+        except Exception:
+            continue
+    atr_like_points = (sum(bar_ranges) / len(bar_ranges)) if bar_ranges else 0.0
+    atr_like_pct = ((atr_like_points / max(1.0, abs(last_close))) * 100.0) if last_close else 0.0
+    if atr_like_pct >= (0.32 if interval_min <= 5 else (0.45 if interval_min <= 15 else 0.65)):
+        vol_regime = "HIGH"
+    elif atr_like_pct <= (0.14 if interval_min <= 5 else (0.20 if interval_min <= 15 else 0.30)):
+        vol_regime = "LOW"
+    else:
+        vol_regime = "NORMAL"
+
+    # Breakout confirmation vs prior window extremes, optionally confirmed by volume expansion.
+    breakout_dir = "NONE"
+    breakout_confirmed = False
+    if len(window) >= 3:
+        prior_high = max(window[:-1])
+        prior_low = min(window[:-1])
+        vol_avg = (sum(window_vols[:-1]) / len(window_vols[:-1])) if len(window_vols) >= 2 else 0.0
+        vol_last = float(window_vols[-1]) if window_vols else 0.0
+        vol_confirm = True if vol_avg <= 0 else (vol_last >= (1.15 * vol_avg))
+        if last_close > prior_high:
+            breakout_dir = "UP"
+            breakout_confirmed = bool(vol_confirm)
+        elif last_close < prior_low:
+            breakout_dir = "DOWN"
+            breakout_confirmed = bool(vol_confirm)
+
+    # Practical thresholds tuned by timeframe for simple trend/pattern labeling.
+    trend_threshold_pct = 0.10 if interval_min <= 5 else (0.18 if interval_min <= 15 else 0.28)
+    trend = "RANGE"
+    if change_pct >= trend_threshold_pct:
+        trend = "UP"
+    elif change_pct <= -trend_threshold_pct:
+        trend = "DOWN"
+
+    pattern = "RANGE"
+    if trend == "UP":
+        pattern = "UPTREND" if (close_pos is not None and close_pos >= 0.65) else "UP_BIAS"
+    elif trend == "DOWN":
+        pattern = "DOWNTREND" if (close_pos is not None and close_pos <= 0.35) else "DOWN_BIAS"
+
+    dir_score = 1.0 if trend == "UP" else (-1.0 if trend == "DOWN" else 0.0)
+    if trend == "RANGE" and close_pos is not None:
+        # Preserve a small directional bias inside range.
+        dir_score = round((close_pos - 0.5) * 0.6, 3)
+
+    return {
+        "interval_min": interval_min,
+        "trend": trend,
+        "pattern": pattern,
+        "bars": len(window),
+        "change_points": round(float(change_points), 2),
+        "change_pct": round(float(change_pct), 3),
+        "range_points": round(float(range_points), 2),
+        "close_position_in_range": None if close_pos is None else round(float(close_pos), 3),
+        "dir_score": round(float(dir_score), 3),
+        "close": round(float(last_close), 2),
+        "support": support,
+        "resistance": resistance,
+        "distance_to_support": round(float(dist_support), 2),
+        "distance_to_resistance": round(float(dist_resistance), 2),
+        "atr_like_points": round(float(atr_like_points), 2),
+        "atr_like_pct": round(float(atr_like_pct), 3),
+        "volatility_regime": vol_regime,
+        "breakout_dir": breakout_dir,
+        "breakout_confirmed": bool(breakout_confirmed),
+    }
+
+
+def _build_bkm_mtf_trend_context(dw: DhanWrapper, *, trade_day: dt_date) -> Dict[str, Any]:
+    per_tf: Dict[str, Dict[str, Any]] = {}
+    weighted_sum = 0.0
+    weighted_denom = 0.0
+    errors: List[str] = []
+    high_vol_votes = 0
+    low_vol_votes = 0
+    breakout_votes: List[str] = []
+    for interval, weight in ((5, 1.0), (15, 2.0), (60, 3.0)):
+        try:
+            candles = _cached_intraday_for_day(dw, trade_day, interval)
+        except Exception as exc:
+            per_tf[str(interval)] = {
+                "interval_min": interval,
+                "trend": "UNKNOWN",
+                "pattern": "UNKNOWN",
+                "error": str(exc),
+            }
+            errors.append(f"{interval}m:{exc}")
+            continue
+        snap = _classify_trend_from_candles(candles, interval_min=interval)
+        per_tf[str(interval)] = snap
+        try:
+            weighted_sum += float(snap.get("dir_score") or 0.0) * weight
+            weighted_denom += weight
+        except Exception:
+            continue
+        if str(snap.get("volatility_regime") or "").upper() == "HIGH":
+            high_vol_votes += 1
+        elif str(snap.get("volatility_regime") or "").upper() == "LOW":
+            low_vol_votes += 1
+        if bool(snap.get("breakout_confirmed")):
+            breakout_votes.append(str(snap.get("breakout_dir") or "NONE").upper())
+    bias_score = (weighted_sum / weighted_denom) if weighted_denom > 0 else 0.0
+    bias = "NEUTRAL"
+    if bias_score >= 0.35:
+        bias = "BULLISH"
+    elif bias_score <= -0.35:
+        bias = "BEARISH"
+    volatility_regime = "NORMAL"
+    if high_vol_votes >= 2:
+        volatility_regime = "HIGH"
+    elif low_vol_votes >= 2:
+        volatility_regime = "LOW"
+    breakout_confirmation = "NONE"
+    if breakout_votes:
+        up = sum(1 for b in breakout_votes if b == "UP")
+        down = sum(1 for b in breakout_votes if b == "DOWN")
+        if up > down and up >= 1:
+            breakout_confirmation = "UP_CONFIRMED"
+        elif down > up and down >= 1:
+            breakout_confirmation = "DOWN_CONFIRMED"
+    return {
+        "timeframes": per_tf,
+        "bias_score": round(float(bias_score), 3),
+        "bias": bias,
+        "volatility_regime": volatility_regime,
+        "breakout_confirmation": breakout_confirmation,
+        "errors": errors,
+    }
+
+
+def _build_bkm_structure_confidence_context(
+    *,
+    spot: float,
+    trend_ctx: Optional[Dict[str, Any]],
+    oc_ctx: Optional[Dict[str, Any]],
+    daily_candles: Optional[List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    trend_ctx = trend_ctx if isinstance(trend_ctx, dict) else {}
+    oc_ctx = oc_ctx if isinstance(oc_ctx, dict) else {}
+    tf_map = trend_ctx.get("timeframes") if isinstance(trend_ctx.get("timeframes"), dict) else {}
+    spot_f = float(spot or 0.0)
+
+    def _f(val: Any) -> Optional[float]:
+        if val in (None, "", "-", "--"):
+            return None
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    def _pick_nearest_support(cands: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        below = [c for c in cands if _f(c.get("level")) is not None and float(c["level"]) <= spot_f]
+        pool = below if below else [c for c in cands if _f(c.get("level")) is not None]
+        pool = sorted(pool, key=lambda c: abs(spot_f - float(c["level"])))
+        first = pool[0] if pool else None
+        second = pool[1] if len(pool) > 1 else None
+        return first, second
+
+    def _pick_nearest_resistance(cands: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        above = [c for c in cands if _f(c.get("level")) is not None and float(c["level"]) >= spot_f]
+        pool = above if above else [c for c in cands if _f(c.get("level")) is not None]
+        pool = sorted(pool, key=lambda c: abs(float(c["level"]) - spot_f))
+        first = pool[0] if pool else None
+        second = pool[1] if len(pool) > 1 else None
+        return first, second
+
+    def _level_payload(item: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        lvl = _f((item or {}).get("level"))
+        dist = None
+        if lvl is not None and spot_f > 0:
+            dist = abs(lvl - spot_f)
+        return {
+            "level": None if lvl is None else round(lvl, 2),
+            "source": (item or {}).get("source"),
+            "strength": (item or {}).get("strength"),
+            "distance_from_spot": None if dist is None else round(float(dist), 2),
+        }
+
+    intraday_support_cands: List[Dict[str, Any]] = []
+    intraday_resistance_cands: List[Dict[str, Any]] = []
+    for tf_key, tf_weight in (("5", 1.0), ("15", 1.5), ("60", 2.0)):
+        tf = tf_map.get(tf_key) if isinstance(tf_map.get(tf_key), dict) else {}
+        sup = _f(tf.get("support"))
+        res = _f(tf.get("resistance"))
+        if sup is not None:
+            intraday_support_cands.append({"level": sup, "source": f"{tf_key}m_price", "strength": tf_weight})
+        if res is not None:
+            intraday_resistance_cands.append({"level": res, "source": f"{tf_key}m_price", "strength": tf_weight})
+
+    put_wall_below = oc_ctx.get("put_wall_below") if isinstance(oc_ctx.get("put_wall_below"), dict) else {}
+    call_wall_above = oc_ctx.get("call_wall_above") if isinstance(oc_ctx.get("call_wall_above"), dict) else {}
+    put_wall = oc_ctx.get("put_wall") if isinstance(oc_ctx.get("put_wall"), dict) else {}
+    call_wall = oc_ctx.get("call_wall") if isinstance(oc_ctx.get("call_wall"), dict) else {}
+
+    for wall, src, strength in (
+        (put_wall_below, "oi_put_wall_below", 2.5),
+        (put_wall, "oi_put_wall", 1.5),
+    ):
+        lvl = _f(wall.get("strike"))
+        if lvl is not None:
+            intraday_support_cands.append({"level": lvl, "source": src, "strength": strength})
+    for wall, src, strength in (
+        (call_wall_above, "oi_call_wall_above", 2.5),
+        (call_wall, "oi_call_wall", 1.5),
+    ):
+        lvl = _f(wall.get("strike"))
+        if lvl is not None:
+            intraday_resistance_cands.append({"level": lvl, "source": src, "strength": strength})
+
+    intraday_support_1, intraday_support_2 = _pick_nearest_support(intraday_support_cands)
+    intraday_res_1, intraday_res_2 = _pick_nearest_resistance(intraday_resistance_cands)
+
+    # Weekly structure from recent daily candles (trading days).
+    dc = [c for c in (daily_candles or []) if isinstance(c, dict)]
+    daily_rows: List[Dict[str, Any]] = []
+    for c in dc:
+        try:
+            daily_rows.append(
+                {
+                    "open": float(c.get("open") or 0.0),
+                    "high": float(c.get("high") or c.get("open") or 0.0),
+                    "low": float(c.get("low") or c.get("open") or 0.0),
+                    "close": float(c.get("close") or c.get("open") or 0.0),
+                }
+            )
+        except Exception:
+            continue
+    weekly_window = daily_rows[-5:] if len(daily_rows) >= 5 else daily_rows
+    weekly_support = min((r["low"] for r in weekly_window), default=None)
+    weekly_resistance = max((r["high"] for r in weekly_window), default=None)
+    weekly_mid = None
+    if weekly_support is not None and weekly_resistance is not None:
+        weekly_mid = (float(weekly_support) + float(weekly_resistance)) / 2.0
+    weekly_close = weekly_window[-1]["close"] if weekly_window else None
+    weekly_bias = "UNKNOWN"
+    if weekly_window and len(weekly_window) >= 2:
+        first_close = float(weekly_window[0]["close"])
+        last_close = float(weekly_window[-1]["close"])
+        move = last_close - first_close
+        move_pct = (move / max(1.0, abs(first_close))) * 100.0
+        if move_pct >= 0.35:
+            weekly_bias = "BULLISH"
+        elif move_pct <= -0.35:
+            weekly_bias = "BEARISH"
+        else:
+            weekly_bias = "RANGE"
+
+    # Directional signal alignment / conflict using trend + PCR + OI build + breakout.
+    def _vote_from_label(label: str, bullish_tokens: Tuple[str, ...], bearish_tokens: Tuple[str, ...]) -> int:
+        text = str(label or "").upper()
+        if any(tok in text for tok in bullish_tokens):
+            return 1
+        if any(tok in text for tok in bearish_tokens):
+            return -1
+        return 0
+
+    trend_vote = _vote_from_label(trend_ctx.get("bias"), ("BULL",), ("BEAR",))
+    pcr_vote = _vote_from_label(oc_ctx.get("pcr_bias"), ("BULL",), ("BEAR",))
+    oi_build = oc_ctx.get("oi_build") if isinstance(oc_ctx.get("oi_build"), dict) else {}
+    oi_build_vote = _vote_from_label(oi_build.get("bias"), ("BULL", "SUPPORT"), ("BEAR", "RESISTANCE"))
+    breakout_vote = _vote_from_label(trend_ctx.get("breakout_confirmation"), ("UP", "BULL"), ("DOWN", "BEAR"))
+    weekly_vote = _vote_from_label(weekly_bias, ("BULL",), ("BEAR",))
+
+    votes = {
+        "trend": trend_vote,
+        "pcr": pcr_vote,
+        "oi_build": oi_build_vote,
+        "breakout": breakout_vote,
+        "weekly": weekly_vote,
+    }
+    non_zero_votes = [v for v in votes.values() if v != 0]
+    bullish_votes = sum(1 for v in non_zero_votes if v > 0)
+    bearish_votes = sum(1 for v in non_zero_votes if v < 0)
+    known_votes = len(non_zero_votes)
+    dominant_votes = max(bullish_votes, bearish_votes) if known_votes else 0
+    conflict_votes = max(0, known_votes - dominant_votes)
+    conflict_ratio = (conflict_votes / known_votes) if known_votes else 0.0
+    trend_bias_score = abs(float(_f(trend_ctx.get("bias_score")) or 0.0))
+    base_conf = (dominant_votes / known_votes) if known_votes else 0.0
+    trend_confidence = (0.55 * base_conf) + (0.25 * min(1.0, trend_bias_score)) + (0.20 * (1.0 - conflict_ratio))
+
+    pcr_total = _f(oc_ctx.get("pcr_total"))
+    pcr_near = _f(oc_ctx.get("pcr_near_atm"))
+    pcr_unbalanced = False
+    pcr_unbalanced_side = "NEUTRAL"
+    pcr_extreme = None
+    for val in [pcr_near, pcr_total]:
+        if val is None:
+            continue
+        if pcr_extreme is None or abs(val - 1.0) > abs(pcr_extreme - 1.0):
+            pcr_extreme = val
+    if pcr_extreme is not None:
+        if pcr_extreme >= 1.30:
+            pcr_unbalanced = True
+            pcr_unbalanced_side = "BULLISH"
+            trend_confidence += 0.05 if bullish_votes >= bearish_votes else -0.05
+        elif pcr_extreme <= 0.70:
+            pcr_unbalanced = True
+            pcr_unbalanced_side = "BEARISH"
+            trend_confidence += 0.05 if bearish_votes >= bullish_votes else -0.05
+
+    # OI/price S-R alignment improves confidence slightly when walls align with price levels.
+    sr_alignment_hits = 0
+    for a, b in (
+        (intraday_support_1, {"level": _f(put_wall_below.get("strike"))}),
+        (intraday_res_1, {"level": _f(call_wall_above.get("strike"))}),
+    ):
+        la = _f((a or {}).get("level"))
+        lb = _f((b or {}).get("level"))
+        if la is not None and lb is not None and abs(la - lb) <= 100.0:
+            sr_alignment_hits += 1
+    if sr_alignment_hits:
+        trend_confidence += 0.03 * sr_alignment_hits
+
+    vol_regime = str(trend_ctx.get("volatility_regime") or "NORMAL").upper()
+    if vol_regime == "HIGH" and conflict_ratio > 0.25:
+        trend_confidence -= 0.06
+    trend_confidence = max(0.05, min(0.98, trend_confidence))
+
+    signal_conflict_score = max(0.0, min(100.0, (conflict_ratio * 100.0)))
+    if known_votes >= 3 and bullish_votes > 0 and bearish_votes > 0:
+        signal_conflict_score = min(100.0, signal_conflict_score + 10.0)
+    signal_conflict_score = round(signal_conflict_score, 1)
+
+    dominant_bias = "NEUTRAL"
+    if bullish_votes > bearish_votes and bullish_votes >= 2:
+        dominant_bias = "BULLISH"
+    elif bearish_votes > bullish_votes and bearish_votes >= 2:
+        dominant_bias = "BEARISH"
+
+    return {
+        "intraday_support": _level_payload(intraday_support_1),
+        "intraday_support_secondary": _level_payload(intraday_support_2),
+        "intraday_resistance": _level_payload(intraday_res_1),
+        "intraday_resistance_secondary": _level_payload(intraday_res_2),
+        "weekly_support": None if weekly_support is None else round(float(weekly_support), 2),
+        "weekly_resistance": None if weekly_resistance is None else round(float(weekly_resistance), 2),
+        "weekly_mid": None if weekly_mid is None else round(float(weekly_mid), 2),
+        "weekly_close": None if weekly_close is None else round(float(weekly_close), 2),
+        "weekly_bias": weekly_bias,
+        "weekly_window_days": len(weekly_window),
+        "trend_confidence": round(float(trend_confidence), 3),
+        "signal_conflict_score": signal_conflict_score,
+        "dominant_signal_bias": dominant_bias,
+        "votes": votes,
+        "bullish_votes": bullish_votes,
+        "bearish_votes": bearish_votes,
+        "known_votes": known_votes,
+        "conflict_votes": conflict_votes,
+        "pcr_unbalanced": bool(pcr_unbalanced),
+        "pcr_unbalanced_side": pcr_unbalanced_side,
+        "pcr_extreme": None if pcr_extreme is None else round(float(pcr_extreme), 3),
+        "sr_alignment_hits": sr_alignment_hits,
+        "volatility_regime": vol_regime,
+    }
+
+
+def _summarize_bkm_option_chain_context(
+    chain_rows: List[dict],
+    *,
+    spot: float,
+    near_atm_band_points: float = 500.0,
+    prev_oi_by_key: Optional[Dict[Tuple[str, float], float]] = None,
+) -> Tuple[Dict[str, Any], Dict[Tuple[str, float], float]]:
+    rows = [r for r in (chain_rows or []) if isinstance(r, dict)]
+    ce_rows: List[dict] = []
+    pe_rows: List[dict] = []
+    current_oi_map: Dict[Tuple[str, float], float] = {}
+
+    def _fv(val: Any) -> Optional[float]:
+        if val in (None, "", "-", "--"):
+            return None
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    for r in rows:
+        opt = str(r.get("option_type") or "").upper()
+        strike = _fv(r.get("strike"))
+        oi = _fv(r.get("oi"))
+        if opt not in {"CE", "PE"} or strike is None:
+            continue
+        row = dict(r)
+        row["strike"] = strike
+        row["oi"] = oi
+        row["oi_change"] = _fv(r.get("oi_change"))
+        if oi is not None:
+            current_oi_map[(opt, float(strike))] = float(oi)
+        if opt == "CE":
+            ce_rows.append(row)
+        else:
+            pe_rows.append(row)
+
+    def _sum_oi(items: List[dict]) -> float:
+        return sum(float(x.get("oi") or 0.0) for x in items if x.get("oi") is not None)
+
+    total_call_oi = _sum_oi(ce_rows)
+    total_put_oi = _sum_oi(pe_rows)
+    pcr_total = (total_put_oi / total_call_oi) if total_call_oi > 0 else None
+
+    band = max(100.0, float(near_atm_band_points))
+    near_ce = [r for r in ce_rows if abs(float(r.get("strike") or 0.0) - float(spot or 0.0)) <= band]
+    near_pe = [r for r in pe_rows if abs(float(r.get("strike") or 0.0) - float(spot or 0.0)) <= band]
+    near_call_oi = _sum_oi(near_ce)
+    near_put_oi = _sum_oi(near_pe)
+    pcr_near = (near_put_oi / near_call_oi) if near_call_oi > 0 else None
+
+    def _max_oi_row(items: List[dict]) -> Optional[dict]:
+        with_oi = [r for r in items if r.get("oi") is not None]
+        if not with_oi:
+            return None
+        try:
+            return max(with_oi, key=lambda x: float(x.get("oi") or 0.0))
+        except Exception:
+            return None
+
+    call_wall = _max_oi_row(ce_rows)
+    put_wall = _max_oi_row(pe_rows)
+    call_wall_above = _max_oi_row([r for r in ce_rows if float(r.get("strike") or 0.0) >= float(spot or 0.0)])
+    put_wall_below = _max_oi_row([r for r in pe_rows if float(r.get("strike") or 0.0) <= float(spot or 0.0)])
+
+    # OI build-up: prefer explicit oi_change from chain; else derive from previous snapshot.
+    near_call_oi_delta = 0.0
+    near_put_oi_delta = 0.0
+    oi_delta_points = 0
+    for r in near_ce + near_pe:
+        opt = str(r.get("option_type") or "").upper()
+        strike = float(r.get("strike") or 0.0)
+        oi_change = _fv(r.get("oi_change"))
+        if oi_change is None and prev_oi_by_key:
+            cur_oi = _fv(r.get("oi"))
+            prev_oi = prev_oi_by_key.get((opt, strike))
+            if cur_oi is not None and prev_oi is not None:
+                oi_change = float(cur_oi) - float(prev_oi)
+        if oi_change is None:
+            continue
+        oi_delta_points += 1
+        if opt == "CE":
+            near_call_oi_delta += float(oi_change)
+        elif opt == "PE":
+            near_put_oi_delta += float(oi_change)
+
+    pcr_oi_change_near = None
+    if abs(near_call_oi_delta) > 0:
+        pcr_oi_change_near = near_put_oi_delta / near_call_oi_delta
+
+    oi_build_bias = "UNKNOWN"
+    if oi_delta_points > 0:
+        if near_put_oi_delta - near_call_oi_delta > 0:
+            oi_build_bias = "BULLISH_SUPPORT"
+        elif near_call_oi_delta - near_put_oi_delta > 0:
+            oi_build_bias = "BEARISH_RESISTANCE"
+        else:
+            oi_build_bias = "NEUTRAL"
+
+    pcr_bias = "NEUTRAL"
+    if pcr_near is not None:
+        if pcr_near >= 1.15:
+            pcr_bias = "BULLISH"
+        elif pcr_near <= 0.85:
+            pcr_bias = "BEARISH"
+
+    def _wall_payload(row: Optional[dict], *, side: str) -> Dict[str, Any]:
+        strike = _fv((row or {}).get("strike"))
+        oi = _fv((row or {}).get("oi"))
+        dist = None
+        if strike is not None:
+            if side == "CALL":
+                dist = float(strike) - float(spot or 0.0)
+            else:
+                dist = float(spot or 0.0) - float(strike)
+        return {
+            "strike": strike,
+            "oi": oi,
+            "distance_from_spot": None if dist is None else round(float(dist), 2),
+        }
+
+    return (
+        {
+            "rows_count": len(rows),
+            "oi_rows_count": len([r for r in ce_rows + pe_rows if r.get("oi") is not None]),
+            "spot": round(float(spot or 0.0), 2),
+            "near_atm_band_points": float(band),
+            "total_call_oi": round(float(total_call_oi), 2),
+            "total_put_oi": round(float(total_put_oi), 2),
+            "pcr_total": None if pcr_total is None else round(float(pcr_total), 3),
+            "near_call_oi": round(float(near_call_oi), 2),
+            "near_put_oi": round(float(near_put_oi), 2),
+            "pcr_near_atm": None if pcr_near is None else round(float(pcr_near), 3),
+            "pcr_bias": pcr_bias,
+            "near_rows_count": len(near_ce) + len(near_pe),
+            "call_wall": _wall_payload(call_wall, side="CALL"),
+            "put_wall": _wall_payload(put_wall, side="PUT"),
+            "call_wall_above": _wall_payload(call_wall_above, side="CALL"),
+            "put_wall_below": _wall_payload(put_wall_below, side="PUT"),
+            "oi_build": {
+                "available": oi_delta_points > 0,
+                "points": int(oi_delta_points),
+                "near_call_oi_change": round(float(near_call_oi_delta), 2) if oi_delta_points else None,
+                "near_put_oi_change": round(float(near_put_oi_delta), 2) if oi_delta_points else None,
+                "pcr_oi_change_near": None if pcr_oi_change_near is None else round(float(pcr_oi_change_near), 3),
+                "bias": oi_build_bias,
+            },
+        },
+        current_oi_map,
+    )
 
 
 def _compute_mtm(legs: List[OptionLeg]) -> float:
@@ -2308,11 +3112,39 @@ def main() -> None:
         force: bool = False,
     ) -> None:
         try:
+            payload_details: Dict[str, Any] = dict(details or {})
+            code_u = str(code or "").upper()
+            if code_u == "LIVEGATE_FAILSAFE_TRIGGERED":
+                payload_details.setdefault("agent_action", "Safety mode ON. Agent locked new entries for today and tried to close the trade if positions were open.")
+                payload_details.setdefault("trade_impact", "Current trade may remain open only if close could not be executed.")
+                payload_details.setdefault("what_you_should_do", "Check broker positions when possible. If trade is still open, keep watching Telegram alerts.")
+                payload_details.setdefault("plain_reason", "Market data/broker feed looked unstable repeatedly.")
+            elif code_u == "POSITION_RECONCILE_MISMATCH_LOCKED":
+                payload_details.setdefault("agent_action", "Agent locked new entries to avoid taking wrong action on a mismatched trade.")
+                payload_details.setdefault("trade_impact", "Monitoring continues, but sync needs review.")
+                payload_details.setdefault("what_you_should_do", "Check the app/broker positions when possible.")
+                payload_details.setdefault("plain_reason", "Agent and broker positions did not match.")
+            elif code_u == "ORDER_EXECUTION_OPEN_FAIL":
+                payload_details.setdefault("agent_action", "Agent stopped new entries and attempted rollback of the partial open.")
+                payload_details.setdefault("trade_impact", "Trade may be partially opened if rollback did not fully close.")
+                payload_details.setdefault("what_you_should_do", "Check broker positions as soon as possible.")
+                payload_details.setdefault("plain_reason", "Some order legs failed while opening the Batman trade.")
+            elif code_u == "ORDER_EXECUTION_CLOSE_FAIL":
+                payload_details.setdefault("agent_action", "Agent tried to close the trade but close execution failed; entries were locked for safety.")
+                payload_details.setdefault("trade_impact", "Trade may still be open.")
+                payload_details.setdefault("what_you_should_do", "Check broker positions and app as soon as possible.")
+                payload_details.setdefault("plain_reason", "Broker rejected/failed one or more close orders.")
+            elif code_u.startswith("BKM_AI_"):
+                action_name = code_u.replace("BKM_AI_", "")
+                payload_details.setdefault("agent_action", "AI warning only. No automatic close was done by AI.")
+                payload_details.setdefault("trade_impact", "Trade remains open unless a hard safety rule or strategy exit closes it.")
+                payload_details.setdefault("what_you_should_do", "Check the app when possible, especially if repeated warnings continue.")
+                payload_details.setdefault("plain_reason", f"AI manager changed recommendation to {action_name}.")
             alert_journal.emit(
                 severity=severity,
                 code=code,
                 message=message,
-                details=details,
+                details=payload_details,
                 source="start_agent",
                 when=_ist_now(),
                 dedupe_key=dedupe_key,
@@ -2357,6 +3189,333 @@ def main() -> None:
             # Never let notifier failures affect trading loop.
             log.warning("[TelegramAlerts] pump error: %s", exc)
 
+    def _telegram_trade_summary(
+        *,
+        now: datetime,
+        basket_expiry: str,
+        spot: float,
+        pnl: float,
+        tp: float,
+        sl: float,
+        day_mode_value: str,
+        ai_eval: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        nonlocal bkm_last_telegram_summary_at
+        if trade_mode != "live":
+            return
+        if not bool(settings.get("telegram_trade_summary_enabled", True)):
+            return
+        if bool(settings.get("telegram_trade_summary_market_hours_only", True)) and not _is_india_market_open(now):
+            return
+        interval_sec = max(60.0, float(settings.get("telegram_trade_summary_interval_sec", 900.0)))
+        if (
+            bkm_last_telegram_summary_at is not None
+            and (now - bkm_last_telegram_summary_at).total_seconds() < interval_sec
+        ):
+            return
+
+        ai_snap = ai_eval if isinstance(ai_eval, dict) and ai_eval else (bkm_ai_manager.snapshot() if bkm_ai_manager else {})
+        ai_action = str((ai_snap or {}).get("action") or "HOLD").upper()
+        ai_sev = str((ai_snap or {}).get("severity") or "INFO").upper()
+        ai_reasons = list((ai_snap or {}).get("reasons") or [])
+        ai_reason = str(ai_reasons[0]) if ai_reasons else "NORMAL_MONITOR"
+
+        gate_snap = live_gate.snapshot() if live_gate else {}
+        rec_snap = position_reconciler.snapshot() if position_reconciler else {}
+        exr_snap = execution_recovery_guard.snapshot() if execution_recovery_guard else {}
+        gate_status = str((gate_snap or {}).get("status") or "NA").upper()
+        gate_locked_for = (gate_snap or {}).get("locked_for_date")
+        rec_status = str((rec_snap or {}).get("status") or "NA").upper()
+        exr_status = str((exr_snap or {}).get("status") or "NA").upper()
+        rec_match = (((rec_snap or {}).get("last_diff_summary") or {}).get("match"))
+
+        level = "RELAX"
+        reason_text = "Trade looks stable and the agent is watching it."
+        next_step = "No action needed now."
+        if exr_status != "OK" or rec_status != "OK" or rec_match is False:
+            level = "WORRY"
+            reason_text = "Agent found a trade sync problem."
+            next_step = "Please check the app when possible."
+        elif ai_action == "FLATTEN_RECOMMEND" or ai_sev == "CRITICAL":
+            level = "WORRY"
+            reason_text = "Risk is high right now."
+            next_step = "Please check the app soon."
+        elif ai_action in {"WATCH_TIGHT", "REDUCE_RISK"} or ai_sev == "WARN" or str(day_mode_value).upper() == "LOCKED_RED":
+            level = "WATCH"
+            reason_text = "Risk is rising, but monitoring is active."
+            next_step = "Check when you get a chance."
+
+        headline = {
+            "RELAX": "Relax: your trade looks okay.",
+            "WATCH": "Watch closely: risk is increasing.",
+            "WORRY": "Worry: please check your trade.",
+        }.get(level, "Trade update")
+
+        if rec_status == "OK" and exr_status == "OK" and rec_match is True:
+            sync_line = "Trade sync with broker: OK."
+        else:
+            sync_line = f"Trade sync: reconcile={rec_status}, recovery={exr_status}."
+        entry_line = "No new trades today (safety lock is on)." if (gate_status == "LOCKED" and gate_locked_for) else "New trades are allowed."
+        if exr_status != "OK" or rec_status != "OK" or rec_match is False:
+            agent_action_line = "Agent action: safety lock is active due to sync issue."
+        elif ai_action == "FLATTEN_RECOMMEND":
+            agent_action_line = "Agent action: no auto-close by AI (AI is advisory only)."
+        elif str(day_mode_value).upper() == "LOCKED_RED" or (gate_status == "LOCKED" and gate_locked_for):
+            agent_action_line = "Agent action: monitoring continues; new entries are blocked."
+        else:
+            agent_action_line = "Agent action: monitoring only (no trade change made)."
+
+        def _fmt_rs(value: Any) -> str:
+            try:
+                amt = float(value or 0.0)
+                sign = "+" if amt >= 0 else "-"
+                return f"{sign}Rs {abs(amt):,.0f}"
+            except Exception:
+                return "NA"
+
+        text = (
+            f"{headline}\n"
+            f"Agent is actively monitoring your Batman trade.\n"
+            f"Current P&L: {_fmt_rs(pnl)}\n"
+            f"NIFTY spot: {float(spot or 0.0):,.0f}\n"
+            f"AI view: {ai_action} ({ai_reason})\n"
+            f"{agent_action_line}\n"
+            f"{sync_line}\n"
+            f"{entry_line}\n"
+            f"Why: {reason_text}\n"
+            f"What you should do: {next_step}\n"
+            f"Time: {now.strftime('%I:%M %p').lstrip('0')}"
+        )
+        out = telegram_forwarder.send_direct_message(
+            creds=_load_saved_creds(),
+            text=text,
+            code=f"TELEGRAM_TRADE_SUMMARY_{level}",
+            trade_mode=trade_mode,
+            when=now,
+        )
+        if out.get("ok"):
+            bkm_last_telegram_summary_at = now
+        elif out.get("reason") == "SEND_FAILED":
+            log.warning("[TelegramSummary] send failed: %s", out.get("error"))
+
+    def _telegram_ai_lock_change(
+        *,
+        now: datetime,
+        active: bool,
+        source: str,
+        ai_eval: Optional[Dict[str, Any]] = None,
+        basket_expiry: Optional[str] = None,
+        note: Optional[str] = None,
+        stable_for_sec: Optional[float] = None,
+    ) -> None:
+        if trade_mode != "live":
+            return
+        if not bool(settings.get("telegram_ai_lock_change_enabled", True)):
+            return
+        ai_snap = ai_eval if isinstance(ai_eval, dict) and ai_eval else (bkm_ai_manager.snapshot() if bkm_ai_manager else {})
+        ai_action = str((ai_snap or {}).get("action") or "HOLD").upper()
+        ai_score = float((ai_snap or {}).get("score") or 0.0)
+        ai_reasons = list((ai_snap or {}).get("reasons") or [])
+        ai_reason = str(ai_reasons[0]) if ai_reasons else "NORMAL_MONITOR"
+        expiry_txt = basket_expiry or str((ai_snap or {}).get("basket_expiry") or "NA")
+        if active:
+            headline = "Watch closely: agent paused new entries."
+            action_line = "Agent action: blocked new entries only. Current trade monitoring continues."
+            why_line = f"Why: AI protective mode saw higher risk ({ai_action}, score {ai_score:.1f}, {ai_reason})."
+            next_step = "No urgent action needed. Review only if you want to override."
+        else:
+            stable_txt = ""
+            if stable_for_sec is not None and stable_for_sec > 0:
+                stable_min = max(1, int(round(float(stable_for_sec) / 60.0)))
+                stable_txt = f" after stable conditions for ~{stable_min} min"
+            headline = "Relax: agent re-enabled new entries."
+            action_line = "Agent action: AI protective entry lock removed. Monitoring continues."
+            why_line = f"Why: risk stayed controlled{stable_txt}."
+            if source == "manual_override":
+                why_line = "Why: you manually cleared the AI protective lock."
+            elif note:
+                why_line = f"Why: {note}"
+            next_step = "No action needed now."
+        text = (
+            f"{headline}\n"
+            f"{action_line}\n"
+            f"{why_line}\n"
+            f"Current AI view: {ai_action} (score {ai_score:.1f})\n"
+            f"Trade expiry: {expiry_txt}\n"
+            f"Source: {source}\n"
+            f"What you should do: {next_step}\n"
+            f"Time: {now.strftime('%I:%M %p').lstrip('0')}"
+        )
+        out = telegram_forwarder.send_direct_message(
+            creds=_load_saved_creds(),
+            text=text,
+            code=f"TELEGRAM_BKM_AI_LOCK_{'ON' if active else 'OFF'}",
+            trade_mode=trade_mode,
+            when=now,
+        )
+        if out.get("reason") == "SEND_FAILED":
+            log.warning("[TelegramAILock] send failed: %s", out.get("error"))
+
+    def _telegram_intraday_signal(
+        *,
+        now: datetime,
+        signal_payload: Dict[str, Any],
+    ) -> None:
+        if trade_mode != "live":
+            return
+        if not bool(settings.get("telegram_intraday_signal_enabled", True)):
+            return
+        if bool(settings.get("telegram_intraday_signal_market_hours_only", True)) and not _is_india_market_open(now):
+            return
+        signal = str(signal_payload.get("signal") or "NO_TRADE").upper()
+        rec = signal_payload.get("recommendation") if isinstance(signal_payload.get("recommendation"), dict) else {}
+        strategy = str(signal_payload.get("strategy") or rec.get("strategy_label") or "NA")
+        bias = str(signal_payload.get("market_bias") or "NEUTRAL")
+        conflict = float(signal_payload.get("signal_conflict_score") or 0.0)
+        trend_conf = float(signal_payload.get("trend_confidence") or 0.0)
+        headline = str(rec.get("headline") or rec.get("signal_text") or "Intraday advisor update")
+        what_to_enter = str(rec.get("what_to_enter") or "No trade now.")
+        sl_text = str((rec.get("sl") or {}).get("text") or rec.get("sl_text") or "SL not applicable")
+        tp_text = str((rec.get("tp") or {}).get("text") or rec.get("tp_text") or "TP not applicable")
+        hold_text = str((rec.get("hold") or {}).get("text") or rec.get("hold_text") or "Hold guidance not available")
+        why = rec.get("why") if isinstance(rec.get("why"), list) else []
+        why_line = str(why[0]) if why else ", ".join([str(x) for x in (signal_payload.get("reasons") or [])[:2]]) or "No specific reason."
+        if signal == "ENTER_NOW":
+            action_line = "Action: You can take this setup if it matches your risk size."
+        elif signal == "WAIT":
+            action_line = "Action: Wait. Do not force an entry yet."
+        else:
+            action_line = "Action: No trade. Stay disciplined and avoid overtrading."
+        text = (
+            f"Intraday AI signal: {signal}\n"
+            f"{headline}\n"
+            f"Setup: {strategy} | Bias: {bias}\n"
+            f"What to enter: {what_to_enter}\n"
+            f"{sl_text}\n"
+            f"{tp_text}\n"
+            f"{hold_text}\n"
+            f"Why: {why_line}\n"
+            f"{action_line}\n"
+            f"Trend confidence: {int(round(trend_conf * 100.0))}% | Conflict: {int(round(conflict))}%\n"
+            f"Time: {now.strftime('%I:%M %p').lstrip('0')}"
+        )
+        out = telegram_forwarder.send_direct_message(
+            creds=_load_saved_creds(),
+            text=text,
+            code=f"TELEGRAM_INTRADAY_SIGNAL_{signal}",
+            trade_mode=trade_mode,
+            when=now,
+        )
+        if out.get("reason") == "SEND_FAILED":
+            log.warning("[TelegramIntradaySignal] send failed: %s", out.get("error"))
+
+    def _telegram_market_close_summary(
+        *,
+        now: datetime,
+        basket_expiry: str,
+        spot: float,
+        pnl: float,
+        tp: float,
+        sl: float,
+        day_mode_value: str,
+        ai_eval: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        nonlocal bkm_last_market_close_summary_date
+        if trade_mode != "live":
+            return
+        if not bool(settings.get("telegram_market_close_summary_enabled", True)):
+            return
+        if now.weekday() >= 5:
+            return
+        if _is_india_market_open(now):
+            return
+        try:
+            hh, mm = str(settings.get("telegram_market_close_summary_not_before", "15:32")).split(":")
+            not_before = dtime(int(hh), int(mm))
+        except Exception:
+            not_before = dtime(15, 32)
+        if now.time() < not_before:
+            return
+        if bkm_last_market_close_summary_date == now.date().isoformat():
+            return
+
+        ai_snap = ai_eval if isinstance(ai_eval, dict) and ai_eval else (bkm_ai_manager.snapshot() if bkm_ai_manager else {})
+        ai_action = str((ai_snap or {}).get("action") or "HOLD").upper()
+        ai_reasons = list((ai_snap or {}).get("reasons") or [])
+        ai_reason = str(ai_reasons[0]) if ai_reasons else "NORMAL_MONITOR"
+        rec_snap = position_reconciler.snapshot() if position_reconciler else {}
+        exr_snap = execution_recovery_guard.snapshot() if execution_recovery_guard else {}
+        gate_snap = live_gate.snapshot() if live_gate else {}
+        rec_status = str((rec_snap or {}).get("status") or "NA").upper()
+        exr_status = str((exr_snap or {}).get("status") or "NA").upper()
+        rec_match = (((rec_snap or {}).get("last_diff_summary") or {}).get("match"))
+        gate_status = str((gate_snap or {}).get("status") or "NA").upper()
+
+        level = "RELAX"
+        if exr_status != "OK" or rec_status != "OK" or rec_match is False:
+            level = "WORRY"
+        elif ai_action in {"WATCH_TIGHT", "REDUCE_RISK", "FLATTEN_RECOMMEND"}:
+            level = "WATCH" if ai_action != "FLATTEN_RECOMMEND" else "WORRY"
+        elif str(day_mode_value).upper() == "LOCKED_RED":
+            level = "WATCH"
+
+        headline = {
+            "RELAX": "Market close update: relax.",
+            "WATCH": "Market close update: watch this trade.",
+            "WORRY": "Market close update: please review.",
+        }.get(level, "Market close update")
+
+        if exr_status == "OK" and rec_status == "OK" and rec_match is True:
+            sync_line = "Trade sync with broker: OK."
+        else:
+            sync_line = f"Trade sync: reconcile={rec_status}, recovery={exr_status}."
+        if gate_status == "LOCKED":
+            entry_line = "Tomorrow new entries may stay blocked until you reset the safety lock."
+        else:
+            entry_line = "No entry lock is active right now."
+
+        if level == "RELAX":
+            action_line = "Agent action: monitoring continues overnight."
+            next_step = "You can relax. Just watch Telegram alerts."
+        elif level == "WATCH":
+            action_line = "Agent action: monitoring continues; no forced action taken."
+            next_step = "Check the app when you have time."
+        else:
+            action_line = "Agent action: safety condition detected. Please review app/broker."
+            next_step = "Check the app before next session."
+
+        def _fmt_rs(value: Any) -> str:
+            try:
+                amt = float(value or 0.0)
+                sign = "+" if amt >= 0 else "-"
+                return f"{sign}Rs {abs(amt):,.0f}"
+            except Exception:
+                return "NA"
+
+        text = (
+            f"{headline}\n"
+            f"Trade is still being monitored.\n"
+            f"Current P&L: {_fmt_rs(pnl)}\n"
+            f"NIFTY spot (last): {float(spot or 0.0):,.0f}\n"
+            f"AI view: {ai_action} ({ai_reason})\n"
+            f"{action_line}\n"
+            f"{sync_line}\n"
+            f"{entry_line}\n"
+            f"What you should do: {next_step}\n"
+            f"Time: {now.strftime('%I:%M %p').lstrip('0')}"
+        )
+        out = telegram_forwarder.send_direct_message(
+            creds=_load_saved_creds(),
+            text=text,
+            code=f"TELEGRAM_MARKET_CLOSE_SUMMARY_{level}",
+            trade_mode=trade_mode,
+            when=now,
+        )
+        if out.get("ok"):
+            bkm_last_market_close_summary_date = now.date().isoformat()
+        elif out.get("reason") == "SEND_FAILED":
+            log.warning("[TelegramCloseSummary] send failed: %s", out.get("error"))
+
     # Enforce rollout policy for live mode.
     if trade_mode == "live":
         settings["max_intraday_loss"] = -abs(float(settings.get("live_daily_loss_cap_abs", 5000.0)))
@@ -2394,6 +3553,21 @@ def main() -> None:
                 status_path=EXECUTION_RECOVERY_STATUS_FILE,
                 logger=log,
             )
+    bkm_ai_manager: Optional[BatmanBKMAIManager] = None
+    if selected_strategy_file == "batman_bkm_monthly" and bool(settings.get("batman_bkm_ai_enabled", True)):
+        bkm_ai_manager = BatmanBKMAIManager(
+            config=BatmanBKMAIConfig.from_settings(settings),
+            status_path=BATMAN_BKM_AI_STATUS_FILE,
+            events_path=BATMAN_BKM_AI_EVENTS_FILE,
+            logger=log,
+        )
+    intraday_ai_advisor: Optional[IntradayOptionSellingAdvisor] = None
+    if selected_strategy_file == "batman_bkm_monthly" and bool(settings.get("intraday_ai_enabled", True)):
+        intraday_ai_advisor = IntradayOptionSellingAdvisor(
+            config=IntradayOptionSellingAdvisorConfig.from_settings(settings),
+            status_path=INTRADAY_AI_ADVISOR_STATUS_FILE,
+            logger=log,
+        )
 
     dw = DhanWrapper(logger=logging.getLogger("dhan_wrapper"))
     startup_resume_bkm_snapshot: Optional[Dict[str, Any]] = None
@@ -2495,6 +3669,17 @@ def main() -> None:
             execution_recovery_guard.snapshot().get("hard_lock"),
             int(settings.get("live_exec_recovery_lookback_days", 45)),
         )
+    if bkm_ai_manager:
+        ai_snap = bkm_ai_manager.snapshot()
+        log.info(
+            "[BatmanBKM-AI] enabled=%s mode=%s status=%s warn=%.1f reduce=%.1f flatten=%.1f",
+            bool(settings.get("batman_bkm_ai_enabled", True)),
+            str(settings.get("batman_bkm_ai_mode", "ADVISOR")).upper(),
+            ai_snap.get("status"),
+            float(settings.get("batman_bkm_ai_warn_score", 30.0)),
+            float(settings.get("batman_bkm_ai_reduce_score", 55.0)),
+            float(settings.get("batman_bkm_ai_flatten_score", 80.0)),
+        )
     log.info(
         "[OpsMonitor] heartbeat_interval=%ss watchdog_stale_after=%ss alert_dedupe=%ss",
         float(settings.get("ops_heartbeat_interval_sec", 10.0)),
@@ -2524,6 +3709,8 @@ def main() -> None:
             "live_gate_status": live_gate.snapshot().get("status") if live_gate else None,
             "reconcile_status": position_reconciler.snapshot().get("status") if position_reconciler else None,
             "execution_recovery_status": execution_recovery_guard.snapshot().get("status") if execution_recovery_guard else None,
+            "bkm_ai_status": bkm_ai_manager.snapshot().get("status") if bkm_ai_manager else None,
+            "bkm_ai_action": bkm_ai_manager.snapshot().get("action") if bkm_ai_manager else None,
         },
     )
     _telegram_pump(force=True)
@@ -2543,12 +3730,143 @@ def main() -> None:
     bkm_strategy: Optional[BatmanBKMStrategy] = None
     loop_seq = 0
     bkm_last_monitor_log_at: Optional[datetime] = None
+    bkm_last_park_log_at: Optional[datetime] = None
+    bkm_last_telegram_summary_at: Optional[datetime] = None
+    bkm_last_market_close_summary_date: Optional[str] = None
+    bkm_ai_last_context_at: Optional[datetime] = None
+    bkm_ai_context_cache: Optional[Dict[str, Any]] = None
+    bkm_ai_prev_oi_map: Dict[Tuple[str, float], float] = {}
+    intraday_ai_last_eval_at: Optional[datetime] = None
+    intraday_ai_prev_oi_map: Dict[Tuple[str, float], float] = {}
+    intraday_ai_last_expiry: Optional[str] = None
+    bkm_ai_entry_lock_active: bool = False
+    bkm_ai_entry_lock_reason: Optional[str] = None
+    bkm_ai_last_entry_lock_state: Optional[bool] = None
+    bkm_ai_unlock_stable_since: Optional[datetime] = None
+    bkm_ai_protection_enabled: bool = True
+    bkm_ai_protect_session_date: str = _ist_now().date().isoformat()
+    if bkm_ai_manager and str(getattr(bkm_ai_manager.config, "mode", "ADVISOR")).upper() in {"AUTO_PROTECT", "PROTECTIVE"}:
+        try:
+            restored_protect = _restore_bkm_ai_protect_lock_for_session(_ist_now())
+            bkm_ai_protect_session_date = str(restored_protect.get("session_date") or bkm_ai_protect_session_date)
+            bkm_ai_protection_enabled = bool(restored_protect.get("protection_enabled", True))
+            if bool(restored_protect.get("active", False)):
+                if bkm_ai_protection_enabled:
+                    bkm_ai_entry_lock_active = True
+                    bkm_ai_entry_lock_reason = str(restored_protect.get("reason") or "AI_PROTECTIVE_ENTRY_LOCK")
+                    bkm_ai_last_entry_lock_state = True
+                    log.warning(
+                        "[BatmanBKM-AI] restored protective entry lock for session=%s reason=%s source_action=%s",
+                        restored_protect.get("session_date"),
+                        restored_protect.get("reason"),
+                        restored_protect.get("source_action"),
+                    )
+                else:
+                    log.info("[BatmanBKM-AI] ignoring restored lock because protection is disabled for session")
+        except Exception:
+            log.exception("[BatmanBKM-AI] failed to restore protective entry lock state")
 
     while True:
         try:
             loop_seq += 1
             now = datetime.now()
             now_ist = _ist_now()
+            if now_ist.date().isoformat() != bkm_ai_protect_session_date:
+                bkm_ai_protect_session_date = now_ist.date().isoformat()
+                if bkm_ai_entry_lock_active:
+                    log.info("[BatmanBKM-AI] clearing protective entry lock on new session")
+                bkm_ai_entry_lock_active = False
+                bkm_ai_entry_lock_reason = None
+                bkm_ai_last_entry_lock_state = False
+                bkm_ai_unlock_stable_since = None
+                bkm_ai_protection_enabled = True
+                try:
+                    _set_bkm_ai_protect_lock(active=False, now=now_ist, protection_enabled=True)
+                except Exception:
+                    log.exception("[BatmanBKM-AI] failed to clear protective lock on session rollover")
+            protect_clear_req = _consume_bkm_ai_protect_clear_request()
+            if protect_clear_req is not None:
+                req_source = str(protect_clear_req.get("source") or "manual_ui")
+                req_note = str(protect_clear_req.get("note") or "")
+                req_op = str(protect_clear_req.get("operation") or "clear_lock").strip().lower()
+                if req_op == "set_protection_enabled":
+                    requested_enabled = bool(protect_clear_req.get("protection_enabled", True))
+                    had_lock = bool(bkm_ai_entry_lock_active)
+                    prev_enabled = bool(bkm_ai_protection_enabled)
+                    bkm_ai_protection_enabled = requested_enabled
+                    if not requested_enabled:
+                        bkm_ai_entry_lock_active = False
+                        bkm_ai_entry_lock_reason = None
+                        bkm_ai_last_entry_lock_state = False
+                        bkm_ai_unlock_stable_since = None
+                    try:
+                        _set_bkm_ai_protect_lock(
+                            active=bool(bkm_ai_entry_lock_active and bkm_ai_protection_enabled),
+                            now=now_ist,
+                            protection_enabled=bkm_ai_protection_enabled,
+                        )
+                    except Exception:
+                        log.exception("[BatmanBKM-AI] failed to persist protection toggle request")
+                    log.warning(
+                        "[BatmanBKM-AI] protection toggled enabled=%s prev_enabled=%s source=%s had_lock=%s note=%s",
+                        bkm_ai_protection_enabled,
+                        prev_enabled,
+                        req_source,
+                        had_lock,
+                        req_note,
+                    )
+                    if trade_mode == "live" and prev_enabled != bkm_ai_protection_enabled:
+                        code = "BKM_AI_PROTECTION_DISABLED_TODAY" if not bkm_ai_protection_enabled else "BKM_AI_PROTECTION_ENABLED"
+                        msg = (
+                            "AI entry protection disabled for this session; monitoring continues."
+                            if not bkm_ai_protection_enabled
+                            else "AI entry protection enabled; agent can apply protective entry locks again."
+                        )
+                        _ops_alert(
+                            "INFO",
+                            code,
+                            msg,
+                            details={
+                                "source": req_source,
+                                "had_lock": had_lock,
+                                "note": req_note,
+                                "protection_enabled": bkm_ai_protection_enabled,
+                            },
+                            dedupe_key=code,
+                        )
+                else:
+                    had_lock = bool(bkm_ai_entry_lock_active)
+                    bkm_ai_entry_lock_active = False
+                    bkm_ai_entry_lock_reason = None
+                    bkm_ai_last_entry_lock_state = False
+                    bkm_ai_unlock_stable_since = None
+                    try:
+                        _set_bkm_ai_protect_lock(active=False, now=now_ist, protection_enabled=bkm_ai_protection_enabled)
+                    except Exception:
+                        log.exception("[BatmanBKM-AI] failed to persist clear after manual override")
+                    log.warning(
+                        "[BatmanBKM-AI] protective entry lock cleared by override source=%s had_lock=%s note=%s",
+                        req_source,
+                        had_lock,
+                        req_note,
+                    )
+                    if trade_mode == "live":
+                        _ops_alert(
+                            "INFO",
+                            "BKM_AI_PROTECT_ENTRY_LOCK_CLEARED",
+                            "AI protective entry lock was manually cleared.",
+                            details={"source": req_source, "had_lock": had_lock, "note": req_note},
+                            dedupe_key="BKM_AI_PROTECT_ENTRY_LOCK_CLEARED",
+                        )
+                        try:
+                            _telegram_ai_lock_change(
+                                now=now_ist,
+                                active=False,
+                                source="manual_override",
+                                note=req_note or "manual override",
+                            )
+                        except Exception:
+                            log.exception("[TelegramAILock] manual clear send failed")
             if live_gate:
                 live_gate.on_tick(now_ist)
             if position_reconciler:
@@ -2565,6 +3883,9 @@ def main() -> None:
                     "live_gate_status": live_gate.snapshot().get("status") if live_gate else None,
                     "reconcile_status": position_reconciler.snapshot().get("status") if position_reconciler else None,
                     "execution_recovery_status": execution_recovery_guard.snapshot().get("status") if execution_recovery_guard else None,
+                    "bkm_ai_entry_lock_active": bool(bkm_ai_entry_lock_active),
+                    "bkm_ai_entry_lock_reason": bkm_ai_entry_lock_reason,
+                    "bkm_ai_protection_enabled": bool(bkm_ai_protection_enabled),
                 },
             )
             log.info("[Loop] tick start mode=%s strategy=%s", trade_mode, selected_strategy_file)
@@ -2591,36 +3912,37 @@ def main() -> None:
             except Exception:
                 if trade_mode == "live" and selected_strategy_file == "batman_bkm_monthly" and live_gate:
                     fail_when = _ist_now()
-                    triggered, fail_reason = live_gate.register_connection_failure(when=fail_when)
-                    if triggered and not live_gate.should_block_entries(fail_when):
-                        closed_legs = _apply_live_gate_failsafe(
-                            live_gate=live_gate,
-                            reason=fail_reason,
-                            dw=dw,
-                            bkm_strategy=bkm_strategy,
-                            trade_mode=trade_mode,
-                            live_order_executor=live_order_executor,
-                            execution_journal=execution_journal,
-                        )
-                        if closed_legs > 0 and position_reconciler:
-                            position_reconciler.defer_checks(
-                                seconds=int(settings.get("live_reconcile_grace_sec", 30)),
-                                reason="DATA_FAILSAFE_CLOSE_SUBMITTED",
-                                when=_ist_now(),
+                    if _is_india_market_open(fail_when):
+                        triggered, fail_reason = live_gate.register_connection_failure(when=fail_when)
+                        if triggered and not live_gate.should_block_entries(fail_when):
+                            closed_legs = _apply_live_gate_failsafe(
+                                live_gate=live_gate,
+                                reason=fail_reason,
+                                dw=dw,
+                                bkm_strategy=bkm_strategy,
+                                trade_mode=trade_mode,
+                                live_order_executor=live_order_executor,
+                                execution_journal=execution_journal,
                             )
-                        day_mode = "LOCKED_RED"
-                        log.error(
-                            "[LiveGate] FAILSAFE_TRIGGERED reason=%s source=market_snapshot closed_legs=%s",
-                            fail_reason,
-                            closed_legs,
-                        )
-                        _ops_alert(
-                            "CRITICAL",
-                            "LIVEGATE_FAILSAFE_TRIGGERED",
-                            "LiveGate fail-safe triggered from market snapshot failure.",
-                            details={"reason": fail_reason, "source": "market_snapshot", "closed_legs": closed_legs},
-                            dedupe_key="LIVEGATE_FAILSAFE_TRIGGERED",
-                        )
+                            if closed_legs > 0 and position_reconciler:
+                                position_reconciler.defer_checks(
+                                    seconds=int(settings.get("live_reconcile_grace_sec", 30)),
+                                    reason="DATA_FAILSAFE_CLOSE_SUBMITTED",
+                                    when=_ist_now(),
+                                )
+                            day_mode = "LOCKED_RED"
+                            log.error(
+                                "[LiveGate] FAILSAFE_TRIGGERED reason=%s source=market_snapshot closed_legs=%s",
+                                fail_reason,
+                                closed_legs,
+                            )
+                            _ops_alert(
+                                "CRITICAL",
+                                "LIVEGATE_FAILSAFE_TRIGGERED",
+                                "LiveGate fail-safe triggered from market snapshot failure.",
+                                details={"reason": fail_reason, "source": "market_snapshot", "closed_legs": closed_legs},
+                                dedupe_key="LIVEGATE_FAILSAFE_TRIGGERED",
+                            )
                 log.exception("[Loop] market snapshot fetch failed")
                 _ops_alert(
                     "ERROR",
@@ -2661,6 +3983,8 @@ def main() -> None:
                     if not live_bkm_gate_enabled or not live_gate:
                         return
                     fail_when = _ist_now()
+                    if not _is_india_market_open(fail_when):
+                        return
                     triggered, fail_reason = live_gate.register_connection_failure(when=fail_when)
                     log.warning(
                         "[LiveGate] conn_failure source=%s triggered=%s reason=%s",
@@ -2713,33 +4037,34 @@ def main() -> None:
 
                 if live_bkm_gate_enabled and live_gate:
                     spot_when = _ist_now()
-                    spot_triggered, spot_reason = live_gate.register_spot(market.spot, when=spot_when)
-                    if spot_triggered and not live_gate.should_block_entries(spot_when):
-                        closed_legs = _apply_live_gate_failsafe(
-                            live_gate=live_gate,
-                            reason=spot_reason,
-                            dw=dw,
-                            bkm_strategy=bkm_strategy,
-                            trade_mode=trade_mode,
-                            live_order_executor=live_order_executor,
-                            execution_journal=execution_journal,
-                        )
-                        if closed_legs > 0:
-                            _defer_reconcile_checks("DATA_FAILSAFE_CLOSE_SUBMITTED")
-                        day_mode = "LOCKED_RED"
-                        log.error(
-                            "[LiveGate] FAILSAFE_TRIGGERED reason=%s source=spot_zero spot=%s closed_legs=%s",
-                            spot_reason,
-                            market.spot,
-                            closed_legs,
-                        )
-                        _ops_alert(
-                            "CRITICAL",
-                            "LIVEGATE_FAILSAFE_TRIGGERED",
-                            "LiveGate fail-safe triggered from zero/invalid spot feed.",
-                            details={"reason": spot_reason, "source": "spot_zero", "spot": market.spot, "closed_legs": closed_legs},
-                            dedupe_key="LIVEGATE_FAILSAFE_TRIGGERED",
-                        )
+                    if _is_india_market_open(spot_when):
+                        spot_triggered, spot_reason = live_gate.register_spot(market.spot, when=spot_when)
+                        if spot_triggered and not live_gate.should_block_entries(spot_when):
+                            closed_legs = _apply_live_gate_failsafe(
+                                live_gate=live_gate,
+                                reason=spot_reason,
+                                dw=dw,
+                                bkm_strategy=bkm_strategy,
+                                trade_mode=trade_mode,
+                                live_order_executor=live_order_executor,
+                                execution_journal=execution_journal,
+                            )
+                            if closed_legs > 0:
+                                _defer_reconcile_checks("DATA_FAILSAFE_CLOSE_SUBMITTED")
+                            day_mode = "LOCKED_RED"
+                            log.error(
+                                "[LiveGate] FAILSAFE_TRIGGERED reason=%s source=spot_zero spot=%s closed_legs=%s",
+                                spot_reason,
+                                market.spot,
+                                closed_legs,
+                            )
+                            _ops_alert(
+                                "CRITICAL",
+                                "LIVEGATE_FAILSAFE_TRIGGERED",
+                                "LiveGate fail-safe triggered from zero/invalid spot feed.",
+                                details={"reason": spot_reason, "source": "spot_zero", "spot": market.spot, "closed_legs": closed_legs},
+                                dedupe_key="LIVEGATE_FAILSAFE_TRIGGERED",
+                            )
 
                 active_lot_multiplier = int(settings.get("batman_bkm_lot_multiplier", 1))
                 if live_bkm_gate_enabled and live_gate:
@@ -2821,6 +4146,112 @@ def main() -> None:
                     roll_anchor_expiry, roll_target_expiry = _fetch_bkm_monthly_roll_plan(dw)
                     expiry = roll_target_expiry or roll_anchor_expiry or today
                 expiry_str = expiry.isoformat()
+                if intraday_ai_advisor:
+                    try:
+                        refresh_sec = max(15.0, float(getattr(intraday_ai_advisor.config, "refresh_sec", 60.0)))
+                        if (
+                            intraday_ai_last_eval_at is None
+                            or (now_ist - intraday_ai_last_eval_at).total_seconds() >= refresh_sec
+                        ):
+                            intraday_chain: List[dict] = []
+                            intraday_ctx: Dict[str, Any] = {}
+                            advisor_expiry = None
+                            if _is_india_market_open(now_ist):
+                                try:
+                                    advisor_expiry = _fetch_expiry_with_settings(dw, settings)
+                                    intraday_ai_last_expiry = advisor_expiry.isoformat()
+                                except Exception:
+                                    log.exception("[IntradayAI] expiry fetch failed")
+                                    advisor_expiry = None
+                                if advisor_expiry is not None:
+                                    try:
+                                        intraday_chain_raw = dw.get_option_chain(
+                                            INDEX_SECURITY_ID,
+                                            INDEX_EXCHANGE_SEG,
+                                            advisor_expiry.isoformat(),
+                                        )
+                                        intraday_chain = _map_chain(
+                                            intraday_chain_raw,
+                                            advisor_expiry,
+                                            symbol="NIFTY",
+                                            spot=float(market.spot or 0.0),
+                                        )
+                                        if not intraday_chain:
+                                            log.warning(
+                                                "[IntradayAI] unusable option chain payload expiry=%s (advisor only; no fail-safe impact)",
+                                                advisor_expiry.isoformat(),
+                                            )
+                                    except Exception:
+                                        log.exception(
+                                            "[IntradayAI] option chain fetch failed expiry=%s (advisor only; no fail-safe impact)",
+                                            advisor_expiry.isoformat(),
+                                        )
+                                        intraday_chain = []
+                                if intraday_chain:
+                                    oc_ctx, next_intraday_oi = _summarize_bkm_option_chain_context(
+                                        intraday_chain,
+                                        spot=float(market.spot or 0.0),
+                                        near_atm_band_points=float(settings.get("batman_bkm_ai_near_atm_oi_band_points", 500.0)),
+                                        prev_oi_by_key=intraday_ai_prev_oi_map,
+                                    )
+                                    if next_intraday_oi:
+                                        intraday_ai_prev_oi_map = next_intraday_oi
+                                    trend_ctx = _build_bkm_mtf_trend_context(dw, trade_day=now_ist.date())
+                                    try:
+                                        daily_for_intraday = _fetch_daily_candles(dw, days=50)
+                                    except Exception:
+                                        daily_for_intraday = []
+                                    try:
+                                        structure_ctx = _build_bkm_structure_confidence_context(
+                                            spot=float(market.spot or 0.0),
+                                            trend_ctx=trend_ctx,
+                                            oc_ctx=oc_ctx,
+                                            daily_candles=daily_for_intraday,
+                                        )
+                                    except Exception:
+                                        log.exception("[IntradayAI] structure context build failed")
+                                        structure_ctx = {}
+                                    intraday_ctx = {
+                                        "computed_at": now_ist.isoformat(timespec="seconds"),
+                                        "option_chain": oc_ctx,
+                                        "trend": trend_ctx,
+                                        "structure": structure_ctx,
+                                    }
+                            if not intraday_ctx:
+                                # Preserve explainability when fresh data is temporarily unavailable.
+                                snap = intraday_ai_advisor.snapshot()
+                                prev_ctx = snap.get("market_context")
+                                intraday_ctx = prev_ctx if isinstance(prev_ctx, dict) else {}
+                            intraday_expiry_str = (
+                                intraday_ai_last_expiry
+                                or (advisor_expiry.isoformat() if advisor_expiry is not None else None)
+                                or expiry_str
+                            )
+                            intraday_out = intraday_ai_advisor.update(
+                                now=now_ist,
+                                expiry=str(intraday_expiry_str),
+                                spot=float(market.spot or 0.0),
+                                chain_rows=intraday_chain,
+                                context=intraday_ctx,
+                                has_open_bkm=bool(bkm_strategy and bkm_strategy.basket),
+                            )
+                            intraday_ai_last_eval_at = now_ist
+                            if bool(intraday_out.get("signal_changed")):
+                                log.info(
+                                    "[IntradayAI] signal=%s strategy=%s bias=%s trend_conf=%.2f conflict=%.1f expiry=%s",
+                                    intraday_out.get("signal"),
+                                    intraday_out.get("strategy"),
+                                    intraday_out.get("market_bias"),
+                                    float(intraday_out.get("trend_confidence") or 0.0),
+                                    float(intraday_out.get("signal_conflict_score") or 0.0),
+                                    intraday_out.get("expiry"),
+                                )
+                                try:
+                                    _telegram_intraday_signal(now=now_ist, signal_payload=intraday_out)
+                                except Exception:
+                                    log.exception("[TelegramIntradaySignal] send failed")
+                    except Exception:
+                        log.exception("[IntradayAI] advisor refresh failed")
                 if live_bkm_reconcile_enabled and position_reconciler:
                     try:
                         broker_positions_raw = dw.get_positions_raw()
@@ -2881,6 +4312,34 @@ def main() -> None:
                 ) or (
                     trade_mode == "live" and execution_recovery_guard and execution_recovery_guard.should_block_entries(now_ist)
                 )
+                if bkm_ai_manager and (not bkm_strategy or bkm_strategy.basket is None):
+                    ai_mode_name = str(getattr(bkm_ai_manager.config, "mode", "ADVISOR") or "ADVISOR").upper()
+                    protect_mode = ai_mode_name in {"AUTO_PROTECT", "PROTECTIVE"} and bool(bkm_ai_protection_enabled)
+                    if not protect_mode:
+                        if bkm_ai_entry_lock_active:
+                            log.info("[BatmanBKM-AI] protective entry lock cleared (mode=%s)", ai_mode_name)
+                        bkm_ai_entry_lock_active = False
+                        bkm_ai_entry_lock_reason = None
+                        bkm_ai_last_entry_lock_state = False
+                        bkm_ai_unlock_stable_since = None
+                        try:
+                            _set_bkm_ai_protect_lock(
+                                active=False,
+                                now=now_ist,
+                                protection_enabled=bkm_ai_protection_enabled,
+                            )
+                        except Exception:
+                            log.exception("[BatmanBKM-AI] failed to clear protective lock while idle")
+                    elif bkm_ai_entry_lock_active:
+                        # Keep session-scoped protective lock even if no basket is currently open.
+                        bkm_ai_last_entry_lock_state = True
+                        bkm_ai_unlock_stable_since = None
+                    try:
+                        bkm_ai_manager.reset_idle(when=now_ist, reason="NO_OPEN_BKM_BASKET")
+                    except Exception:
+                        log.exception("[BatmanBKM-AI] reset idle failed")
+                ai_protect_entries_locked = bool(trade_mode == "live" and bkm_ai_entry_lock_active)
+                entries_locked = entries_locked or ai_protect_entries_locked
                 if bkm_strategy.basket is None and _is_bkm_blocked(expiry_str):
                     blotter_empty = (not TRADE_BLOTTER_PATH.exists()) or TRADE_BLOTTER_PATH.stat().st_size == 0
                     if trade_mode == "paper" and blotter_empty:
@@ -2896,7 +4355,7 @@ def main() -> None:
                     reconcile_payload = position_reconciler.snapshot() if (live_bkm_reconcile_enabled and position_reconciler) else {}
                     exec_recovery_payload = execution_recovery_guard.snapshot() if (trade_mode == "live" and execution_recovery_guard) else {}
                     log.warning(
-                        "[BatmanBKM] entry blocked day_mode=%s live_gate_status=%s live_gate_locked_for=%s reconcile_status=%s reconcile_hard_lock=%s exec_recovery_status=%s exec_recovery_hard_lock=%s",
+                        "[BatmanBKM] entry blocked day_mode=%s live_gate_status=%s live_gate_locked_for=%s reconcile_status=%s reconcile_hard_lock=%s exec_recovery_status=%s exec_recovery_hard_lock=%s ai_entry_lock=%s ai_entry_lock_reason=%s",
                         day_mode,
                         lock_payload.get("status"),
                         lock_payload.get("locked_for_date"),
@@ -2904,6 +4363,8 @@ def main() -> None:
                         reconcile_payload.get("hard_lock"),
                         exec_recovery_payload.get("status"),
                         exec_recovery_payload.get("hard_lock"),
+                        ai_protect_entries_locked,
+                        bkm_ai_entry_lock_reason,
                     )
                 elif bkm_strategy.basket is None and not _is_bkm_blocked(expiry_str):
                     log.info(
@@ -3204,6 +4665,62 @@ def main() -> None:
                             if live_bkm_gate_enabled and live_gate:
                                 live_gate.note_live_event(mtm=basket.mtm(), when=_ist_now())
                 elif bkm_strategy.basket:
+                    basket_ref = bkm_strategy.basket
+                    if bool(settings.get("batman_bkm_market_closed_park_enabled", True)) and not _is_india_market_open(now_ist):
+                        park_log_every = max(30.0, float(settings.get("batman_bkm_park_log_interval_sec", 300.0)))
+                        try:
+                            park_pnl = float(basket_ref.mtm() or 0.0) if basket_ref else 0.0
+                        except Exception:
+                            park_pnl = 0.0
+                        tp_val = (bkm_strategy.cfg.tp_pct * float(getattr(basket_ref, "margin_required", 0.0) or 0.0)) if basket_ref else 0.0
+                        sl_val = -(bkm_strategy.cfg.sl_pct * float(getattr(basket_ref, "margin_required", 0.0) or 0.0)) if basket_ref else 0.0
+                        if (
+                            bkm_last_park_log_at is None
+                            or (now_ist - bkm_last_park_log_at).total_seconds() >= park_log_every
+                        ):
+                            bkm_last_park_log_at = now_ist
+                            log.info(
+                                "[BatmanBKM] park mode market_closed expiry=%s spot=%.2f last_pnl=%.2f tp=%.2f sl=%.2f day_mode=%s",
+                                basket_ref.expiry.isoformat() if basket_ref else expiry_str,
+                                float(market.spot or 0.0),
+                                float(park_pnl),
+                                float(tp_val),
+                                float(sl_val),
+                                day_mode,
+                            )
+                            _heartbeat(
+                                phase="bkm_market_closed_park",
+                                extra={
+                                    "day_mode": day_mode,
+                                    "bkm_open_expiry": basket_ref.expiry.isoformat() if basket_ref else expiry_str,
+                                    "bkm_pnl": float(park_pnl),
+                                    "bkm_tp": float(tp_val),
+                                    "bkm_sl": float(sl_val),
+                                    "bkm_quotes_stale": True,
+                                    "market_open": False,
+                                    "bkm_ai_action": bkm_ai_manager.snapshot().get("action") if bkm_ai_manager else None,
+                                    "bkm_ai_score": float(bkm_ai_manager.snapshot().get("score") or 0.0) if bkm_ai_manager else None,
+                                    "bkm_ai_severity": bkm_ai_manager.snapshot().get("severity") if bkm_ai_manager else None,
+                                    "bkm_ai_entry_lock_active": bool(bkm_ai_entry_lock_active),
+                                    "bkm_ai_entry_lock_reason": bkm_ai_entry_lock_reason,
+                                },
+                            )
+                        try:
+                            _telegram_market_close_summary(
+                                now=now_ist,
+                                basket_expiry=basket_ref.expiry.isoformat() if basket_ref else expiry_str,
+                                spot=float(market.spot or 0.0),
+                                pnl=float(park_pnl),
+                                tp=float(tp_val),
+                                sl=float(sl_val),
+                                day_mode_value=day_mode,
+                                ai_eval=(bkm_ai_manager.snapshot() if bkm_ai_manager else None),
+                            )
+                        except Exception:
+                            log.exception("[TelegramCloseSummary] send failed")
+                        time.sleep(poll_sec)
+                        continue
+                    bkm_last_park_log_at = None
                     chain = _fetch_bkm_chain(expiry)
                     if not chain:
                         time.sleep(poll_sec)
@@ -3211,15 +4728,306 @@ def main() -> None:
                     pnl = bkm_strategy.update_mtm(chain) or 0.0
                     if live_bkm_gate_enabled and live_gate:
                         live_gate.note_live_event(mtm=pnl, when=_ist_now())
+                    ai_eval: Optional[Dict[str, Any]] = None
+                    bkm_ai_context: Optional[Dict[str, Any]] = None
+                    basket_ref = bkm_strategy.basket
+                    tp_val = (bkm_strategy.cfg.tp_pct * float(getattr(basket_ref, "margin_required", 0.0) or 0.0)) if basket_ref else 0.0
+                    sl_val = -(bkm_strategy.cfg.sl_pct * float(getattr(basket_ref, "margin_required", 0.0) or 0.0)) if basket_ref else 0.0
+                    if bkm_ai_manager and basket_ref:
+                        try:
+                            ctx_refresh_sec = max(5.0, float(settings.get("batman_bkm_ai_context_refresh_sec", 60.0)))
+                            need_ctx_refresh = (
+                                bkm_ai_context_cache is None
+                                or bkm_ai_last_context_at is None
+                                or (now_ist - bkm_ai_last_context_at).total_seconds() >= ctx_refresh_sec
+                            )
+                            if need_ctx_refresh:
+                                chain_ctx, next_oi_map = _summarize_bkm_option_chain_context(
+                                    chain,
+                                    spot=float(market.spot or 0.0),
+                                    near_atm_band_points=float(settings.get("batman_bkm_ai_near_atm_oi_band_points", 500.0)),
+                                    prev_oi_by_key=bkm_ai_prev_oi_map,
+                                )
+                                if next_oi_map:
+                                    bkm_ai_prev_oi_map = next_oi_map
+                                trend_ctx = _build_bkm_mtf_trend_context(dw, trade_day=now_ist.date())
+                                structure_ctx: Dict[str, Any] = {}
+                                try:
+                                    daily_candles_ctx = _fetch_daily_candles(dw, days=50)
+                                except Exception:
+                                    daily_candles_ctx = []
+                                try:
+                                    structure_ctx = _build_bkm_structure_confidence_context(
+                                        spot=float(market.spot or 0.0),
+                                        trend_ctx=trend_ctx,
+                                        oc_ctx=chain_ctx,
+                                        daily_candles=daily_candles_ctx,
+                                    )
+                                except Exception:
+                                    log.exception("[BatmanBKM-AI] structure context build failed")
+                                    structure_ctx = {}
+                                bkm_ai_context_cache = {
+                                    "computed_at": now_ist.isoformat(timespec="seconds"),
+                                    "option_chain": chain_ctx,
+                                    "trend": trend_ctx,
+                                    "structure": structure_ctx,
+                                }
+                                bkm_ai_last_context_at = now_ist
+                            bkm_ai_context = dict(bkm_ai_context_cache or {})
+                        except Exception:
+                            log.exception("[BatmanBKM-AI] market context build failed")
+                            bkm_ai_context = bkm_ai_context_cache
+                    if bkm_ai_manager and basket_ref:
+                        try:
+                            ai_eval = bkm_ai_manager.update_open(
+                                basket=basket_ref,
+                                spot=float(market.spot or 0.0),
+                                pnl=float(pnl or 0.0),
+                                tp=float(tp_val),
+                                sl=float(sl_val),
+                                day_mode=day_mode,
+                                context=bkm_ai_context,
+                                when=now_ist,
+                            )
+                            ai_plan = ai_eval.get("plan") if isinstance(ai_eval.get("plan"), dict) else {}
+                            ai_mode_name = str(getattr(bkm_ai_manager.config, "mode", "ADVISOR") or "ADVISOR").upper()
+                            ai_protect_mode = ai_mode_name in {"AUTO_PROTECT", "PROTECTIVE"} and bool(bkm_ai_protection_enabled)
+                            if not bool(bkm_ai_protection_enabled):
+                                ai_plan["entry_lock_active"] = False
+                                ai_plan["entry_lock_reason"] = None
+                                ai_plan["entry_protection_enabled"] = False
+                                ai_plan["next_course"] = (
+                                    str(ai_plan.get("next_course") or "Hold and monitor. No action needed.")
+                                    + " (AI entry protection disabled for today.)"
+                                )
+                            computed_ai_entry_lock_active = bool(ai_plan.get("entry_lock_active", False))
+                            computed_ai_entry_lock_reason = ai_plan.get("entry_lock_reason") if computed_ai_entry_lock_active else None
+                            prev_ai_entry_lock_active = bool(bkm_ai_entry_lock_active)
+                            prev_ai_entry_lock_reason = bkm_ai_entry_lock_reason
+                            ai_lock_auto_unlocked = False
+                            ai_lock_auto_unlock_stable_for_sec: Optional[float] = None
+                            next_ai_entry_lock_active = computed_ai_entry_lock_active if ai_protect_mode else False
+                            next_ai_entry_lock_reason = computed_ai_entry_lock_reason if ai_protect_mode else None
+
+                            # In protective mode, hold the AI entry lock until risk stays stable for a configured window.
+                            if ai_protect_mode and prev_ai_entry_lock_active:
+                                if computed_ai_entry_lock_active:
+                                    bkm_ai_unlock_stable_since = None
+                                elif bool(settings.get("batman_bkm_ai_protect_auto_unlock_enabled", True)):
+                                    stable_sec_required = max(
+                                        60.0,
+                                        float(settings.get("batman_bkm_ai_protect_auto_unlock_stable_sec", 1200.0)),
+                                    )
+                                    max_unlock_score = float(settings.get("batman_bkm_ai_protect_auto_unlock_max_score", 18.0))
+                                    req_action_raw = str(
+                                        settings.get("batman_bkm_ai_protect_auto_unlock_require_action", "HOLD")
+                                    ).strip()
+                                    req_actions = {a.strip().upper() for a in req_action_raw.split(",") if a.strip()}
+                                    current_action = str(ai_eval.get("action") or "HOLD").upper()
+                                    current_score = float(ai_eval.get("score") or 0.0)
+                                    action_ok = (not req_actions) or ("ANY" in req_actions) or (current_action in req_actions)
+                                    score_ok = current_score <= max_unlock_score
+                                    market_hours_ok = True
+                                    if bool(settings.get("batman_bkm_ai_protect_auto_unlock_market_hours_only", True)):
+                                        market_hours_ok = _is_india_market_open(now_ist)
+                                    clean_system_ok = True
+                                    if bool(settings.get("batman_bkm_ai_protect_auto_unlock_require_clean_system", True)):
+                                        clean_system_ok = (
+                                            day_mode != "LOCKED_RED"
+                                            and not (live_bkm_gate_enabled and live_gate and live_gate.should_block_entries(now_ist))
+                                            and not (live_bkm_reconcile_enabled and position_reconciler and position_reconciler.should_block_entries(now_ist))
+                                            and not (trade_mode == "live" and execution_recovery_guard and execution_recovery_guard.should_block_entries(now_ist))
+                                        )
+                                    unlock_candidate = (
+                                        (not computed_ai_entry_lock_active)
+                                        and action_ok
+                                        and score_ok
+                                        and market_hours_ok
+                                        and clean_system_ok
+                                    )
+                                    if unlock_candidate:
+                                        if bkm_ai_unlock_stable_since is None:
+                                            bkm_ai_unlock_stable_since = now_ist
+                                        stable_elapsed = max(
+                                            0.0,
+                                            (now_ist - bkm_ai_unlock_stable_since).total_seconds(),
+                                        )
+                                        ai_lock_auto_unlock_stable_for_sec = stable_elapsed
+                                        if stable_elapsed < stable_sec_required:
+                                            next_ai_entry_lock_active = True
+                                            next_ai_entry_lock_reason = (
+                                                prev_ai_entry_lock_reason or "AI_PROTECTIVE_ENTRY_LOCK"
+                                            )
+                                            ai_plan["entry_lock_active"] = True
+                                            ai_plan["entry_lock_reason"] = next_ai_entry_lock_reason
+                                            ai_plan["entry_lock_auto_unlock_pending"] = True
+                                            ai_plan["entry_lock_auto_unlock_remaining_sec"] = round(
+                                                max(0.0, stable_sec_required - stable_elapsed),
+                                                1,
+                                            )
+                                        else:
+                                            next_ai_entry_lock_active = False
+                                            next_ai_entry_lock_reason = None
+                                            ai_lock_auto_unlocked = True
+                                            bkm_ai_unlock_stable_since = None
+                                            ai_plan["entry_lock_active"] = False
+                                            ai_plan["entry_lock_reason"] = None
+                                            ai_plan["entry_lock_auto_unlocked"] = True
+                                            ai_plan["entry_lock_auto_unlock_stable_for_sec"] = round(stable_elapsed, 1)
+                                    else:
+                                        bkm_ai_unlock_stable_since = None
+                                        next_ai_entry_lock_active = True
+                                        next_ai_entry_lock_reason = (
+                                            prev_ai_entry_lock_reason or "AI_PROTECTIVE_ENTRY_LOCK"
+                                        )
+                                        ai_plan["entry_lock_active"] = True
+                                        ai_plan["entry_lock_reason"] = next_ai_entry_lock_reason
+                                        ai_plan["entry_lock_auto_unlock_pending"] = False
+                                else:
+                                    bkm_ai_unlock_stable_since = None
+                            elif not next_ai_entry_lock_active:
+                                bkm_ai_unlock_stable_since = None
+
+                            bkm_ai_entry_lock_active = next_ai_entry_lock_active
+                            bkm_ai_entry_lock_reason = next_ai_entry_lock_reason
+                            if bkm_ai_last_entry_lock_state is None:
+                                bkm_ai_last_entry_lock_state = bkm_ai_entry_lock_active
+                            elif bkm_ai_last_entry_lock_state != bkm_ai_entry_lock_active:
+                                bkm_ai_last_entry_lock_state = bkm_ai_entry_lock_active
+                                try:
+                                    _set_bkm_ai_protect_lock(
+                                        active=bkm_ai_entry_lock_active,
+                                        now=now_ist,
+                                        reason=bkm_ai_entry_lock_reason,
+                                        source_action=str(ai_eval.get("action") or "HOLD"),
+                                        score=float(ai_eval.get("score") or 0.0),
+                                        expiry=(basket_ref.expiry.isoformat() if basket_ref else expiry_str),
+                                        protection_enabled=bkm_ai_protection_enabled,
+                                    )
+                                except Exception:
+                                    log.exception("[BatmanBKM-AI] failed to persist protective entry lock state")
+                                if trade_mode == "live":
+                                    if bkm_ai_entry_lock_active:
+                                        _ops_alert(
+                                            "WARN",
+                                            "BKM_AI_PROTECT_ENTRY_LOCK_ON",
+                                            "AI protective mode blocked new entries; monitoring current trade.",
+                                            details={
+                                                "action": ai_eval.get("action"),
+                                                "reason": bkm_ai_entry_lock_reason,
+                                                "score": ai_eval.get("score"),
+                                                "expiry": basket_ref.expiry.isoformat() if basket_ref else expiry_str,
+                                            },
+                                            dedupe_key="BKM_AI_PROTECT_ENTRY_LOCK_ON",
+                                        )
+                                        try:
+                                            _telegram_ai_lock_change(
+                                                now=now_ist,
+                                                active=True,
+                                                source="ai_protect",
+                                                ai_eval=ai_eval,
+                                                basket_expiry=(basket_ref.expiry.isoformat() if basket_ref else expiry_str),
+                                            )
+                                        except Exception:
+                                            log.exception("[TelegramAILock] lock-on send failed")
+                                    else:
+                                        log.info("[BatmanBKM-AI] protective entry lock cleared")
+                                        if ai_lock_auto_unlocked:
+                                            _ops_alert(
+                                                "INFO",
+                                                "BKM_AI_PROTECT_ENTRY_LOCK_AUTO_UNLOCKED",
+                                                "AI protective entry lock auto-cleared after stable conditions.",
+                                                details={
+                                                    "action": ai_eval.get("action"),
+                                                    "score": ai_eval.get("score"),
+                                                    "stable_for_sec": ai_lock_auto_unlock_stable_for_sec,
+                                                    "expiry": basket_ref.expiry.isoformat() if basket_ref else expiry_str,
+                                                },
+                                                dedupe_key="BKM_AI_PROTECT_ENTRY_LOCK_AUTO_UNLOCKED",
+                                            )
+                                            try:
+                                                _telegram_ai_lock_change(
+                                                    now=now_ist,
+                                                    active=False,
+                                                    source="auto_unlock",
+                                                    ai_eval=ai_eval,
+                                                    basket_expiry=(basket_ref.expiry.isoformat() if basket_ref else expiry_str),
+                                                    stable_for_sec=ai_lock_auto_unlock_stable_for_sec,
+                                                )
+                                            except Exception:
+                                                log.exception("[TelegramAILock] auto-unlock send failed")
+                            elif (
+                                bkm_ai_entry_lock_active
+                                and bool(bkm_ai_protection_enabled)
+                                and str(getattr(bkm_ai_manager.config, "mode", "ADVISOR")).upper() in {"AUTO_PROTECT", "PROTECTIVE"}
+                            ):
+                                # Refresh persisted metadata while lock remains active (low-frequency writes avoided by monitor cadence).
+                                try:
+                                    _set_bkm_ai_protect_lock(
+                                        active=True,
+                                        now=now_ist,
+                                        reason=bkm_ai_entry_lock_reason,
+                                        source_action=str(ai_eval.get("action") or "HOLD"),
+                                        score=float(ai_eval.get("score") or 0.0),
+                                        expiry=(basket_ref.expiry.isoformat() if basket_ref else expiry_str),
+                                        protection_enabled=bkm_ai_protection_enabled,
+                                    )
+                                except Exception:
+                                    pass
+                            if ai_eval.get("action_changed"):
+                                alert_sev = str(ai_eval.get("alert_severity_override") or ai_eval.get("severity") or "INFO").upper()
+                                log_fn = log.warning if alert_sev in {"WARN", "CRITICAL"} else log.info
+                                log_fn(
+                                    "[BatmanBKM-AI] action=%s severity=%s score=%.1f confidence=%.2f reasons=%s spot=%.2f pnl=%.2f",
+                                    ai_eval.get("action"),
+                                    ai_eval.get("severity"),
+                                    float(ai_eval.get("score") or 0.0),
+                                    float(ai_eval.get("confidence") or 0.0),
+                                    ",".join(list(ai_eval.get("reasons") or [])),
+                                    float(market.spot or 0.0),
+                                    float(pnl or 0.0),
+                                )
+                                sev = alert_sev
+                                if trade_mode == "live" and sev in {"WARN", "CRITICAL"}:
+                                    _ops_alert(
+                                        sev,
+                                        f"BKM_AI_{str(ai_eval.get('action') or 'HOLD')}",
+                                        "Batman BKM AI manager recommendation changed.",
+                                        details={
+                                            "action": ai_eval.get("action"),
+                                            "recommended_action": (ai_plan.get("recommended_action") if isinstance(ai_plan, dict) else None),
+                                            "entry_lock_active": (ai_plan.get("entry_lock_active") if isinstance(ai_plan, dict) else None),
+                                            "next_course": (ai_plan.get("next_course") if isinstance(ai_plan, dict) else None),
+                                            "score": ai_eval.get("score"),
+                                            "confidence": ai_eval.get("confidence"),
+                                            "reasons": ai_eval.get("reasons"),
+                                            "spot": float(market.spot or 0.0),
+                                            "pnl": float(pnl or 0.0),
+                                            "expiry": basket_ref.expiry.isoformat() if basket_ref else expiry_str,
+                                        },
+                                        dedupe_key=f"BKM_AI_{str(ai_eval.get('action') or 'HOLD')}",
+                                    )
+                        except Exception:
+                            log.exception("[BatmanBKM-AI] evaluation failed")
+                    try:
+                        _telegram_trade_summary(
+                            now=now_ist,
+                            basket_expiry=basket_ref.expiry.isoformat() if basket_ref else expiry_str,
+                            spot=float(market.spot or 0.0),
+                            pnl=float(pnl or 0.0),
+                            tp=float(tp_val),
+                            sl=float(sl_val),
+                            day_mode_value=day_mode,
+                            ai_eval=ai_eval,
+                        )
+                    except Exception:
+                        log.exception("[TelegramSummary] periodic trade summary failed")
                     monitor_every = max(5.0, float(settings.get("batman_bkm_monitor_log_interval_sec", 20.0)))
                     if (
                         bkm_last_monitor_log_at is None
                         or (now_ist - bkm_last_monitor_log_at).total_seconds() >= monitor_every
                     ):
                         bkm_last_monitor_log_at = now_ist
-                        basket_ref = bkm_strategy.basket
-                        tp_val = (bkm_strategy.cfg.tp_pct * float(getattr(basket_ref, "margin_required", 0.0) or 0.0)) if basket_ref else 0.0
-                        sl_val = -(bkm_strategy.cfg.sl_pct * float(getattr(basket_ref, "margin_required", 0.0) or 0.0)) if basket_ref else 0.0
                         log.info(
                             "[BatmanBKM] monitor expiry=%s spot=%.2f pnl=%.2f tp=%.2f sl=%.2f net_credit=%.2f credit_pct=%.3f day_mode=%s",
                             basket_ref.expiry.isoformat() if basket_ref else expiry_str,
@@ -3239,6 +5047,12 @@ def main() -> None:
                                 "bkm_pnl": float(pnl),
                                 "bkm_tp": float(tp_val),
                                 "bkm_sl": float(sl_val),
+                                "bkm_ai_action": ai_eval.get("action") if ai_eval else (bkm_ai_manager.snapshot().get("action") if bkm_ai_manager else None),
+                                "bkm_ai_score": float(ai_eval.get("score") or 0.0) if ai_eval else (float(bkm_ai_manager.snapshot().get("score") or 0.0) if bkm_ai_manager else None),
+                                "bkm_ai_severity": ai_eval.get("severity") if ai_eval else (bkm_ai_manager.snapshot().get("severity") if bkm_ai_manager else None),
+                                "bkm_ai_entry_lock_active": bool(bkm_ai_entry_lock_active),
+                                "bkm_ai_entry_lock_reason": bkm_ai_entry_lock_reason,
+                                "bkm_ai_protection_enabled": bool(bkm_ai_protection_enabled),
                             },
                         )
                     try:
