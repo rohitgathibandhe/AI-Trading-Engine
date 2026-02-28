@@ -18,6 +18,8 @@ import time
 from datetime import datetime, date as dt_date, time as dtime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib import request as urllib_request
+from urllib import error as urllib_error
 
 try:  # Python 3.9+
     from zoneinfo import ZoneInfo  # type: ignore
@@ -54,6 +56,9 @@ BATMAN_BKM_AI_EVENTS_FILE = STATE_DIR / "batman_bkm_ai_events.jsonl"
 BATMAN_BKM_AI_PROTECT_STATUS_FILE = STATE_DIR / "batman_bkm_ai_protect_status.json"
 BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_FILE = STATE_DIR / "batman_bkm_ai_protect_clear_request.json"
 INTRADAY_AI_ADVISOR_STATUS_FILE = STATE_DIR / "intraday_ai_advisor_status.json"
+INTRADAY_AI_DEPLOY_REQUEST_FILE = STATE_DIR / "intraday_ai_deploy_request.json"
+INTRADAY_AI_DEPLOY_STATUS_FILE = STATE_DIR / "intraday_ai_deploy_status.json"
+TELEGRAM_COMMAND_STATUS_FILE = STATE_DIR / "telegram_command_status.json"
 BLOTTER_FIELDS = [
     "timestamp",
     "trade_mode",
@@ -153,6 +158,15 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "batman_bkm_exit_time": "15:10",
     "batman_bkm_enable_balance": True,
     "batman_bkm_estimated_margin": 1_000_000.0,
+    "batman_bkm_min_credit_pct": 0.75,
+    "batman_bkm_min_short_distance_points": 450.0,
+    "batman_bkm_min_short_width_points": 1000.0,
+    "batman_bkm_max_center_offset_points": 250.0,
+    "batman_bkm_max_outer_distance_ratio": 1.80,
+    "batman_bkm_max_tail_loss_imbalance_abs": 35000.0,
+    "batman_bkm_max_tail_loss_imbalance_ratio": 0.35,
+    "batman_bkm_max_worst_loss_to_credit_ratio": 25.0,
+    "batman_bkm_quality_block_on_fail": True,
     # For paper runs, allow immediate entry (bypass schedule) if needed
     "batman_bkm_force_entry": False,
     # Batman BKM live catch-up / entry planning safeguards
@@ -196,7 +210,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "batman_bkm_ai_protect_auto_unlock_require_action": "HOLD",
     "batman_bkm_ai_protect_auto_unlock_market_hours_only": True,
     "batman_bkm_ai_protect_auto_unlock_require_clean_system": True,
-    # Intraday option-selling advisor (Phase A: advisory-only)
+    # Intraday option-selling advisor (Phase A)
     "intraday_ai_enabled": True,
     "intraday_ai_refresh_sec": 60.0,
     "intraday_ai_market_open_time": "09:15",
@@ -220,6 +234,14 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "intraday_ai_ic_stop_credit_multiple": 1.8,
     "intraday_ai_spread_stop_credit_multiple": 1.6,
     "intraday_ai_min_credit_per_set_rs": 500.0,
+    "intraday_ai_max_signal_age_sec": 180.0,
+    "intraday_ai_deploy_enabled": True,
+    "intraday_ai_deploy_lots_multiplier": 1,
+    "intraday_ai_deploy_dedupe_sec": 90.0,
+    "intraday_ai_deploy_require_live_mode": True,
+    "intraday_ai_deploy_require_agent_running": True,
+    "intraday_ai_deploy_require_market_hours": True,
+    "intraday_ai_deploy_block_if_any_live_positions": False,
     # Batman BKM live rollout gate
     "live_gate_enabled": True,
     "live_probation_sessions": 10,
@@ -267,6 +289,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "telegram_ai_lock_change_enabled": True,
     "telegram_intraday_signal_enabled": True,
     "telegram_intraday_signal_market_hours_only": True,
+    "telegram_commands_enabled": True,
+    "telegram_commands_live_only": True,
+    "telegram_commands_poll_interval_sec": 5.0,
+    "telegram_commands_allow_deploy_intraday": True,
+    "telegram_commands_allow_intraday_status": True,
     "gap_entry_threshold": 0.004,
     "iv_floor_percentile": 0.2,
     "short_lots": 1,
@@ -949,6 +976,11 @@ def _build_bkm_basket_from_journal_snapshot(snapshot: Dict[str, Any], cfg: "Batm
     net_credit = meta.get("net_credit")
     margin_required = meta.get("margin_required")
     credit_pct = meta.get("credit_pct")
+    quality_status = str(meta.get("quality_status") or "UNKNOWN")
+    quality_score = float(meta.get("quality_score") or 0.0)
+    quality_reasons_raw = meta.get("quality_reasons")
+    quality_reasons = quality_reasons_raw if isinstance(quality_reasons_raw, list) else []
+    quality_metrics = meta.get("quality_metrics") if isinstance(meta.get("quality_metrics"), dict) else {}
     try:
         net_credit_f = float(net_credit) if net_credit is not None else sum(
             (1 if str(l.side).upper() == "SELL" else -1) * float(l.entry) * int(l.qty) for l in built_legs
@@ -972,6 +1004,10 @@ def _build_bkm_basket_from_journal_snapshot(snapshot: Dict[str, Any], cfg: "Batm
         entry_ts=_ist_now(),
         hedge_qty_call=2 * cfg.lot_multiplier,
         hedge_qty_put=2 * cfg.lot_multiplier,
+        quality_status=quality_status,
+        quality_score=quality_score,
+        quality_reasons=quality_reasons,
+        quality_metrics=quality_metrics,
     )
 
 
@@ -1047,6 +1083,10 @@ def _execute_bkm_open_live(
                 "net_credit": float(getattr(basket, "net_credit", 0.0) or 0.0),
                 "margin_required": float(getattr(basket, "margin_required", 0.0) or 0.0),
                 "credit_pct": float(getattr(basket, "credit_pct", 0.0) or 0.0),
+                "quality_status": str(getattr(basket, "quality_status", "UNKNOWN") or "UNKNOWN"),
+                "quality_score": float(getattr(basket, "quality_score", 0.0) or 0.0),
+                "quality_reasons": list(getattr(basket, "quality_reasons", []) or []),
+                "quality_metrics": dict(getattr(basket, "quality_metrics", {}) or {}),
             },
         },
     )
@@ -1101,6 +1141,10 @@ def _execute_bkm_open_live(
                     "net_credit": float(getattr(basket, "net_credit", 0.0) or 0.0),
                     "margin_required": float(getattr(basket, "margin_required", 0.0) or 0.0),
                     "credit_pct": float(getattr(basket, "credit_pct", 0.0) or 0.0),
+                    "quality_status": str(getattr(basket, "quality_status", "UNKNOWN") or "UNKNOWN"),
+                    "quality_score": float(getattr(basket, "quality_score", 0.0) or 0.0),
+                    "quality_reasons": list(getattr(basket, "quality_reasons", []) or []),
+                    "quality_metrics": dict(getattr(basket, "quality_metrics", {}) or {}),
                 },
                 "details": {"opened_legs": opened_legs, "planned_legs": len(option_legs)},
             },
@@ -1600,6 +1644,23 @@ def _now_iso() -> str:
     return _ist_now().isoformat(timespec="seconds")
 
 
+def _parse_iso_dt(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+def _parse_hhmm(value: Any, fallback: dtime) -> dtime:
+    try:
+        hh, mm = str(value).strip().split(":")
+        return dtime(int(hh), int(mm))
+    except Exception:
+        return fallback
+
+
 def _is_india_market_open(now: Optional[datetime] = None) -> bool:
     current = now or _ist_now()
     if current.weekday() >= 5:
@@ -1735,6 +1796,183 @@ def _consume_bkm_ai_protect_clear_request() -> Optional[Dict[str, Any]]:
     except Exception:
         pass
     return payload or {}
+
+
+def _default_intraday_ai_deploy_status(now: Optional[datetime] = None) -> Dict[str, Any]:
+    ts = now or _ist_now()
+    return {
+        "status": "IDLE",
+        "pending": False,
+        "request_id": None,
+        "requested_at": None,
+        "request_source": None,
+        "request_note": None,
+        "processed_at": None,
+        "result_code": None,
+        "message": None,
+        "details": {},
+        "current_session_date": ts.date().isoformat(),
+        "updated_at": ts.isoformat(timespec="seconds"),
+    }
+
+
+def _load_intraday_ai_deploy_status(now: Optional[datetime] = None) -> Dict[str, Any]:
+    default = _default_intraday_ai_deploy_status(now)
+    try:
+        if not INTRADAY_AI_DEPLOY_STATUS_FILE.exists():
+            return default
+        payload = json.loads(INTRADAY_AI_DEPLOY_STATUS_FILE.read_text())
+        if not isinstance(payload, dict):
+            return default
+        out = dict(default)
+        out.update(payload)
+        out["pending"] = bool(out.get("pending", False))
+        out["details"] = out.get("details") if isinstance(out.get("details"), dict) else {}
+        return out
+    except Exception:
+        return default
+
+
+def _save_intraday_ai_deploy_status(payload: Dict[str, Any]) -> None:
+    try:
+        INTRADAY_AI_DEPLOY_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        INTRADAY_AI_DEPLOY_STATUS_FILE.write_text(json.dumps(payload, indent=2, default=str))
+    except Exception:
+        log.exception("[IntradayDeploy] failed to persist deploy status")
+
+
+def _set_intraday_ai_deploy_requested(request_payload: Dict[str, Any], now: Optional[datetime] = None) -> Dict[str, Any]:
+    ts = now or _ist_now()
+    existing = _load_intraday_ai_deploy_status(ts)
+    payload = dict(existing)
+    payload.update(
+        {
+            "status": "REQUESTED",
+            "pending": True,
+            "request_id": str(request_payload.get("request_id") or ""),
+            "requested_at": str(request_payload.get("requested_at") or ts.isoformat(timespec="seconds")),
+            "request_source": str(request_payload.get("source") or "unknown"),
+            "request_note": str(request_payload.get("note") or ""),
+            "processed_at": None,
+            "result_code": None,
+            "message": "Deployment request accepted and queued.",
+            "details": {},
+            "current_session_date": ts.date().isoformat(),
+            "updated_at": ts.isoformat(timespec="seconds"),
+        }
+    )
+    _save_intraday_ai_deploy_status(payload)
+    return payload
+
+
+def _set_intraday_ai_deploy_result(
+    *,
+    status: str,
+    request_id: str,
+    source: str,
+    note: str,
+    code: str,
+    message: str,
+    details: Optional[Dict[str, Any]] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    ts = now or _ist_now()
+    payload = _load_intraday_ai_deploy_status(ts)
+    payload.update(
+        {
+            "status": str(status or "FAILED").upper(),
+            "pending": False,
+            "request_id": str(request_id or payload.get("request_id") or ""),
+            "request_source": str(source or payload.get("request_source") or "unknown"),
+            "request_note": str(note or payload.get("request_note") or ""),
+            "processed_at": ts.isoformat(timespec="seconds"),
+            "result_code": str(code or "UNKNOWN"),
+            "message": str(message or ""),
+            "details": details if isinstance(details, dict) else {},
+            "current_session_date": ts.date().isoformat(),
+            "updated_at": ts.isoformat(timespec="seconds"),
+        }
+    )
+    _save_intraday_ai_deploy_status(payload)
+    return payload
+
+
+def _consume_intraday_ai_deploy_request() -> Optional[Dict[str, Any]]:
+    try:
+        if not INTRADAY_AI_DEPLOY_REQUEST_FILE.exists():
+            return None
+        raw = INTRADAY_AI_DEPLOY_REQUEST_FILE.read_text()
+        payload = json.loads(raw) if raw else {}
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+    try:
+        INTRADAY_AI_DEPLOY_REQUEST_FILE.unlink(missing_ok=True)  # type: ignore[arg-type]
+    except TypeError:
+        try:
+            if INTRADAY_AI_DEPLOY_REQUEST_FILE.exists():
+                INTRADAY_AI_DEPLOY_REQUEST_FILE.unlink()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return payload or {}
+
+
+def _peek_intraday_ai_deploy_request() -> Optional[Dict[str, Any]]:
+    try:
+        if not INTRADAY_AI_DEPLOY_REQUEST_FILE.exists():
+            return None
+        raw = INTRADAY_AI_DEPLOY_REQUEST_FILE.read_text()
+        payload = json.loads(raw) if raw else {}
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _default_telegram_command_status(now: Optional[datetime] = None) -> Dict[str, Any]:
+    ts = now or _ist_now()
+    return {
+        "enabled": False,
+        "configured": False,
+        "last_poll_at": None,
+        "last_update_id": 0,
+        "last_command": None,
+        "last_command_at": None,
+        "last_result": None,
+        "last_error": None,
+        "next_poll_after": None,
+        "updated_at": ts.isoformat(timespec="seconds"),
+    }
+
+
+def _load_telegram_command_status(now: Optional[datetime] = None) -> Dict[str, Any]:
+    default = _default_telegram_command_status(now)
+    try:
+        if not TELEGRAM_COMMAND_STATUS_FILE.exists():
+            return default
+        payload = json.loads(TELEGRAM_COMMAND_STATUS_FILE.read_text())
+        if not isinstance(payload, dict):
+            return default
+        out = dict(default)
+        out.update(payload)
+        out["last_update_id"] = int(out.get("last_update_id") or 0)
+        return out
+    except Exception:
+        return default
+
+
+def _save_telegram_command_status(payload: Dict[str, Any], now: Optional[datetime] = None) -> None:
+    ts = now or _ist_now()
+    out = _default_telegram_command_status(ts)
+    out.update(payload if isinstance(payload, dict) else {})
+    out["updated_at"] = ts.isoformat(timespec="seconds")
+    try:
+        TELEGRAM_COMMAND_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TELEGRAM_COMMAND_STATUS_FILE.write_text(json.dumps(out, indent=2, default=str))
+    except Exception:
+        log.exception("[TelegramCommands] failed to persist command status")
 
 
 def _looks_like_chain_dict(obj: Any) -> bool:
@@ -2053,6 +2291,61 @@ def _update_leg_ltps_from_chain(legs: List[OptionLeg], chain_rows: List[dict]) -
                 leg.current_ltp = ltp
         except Exception:
             continue
+
+
+def _chain_row_for_option(chain_rows: List[Dict[str, Any]], *, option_type: str, strike: float) -> Optional[Dict[str, Any]]:
+    opt_u = str(option_type or "").upper()
+    target = float(strike or 0.0)
+    for row in chain_rows or []:
+        try:
+            row_opt = str(row.get("option_type") or "").upper()
+            row_strike = float(row.get("strike") or 0.0)
+            if row_opt == opt_u and abs(row_strike - target) < 0.001:
+                return row
+        except Exception:
+            continue
+    return None
+
+
+def _intraday_rec_leg_to_option_leg(
+    *,
+    rec_leg: Dict[str, Any],
+    expiry: dt_date,
+    lot_size: int,
+    deploy_lot_multiplier: int,
+    chain_rows: List[Dict[str, Any]],
+) -> OptionLeg:
+    side_raw = str(rec_leg.get("side") or "").upper()
+    if side_raw not in {"BUY", "SELL"}:
+        raise ValueError(f"invalid_side:{side_raw}")
+    opt_raw = str(rec_leg.get("option_type") or "").upper()
+    if opt_raw not in {"CE", "PE"}:
+        raise ValueError(f"invalid_option_type:{opt_raw}")
+    strike = float(rec_leg.get("strike") or 0.0)
+    if strike <= 0:
+        raise ValueError(f"invalid_strike:{strike}")
+    qty_lots = int(float(rec_leg.get("qty_lots") or 1))
+    if qty_lots <= 0:
+        qty_lots = 1
+    qty = int(max(1, lot_size) * max(1, deploy_lot_multiplier) * qty_lots)
+    row = _chain_row_for_option(chain_rows, option_type=opt_raw, strike=strike)
+    sec_id = str((row or {}).get("security_id") or "").strip() or None
+    ltp = (row or {}).get("ltp")
+    try:
+        ltp_f = float(ltp) if ltp not in (None, "", "-", "--") else 0.0
+    except Exception:
+        ltp_f = 0.0
+    return OptionLeg(
+        symbol="NIFTY",
+        expiry=expiry,
+        strike=float(strike),
+        option_type=OptionType.CALL if opt_raw == "CE" else OptionType.PUT,
+        side=LegSide.BUY if side_raw == "BUY" else LegSide.SELL,
+        quantity=int(qty),
+        entry_price=float(ltp_f),
+        security_id=sec_id,
+        strategy_type=StrategyType.NONE,
+    )
 
 
 def _classify_trend_from_candles(candles: List[dict], *, interval_min: int) -> Dict[str, Any]:
@@ -3409,6 +3702,557 @@ def main() -> None:
         if out.get("reason") == "SEND_FAILED":
             log.warning("[TelegramIntradaySignal] send failed: %s", out.get("error"))
 
+    def _telegram_send_raw(*, token: str, chat_id: str, text: str, timeout_sec: float) -> Dict[str, Any]:
+        payload = {
+            "chat_id": str(chat_id or "").strip(),
+            "text": str(text or ""),
+            "disable_web_page_preview": True,
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib_request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=max(1.0, float(timeout_sec))) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            js = json.loads(raw)
+            if not isinstance(js, dict) or not js.get("ok"):
+                return {"ok": False, "error": f"telegram_api_error:{str(js)[:240]}"}
+            return {"ok": True}
+        except urllib_error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else str(exc)
+            return {"ok": False, "error": f"telegram_http_{exc.code}:{body[:240]}"}
+        except Exception as exc:
+            return {"ok": False, "error": f"telegram_send_error:{exc}"}
+
+    telegram_command_status = _load_telegram_command_status(_ist_now())
+
+    def _queue_intraday_deploy_request(*, now: datetime, source: str, note: str) -> Dict[str, Any]:
+        request_id = f"INTRADAYDEP-{int(time.time() * 1000)}"
+        payload = {
+            "request_id": request_id,
+            "requested_at": now.isoformat(timespec="seconds"),
+            "source": str(source or "unknown"),
+            "note": str(note or ""),
+        }
+        INTRADAY_AI_DEPLOY_REQUEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        INTRADAY_AI_DEPLOY_REQUEST_FILE.write_text(json.dumps(payload, indent=2))
+        _set_intraday_ai_deploy_requested(payload, now=now)
+        return payload
+
+    def _telegram_command_pump(*, now: datetime) -> None:
+        nonlocal telegram_command_status
+        enabled = bool(settings.get("telegram_commands_enabled", True))
+        live_only = bool(settings.get("telegram_commands_live_only", True))
+        poll_interval = max(1.0, float(settings.get("telegram_commands_poll_interval_sec", 5.0)))
+        timeout_sec = max(1.0, float(settings.get("telegram_alert_timeout_sec", 10.0)))
+        telegram_command_status["enabled"] = bool(enabled)
+        telegram_command_status["last_error"] = None
+        if not enabled:
+            _save_telegram_command_status(telegram_command_status, now=now)
+            return
+        if live_only and trade_mode != "live":
+            telegram_command_status["last_result"] = "LIVE_ONLY_SKIP"
+            _save_telegram_command_status(telegram_command_status, now=now)
+            return
+        last_poll = _parse_iso_dt(telegram_command_status.get("last_poll_at"))
+        if last_poll is not None and (now - last_poll).total_seconds() < poll_interval:
+            return
+        creds = _load_saved_creds()
+        token = str(creds.get("telegram_bot_token") or creds.get("telegram_token") or "").strip()
+        chat_id = str(creds.get("telegram_chat_id") or "").strip()
+        telegram_command_status["configured"] = bool(token and chat_id)
+        telegram_command_status["last_poll_at"] = now.isoformat(timespec="seconds")
+        telegram_command_status["next_poll_after"] = (now + timedelta(seconds=poll_interval)).isoformat(timespec="seconds")
+        if not token or not chat_id:
+            telegram_command_status["last_result"] = "NOT_CONFIGURED"
+            _save_telegram_command_status(telegram_command_status, now=now)
+            return
+        last_update_id = int(telegram_command_status.get("last_update_id") or 0)
+        url = (
+            f"https://api.telegram.org/bot{token}/getUpdates"
+            f"?offset={last_update_id + 1}&timeout=0&allowed_updates=%5B%22message%22%5D"
+        )
+        try:
+            req = urllib_request.Request(url, method="GET")
+            with urllib_request.urlopen(req, timeout=timeout_sec) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            js = json.loads(raw)
+            if not isinstance(js, dict) or not js.get("ok"):
+                raise RuntimeError(f"telegram_get_updates_error:{str(js)[:300]}")
+            updates = js.get("result") if isinstance(js.get("result"), list) else []
+        except Exception as exc:
+            telegram_command_status["last_error"] = str(exc)
+            telegram_command_status["last_result"] = "POLL_FAILED"
+            _save_telegram_command_status(telegram_command_status, now=now)
+            log.warning("[TelegramCommands] poll failed: %s", exc)
+            return
+
+        def _reply(msg: str) -> None:
+            out = _telegram_send_raw(token=token, chat_id=chat_id, text=msg, timeout_sec=timeout_sec)
+            if not out.get("ok"):
+                log.warning("[TelegramCommands] reply failed: %s", out.get("error"))
+
+        handled = 0
+        for upd in updates:
+            if not isinstance(upd, dict):
+                continue
+            try:
+                upd_id = int(upd.get("update_id") or 0)
+            except Exception:
+                upd_id = 0
+            if upd_id > last_update_id:
+                last_update_id = upd_id
+            message = upd.get("message") if isinstance(upd.get("message"), dict) else {}
+            text = str(message.get("text") or "").strip()
+            if not text.startswith("/"):
+                continue
+            msg_chat = str((message.get("chat") or {}).get("id") or "")
+            if msg_chat != chat_id:
+                continue
+            cmd = text.split()[0].split("@")[0].strip().lower()
+            telegram_command_status["last_command"] = cmd
+            telegram_command_status["last_command_at"] = now.isoformat(timespec="seconds")
+            handled += 1
+
+            if cmd in {"/deploy_intraday", "/deploy_ai"}:
+                if not bool(settings.get("telegram_commands_allow_deploy_intraday", True)):
+                    telegram_command_status["last_result"] = "DEPLOY_DISABLED"
+                    _reply("Deploy command is currently disabled in settings.")
+                    continue
+                if INTRADAY_AI_DEPLOY_REQUEST_FILE.exists():
+                    telegram_command_status["last_result"] = "DEPLOY_ALREADY_PENDING"
+                    _reply("A deploy request is already pending. Please wait for it to complete.")
+                    continue
+                req = _queue_intraday_deploy_request(
+                    now=now,
+                    source="telegram",
+                    note=f"telegram_command:{cmd}",
+                )
+                telegram_command_status["last_result"] = "DEPLOY_REQUEST_QUEUED"
+                _reply(
+                    "Deploy command received.\n"
+                    "Agent will deploy only if AI says ENTER_NOW and all safety checks pass.\n"
+                    f"Request ID: {req.get('request_id')}"
+                )
+                continue
+
+            if cmd in {"/intraday_status", "/ai_status"}:
+                if not bool(settings.get("telegram_commands_allow_intraday_status", True)):
+                    telegram_command_status["last_result"] = "STATUS_DISABLED"
+                    _reply("Intraday status command is currently disabled in settings.")
+                    continue
+                adv = intraday_ai_advisor.snapshot() if intraday_ai_advisor else {}
+                rec = adv.get("recommendation") if isinstance(adv.get("recommendation"), dict) else {}
+                sig = str(adv.get("signal") or "NO_TRADE").upper()
+                strategy = str(adv.get("strategy") or rec.get("strategy_label") or "NA")
+                headline = str(rec.get("headline") or rec.get("signal_text") or "No recommendation")
+                what = str(rec.get("what_to_enter") or "No trade now.")
+                _reply(
+                    "Intraday AI status:\n"
+                    f"Signal: {sig}\n"
+                    f"Setup: {strategy}\n"
+                    f"{headline}\n"
+                    f"{what}\n"
+                    f"Updated: {adv.get('updated_at') or 'NA'}"
+                )
+                telegram_command_status["last_result"] = "STATUS_SENT"
+                continue
+
+            if cmd in {"/start", "/help"}:
+                telegram_command_status["last_result"] = "HELP_SENT"
+                _reply(
+                    "Available commands:\n"
+                    "/deploy_intraday - queue deploy using latest AI recommendation\n"
+                    "/intraday_status - show latest intraday AI signal"
+                )
+                continue
+
+            telegram_command_status["last_result"] = "UNKNOWN_COMMAND"
+            _reply("Unknown command. Use /help")
+
+        telegram_command_status["last_update_id"] = int(last_update_id)
+        if handled == 0:
+            telegram_command_status["last_result"] = "NO_NEW_COMMANDS"
+        _save_telegram_command_status(telegram_command_status, now=now)
+
+    def _execute_intraday_deploy_request(
+        *,
+        now: datetime,
+        request_payload: Dict[str, Any],
+        signal_payload: Dict[str, Any],
+        chain_rows: List[Dict[str, Any]],
+        spot: float,
+    ) -> Dict[str, Any]:
+        request_id = str(request_payload.get("request_id") or f"INTRADAYDEP-{int(time.time() * 1000)}")
+        source = str(request_payload.get("source") or "unknown")
+        note = str(request_payload.get("note") or "")
+
+        def _finalize(
+            *,
+            ok: bool,
+            status: str,
+            code: str,
+            message: str,
+            details: Optional[Dict[str, Any]] = None,
+            alert_severity: str = "INFO",
+        ) -> Dict[str, Any]:
+            payload = _set_intraday_ai_deploy_result(
+                status=status,
+                request_id=request_id,
+                source=source,
+                note=note,
+                code=code,
+                message=message,
+                details=details or {},
+                now=now,
+            )
+            if trade_mode == "live":
+                tg_text = (
+                    f"Intraday deploy: {'SUCCESS' if ok else 'BLOCKED'}\n"
+                    f"Reason: {message}\n"
+                    f"Request: {request_id}\n"
+                    f"Time: {now.strftime('%I:%M %p').lstrip('0')}"
+                )
+                out = telegram_forwarder.send_direct_message(
+                    creds=_load_saved_creds(),
+                    text=tg_text,
+                    code=f"INTRADAY_DEPLOY_{code}",
+                    trade_mode=trade_mode,
+                    when=now,
+                )
+                if source == "telegram" and not out.get("ok"):
+                    creds = _load_saved_creds()
+                    token = str(creds.get("telegram_bot_token") or creds.get("telegram_token") or "").strip()
+                    chat_id = str(creds.get("telegram_chat_id") or "").strip()
+                    if token and chat_id:
+                        _telegram_send_raw(
+                            token=token,
+                            chat_id=chat_id,
+                            text=tg_text,
+                            timeout_sec=max(1.0, float(settings.get("telegram_alert_timeout_sec", 10.0))),
+                        )
+            if alert_severity:
+                _ops_alert(
+                    alert_severity,
+                    f"INTRADAY_DEPLOY_{code}",
+                    message,
+                    details={
+                        "request_id": request_id,
+                        "source": source,
+                        "note": note,
+                        "details": details or {},
+                    },
+                    dedupe_key=f"INTRADAY_DEPLOY_{code}",
+                    force=False,
+                )
+            return {"ok": ok, "status": payload}
+
+        if bool(settings.get("intraday_ai_deploy_require_live_mode", True)) and trade_mode != "live":
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="NOT_LIVE_MODE",
+                message="Deploy blocked: agent is not in live mode.",
+                alert_severity="WARNING",
+            )
+        if bool(settings.get("intraday_ai_deploy_require_market_hours", True)) and not _is_india_market_open(now):
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="MARKET_CLOSED",
+                message="Deploy blocked: market is closed.",
+                alert_severity="WARNING",
+            )
+        not_before = _parse_hhmm(settings.get("intraday_ai_entry_not_before", "09:25"), dtime(9, 25))
+        last_entry = _parse_hhmm(settings.get("intraday_ai_last_new_entry_time", "14:20"), dtime(14, 20))
+        now_time = now.timetz().replace(tzinfo=None) if getattr(now, "tzinfo", None) else now.time()
+        if now_time < not_before:
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="ENTRY_WINDOW_NOT_OPEN",
+                message=f"Deploy blocked: wait until {not_before.strftime('%H:%M')} IST.",
+                alert_severity="WARNING",
+            )
+        if now_time > last_entry:
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="ENTRY_WINDOW_CLOSED",
+                message=f"Deploy blocked: new entries are closed after {last_entry.strftime('%H:%M')} IST.",
+                alert_severity="WARNING",
+            )
+        if str(day_mode).upper() == "LOCKED_RED":
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="DAY_LOCKED_RED",
+                message="Deploy blocked: day is locked in red mode.",
+                alert_severity="CRITICAL",
+            )
+        if live_gate and live_gate.should_block_entries(now):
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="LIVE_GATE_LOCKED",
+                message="Deploy blocked: live gate is locked for entries.",
+                alert_severity="CRITICAL",
+            )
+        if position_reconciler and position_reconciler.should_block_entries(now):
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="RECONCILE_LOCKED",
+                message="Deploy blocked: reconcile lock is active.",
+                alert_severity="CRITICAL",
+            )
+        if execution_recovery_guard and execution_recovery_guard.should_block_entries(now):
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="EXEC_RECOVERY_LOCKED",
+                message="Deploy blocked: execution recovery lock is active.",
+                alert_severity="CRITICAL",
+            )
+        if bkm_ai_entry_lock_active:
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="AI_ENTRY_LOCKED",
+                message="Deploy blocked: Batman AI protective entry lock is active.",
+                alert_severity="WARNING",
+            )
+        if bkm_strategy and bkm_strategy.basket and not bool(settings.get("intraday_ai_allow_parallel_with_bkm", False)):
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="OPEN_BKM_POSITION_PRESENT",
+                message="Deploy blocked: Batman basket is open and parallel intraday trades are disabled.",
+                alert_severity="WARNING",
+            )
+
+        signal = str(signal_payload.get("signal") or "NO_TRADE").upper()
+        rec = signal_payload.get("recommendation") if isinstance(signal_payload.get("recommendation"), dict) else {}
+        if signal != "ENTER_NOW":
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="SIGNAL_NOT_ENTER",
+                message=f"Deploy blocked: current AI signal is {signal}, not ENTER_NOW.",
+                details={"signal": signal},
+                alert_severity="INFO",
+            )
+        updated_at = _parse_iso_dt(signal_payload.get("updated_at"))
+        max_signal_age = max(10.0, float(settings.get("intraday_ai_max_signal_age_sec", 180.0)))
+        if updated_at and (now - updated_at).total_seconds() > max_signal_age:
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="STALE_SIGNAL",
+                message="Deploy blocked: recommendation is stale. Wait for a fresh update.",
+                details={"updated_at": updated_at.isoformat(timespec="seconds"), "max_age_sec": max_signal_age},
+                alert_severity="WARNING",
+            )
+
+        rec_legs = rec.get("legs") if isinstance(rec.get("legs"), list) else []
+        if not rec_legs:
+            return _finalize(
+                ok=False,
+                status="FAILED",
+                code="NO_RECOMMENDED_LEGS",
+                message="Deploy failed: recommendation has no executable legs.",
+                alert_severity="ERROR",
+            )
+        expiry_raw = rec.get("expiry") or signal_payload.get("expiry")
+        try:
+            expiry_date = datetime.fromisoformat(str(expiry_raw)).date()
+        except Exception:
+            return _finalize(
+                ok=False,
+                status="FAILED",
+                code="INVALID_EXPIRY",
+                message="Deploy failed: recommendation expiry is invalid.",
+                details={"expiry": expiry_raw},
+                alert_severity="ERROR",
+            )
+
+        deploy_status = _load_intraday_ai_deploy_status(now)
+        dedupe_sec = max(0.0, float(settings.get("intraday_ai_deploy_dedupe_sec", 90.0)))
+        if dedupe_sec > 0 and str(deploy_status.get("status") or "").upper() == "SUCCESS":
+            last_processed = _parse_iso_dt(deploy_status.get("processed_at"))
+            if last_processed and (now - last_processed).total_seconds() < dedupe_sec:
+                return _finalize(
+                    ok=False,
+                    status="REJECTED",
+                    code="DUPLICATE_COOLDOWN",
+                    message=f"Deploy blocked: cooldown active ({int(dedupe_sec)} sec) to avoid duplicate entries.",
+                    alert_severity="INFO",
+                )
+
+        active_chain_rows = list(chain_rows or [])
+        if not active_chain_rows:
+            try:
+                chain_raw = dw.get_option_chain(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, expiry_date.isoformat())
+                active_chain_rows = _map_chain(chain_raw, expiry_date, symbol="NIFTY", spot=float(spot or 0.0))
+            except Exception:
+                log.exception("[IntradayDeploy] option chain fetch failed for expiry=%s", expiry_date.isoformat())
+                active_chain_rows = []
+        if not active_chain_rows:
+            return _finalize(
+                ok=False,
+                status="FAILED",
+                code="CHAIN_UNAVAILABLE",
+                message="Deploy failed: option-chain quotes unavailable.",
+                alert_severity="ERROR",
+            )
+
+        lot_size = int(settings.get("nifty_lot_size", settings.get("lot_size", 65)) or 65)
+        lot_mult = max(1, int(settings.get("intraday_ai_deploy_lots_multiplier", 1) or 1))
+        try:
+            option_legs = [
+                _intraday_rec_leg_to_option_leg(
+                    rec_leg=leg_payload if isinstance(leg_payload, dict) else {},
+                    expiry=expiry_date,
+                    lot_size=lot_size,
+                    deploy_lot_multiplier=lot_mult,
+                    chain_rows=active_chain_rows,
+                )
+                for leg_payload in rec_legs
+            ]
+        except Exception as exc:
+            return _finalize(
+                ok=False,
+                status="FAILED",
+                code="LEG_BUILD_FAILED",
+                message=f"Deploy failed: could not build order legs ({exc}).",
+                alert_severity="ERROR",
+            )
+        if not option_legs:
+            return _finalize(
+                ok=False,
+                status="FAILED",
+                code="NO_EXEC_LEGS",
+                message="Deploy failed: no executable legs after validation.",
+                alert_severity="ERROR",
+            )
+
+        broker_legs: List[OptionLeg] = []
+        try:
+            broker_legs = _map_positions(dw.get_positions_raw())
+        except Exception:
+            broker_legs = []
+        if bool(settings.get("intraday_ai_deploy_block_if_any_live_positions", False)) and broker_legs:
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="BROKER_NOT_FLAT",
+                message="Deploy blocked: broker has existing open positions.",
+                details={"open_positions": len(broker_legs)},
+                alert_severity="WARNING",
+            )
+
+        def _leg_match(target: OptionLeg, current: OptionLeg) -> bool:
+            try:
+                return (
+                    current.expiry == target.expiry
+                    and current.side == target.side
+                    and current.option_type == target.option_type
+                    and abs(float(current.strike) - float(target.strike)) < 0.01
+                    and int(current.quantity) >= int(target.quantity)
+                )
+            except Exception:
+                return False
+
+        if broker_legs and all(any(_leg_match(t, c) for c in broker_legs) for t in option_legs):
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="SETUP_ALREADY_OPEN",
+                message="Deploy blocked: same setup already appears open at broker.",
+                alert_severity="INFO",
+            )
+
+        # Buy hedges first, then sell shorts.
+        order_legs = sorted(option_legs, key=lambda leg: 0 if leg.side == LegSide.BUY else 1)
+        opened: List[OptionLeg] = []
+        errors: List[Dict[str, Any]] = []
+        for leg in order_legs:
+            out = _place_leg_order(
+                dw,
+                leg,
+                close=False,
+                trade_mode=trade_mode,
+                live_order_executor=live_order_executor if trade_mode == "live" else None,
+            )
+            if bool(out.get("ok")):
+                opened.append(leg)
+                continue
+            errors.append(
+                {
+                    "strike": leg.strike,
+                    "option_type": leg.option_type.value if hasattr(leg.option_type, "value") else str(leg.option_type),
+                    "side": leg.side.value if hasattr(leg.side, "value") else str(leg.side),
+                    "qty": leg.quantity,
+                    "error": out,
+                }
+            )
+            break
+
+        rollback: List[Dict[str, Any]] = []
+        if errors and opened:
+            for leg in reversed(opened):
+                close_out = _place_leg_order(
+                    dw,
+                    leg,
+                    close=True,
+                    trade_mode=trade_mode,
+                    live_order_executor=live_order_executor if trade_mode == "live" else None,
+                )
+                rollback.append(
+                    {
+                        "strike": leg.strike,
+                        "option_type": leg.option_type.value if hasattr(leg.option_type, "value") else str(leg.option_type),
+                        "side": leg.side.value if hasattr(leg.side, "value") else str(leg.side),
+                        "qty": leg.quantity,
+                        "close_result": close_out,
+                    }
+                )
+
+        strategy_label = str(rec.get("strategy_label") or rec.get("strategy_type") or signal_payload.get("strategy") or "Intraday AI")
+        sl_txt = str((rec.get("sl") or {}).get("text") or rec.get("sl_text") or "")
+        tp_txt = str((rec.get("tp") or {}).get("text") or rec.get("tp_text") or "")
+        details = {
+            "strategy": strategy_label,
+            "expiry": expiry_date.isoformat(),
+            "legs_requested": len(order_legs),
+            "legs_opened": len(opened),
+            "errors": errors,
+            "rollback": rollback,
+            "sl": sl_txt,
+            "tp": tp_txt,
+        }
+        if errors:
+            return _finalize(
+                ok=False,
+                status="FAILED",
+                code="ORDER_EXECUTION_FAILED",
+                message="Deploy failed during order placement. Rollback attempted.",
+                details=details,
+                alert_severity="CRITICAL",
+            )
+        return _finalize(
+            ok=True,
+            status="SUCCESS",
+            code="DEPLOY_SUCCESS",
+            message=f"Trade deployed: {strategy_label} ({expiry_date.isoformat()}).",
+            details=details,
+            alert_severity="INFO",
+        )
+
     def _telegram_market_close_summary(
         *,
         now: datetime,
@@ -3874,6 +4718,8 @@ def main() -> None:
             if execution_recovery_guard:
                 execution_recovery_guard.on_tick(now_ist)
             _telegram_pump()
+            _telegram_command_pump(now=now_ist)
+            intraday_deploy_request_pending = _peek_intraday_ai_deploy_request() or None
             _heartbeat(
                 phase="loop_start",
                 extra={
@@ -4098,6 +4944,15 @@ def main() -> None:
                         payoff_step=int(settings.get("batman_bkm_payoff_step", 50)),
                         enable_balance=bool(settings.get("batman_bkm_enable_balance", True)),
                         estimated_margin=float(settings.get("batman_bkm_estimated_margin", 1_000_000.0)),
+                        min_credit_pct=float(settings.get("batman_bkm_min_credit_pct", 0.75)),
+                        min_short_distance_points=float(settings.get("batman_bkm_min_short_distance_points", 450.0)),
+                        min_short_width_points=float(settings.get("batman_bkm_min_short_width_points", 1000.0)),
+                        max_center_offset_points=float(settings.get("batman_bkm_max_center_offset_points", 250.0)),
+                        max_outer_distance_ratio=float(settings.get("batman_bkm_max_outer_distance_ratio", 1.80)),
+                        max_tail_loss_imbalance_abs=float(settings.get("batman_bkm_max_tail_loss_imbalance_abs", 35000.0)),
+                        max_tail_loss_imbalance_ratio=float(settings.get("batman_bkm_max_tail_loss_imbalance_ratio", 0.35)),
+                        max_worst_loss_to_credit_ratio=float(settings.get("batman_bkm_max_worst_loss_to_credit_ratio", 25.0)),
+                        quality_block_on_fail=bool(settings.get("batman_bkm_quality_block_on_fail", True)),
                     )
                     bkm_strategy = BatmanBKMStrategy(cfg)
                 elif bkm_strategy.basket is None and bkm_strategy.cfg.lot_multiplier != active_lot_multiplier:
@@ -4146,10 +5001,15 @@ def main() -> None:
                     roll_anchor_expiry, roll_target_expiry = _fetch_bkm_monthly_roll_plan(dw)
                     expiry = roll_target_expiry or roll_anchor_expiry or today
                 expiry_str = expiry.isoformat()
+                intraday_out: Dict[str, Any] = intraday_ai_advisor.snapshot() if intraday_ai_advisor else {}
+                intraday_chain_for_deploy: List[Dict[str, Any]] = []
                 if intraday_ai_advisor:
                     try:
                         refresh_sec = max(15.0, float(getattr(intraday_ai_advisor.config, "refresh_sec", 60.0)))
+                        force_intraday_eval = bool(intraday_deploy_request_pending)
                         if (
+                            force_intraday_eval
+                            or
                             intraday_ai_last_eval_at is None
                             or (now_ist - intraday_ai_last_eval_at).total_seconds() >= refresh_sec
                         ):
@@ -4187,6 +5047,7 @@ def main() -> None:
                                             advisor_expiry.isoformat(),
                                         )
                                         intraday_chain = []
+                                intraday_chain_for_deploy = list(intraday_chain)
                                 if intraday_chain:
                                     oc_ctx, next_intraday_oi = _summarize_bkm_option_chain_context(
                                         intraday_chain,
@@ -4250,8 +5111,56 @@ def main() -> None:
                                     _telegram_intraday_signal(now=now_ist, signal_payload=intraday_out)
                                 except Exception:
                                     log.exception("[TelegramIntradaySignal] send failed")
+                        else:
+                            intraday_out = intraday_ai_advisor.snapshot()
                     except Exception:
                         log.exception("[IntradayAI] advisor refresh failed")
+                        intraday_out = intraday_ai_advisor.snapshot()
+                intraday_deploy_request = _consume_intraday_ai_deploy_request() or None
+                if intraday_deploy_request:
+                    req_id = str(intraday_deploy_request.get("request_id") or "")
+                    req_source = str(intraday_deploy_request.get("source") or "unknown")
+                    _set_intraday_ai_deploy_requested(intraday_deploy_request, now=now_ist)
+                    if intraday_ai_advisor:
+                        try:
+                            dep_out = _execute_intraday_deploy_request(
+                                now=now_ist,
+                                request_payload=intraday_deploy_request,
+                                signal_payload=intraday_out if isinstance(intraday_out, dict) else {},
+                                chain_rows=intraday_chain_for_deploy,
+                                spot=float(market.spot or 0.0),
+                            )
+                            log.info(
+                                "[IntradayDeploy] completed id=%s source=%s ok=%s status=%s code=%s",
+                                req_id or "NA",
+                                req_source,
+                                bool(dep_out.get("ok")),
+                                (dep_out.get("status") or {}).get("status"),
+                                (dep_out.get("status") or {}).get("result_code"),
+                            )
+                        except Exception as exc:
+                            log.exception("[IntradayDeploy] execution failed id=%s source=%s", req_id, req_source)
+                            _set_intraday_ai_deploy_result(
+                                status="FAILED",
+                                request_id=req_id,
+                                source=req_source,
+                                note=str(intraday_deploy_request.get("note") or ""),
+                                code="HANDLER_EXCEPTION",
+                                message=f"Deploy failed due to internal error: {exc}",
+                                details={},
+                                now=now_ist,
+                            )
+                    else:
+                        _set_intraday_ai_deploy_result(
+                            status="FAILED",
+                            request_id=req_id,
+                            source=req_source,
+                            note=str(intraday_deploy_request.get("note") or ""),
+                            code="INTRADAY_ADVISOR_DISABLED",
+                            message="Deploy failed: intraday AI advisor is disabled.",
+                            details={},
+                            now=now_ist,
+                        )
                 if live_bkm_reconcile_enabled and position_reconciler:
                     try:
                         broker_positions_raw = dw.get_positions_raw()
@@ -4464,9 +5373,16 @@ def main() -> None:
                                     break
                                 probe = BatmanBKMStrategy(bkm_strategy.cfg)
                                 plan_basket, plan_reason = probe.maybe_enter(snap_spot, snap_chain, expiry)
+                                plan_quality = dict(getattr(probe, "last_quality_report", {}) or {})
                                 snap_reasons.append(plan_reason)
                                 if not plan_basket or plan_reason != "ENTER":
                                     planner_block_reason = f"PRETRADE_{plan_reason}"
+                                    if plan_quality:
+                                        planner_summary = {
+                                            "quality_status": plan_quality.get("status"),
+                                            "quality_reason": plan_quality.get("reason"),
+                                            "quality_score": plan_quality.get("score"),
+                                        }
                                     break
                                 try:
                                     plan_sig = tuple(sorted(
@@ -4537,6 +5453,13 @@ def main() -> None:
                                     "max_up_loss": max_up,
                                     "max_down_loss": max_down,
                                     "loss_skew_abs": loss_skew_abs,
+                                    "quality_status": getattr(plan_basket, "quality_status", "UNKNOWN"),
+                                    "quality_score": float(getattr(plan_basket, "quality_score", 0.0) or 0.0),
+                                    "quality_reason": (
+                                        (list(getattr(plan_basket, "quality_reasons", []) or ["QUALITY_OK"])[0])
+                                        if getattr(plan_basket, "quality_reasons", None) is not None
+                                        else "QUALITY_OK"
+                                    ),
                                     "snapshots": planner_snapshots,
                                 }
 
@@ -4566,7 +5489,7 @@ def main() -> None:
                                 ):
                                     planner_block_reason = "PRETRADE_DELTA_SKEW"
                                 log.info(
-                                    "[BatmanBKM] pretrade plan expiry=%s anchor=%s snapshots=%s spot_span=%.2f credit_span_pct=%.3f sig_stable=%s net_delta=%s loss_skew_abs=%s net_credit=%.2f credit_pct=%.3f",
+                                    "[BatmanBKM] pretrade plan expiry=%s anchor=%s snapshots=%s spot_span=%.2f credit_span_pct=%.3f sig_stable=%s net_delta=%s loss_skew_abs=%s quality_status=%s quality_reason=%s quality_score=%s net_credit=%.2f credit_pct=%.3f",
                                     expiry_str,
                                     entry_anchor_expiry.isoformat() if entry_anchor_expiry else None,
                                     planner_snapshots,
@@ -4575,6 +5498,9 @@ def main() -> None:
                                     planner_summary.get("signature_stable"),
                                     "NA" if planner_summary.get("net_delta") is None else f"{float(planner_summary.get('net_delta')):.2f}",
                                     "NA" if planner_summary.get("loss_skew_abs") is None else f"{float(planner_summary.get('loss_skew_abs')):.2f}",
+                                    planner_summary.get("quality_status"),
+                                    planner_summary.get("quality_reason"),
+                                    planner_summary.get("quality_score"),
                                     float(planner_summary.get("net_credit") or 0.0),
                                     float(planner_summary.get("credit_pct") or 0.0),
                                 )
@@ -4610,7 +5536,15 @@ def main() -> None:
                                 time.sleep(poll_sec)
                                 continue
                         basket, reason = bkm_strategy.maybe_enter(entry_spot, chain, expiry)
-                        log.info("[BatmanBKM] attempt reason=%s expiry=%s", reason, expiry_str)
+                        quality_report = dict(getattr(bkm_strategy, "last_quality_report", {}) or {})
+                        log.info(
+                            "[BatmanBKM] attempt reason=%s expiry=%s quality_status=%s quality_reason=%s quality_score=%s",
+                            reason,
+                            expiry_str,
+                            quality_report.get("status"),
+                            quality_report.get("reason"),
+                            quality_report.get("score"),
+                        )
                         if basket and reason == "ENTER":
                             if trade_mode == "live":
                                 open_exec = _execute_bkm_open_live(
@@ -4657,7 +5591,17 @@ def main() -> None:
                                     time.sleep(poll_sec)
                                     continue
                                 _defer_reconcile_checks("BKM_OPEN_SUBMITTED")
-                            _mark_bkm_open(expiry_str, {"net_credit": basket.net_credit, "credit_pct": basket.credit_pct})
+                            _mark_bkm_open(
+                                expiry_str,
+                                {
+                                    "net_credit": basket.net_credit,
+                                    "credit_pct": basket.credit_pct,
+                                    "quality_status": getattr(basket, "quality_status", "UNKNOWN"),
+                                    "quality_score": float(getattr(basket, "quality_score", 0.0) or 0.0),
+                                    "quality_reasons": list(getattr(basket, "quality_reasons", []) or []),
+                                    "quality_metrics": dict(getattr(basket, "quality_metrics", {}) or {}),
+                                },
+                            )
                             try:
                                 _log_batman_blotter(trade_mode, basket.legs, "OPEN")
                             except Exception:

@@ -51,6 +51,9 @@ BATMAN_BKM_AI_EVENTS_JSONL = STATE_DIR / "batman_bkm_ai_events.jsonl"
 BATMAN_BKM_AI_PROTECT_STATUS_JSON = STATE_DIR / "batman_bkm_ai_protect_status.json"
 BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_JSON = STATE_DIR / "batman_bkm_ai_protect_clear_request.json"
 INTRADAY_AI_ADVISOR_STATUS_JSON = STATE_DIR / "intraday_ai_advisor_status.json"
+INTRADAY_AI_DEPLOY_REQUEST_JSON = STATE_DIR / "intraday_ai_deploy_request.json"
+INTRADAY_AI_DEPLOY_STATUS_JSON = STATE_DIR / "intraday_ai_deploy_status.json"
+TELEGRAM_COMMAND_STATUS_JSON = STATE_DIR / "telegram_command_status.json"
 BATMAN_BKM_TUNING_ADVICE_JSON = STATE_DIR / "batman_bkm_tuning_advice.json"
 BATMAN_BKM_TUNING_HISTORY_JSONL = STATE_DIR / "batman_bkm_tuning_history.jsonl"
 CREDS_FILE = STATE_DIR / "creds.json"
@@ -968,6 +971,101 @@ def _load_intraday_ai_status() -> Dict[str, Any]:
     return payload if isinstance(payload, dict) and payload else _default_intraday_ai_status()
 
 
+def _default_intraday_ai_deploy_status() -> Dict[str, Any]:
+    now = _ist_now()
+    return {
+        "status": "IDLE",
+        "pending": False,
+        "request_id": None,
+        "requested_at": None,
+        "request_source": None,
+        "request_note": None,
+        "processed_at": None,
+        "result_code": None,
+        "message": None,
+        "details": {},
+        "current_session_date": now.date().isoformat(),
+        "updated_at": now.isoformat(timespec="seconds"),
+    }
+
+
+def _load_intraday_ai_deploy_status() -> Dict[str, Any]:
+    payload = _json_read(INTRADAY_AI_DEPLOY_STATUS_JSON)
+    if not payload or not isinstance(payload, dict):
+        return _default_intraday_ai_deploy_status()
+    out = _default_intraday_ai_deploy_status()
+    out.update(payload)
+    out["pending"] = bool(out.get("pending", False))
+    out["details"] = out.get("details") if isinstance(out.get("details"), dict) else {}
+    return out
+
+
+def _load_telegram_command_status() -> Dict[str, Any]:
+    payload = _json_read(TELEGRAM_COMMAND_STATUS_JSON)
+    if isinstance(payload, dict) and payload:
+        return payload
+    now = _ist_now()
+    return {
+        "enabled": False,
+        "configured": False,
+        "last_poll_at": None,
+        "last_update_id": 0,
+        "last_command": None,
+        "last_command_at": None,
+        "last_result": None,
+        "last_error": None,
+        "next_poll_after": None,
+        "updated_at": now.isoformat(timespec="seconds"),
+    }
+
+
+def _queue_intraday_ai_deploy_request(*, source: str, note: str) -> Dict[str, Any]:
+    now = _ist_now()
+    if INTRADAY_AI_DEPLOY_REQUEST_JSON.exists():
+        pending = _json_read(INTRADAY_AI_DEPLOY_REQUEST_JSON)
+        if isinstance(pending, dict) and pending:
+            return {
+                "ok": False,
+                "queued": False,
+                "error": "DEPLOY_REQUEST_PENDING",
+                "pending_request": pending,
+            }
+    request_id = f"INTRADAYDEP-{int(time.time() * 1000)}"
+    payload = {
+        "request_id": request_id,
+        "requested_at": now.isoformat(timespec="seconds"),
+        "source": str(source or "manual_ui"),
+        "note": str(note or ""),
+    }
+    INTRADAY_AI_DEPLOY_REQUEST_JSON.parent.mkdir(parents=True, exist_ok=True)
+    _json_write(INTRADAY_AI_DEPLOY_REQUEST_JSON, payload)
+    status = _load_intraday_ai_deploy_status()
+    status.update(
+        {
+            "status": "REQUESTED",
+            "pending": True,
+            "request_id": request_id,
+            "requested_at": payload["requested_at"],
+            "request_source": payload["source"],
+            "request_note": payload["note"],
+            "processed_at": None,
+            "result_code": None,
+            "message": "Deployment request accepted and queued.",
+            "details": {},
+            "current_session_date": now.date().isoformat(),
+            "updated_at": now.isoformat(timespec="seconds"),
+        }
+    )
+    _json_write(INTRADAY_AI_DEPLOY_STATUS_JSON, status)
+    return {
+        "ok": True,
+        "queued": True,
+        "request_id": request_id,
+        "request": payload,
+        "deploy_status": status,
+    }
+
+
 def _clear_bkm_ai_protect_lock(*, source: str = "manual_ui", note: str = "") -> Dict[str, Any]:
     now = _ist_now()
     before = _load_bkm_ai_protect_status()
@@ -1168,7 +1266,86 @@ def _parse_bkm_pos_identity(pos: Dict[str, Any]) -> Tuple[Optional[str], Optiona
     return expiry_iso, strike_val, opt_val
 
 
-def _build_importable_bkm_from_broker_positions(positions: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _assess_imported_bkm_quality(
+    *,
+    legs: List[Dict[str, Any]],
+    expiry: str,
+    net_credit: float,
+    margin_required: float,
+    settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    try:
+        from data_engine.market_ai.modules.strategies.batman_bkm_monthly import (  # type: ignore
+            BatmanBKMConfig,
+            BatmanBKMStrategy,
+            Leg as BKMLeg,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "UNKNOWN",
+            "reason": "QUALITY_EVAL_IMPORT_ERROR",
+            "reasons": ["QUALITY_EVAL_IMPORT_ERROR"],
+            "score": 0.0,
+            "metrics": {"error": str(exc)},
+        }
+
+    cfg = BatmanBKMConfig(
+        base_distance_points=_parse_int((settings or {}).get("batman_bkm_base_distance"), 400),
+        inner_step_points=_parse_int((settings or {}).get("batman_bkm_inner_step"), 200),
+        outer_step_points=_parse_int((settings or {}).get("batman_bkm_outer_step"), 800),
+        strike_rounding=_parse_int((settings or {}).get("batman_bkm_strike_rounding"), 50),
+        lot_size=_parse_int((settings or {}).get("batman_v2_lot_size") or (settings or {}).get("lot_size"), 65),
+        lot_multiplier=_parse_int((settings or {}).get("batman_bkm_lot_multiplier"), 1),
+        max_credit_pct=_parse_float((settings or {}).get("batman_bkm_max_credit_pct"), 6.0),
+        credit_step_points=_parse_int((settings or {}).get("batman_bkm_credit_step"), 100),
+        max_widen_iterations=_parse_int((settings or {}).get("batman_bkm_max_widen_iterations"), 10),
+        balance_tolerance=_parse_float((settings or {}).get("batman_bkm_balance_tolerance"), 5000.0),
+        max_hedge_lots=_parse_int((settings or {}).get("batman_bkm_max_hedge_lots"), 6),
+        tp_pct=_parse_float((settings or {}).get("batman_bkm_tp_pct"), 0.02),
+        sl_pct=_parse_float((settings or {}).get("batman_bkm_sl_pct"), 0.025),
+        enable_balance=bool((settings or {}).get("batman_bkm_enable_balance", True)),
+        estimated_margin=_parse_float((settings or {}).get("batman_bkm_estimated_margin"), 1_000_000.0),
+        min_credit_pct=_parse_float((settings or {}).get("batman_bkm_min_credit_pct"), 0.75),
+        min_short_distance_points=_parse_float((settings or {}).get("batman_bkm_min_short_distance_points"), 450.0),
+        min_short_width_points=_parse_float((settings or {}).get("batman_bkm_min_short_width_points"), 1000.0),
+        max_center_offset_points=_parse_float((settings or {}).get("batman_bkm_max_center_offset_points"), 250.0),
+        max_outer_distance_ratio=_parse_float((settings or {}).get("batman_bkm_max_outer_distance_ratio"), 1.80),
+        max_tail_loss_imbalance_abs=_parse_float((settings or {}).get("batman_bkm_max_tail_loss_imbalance_abs"), 35000.0),
+        max_tail_loss_imbalance_ratio=_parse_float((settings or {}).get("batman_bkm_max_tail_loss_imbalance_ratio"), 0.35),
+        max_worst_loss_to_credit_ratio=_parse_float((settings or {}).get("batman_bkm_max_worst_loss_to_credit_ratio"), 25.0),
+        quality_block_on_fail=bool((settings or {}).get("batman_bkm_quality_block_on_fail", True)),
+    )
+    strat = BatmanBKMStrategy(cfg)
+    built_legs: List[BKMLeg] = []
+    for leg in legs:
+        try:
+            built_legs.append(
+                BKMLeg(
+                    option_type=str(leg.get("option_type") or "").upper(),
+                    side=str(leg.get("side") or "").upper(),
+                    strike=_parse_float(leg.get("strike"), 0.0),
+                    qty=_parse_int(leg.get("quantity"), 0),
+                    entry=_parse_float(leg.get("entry_price"), 0.0),
+                    ltp=_parse_float(leg.get("entry_price"), 0.0),
+                    security_id=str(leg.get("security_id") or ""),
+                    expiry=str(expiry or ""),
+                )
+            )
+        except Exception:
+            continue
+    cm = _build_chain_map(str(expiry or ""))
+    spot = cm.get("spot") if isinstance(cm, dict) else None
+    quality = strat.assess_legs_quality(
+        legs=built_legs,
+        spot=_parse_float(spot, 0.0) if spot is not None else None,
+        margin_required=float(margin_required or 0.0),
+        net_credit=float(net_credit or 0.0),
+    )
+    return quality if isinstance(quality, dict) else {}
+
+
+def _build_importable_bkm_from_broker_positions(positions: List[Dict[str, Any]], settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Validate and normalize a live broker basket into BKM journal/local-state payload.
     Returns: {"ok": bool, "imported": bool, ...}
@@ -1289,15 +1466,38 @@ def _build_importable_bkm_from_broker_positions(positions: List[Dict[str, Any]])
         sign = 1.0 if str(leg.get("side") or "").upper() == "SELL" else -1.0
         net_credit += sign * float(leg.get("entry_price") or 0.0) * int(leg.get("quantity") or 0)
 
-    settings = _json_read(SETTINGS_JSON)
+    settings = settings if isinstance(settings, dict) else _json_read(SETTINGS_JSON)
     est_margin = _parse_float((settings or {}).get("batman_bkm_estimated_margin"), 1_000_000.0)
     credit_pct = (net_credit / est_margin) * 100.0 if est_margin > 0 else 0.0
+    quality = _assess_imported_bkm_quality(
+        legs=ordered_legs,
+        expiry=expiry,
+        net_credit=net_credit,
+        margin_required=est_margin,
+        settings=settings or {},
+    )
+    quality_ok = bool(quality.get("ok")) if isinstance(quality, dict) else False
+    import_quality_enforce = bool((settings or {}).get("batman_bkm_import_enforce_quality", False))
+    if import_quality_enforce and not quality_ok:
+        return {
+            "ok": False,
+            "imported": False,
+            "error": "BKM_QUALITY_CHECK_FAILED",
+            "details": {
+                "quality": quality,
+                "message": "Imported basket failed Batman quality checks.",
+            },
+        }
 
     meta = {
         "net_credit": net_credit,
         "margin_required": est_margin,
         "credit_pct": credit_pct,
         "imported_from_broker": True,
+        "quality_status": str((quality or {}).get("status") or ("PASS" if quality_ok else "BLOCKED")),
+        "quality_score": float((quality or {}).get("score") or 0.0),
+        "quality_reasons": list((quality or {}).get("reasons") or []),
+        "quality_metrics": dict((quality or {}).get("metrics") or {}),
     }
     return {
         "ok": True,
@@ -1305,6 +1505,8 @@ def _build_importable_bkm_from_broker_positions(positions: List[Dict[str, Any]])
         "expiry": expiry,
         "legs": ordered_legs,
         "meta": meta,
+        "quality": quality,
+        "quality_warning": bool(not quality_ok),
         "q_long": int(ce_info["q_long"]),
         "ce_hedge_qty": int(ce_info["q_hedge"]),
         "pe_hedge_qty": int(pe_info["q_hedge"]),
@@ -1322,7 +1524,11 @@ def _import_live_bkm_from_broker() -> Dict[str, Any]:
     if str(broker_payload.get("source") or "") != "broker":
         return {"ok": False, "imported": False, "error": "BROKER_CHECK_UNAVAILABLE"}
     positions = broker_payload.get("positions") if isinstance(broker_payload, dict) else []
-    normalized = _build_importable_bkm_from_broker_positions(positions if isinstance(positions, list) else [])
+    settings = _json_read(SETTINGS_JSON)
+    normalized = _build_importable_bkm_from_broker_positions(
+        positions if isinstance(positions, list) else [],
+        settings=settings if isinstance(settings, dict) else {},
+    )
     if not bool(normalized.get("ok")) or not bool(normalized.get("imported")):
         return normalized
 
@@ -1332,7 +1538,6 @@ def _import_live_bkm_from_broker() -> Dict[str, Any]:
     now = _ist_now().isoformat(timespec="seconds")
 
     # Close any previously active BKM basket in journal so analyze_bkm() sees exactly one active basket.
-    settings = _json_read(SETTINGS_JSON)
     lookback_days = max(1, _parse_int((settings or {}).get("live_exec_recovery_lookback_days"), 45))
     journal = ExecutionJournal(journal_path=EXECUTION_JOURNAL_JSONL, logger=None)
     summary = journal.analyze_bkm(lookback_days=lookback_days)
@@ -1375,6 +1580,9 @@ def _import_live_bkm_from_broker() -> Dict[str, Any]:
             "opened_at": now,
             "net_credit": float(meta.get("net_credit") or 0.0),
             "credit_pct": float(meta.get("credit_pct") or 0.0),
+            "quality_status": str(meta.get("quality_status") or "UNKNOWN"),
+            "quality_score": float(meta.get("quality_score") or 0.0),
+            "quality_reasons": list(meta.get("quality_reasons") or []),
             "imported_from_broker": True,
         }
     }
@@ -1388,6 +1596,8 @@ def _import_live_bkm_from_broker() -> Dict[str, Any]:
         "expiry": expiry,
         "legs": len(legs),
         "meta": meta,
+        "quality": normalized.get("quality"),
+        "quality_warning": bool(normalized.get("quality_warning", False)),
         "reconcile_status": rec_status.get("status"),
         "execution_recovery_status": exec_status.get("status"),
     }
@@ -1681,6 +1891,65 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 if isinstance(exc, KeyboardInterrupt):
                     raise
                 self._send_json(_api_error_payload(exc, code="BKM_AI_PROTECT_SET_HANDLER_CRASH"), status=500)
+            return
+        if self.path.startswith("/api/intraday_ai/deploy"):
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+                source = str((data or {}).get("source") or "manual_ui")
+                note = str((data or {}).get("note") or "")
+
+                settings = _json_read(SETTINGS_JSON)
+                pid_data = _json_read(PID_FILE)
+                pid = int(pid_data.get("pid", 0)) if isinstance(pid_data, dict) else 0
+                running = bool(pid and _is_process_alive(pid))
+                require_running = bool((settings or {}).get("intraday_ai_deploy_require_agent_running", True))
+                if require_running and not running:
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "queued": False,
+                            "error": "AGENT_NOT_RUNNING",
+                            "message": "Start the agent in live mode before deploying.",
+                        },
+                        status=409,
+                    )
+                    return
+                require_live_mode = bool((settings or {}).get("intraday_ai_deploy_require_live_mode", True))
+                active_mode = str((pid_data or {}).get("trade_mode") or "").strip().lower()
+                if require_live_mode and active_mode != "live":
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "queued": False,
+                            "error": "AGENT_NOT_LIVE_MODE",
+                            "message": "Agent is not in live mode.",
+                            "trade_mode": active_mode or None,
+                        },
+                        status=409,
+                    )
+                    return
+                strategy = str((_json_read(LAST_STRATEGY_FILE) or {}).get("strategy_file") or "batman_bkm_monthly").strip()
+                if strategy != "batman_bkm_monthly":
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "queued": False,
+                            "error": "UNSUPPORTED_STRATEGY",
+                            "message": "Intraday AI deploy is currently supported only with batman_bkm_monthly runtime.",
+                            "strategy_file": strategy,
+                        },
+                        status=409,
+                    )
+                    return
+                result = _queue_intraday_ai_deploy_request(source=source, note=note)
+                status = 200 if bool(result.get("ok")) else 409
+                self._send_json(result, status=status)
+            except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                self._send_json(_api_error_payload(exc, code="INTRADAY_AI_DEPLOY_HANDLER_CRASH"), status=500)
             return
         if self.path.startswith("/api/control/restart"):
             try:
@@ -1983,6 +2252,7 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 exec_recovery = _load_execution_recovery_status()
                 bkm_ai = _load_bkm_ai_status()
                 intraday_ai = _load_intraday_ai_status()
+                intraday_deploy = _load_intraday_ai_deploy_status()
                 bkm_ai_plan = bkm_ai.get("plan") if isinstance(bkm_ai.get("plan"), dict) else {}
                 bkm_ai_ctx = bkm_ai.get("market_context") if isinstance(bkm_ai.get("market_context"), dict) else {}
                 bkm_ai_structure = bkm_ai_ctx.get("structure") if isinstance(bkm_ai_ctx.get("structure"), dict) else {}
@@ -2007,7 +2277,20 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 watchdog = _watchdog_health_status()
                 alerts = _load_alerts_tail(limit=50)
                 telegram_status = _load_telegram_alert_status()
+                telegram_cmd_status = _load_telegram_command_status()
                 advice = _json_read(BATMAN_BKM_TUNING_ADVICE_JSON)
+                strategy_state = _json_read(STRATEGY_STATE)
+                bkm_open_meta: Dict[str, Any] = {}
+                try:
+                    bkm_bucket = (strategy_state or {}).get("BATMAN_BKM") if isinstance(strategy_state, dict) else {}
+                    if isinstance(bkm_bucket, dict):
+                        for exp_key, info in bkm_bucket.items():
+                            if isinstance(info, dict) and str(info.get("status") or "").upper() == "OPEN":
+                                bkm_open_meta = dict(info)
+                                bkm_open_meta.setdefault("expiry", exp_key)
+                                break
+                except Exception:
+                    bkm_open_meta = {}
                 proposal_count = 0
                 if isinstance(advice, dict):
                     try:
@@ -2019,6 +2302,7 @@ class PaperHandler(SimpleHTTPRequestHandler):
                     {
                         "running": bool(running),
                         "pid": pid,
+                        "trade_mode": (str(pid_data.get("trade_mode") or "").lower() if isinstance(pid_data, dict) else None),
                         "watchdog_status": watchdog.get("status"),
                         "heartbeat_age_sec": watchdog.get("age_sec"),
                         "last_heartbeat_at": watchdog.get("last_heartbeat_at"),
@@ -2083,6 +2367,25 @@ class PaperHandler(SimpleHTTPRequestHandler):
                         "intraday_ai_updated_at": intraday_ai.get("updated_at"),
                         "intraday_ai_headline": intraday_ai_rec.get("headline"),
                         "intraday_ai_what_to_enter": intraday_ai_rec.get("what_to_enter"),
+                        "intraday_ai_deploy_status": intraday_deploy.get("status"),
+                        "intraday_ai_deploy_pending": bool(intraday_deploy.get("pending", False)),
+                        "intraday_ai_deploy_result_code": intraday_deploy.get("result_code"),
+                        "intraday_ai_deploy_message": intraday_deploy.get("message"),
+                        "intraday_ai_deploy_updated_at": intraday_deploy.get("updated_at"),
+                        "bkm_quality_status": bkm_open_meta.get("quality_status"),
+                        "bkm_quality_score": _parse_float(bkm_open_meta.get("quality_score"), None),
+                        "bkm_quality_reasons": (
+                            bkm_open_meta.get("quality_reasons")
+                            if isinstance(bkm_open_meta.get("quality_reasons"), list)
+                            else []
+                        ),
+                        "bkm_open_expiry": bkm_open_meta.get("expiry"),
+                        "telegram_commands_enabled": bool(telegram_cmd_status.get("enabled", False)),
+                        "telegram_commands_configured": bool(telegram_cmd_status.get("configured", False)),
+                        "telegram_commands_last_command": telegram_cmd_status.get("last_command"),
+                        "telegram_commands_last_result": telegram_cmd_status.get("last_result"),
+                        "telegram_commands_last_error": telegram_cmd_status.get("last_error"),
+                        "telegram_commands_last_poll_at": telegram_cmd_status.get("last_poll_at"),
                         "alerts_recent_count": len(alerts),
                         "last_alert_severity": last_alert.get("severity"),
                         "last_alert_code": last_alert.get("code"),
@@ -2106,6 +2409,18 @@ class PaperHandler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/intraday_ai/status"):
             try:
                 self._send_json({"ok": True, "advisor": _load_intraday_ai_status()})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/intraday_ai/deploy_status"):
+            try:
+                self._send_json({"ok": True, "deploy": _load_intraday_ai_deploy_status()})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/telegram/commands/status"):
+            try:
+                self._send_json({"ok": True, "telegram_commands": _load_telegram_command_status()})
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return

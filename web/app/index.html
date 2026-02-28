@@ -110,6 +110,16 @@
       border-color: rgba(251,191,36,0.35);
       color: #1f1300;
     }
+    .action-btn.intraday-deploy-on {
+      background: linear-gradient(135deg, rgba(34,197,94,0.95), rgba(16,185,129,0.95));
+      border-color: rgba(52,211,153,0.35);
+      color: #052e16;
+    }
+    .action-btn.intraday-deploy-off {
+      background: linear-gradient(135deg, rgba(51,65,85,0.95), rgba(30,41,59,0.95));
+      border-color: rgba(100,116,139,0.35);
+      color: #cbd5e1;
+    }
     .meter-block { margin-top: 6px; }
     .meter-row { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:4px; }
     .meter-label { color: var(--muted); font-size: 11px; }
@@ -271,12 +281,17 @@
             <div class="summary-title">Intraday Sell Advisor (Phase A)</div>
             <div class="summary-value" id="intraday-ai-headline" style="font-size:16px;">No signal yet</div>
             <div class="summary-sub" id="intraday-ai-meta">Signal: — | Strategy: — | Bias: —</div>
+            <div style="margin-top:6px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <button id="intraday-ai-deploy" class="action-btn intraday-deploy-off" disabled>Deploy Recommended Trade</button>
+              <span class="chip" id="intraday-ai-deploy-chip">Deploy: —</span>
+            </div>
             <div class="summary-sub" id="intraday-ai-what">What to enter: —</div>
             <div class="summary-sub" id="intraday-ai-sl">SL: —</div>
             <div class="summary-sub" id="intraday-ai-tp">TP: —</div>
             <div class="summary-sub" id="intraday-ai-hold">Hold: —</div>
             <div class="summary-sub" id="intraday-ai-why">Why: —</div>
             <div class="summary-sub" id="intraday-ai-updated">Updated: —</div>
+            <div class="summary-sub" id="intraday-ai-deploy-note">Telegram command: /deploy_intraday</div>
           </div>
         </div>
       </div>
@@ -552,6 +567,7 @@
     const loadedTabs = new Set();
     const TABS = ["control", "pnl", "live", "state", "logs", "settings"];
     let activeTab = "control";
+    let latestControlStatus = {};
 
     async function loadPnl() {
       if (inflight.pnl) return;
@@ -852,10 +868,74 @@
       }
     }
 
+    function _setIntradayDeployButtonState({
+      canDeploy,
+      reason,
+      pending,
+      deployStatus,
+      deployMessage,
+    }) {
+      const btn = document.getElementById("intraday-ai-deploy");
+      const chip = document.getElementById("intraday-ai-deploy-chip");
+      const note = document.getElementById("intraday-ai-deploy-note");
+      if (!btn || !chip) return;
+      const isPending = !!pending;
+      const ready = !!canDeploy && !isPending;
+      btn.disabled = !ready;
+      btn.classList.remove("intraday-deploy-on", "intraday-deploy-off");
+      btn.classList.add(ready ? "intraday-deploy-on" : "intraday-deploy-off");
+      btn.textContent = isPending ? "Deploy Pending…" : "Deploy Recommended Trade";
+      btn.title = ready
+        ? "Queue deployment using the latest AI recommendation."
+        : (reason || "Deploy disabled.");
+      const statusText = deployStatus || (isPending ? "REQUESTED" : "IDLE");
+      const msg = deployMessage ? ` | ${deployMessage}` : "";
+      chip.textContent = `Deploy: ${statusText}${msg}`;
+      if (note) {
+        note.textContent = ready
+          ? "Telegram command: /deploy_intraday (same safety checks apply)"
+          : `Deploy blocked: ${reason || "waiting for valid ENTER_NOW signal"}`;
+      }
+    }
+
+    async function deployIntradayRecommendation() {
+      const btn = document.getElementById("intraday-ai-deploy");
+      const statusEl = document.getElementById("agent-status");
+      if (btn) { btn.disabled = true; btn.textContent = "Queueing…"; }
+      try {
+        const resp = await fetch("/api/intraday_ai/deploy", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ source: "manual_ui", note: "ui_deploy_button" }),
+        });
+        const data = await resp.json();
+        if (!resp.ok || data.error || !data.ok) {
+          throw new Error(data.message || data.error || "deploy request failed");
+        }
+        statusEl.textContent = `Intraday deploy queued (${data.request_id || "request accepted"})`;
+        await Promise.allSettled([loadLive(), refreshAgentStatus()]);
+      } catch (e) {
+        statusEl.textContent = `Deploy failed: ${e.message || "request failed"}`;
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = "Deploy Recommended Trade";
+        }
+      }
+    }
+
     async function refreshAgentStatus() {
       const data = await fetchJSON("/api/control/status");
+      latestControlStatus = data || {};
       if (!data.running) {
         document.getElementById("agent-status").textContent = "Stopped";
+        _setIntradayDeployButtonState({
+          canDeploy: false,
+          reason: "agent is not running",
+          pending: false,
+          deployStatus: "IDLE",
+          deployMessage: "",
+        });
         return;
       }
       const aiAction = data.bkm_ai_action || null;
@@ -1064,9 +1144,10 @@
       _setBkmAiProtectButtonState(protectionEnabled);
     }
 
-    function renderIntradayAdvisor(wrap) {
+    function renderIntradayAdvisor(wrap, deployWrap) {
       const adv = (wrap && wrap.advisor) ? wrap.advisor : (wrap || {});
       const rec = (adv && typeof adv.recommendation === "object" && adv.recommendation) ? adv.recommendation : {};
+      const dep = (deployWrap && deployWrap.deploy) ? deployWrap.deploy : (deployWrap || {});
       const signal = String(adv.signal || "NO_TRADE").toUpperCase();
       const strategy = adv.strategy || rec.strategy_label || "—";
       const bias = adv.market_bias || "NEUTRAL";
@@ -1108,6 +1189,27 @@
       if (holdEl) holdEl.textContent = `${holdText.startsWith("Hold") ? holdText : `Hold: ${holdText}`}`;
       if (whyEl) whyEl.textContent = `Why: ${whyText}`;
       if (updatedEl) updatedEl.textContent = `Updated: ${adv.updated_at || "—"}`;
+
+      const ctrl = latestControlStatus || {};
+      const running = !!ctrl.running;
+      const liveMode = String(ctrl.trade_mode || "").toLowerCase() === "live";
+      const locked = !!ctrl.bkm_ai_entry_lock_active || String(ctrl.live_gate_status || "").toUpperCase() === "LOCKED"
+        || !!ctrl.reconcile_hard_lock || !!ctrl.execution_recovery_hard_lock;
+      const pending = !!dep.pending;
+      let canDeploy = signal === "ENTER_NOW";
+      let blockReason = "";
+      if (!running) { canDeploy = false; blockReason = "agent is not running"; }
+      else if (!liveMode) { canDeploy = false; blockReason = "agent is not in live mode"; }
+      else if (locked) { canDeploy = false; blockReason = "entry locks are active"; }
+      else if (signal !== "ENTER_NOW") { canDeploy = false; blockReason = "AI signal is not ENTER_NOW"; }
+      else { blockReason = "ready"; }
+      _setIntradayDeployButtonState({
+        canDeploy,
+        reason: blockReason,
+        pending,
+        deployStatus: dep.status,
+        deployMessage: dep.message,
+      });
     }
 
     async function loadState() {
@@ -1136,13 +1238,14 @@
       if (inflight.live) return;
       inflight.live = true;
       try {
-        const [data, aiData, intradayAiData] = await Promise.all([
+        const [data, aiData, intradayAiData, intradayDeployData] = await Promise.all([
           fetchJSON("/api/live_positions"),
           fetchJSON("/api/bkm/ai_status").catch(() => ({ ok: false, ai: {} })),
           fetchJSON("/api/intraday_ai/status").catch(() => ({ ok: false, advisor: {} })),
+          fetchJSON("/api/intraday_ai/deploy_status").catch(() => ({ ok: false, deploy: {} })),
         ]);
       renderBkmAI(aiData);
-      renderIntradayAdvisor(intradayAiData);
+      renderIntradayAdvisor(intradayAiData, intradayDeployData);
       let openTotal = 0.0;
       upsertRows(
         "#live-legs-table tbody",
@@ -1287,6 +1390,7 @@
     document.getElementById("start-agent").addEventListener("click", startAgent);
     document.getElementById("stop-agent").addEventListener("click", stopAgent);
     document.getElementById("bkm-ai-clear-lock").addEventListener("click", toggleBkmAiProtection);
+    document.getElementById("intraday-ai-deploy").addEventListener("click", deployIntradayRecommendation);
     document.getElementById("paper-close-all").addEventListener("click", closePaperTrades);
 
     function pageVisible() {

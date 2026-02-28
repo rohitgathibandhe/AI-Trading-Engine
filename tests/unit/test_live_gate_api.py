@@ -404,3 +404,39 @@ def test_tuning_apply_blocked_when_live_pid_file_present(monkeypatch, tmp_path: 
     )
     assert code == 500
     assert "Stop agent first" in payload["error"]
+
+
+def _bkm_positions_payload_skewed() -> list[dict]:
+    return [
+        {"side": "SELL", "qty": 195, "entry": 73.4, "sec_id": "1", "expiry": "2026-03-30", "strike": "NIFTY-Mar2026-24500-PE"},
+        {"side": "BUY", "qty": 65, "entry": 102.6, "sec_id": "2", "expiry": "2026-03-30", "strike": "NIFTY-Mar2026-24750-PE"},
+        {"side": "BUY", "qty": 130, "entry": 15.9, "sec_id": "3", "expiry": "2026-03-30", "strike": "NIFTY-Mar2026-23000-PE"},
+        {"side": "BUY", "qty": 65, "entry": 86.8, "sec_id": "4", "expiry": "2026-03-30", "strike": "NIFTY-Mar2026-26300-CE"},
+        {"side": "SELL", "qty": 195, "entry": 53.05, "sec_id": "5", "expiry": "2026-03-30", "strike": "NIFTY-Mar2026-26500-CE"},
+        {"side": "BUY", "qty": 130, "entry": 12.05, "sec_id": "6", "expiry": "2026-03-30", "strike": "NIFTY-Mar2026-27200-CE"},
+    ]
+
+
+def test_importable_bkm_quality_warns_on_skewed_wings(monkeypatch, tmp_path: Path) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, "_build_chain_map", lambda expiry: {"map": {}, "spot": 25446.35, "ts": 0.0})
+    settings = json.loads((tmp_path / "state" / "agent_settings.json").read_text())
+    settings["batman_bkm_import_enforce_quality"] = False
+    out = server._build_importable_bkm_from_broker_positions(_bkm_positions_payload_skewed(), settings=settings)
+    assert out["ok"] is True
+    assert out["imported"] is True
+    assert out["quality_warning"] is True
+    quality = out.get("quality") or {}
+    assert quality.get("ok") is False
+    assert "OUTER_WING_ASYMMETRY_HIGH" in (quality.get("reasons") or [])
+
+
+def test_importable_bkm_quality_can_block_when_enforced(monkeypatch, tmp_path: Path) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, "_build_chain_map", lambda expiry: {"map": {}, "spot": 25446.35, "ts": 0.0})
+    settings = json.loads((tmp_path / "state" / "agent_settings.json").read_text())
+    settings["batman_bkm_import_enforce_quality"] = True
+    out = server._build_importable_bkm_from_broker_positions(_bkm_positions_payload_skewed(), settings=settings)
+    assert out["ok"] is False
+    assert out["imported"] is False
+    assert out["error"] == "BKM_QUALITY_CHECK_FAILED"

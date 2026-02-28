@@ -15,9 +15,21 @@ user `LaunchAgents` with auto-start on login and auto-restart on crash.
 
 - `run_agent_launchd.sh` : wrapper that resolves Python and runs the agent
 - `run_ui_server_launchd.sh` : wrapper that runs the UI/API server
+- `ui_server_ctl.sh` : single command wrapper for UI start/restart/stop/status/health/logs
 - `install_launchagents.sh` : generate/install plists (optionally load now)
 - `status_launchagents.sh` : inspect `launchctl` status
 - `uninstall_launchagents.sh` : unload/remove plists
+
+## UI one-command controls
+
+```bash
+scripts/launchd/ui_server_ctl.sh start --port 8000
+scripts/launchd/ui_server_ctl.sh status --port 8000
+scripts/launchd/ui_server_ctl.sh restart --port 8000
+scripts/launchd/ui_server_ctl.sh health --port 8000
+scripts/launchd/ui_server_ctl.sh logs
+scripts/launchd/ui_server_ctl.sh stop
+```
 
 ## Recommended sequence
 
