@@ -58,6 +58,7 @@ BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_FILE = STATE_DIR / "batman_bkm_ai_protect_cl
 INTRADAY_AI_ADVISOR_STATUS_FILE = STATE_DIR / "intraday_ai_advisor_status.json"
 INTRADAY_AI_DEPLOY_REQUEST_FILE = STATE_DIR / "intraday_ai_deploy_request.json"
 INTRADAY_AI_DEPLOY_STATUS_FILE = STATE_DIR / "intraday_ai_deploy_status.json"
+INTRADAY_AI_APPROVAL_STATUS_FILE = STATE_DIR / "intraday_ai_approval_status.json"
 TELEGRAM_COMMAND_STATUS_FILE = STATE_DIR / "telegram_command_status.json"
 BLOTTER_FIELDS = [
     "timestamp",
@@ -235,6 +236,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "intraday_ai_spread_stop_credit_multiple": 1.6,
     "intraday_ai_min_credit_per_set_rs": 500.0,
     "intraday_ai_max_signal_age_sec": 180.0,
+    "intraday_ai_preferred_bias": "BEARISH",
     "intraday_ai_deploy_enabled": True,
     "intraday_ai_deploy_lots_multiplier": 1,
     "intraday_ai_deploy_dedupe_sec": 90.0,
@@ -242,6 +244,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "intraday_ai_deploy_require_agent_running": True,
     "intraday_ai_deploy_require_market_hours": True,
     "intraday_ai_deploy_block_if_any_live_positions": False,
+    "telegram_intraday_plan_enabled": True,
+    "telegram_intraday_plan_ttl_sec": 300.0,
+    "telegram_intraday_plan_default_lots_multiplier": 1,
+    "telegram_intraday_plan_max_loss_rs": 1500.0,
+    "telegram_intraday_plan_trailing_enabled": True,
     # Batman BKM live rollout gate
     "live_gate_enabled": True,
     "live_probation_sessions": 10,
@@ -275,6 +282,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "telegram_alerts_enabled": False,
     "telegram_alert_min_severity": "CRITICAL",
     "telegram_alert_live_only": True,
+    "telegram_alert_max_age_sec": 180.0,
     "telegram_alert_poll_interval_sec": 5.0,
     "telegram_alert_timeout_sec": 10.0,
     "telegram_alert_max_batch": 5,
@@ -289,6 +297,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "telegram_ai_lock_change_enabled": True,
     "telegram_intraday_signal_enabled": True,
     "telegram_intraday_signal_market_hours_only": True,
+    "telegram_intraday_signal_repeat_enabled": True,
+    "telegram_intraday_signal_repeat_interval_sec": 900.0,
+    "telegram_intraday_signal_repeat_enter_only": True,
     "telegram_commands_enabled": True,
     "telegram_commands_live_only": True,
     "telegram_commands_poll_interval_sec": 5.0,
@@ -1929,6 +1940,60 @@ def _peek_intraday_ai_deploy_request() -> Optional[Dict[str, Any]]:
         return payload if isinstance(payload, dict) else {}
     except Exception:
         return {}
+
+
+def _default_intraday_ai_approval_status(now: Optional[datetime] = None) -> Dict[str, Any]:
+    ts = now or _ist_now()
+    return {
+        "status": "IDLE",  # IDLE|PENDING|QUEUED|REJECTED|EXPIRED|INVALIDATED|DEPLOYED|FAILED
+        "plan_id": None,
+        "plan_created_at": None,
+        "plan_expires_at": None,
+        "plan_signal_signature": None,
+        "plan_signal": None,
+        "plan_strategy": None,
+        "plan_expiry": None,
+        "plan_what_to_enter": None,
+        "plan_lots_multiplier": None,
+        "plan_max_loss_rs": None,
+        "plan_trailing_enabled": None,
+        "decision": None,  # YES|NO
+        "decision_at": None,
+        "decision_source": None,
+        "request_id": None,
+        "reason": None,
+        "current_session_date": ts.date().isoformat(),
+        "updated_at": ts.isoformat(timespec="seconds"),
+    }
+
+
+def _load_intraday_ai_approval_status(now: Optional[datetime] = None) -> Dict[str, Any]:
+    default = _default_intraday_ai_approval_status(now)
+    try:
+        if not INTRADAY_AI_APPROVAL_STATUS_FILE.exists():
+            return default
+        payload = json.loads(INTRADAY_AI_APPROVAL_STATUS_FILE.read_text())
+        if not isinstance(payload, dict):
+            return default
+        out = dict(default)
+        out.update(payload)
+        return out
+    except Exception:
+        return default
+
+
+def _save_intraday_ai_approval_status(payload: Dict[str, Any], now: Optional[datetime] = None) -> Dict[str, Any]:
+    ts = now or _ist_now()
+    out = _default_intraday_ai_approval_status(ts)
+    out.update(payload if isinstance(payload, dict) else {})
+    out["updated_at"] = ts.isoformat(timespec="seconds")
+    out["current_session_date"] = ts.date().isoformat()
+    try:
+        INTRADAY_AI_APPROVAL_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        INTRADAY_AI_APPROVAL_STATUS_FILE.write_text(json.dumps(out, indent=2, default=str))
+    except Exception:
+        log.exception("[IntradayApproval] failed to persist approval status")
+    return out
 
 
 def _default_telegram_command_status(now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -3649,17 +3714,50 @@ def main() -> None:
         if out.get("reason") == "SEND_FAILED":
             log.warning("[TelegramAILock] send failed: %s", out.get("error"))
 
+    def _intraday_signal_signature(signal_payload: Dict[str, Any]) -> str:
+        rec = signal_payload.get("recommendation") if isinstance(signal_payload.get("recommendation"), dict) else {}
+        legs_raw = rec.get("legs") if isinstance(rec.get("legs"), list) else []
+        legs_sig: List[str] = []
+        for leg in legs_raw:
+            if not isinstance(leg, dict):
+                continue
+            try:
+                legs_sig.append(
+                    "|".join(
+                        [
+                            str(leg.get("side") or "").upper(),
+                            str(leg.get("option_type") or "").upper(),
+                            str(int(float(leg.get("strike") or 0.0))),
+                            str(int(float(leg.get("qty_lots") or 0))),
+                        ]
+                    )
+                )
+            except Exception:
+                continue
+        core = {
+            "signal": str(signal_payload.get("signal") or "NO_TRADE").upper(),
+            "strategy": str(signal_payload.get("strategy") or rec.get("strategy_label") or "NA"),
+            "expiry": str(signal_payload.get("expiry") or rec.get("expiry") or "NA"),
+            "what": str(rec.get("what_to_enter") or ""),
+            "legs": sorted(legs_sig),
+            "sl": str((rec.get("sl") or {}).get("text") or rec.get("sl_text") or ""),
+            "tp": str((rec.get("tp") or {}).get("text") or rec.get("tp_text") or ""),
+            "hold": str((rec.get("hold") or {}).get("text") or rec.get("hold_text") or ""),
+        }
+        return json.dumps(core, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
     def _telegram_intraday_signal(
         *,
         now: datetime,
         signal_payload: Dict[str, Any],
-    ) -> None:
+        periodic: bool = False,
+    ) -> Dict[str, Any]:
         if trade_mode != "live":
-            return
+            return {"ok": False, "reason": "LIVE_ONLY_SKIP"}
         if not bool(settings.get("telegram_intraday_signal_enabled", True)):
-            return
+            return {"ok": False, "reason": "DISABLED"}
         if bool(settings.get("telegram_intraday_signal_market_hours_only", True)) and not _is_india_market_open(now):
-            return
+            return {"ok": False, "reason": "MARKET_HOURS_ONLY_SKIP"}
         signal = str(signal_payload.get("signal") or "NO_TRADE").upper()
         rec = signal_payload.get("recommendation") if isinstance(signal_payload.get("recommendation"), dict) else {}
         strategy = str(signal_payload.get("strategy") or rec.get("strategy_label") or "NA")
@@ -3679,8 +3777,14 @@ def main() -> None:
             action_line = "Action: Wait. Do not force an entry yet."
         else:
             action_line = "Action: No trade. Stay disciplined and avoid overtrading."
+        mode_line = (
+            "No change update: recommendation remains valid."
+            if periodic
+            else "New update: recommendation changed."
+        )
         text = (
             f"Intraday AI signal: {signal}\n"
+            f"{mode_line}\n"
             f"{headline}\n"
             f"Setup: {strategy} | Bias: {bias}\n"
             f"What to enter: {what_to_enter}\n"
@@ -3695,12 +3799,43 @@ def main() -> None:
         out = telegram_forwarder.send_direct_message(
             creds=_load_saved_creds(),
             text=text,
-            code=f"TELEGRAM_INTRADAY_SIGNAL_{signal}",
+            code=f"TELEGRAM_INTRADAY_SIGNAL_{signal}{'_REPEAT' if periodic else ''}",
             trade_mode=trade_mode,
             when=now,
         )
         if out.get("reason") == "SEND_FAILED":
             log.warning("[TelegramIntradaySignal] send failed: %s", out.get("error"))
+        return out
+
+    def _telegram_intraday_signal_repeat(
+        *,
+        now: datetime,
+        signal_payload: Dict[str, Any],
+    ) -> None:
+        nonlocal intraday_telegram_last_signal_sent_at
+        nonlocal intraday_telegram_last_signal_signature
+        if trade_mode != "live":
+            return
+        if not bool(settings.get("telegram_intraday_signal_repeat_enabled", True)):
+            return
+        signal = str(signal_payload.get("signal") or "NO_TRADE").upper()
+        if bool(settings.get("telegram_intraday_signal_repeat_enter_only", True)) and signal != "ENTER_NOW":
+            return
+        interval_sec = max(120.0, float(settings.get("telegram_intraday_signal_repeat_interval_sec", 900.0)))
+        signature = _intraday_signal_signature(signal_payload)
+        due = False
+        if intraday_telegram_last_signal_sent_at is None:
+            due = True
+        elif intraday_telegram_last_signal_signature != signature:
+            due = True
+        elif (now - intraday_telegram_last_signal_sent_at).total_seconds() >= interval_sec:
+            due = True
+        if not due:
+            return
+        out = _telegram_intraday_signal(now=now, signal_payload=signal_payload, periodic=True)
+        if bool(out.get("ok")):
+            intraday_telegram_last_signal_sent_at = now
+            intraday_telegram_last_signal_signature = signature
 
     def _telegram_send_raw(*, token: str, chat_id: str, text: str, timeout_sec: float) -> Dict[str, Any]:
         payload = {
@@ -3729,22 +3864,200 @@ def main() -> None:
             return {"ok": False, "error": f"telegram_send_error:{exc}"}
 
     telegram_command_status = _load_telegram_command_status(_ist_now())
+    intraday_approval_status = _load_intraday_ai_approval_status(_ist_now())
 
-    def _queue_intraday_deploy_request(*, now: datetime, source: str, note: str) -> Dict[str, Any]:
+    def _queue_intraday_deploy_request(
+        *,
+        now: datetime,
+        source: str,
+        note: str,
+        approval: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         request_id = f"INTRADAYDEP-{int(time.time() * 1000)}"
         payload = {
             "request_id": request_id,
             "requested_at": now.isoformat(timespec="seconds"),
             "source": str(source or "unknown"),
             "note": str(note or ""),
+            "approval_plan_id": None,
+            "approval_signal_signature": None,
+            "approval_expires_at": None,
+            "approval_lots_multiplier": None,
+            "approval_max_loss_rs": None,
+            "approval_trailing_enabled": None,
         }
+        if isinstance(approval, dict):
+            payload["approval_plan_id"] = str(approval.get("plan_id") or "")
+            payload["approval_signal_signature"] = str(approval.get("plan_signal_signature") or "")
+            payload["approval_expires_at"] = str(approval.get("plan_expires_at") or "")
+            payload["approval_lots_multiplier"] = approval.get("plan_lots_multiplier")
+            payload["approval_max_loss_rs"] = approval.get("plan_max_loss_rs")
+            payload["approval_trailing_enabled"] = bool(approval.get("plan_trailing_enabled", True))
         INTRADAY_AI_DEPLOY_REQUEST_FILE.parent.mkdir(parents=True, exist_ok=True)
         INTRADAY_AI_DEPLOY_REQUEST_FILE.write_text(json.dumps(payload, indent=2))
         _set_intraday_ai_deploy_requested(payload, now=now)
         return payload
 
+    def _persist_intraday_approval(*, now: datetime, patch: Dict[str, Any]) -> Dict[str, Any]:
+        nonlocal intraday_approval_status
+        out = dict(intraday_approval_status or {})
+        out.update(patch if isinstance(patch, dict) else {})
+        intraday_approval_status = _save_intraday_ai_approval_status(out, now=now)
+        return intraday_approval_status
+
+    def _is_pending_approval(st: Dict[str, Any]) -> bool:
+        return str((st or {}).get("status") or "").upper() == "PENDING" and bool((st or {}).get("plan_id"))
+
+    def _is_approval_expired(st: Dict[str, Any], now: datetime) -> bool:
+        exp = _parse_iso_dt((st or {}).get("plan_expires_at"))
+        return bool(exp and now > exp)
+
+    def _expire_intraday_approval_if_due(*, now: datetime, notify: bool = True) -> bool:
+        st = intraday_approval_status if isinstance(intraday_approval_status, dict) else {}
+        if not _is_pending_approval(st):
+            return False
+        if not _is_approval_expired(st, now):
+            return False
+        plan_id = str(st.get("plan_id") or "NA")
+        _persist_intraday_approval(
+            now=now,
+            patch={
+                "status": "EXPIRED",
+                "decision": None,
+                "decision_at": now.isoformat(timespec="seconds"),
+                "decision_source": "system_timeout",
+                "reason": "No operator response within approval window.",
+            },
+        )
+        if notify and trade_mode == "live":
+            txt = (
+                f"Intraday plan expired: {plan_id}\n"
+                "No action taken. Old setup is invalid now.\n"
+                "Agent is scanning for the next valid opportunity."
+            )
+            telegram_forwarder.send_direct_message(
+                creds=_load_saved_creds(),
+                text=txt,
+                code="INTRADAY_PLAN_EXPIRED",
+                trade_mode=trade_mode,
+                when=now,
+            )
+        return True
+
+    def _invalidate_intraday_approval(
+        *,
+        now: datetime,
+        reason: str,
+        notify: bool = True,
+        code: str = "INTRADAY_PLAN_INVALIDATED",
+    ) -> None:
+        st = intraday_approval_status if isinstance(intraday_approval_status, dict) else {}
+        if not _is_pending_approval(st):
+            return
+        plan_id = str(st.get("plan_id") or "NA")
+        _persist_intraday_approval(
+            now=now,
+            patch={
+                "status": "INVALIDATED",
+                "decision": None,
+                "decision_at": now.isoformat(timespec="seconds"),
+                "decision_source": "system_signal_change",
+                "reason": str(reason or "Signal changed."),
+            },
+        )
+        if notify and trade_mode == "live":
+            telegram_forwarder.send_direct_message(
+                creds=_load_saved_creds(),
+                text=(
+                    f"Intraday plan invalidated: {plan_id}\n"
+                    f"Reason: {reason}\n"
+                    "Old approval will not be used. Agent is scanning for a fresh setup."
+                ),
+                code=code,
+                trade_mode=trade_mode,
+                when=now,
+            )
+
+    def _open_intraday_approval_plan(*, now: datetime, signal_payload: Dict[str, Any]) -> None:
+        if trade_mode != "live":
+            return
+        if not bool(settings.get("telegram_intraday_plan_enabled", True)):
+            return
+        signal = str(signal_payload.get("signal") or "NO_TRADE").upper()
+        if signal != "ENTER_NOW":
+            return
+        rec = signal_payload.get("recommendation") if isinstance(signal_payload.get("recommendation"), dict) else {}
+        signature = _intraday_signal_signature(signal_payload)
+        st = intraday_approval_status if isinstance(intraday_approval_status, dict) else {}
+        st_status = str(st.get("status") or "").upper()
+        if st_status in {"QUEUED", "DEPLOYED"} and str(st.get("plan_signal_signature") or "") == signature:
+            return
+        if st_status in {"EXPIRED", "INVALIDATED", "REJECTED"} and str(st.get("plan_signal_signature") or "") == signature:
+            # Do not keep re-issuing the same stale/rejected plan.
+            return
+        if _is_pending_approval(st):
+            if _is_approval_expired(st, now):
+                _expire_intraday_approval_if_due(now=now, notify=True)
+            elif str(st.get("plan_signal_signature") or "") == signature:
+                return
+            else:
+                _invalidate_intraday_approval(
+                    now=now,
+                    reason="Signal changed before your response.",
+                    notify=True,
+                    code="INTRADAY_PLAN_REPLACED",
+                )
+        ttl_sec = max(60.0, float(settings.get("telegram_intraday_plan_ttl_sec", 300.0)))
+        lots_mult = max(1, int(settings.get("telegram_intraday_plan_default_lots_multiplier", 1) or 1))
+        max_loss_rs = max(500.0, float(settings.get("telegram_intraday_plan_max_loss_rs", 1500.0) or 1500.0))
+        trailing_on = bool(settings.get("telegram_intraday_plan_trailing_enabled", True))
+        plan_id = f"IAP-{int(time.time() * 1000)}"
+        expires_at = now + timedelta(seconds=ttl_sec)
+        strategy = str(signal_payload.get("strategy") or rec.get("strategy_label") or "NA")
+        what = str(rec.get("what_to_enter") or "No setup")
+        _persist_intraday_approval(
+            now=now,
+            patch={
+                "status": "PENDING",
+                "plan_id": plan_id,
+                "plan_created_at": now.isoformat(timespec="seconds"),
+                "plan_expires_at": expires_at.isoformat(timespec="seconds"),
+                "plan_signal_signature": signature,
+                "plan_signal": signal,
+                "plan_strategy": strategy,
+                "plan_expiry": str(signal_payload.get("expiry") or rec.get("expiry") or ""),
+                "plan_what_to_enter": what,
+                "plan_lots_multiplier": lots_mult,
+                "plan_max_loss_rs": max_loss_rs,
+                "plan_trailing_enabled": trailing_on,
+                "decision": None,
+                "decision_at": None,
+                "decision_source": None,
+                "request_id": None,
+                "reason": None,
+            },
+        )
+        mins = max(1, int(round(ttl_sec / 60.0)))
+        text = (
+            "Intraday plan identified.\n"
+            f"Plan ID: {plan_id}\n"
+            f"Setup: {strategy}\n"
+            f"What to enter: {what}\n"
+            f"Risk plan: lots x{lots_mult}, max loss Rs {max_loss_rs:,.0f}, trailing {'ON' if trailing_on else 'OFF'}\n"
+            f"Reply: /deploy_yes {plan_id} OR /deploy_no {plan_id}\n"
+            f"Plan expires in ~{mins} min."
+        )
+        telegram_forwarder.send_direct_message(
+            creds=_load_saved_creds(),
+            text=text,
+            code="INTRADAY_PLAN_PENDING",
+            trade_mode=trade_mode,
+            when=now,
+        )
+
     def _telegram_command_pump(*, now: datetime) -> None:
         nonlocal telegram_command_status
+        nonlocal intraday_approval_status
         enabled = bool(settings.get("telegram_commands_enabled", True))
         live_only = bool(settings.get("telegram_commands_live_only", True))
         poll_interval = max(1.0, float(settings.get("telegram_commands_poll_interval_sec", 5.0)))
@@ -3813,31 +4126,100 @@ def main() -> None:
             msg_chat = str((message.get("chat") or {}).get("id") or "")
             if msg_chat != chat_id:
                 continue
-            cmd = text.split()[0].split("@")[0].strip().lower()
+            parts = text.split()
+            cmd = parts[0].split("@")[0].strip().lower()
+            cmd_arg = parts[1].strip() if len(parts) > 1 else ""
             telegram_command_status["last_command"] = cmd
             telegram_command_status["last_command_at"] = now.isoformat(timespec="seconds")
             handled += 1
 
-            if cmd in {"/deploy_intraday", "/deploy_ai"}:
+            if cmd in {"/deploy_yes", "/deploy_intraday", "/deploy_ai"}:
                 if not bool(settings.get("telegram_commands_allow_deploy_intraday", True)):
                     telegram_command_status["last_result"] = "DEPLOY_DISABLED"
                     _reply("Deploy command is currently disabled in settings.")
                     continue
+                plan_enabled = bool(settings.get("telegram_intraday_plan_enabled", True))
+                if plan_enabled:
+                    _expire_intraday_approval_if_due(now=now, notify=True)
+                    st = intraday_approval_status if isinstance(intraday_approval_status, dict) else {}
+                    plan_id = str(st.get("plan_id") or "")
+                    if not _is_pending_approval(st):
+                        telegram_command_status["last_result"] = "NO_PENDING_PLAN"
+                        _reply("No active plan awaiting approval. Wait for next AI plan message.")
+                        continue
+                    if cmd_arg and cmd_arg != plan_id:
+                        telegram_command_status["last_result"] = "PLAN_ID_MISMATCH"
+                        _reply(f"Plan ID mismatch. Current active plan: {plan_id}")
+                        continue
+                    adv = intraday_ai_advisor.snapshot() if intraday_ai_advisor else {}
+                    live_sig = _intraday_signal_signature(adv if isinstance(adv, dict) else {})
+                    plan_sig = str(st.get("plan_signal_signature") or "")
+                    live_signal = str((adv or {}).get("signal") or "NO_TRADE").upper()
+                    if live_signal != "ENTER_NOW" or not plan_sig or live_sig != plan_sig:
+                        _invalidate_intraday_approval(
+                            now=now,
+                            reason="Signal changed before approval execution.",
+                            notify=True,
+                            code="INTRADAY_PLAN_INVALIDATED_BEFORE_DEPLOY",
+                        )
+                        telegram_command_status["last_result"] = "PLAN_STALE_SIGNAL_CHANGED"
+                        _reply("Old plan invalid now because market signal changed. Wait for next plan.")
+                        continue
                 if INTRADAY_AI_DEPLOY_REQUEST_FILE.exists():
                     telegram_command_status["last_result"] = "DEPLOY_ALREADY_PENDING"
                     _reply("A deploy request is already pending. Please wait for it to complete.")
                     continue
+                approval_payload = intraday_approval_status if plan_enabled else None
                 req = _queue_intraday_deploy_request(
                     now=now,
                     source="telegram",
                     note=f"telegram_command:{cmd}",
+                    approval=approval_payload,
                 )
+                if plan_enabled:
+                    _persist_intraday_approval(
+                        now=now,
+                        patch={
+                            "status": "QUEUED",
+                            "decision": "YES",
+                            "decision_at": now.isoformat(timespec="seconds"),
+                            "decision_source": "telegram",
+                            "request_id": str(req.get("request_id") or ""),
+                            "reason": "Operator approved deployment.",
+                        },
+                    )
                 telegram_command_status["last_result"] = "DEPLOY_REQUEST_QUEUED"
                 _reply(
                     "Deploy command received.\n"
                     "Agent will deploy only if AI says ENTER_NOW and all safety checks pass.\n"
                     f"Request ID: {req.get('request_id')}"
                 )
+                continue
+
+            if cmd in {"/deploy_no", "/skip_intraday"}:
+                _expire_intraday_approval_if_due(now=now, notify=True)
+                st = intraday_approval_status if isinstance(intraday_approval_status, dict) else {}
+                plan_id = str(st.get("plan_id") or "")
+                if not _is_pending_approval(st):
+                    telegram_command_status["last_result"] = "NO_PENDING_PLAN"
+                    _reply("No active pending plan to reject.")
+                    continue
+                if cmd_arg and cmd_arg != plan_id:
+                    telegram_command_status["last_result"] = "PLAN_ID_MISMATCH"
+                    _reply(f"Plan ID mismatch. Current active plan: {plan_id}")
+                    continue
+                _persist_intraday_approval(
+                    now=now,
+                    patch={
+                        "status": "REJECTED",
+                        "decision": "NO",
+                        "decision_at": now.isoformat(timespec="seconds"),
+                        "decision_source": "telegram",
+                        "reason": "Operator chose not to deploy.",
+                    },
+                )
+                telegram_command_status["last_result"] = "PLAN_REJECTED"
+                _reply(f"Plan {plan_id} rejected. Agent will look for the next valid setup.")
                 continue
 
             if cmd in {"/intraday_status", "/ai_status"}:
@@ -3851,12 +4233,18 @@ def main() -> None:
                 strategy = str(adv.get("strategy") or rec.get("strategy_label") or "NA")
                 headline = str(rec.get("headline") or rec.get("signal_text") or "No recommendation")
                 what = str(rec.get("what_to_enter") or "No trade now.")
+                st = intraday_approval_status if isinstance(intraday_approval_status, dict) else {}
+                plan_status = str(st.get("status") or "IDLE")
+                plan_id = str(st.get("plan_id") or "-")
+                plan_exp = str(st.get("plan_expires_at") or "-")
                 _reply(
                     "Intraday AI status:\n"
                     f"Signal: {sig}\n"
                     f"Setup: {strategy}\n"
                     f"{headline}\n"
                     f"{what}\n"
+                    f"Plan: {plan_status} ({plan_id})\n"
+                    f"Plan expiry: {plan_exp}\n"
                     f"Updated: {adv.get('updated_at') or 'NA'}"
                 )
                 telegram_command_status["last_result"] = "STATUS_SENT"
@@ -3866,7 +4254,8 @@ def main() -> None:
                 telegram_command_status["last_result"] = "HELP_SENT"
                 _reply(
                     "Available commands:\n"
-                    "/deploy_intraday - queue deploy using latest AI recommendation\n"
+                    "/deploy_yes <PLAN_ID> - approve and queue deploy for active plan\n"
+                    "/deploy_no <PLAN_ID> - reject active plan\n"
                     "/intraday_status - show latest intraday AI signal"
                 )
                 continue
@@ -3890,6 +4279,18 @@ def main() -> None:
         request_id = str(request_payload.get("request_id") or f"INTRADAYDEP-{int(time.time() * 1000)}")
         source = str(request_payload.get("source") or "unknown")
         note = str(request_payload.get("note") or "")
+        approval_plan_id = str(request_payload.get("approval_plan_id") or "")
+        approval_signal_signature = str(request_payload.get("approval_signal_signature") or "")
+        approval_expires_at = _parse_iso_dt(request_payload.get("approval_expires_at"))
+        try:
+            approval_lots_mult = max(1, int(float(request_payload.get("approval_lots_multiplier") or 0)))
+        except Exception:
+            approval_lots_mult = 0
+        try:
+            approval_max_loss_rs = max(0.0, float(request_payload.get("approval_max_loss_rs") or 0.0))
+        except Exception:
+            approval_max_loss_rs = 0.0
+        approval_trailing_enabled = bool(request_payload.get("approval_trailing_enabled", True))
 
         def _finalize(
             *,
@@ -3957,6 +4358,15 @@ def main() -> None:
                 status="REJECTED",
                 code="NOT_LIVE_MODE",
                 message="Deploy blocked: agent is not in live mode.",
+                alert_severity="WARNING",
+            )
+        if approval_expires_at and now > approval_expires_at:
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="PLAN_EXPIRED",
+                message="Deploy blocked: approved plan expired before execution.",
+                details={"plan_id": approval_plan_id, "expires_at": approval_expires_at.isoformat(timespec="seconds")},
                 alert_severity="WARNING",
             )
         if bool(settings.get("intraday_ai_deploy_require_market_hours", True)) and not _is_india_market_open(now):
@@ -4037,6 +4447,17 @@ def main() -> None:
 
         signal = str(signal_payload.get("signal") or "NO_TRADE").upper()
         rec = signal_payload.get("recommendation") if isinstance(signal_payload.get("recommendation"), dict) else {}
+        if approval_signal_signature:
+            live_sig = _intraday_signal_signature(signal_payload)
+            if not live_sig or live_sig != approval_signal_signature:
+                return _finalize(
+                    ok=False,
+                    status="REJECTED",
+                    code="PLAN_INVALIDATED_SIGNAL_CHANGED",
+                    message="Deploy blocked: approved plan is stale because recommendation changed.",
+                    details={"plan_id": approval_plan_id},
+                    alert_severity="WARNING",
+                )
         if signal != "ENTER_NOW":
             return _finalize(
                 ok=False,
@@ -4111,7 +4532,33 @@ def main() -> None:
             )
 
         lot_size = int(settings.get("nifty_lot_size", settings.get("lot_size", 65)) or 65)
-        lot_mult = max(1, int(settings.get("intraday_ai_deploy_lots_multiplier", 1) or 1))
+        lot_mult = approval_lots_mult if approval_lots_mult > 0 else max(
+            1, int(settings.get("intraday_ai_deploy_lots_multiplier", 1) or 1)
+        )
+        rec_sl_block = rec.get("sl") if isinstance(rec.get("sl"), dict) else {}
+        rec_sl_per_set = 0.0
+        try:
+            rec_sl_per_set = max(0.0, float(rec_sl_block.get("loss_rs_per_set") or 0.0))
+        except Exception:
+            rec_sl_per_set = 0.0
+        if approval_max_loss_rs > 0 and rec_sl_per_set > 0:
+            est_sl_total = rec_sl_per_set * float(lot_mult)
+            if est_sl_total > approval_max_loss_rs:
+                return _finalize(
+                    ok=False,
+                    status="REJECTED",
+                    code="PLAN_MAX_LOSS_BREACH",
+                    message=(
+                        f"Deploy blocked: estimated SL Rs {est_sl_total:,.0f} exceeds plan max loss "
+                        f"Rs {approval_max_loss_rs:,.0f}."
+                    ),
+                    details={
+                        "plan_id": approval_plan_id,
+                        "est_sl_total_rs": round(est_sl_total, 2),
+                        "plan_max_loss_rs": round(approval_max_loss_rs, 2),
+                    },
+                    alert_severity="WARNING",
+                )
         try:
             option_legs = [
                 _intraday_rec_leg_to_option_leg(
@@ -4234,6 +4681,10 @@ def main() -> None:
             "rollback": rollback,
             "sl": sl_txt,
             "tp": tp_txt,
+            "approval_plan_id": approval_plan_id or None,
+            "lots_multiplier": lot_mult,
+            "max_loss_rs": approval_max_loss_rs if approval_max_loss_rs > 0 else None,
+            "trailing_enabled": bool(approval_trailing_enabled),
         }
         if errors:
             return _finalize(
@@ -4583,6 +5034,9 @@ def main() -> None:
     intraday_ai_last_eval_at: Optional[datetime] = None
     intraday_ai_prev_oi_map: Dict[Tuple[str, float], float] = {}
     intraday_ai_last_expiry: Optional[str] = None
+    intraday_telegram_last_signal_sent_at: Optional[datetime] = None
+    intraday_telegram_last_signal_signature: Optional[str] = None
+    reconcile_lock_alert_signature: Optional[str] = None
     bkm_ai_entry_lock_active: bool = False
     bkm_ai_entry_lock_reason: Optional[str] = None
     bkm_ai_last_entry_lock_state: Optional[bool] = None
@@ -5003,6 +5457,7 @@ def main() -> None:
                 expiry_str = expiry.isoformat()
                 intraday_out: Dict[str, Any] = intraday_ai_advisor.snapshot() if intraday_ai_advisor else {}
                 intraday_chain_for_deploy: List[Dict[str, Any]] = []
+                intraday_signal_sent_now = False
                 if intraday_ai_advisor:
                     try:
                         refresh_sec = max(15.0, float(getattr(intraday_ai_advisor.config, "refresh_sec", 60.0)))
@@ -5108,7 +5563,11 @@ def main() -> None:
                                     intraday_out.get("expiry"),
                                 )
                                 try:
-                                    _telegram_intraday_signal(now=now_ist, signal_payload=intraday_out)
+                                    out = _telegram_intraday_signal(now=now_ist, signal_payload=intraday_out)
+                                    if bool(out.get("ok")):
+                                        intraday_signal_sent_now = True
+                                        intraday_telegram_last_signal_sent_at = now_ist
+                                        intraday_telegram_last_signal_signature = _intraday_signal_signature(intraday_out)
                                 except Exception:
                                     log.exception("[TelegramIntradaySignal] send failed")
                         else:
@@ -5116,6 +5575,25 @@ def main() -> None:
                     except Exception:
                         log.exception("[IntradayAI] advisor refresh failed")
                         intraday_out = intraday_ai_advisor.snapshot()
+                    if not intraday_signal_sent_now and isinstance(intraday_out, dict) and intraday_out:
+                        try:
+                            _telegram_intraday_signal_repeat(now=now_ist, signal_payload=intraday_out)
+                        except Exception:
+                            log.exception("[TelegramIntradaySignal] periodic send failed")
+                    try:
+                        _expire_intraday_approval_if_due(now=now_ist, notify=True)
+                        if bool(settings.get("telegram_intraday_plan_enabled", True)) and isinstance(intraday_out, dict) and intraday_out:
+                            sig_now = str(intraday_out.get("signal") or "NO_TRADE").upper()
+                            if sig_now == "ENTER_NOW":
+                                _open_intraday_approval_plan(now=now_ist, signal_payload=intraday_out)
+                            else:
+                                _invalidate_intraday_approval(
+                                    now=now_ist,
+                                    reason=f"Signal switched to {sig_now}.",
+                                    notify=True,
+                                )
+                    except Exception:
+                        log.exception("[IntradayApproval] plan state update failed")
                 intraday_deploy_request = _consume_intraday_ai_deploy_request() or None
                 if intraday_deploy_request:
                     req_id = str(intraday_deploy_request.get("request_id") or "")
@@ -5138,6 +5616,18 @@ def main() -> None:
                                 (dep_out.get("status") or {}).get("status"),
                                 (dep_out.get("status") or {}).get("result_code"),
                             )
+                            if bool(intraday_deploy_request.get("approval_plan_id")):
+                                _persist_intraday_approval(
+                                    now=now_ist,
+                                    patch={
+                                        "status": "DEPLOYED" if bool(dep_out.get("ok")) else "FAILED",
+                                        "request_id": req_id,
+                                        "decision": "YES",
+                                        "decision_source": req_source,
+                                        "decision_at": now_ist.isoformat(timespec="seconds"),
+                                        "reason": str((dep_out.get("status") or {}).get("message") or ""),
+                                    },
+                                )
                         except Exception as exc:
                             log.exception("[IntradayDeploy] execution failed id=%s source=%s", req_id, req_source)
                             _set_intraday_ai_deploy_result(
@@ -5150,6 +5640,18 @@ def main() -> None:
                                 details={},
                                 now=now_ist,
                             )
+                            if bool(intraday_deploy_request.get("approval_plan_id")):
+                                _persist_intraday_approval(
+                                    now=now_ist,
+                                    patch={
+                                        "status": "FAILED",
+                                        "request_id": req_id,
+                                        "decision": "YES",
+                                        "decision_source": req_source,
+                                        "decision_at": now_ist.isoformat(timespec="seconds"),
+                                        "reason": f"Deployment handler failed: {exc}",
+                                    },
+                                )
                     else:
                         _set_intraday_ai_deploy_result(
                             status="FAILED",
@@ -5161,6 +5663,18 @@ def main() -> None:
                             details={},
                             now=now_ist,
                         )
+                        if bool(intraday_deploy_request.get("approval_plan_id")):
+                            _persist_intraday_approval(
+                                now=now_ist,
+                                patch={
+                                    "status": "FAILED",
+                                    "request_id": req_id,
+                                    "decision": "YES",
+                                    "decision_source": req_source,
+                                    "decision_at": now_ist.isoformat(timespec="seconds"),
+                                    "reason": "Intraday advisor disabled.",
+                                },
+                            )
                 if live_bkm_reconcile_enabled and position_reconciler:
                     try:
                         broker_positions_raw = dw.get_positions_raw()
@@ -5189,31 +5703,60 @@ def main() -> None:
                         log.info("[Reconcile] skipped: %s", reconcile_out.get("reason"))
                     elif not reconcile_out.get("ok"):
                         if reconcile_out.get("locked"):
+                            reconcile_snap = position_reconciler.snapshot() if position_reconciler else {}
+                            mismatch_streak = reconcile_out.get("mismatch_streak")
+                            if mismatch_streak is None:
+                                mismatch_streak = reconcile_snap.get("mismatch_streak")
+                            diff_summary = reconcile_out.get("diff")
+                            if not isinstance(diff_summary, dict):
+                                diff_summary = reconcile_snap.get("last_diff_summary") if isinstance(reconcile_snap.get("last_diff_summary"), dict) else {}
+                            lock_reason = str(
+                                reconcile_out.get("reason")
+                                or reconcile_snap.get("last_mismatch_reason")
+                                or "POSITION_RECONCILE_MISMATCH"
+                            )
+                            try:
+                                alert_signature = json.dumps(
+                                    {
+                                        "reason": lock_reason,
+                                        "diff": diff_summary,
+                                    },
+                                    sort_keys=True,
+                                    default=str,
+                                )
+                            except Exception:
+                                alert_signature = f"{lock_reason}|{diff_summary}"
                             day_mode = "LOCKED_RED"
                             if live_bkm_gate_enabled and live_gate:
                                 live_gate.mark_loop_error("POSITION_RECONCILE_MISMATCH", when=_ist_now())
                             log.error(
                                 "[Reconcile] MISMATCH_LOCKED streak=%s diff=%s",
-                                reconcile_out.get("mismatch_streak"),
-                                reconcile_out.get("diff"),
+                                mismatch_streak,
+                                diff_summary,
                             )
-                            _ops_alert(
-                                "CRITICAL",
-                                "POSITION_RECONCILE_MISMATCH_LOCKED",
-                                "Broker/local position reconciliation locked trading.",
-                                details={
-                                    "mismatch_streak": reconcile_out.get("mismatch_streak"),
-                                    "diff": reconcile_out.get("diff"),
-                                },
-                                dedupe_key="POSITION_RECONCILE_MISMATCH_LOCKED",
-                            )
+                            if alert_signature != reconcile_lock_alert_signature:
+                                _ops_alert(
+                                    "CRITICAL",
+                                    "POSITION_RECONCILE_MISMATCH_LOCKED",
+                                    "Broker/local position reconciliation locked trading.",
+                                    details={
+                                        "mismatch_streak": mismatch_streak,
+                                        "diff": diff_summary,
+                                        "reason": lock_reason,
+                                    },
+                                    dedupe_key="POSITION_RECONCILE_MISMATCH_LOCKED",
+                                )
+                                reconcile_lock_alert_signature = alert_signature
                             time.sleep(poll_sec)
                             continue
+                        reconcile_lock_alert_signature = None
                         log.warning(
                             "[Reconcile] mismatch_detected streak=%s diff=%s",
                             reconcile_out.get("mismatch_streak"),
                             reconcile_out.get("diff"),
                         )
+                    else:
+                        reconcile_lock_alert_signature = None
                 entries_locked = day_mode == "LOCKED_RED" or (
                     live_bkm_gate_enabled and live_gate and live_gate.should_block_entries(now_ist)
                 ) or (

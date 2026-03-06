@@ -47,6 +47,7 @@ class TelegramAlertConfig:
     enabled: bool = False
     min_severity: str = "CRITICAL"
     live_only: bool = True
+    max_alert_age_sec: float = 180.0
     poll_interval_sec: float = 5.0
     timeout_sec: float = 10.0
     max_batch: int = 5
@@ -60,6 +61,7 @@ class TelegramAlertConfig:
             enabled=bool(settings.get("telegram_alerts_enabled", False)),
             min_severity=str(settings.get("telegram_alert_min_severity", "CRITICAL")).upper(),
             live_only=bool(settings.get("telegram_alert_live_only", True)),
+            max_alert_age_sec=max(0.0, float(settings.get("telegram_alert_max_age_sec", 180.0))),
             poll_interval_sec=max(0.5, float(settings.get("telegram_alert_poll_interval_sec", 5.0))),
             timeout_sec=max(1.0, float(settings.get("telegram_alert_timeout_sec", 10.0))),
             max_batch=max(1, int(settings.get("telegram_alert_max_batch", 5))),
@@ -229,6 +231,15 @@ class TelegramAlertForwarder:
         self.state.pending_bytes = max(0, file_size - start)
         return rows
 
+    def _is_stale_alert(self, alert: Dict[str, Any], *, now: datetime) -> bool:
+        max_age = max(0.0, float(self.config.max_alert_age_sec))
+        if max_age <= 0:
+            return False
+        ts = _parse_dt(alert.get("timestamp"))
+        if ts is None:
+            return False
+        return (now - ts).total_seconds() > max_age
+
     def _format_message(
         self,
         alert: Dict[str, Any],
@@ -371,6 +382,11 @@ class TelegramAlertForwarder:
                 continue
             sev = str(alert.get("severity") or "").upper()
             if _severity_score(sev) < threshold:
+                skipped += 1
+                self.state.skipped_total = int(self.state.skipped_total) + 1
+                self.state.last_offset = int(next_offset)
+                continue
+            if self._is_stale_alert(alert, now=now):
                 skipped += 1
                 self.state.skipped_total = int(self.state.skipped_total) + 1
                 self.state.last_offset = int(next_offset)

@@ -62,6 +62,7 @@ class IntradayOptionSellingAdvisorConfig:
     spread_stop_credit_multiple: float = 1.6
     min_credit_per_set_rs: float = 500.0
     max_signal_age_sec: float = 180.0
+    preferred_bias: str = "NEUTRAL"  # NEUTRAL|BULLISH|BEARISH
 
     @classmethod
     def from_settings(cls, settings: Dict[str, Any]) -> "IntradayOptionSellingAdvisorConfig":
@@ -100,6 +101,7 @@ class IntradayOptionSellingAdvisorConfig:
             ),
             min_credit_per_set_rs=max(0.0, float(settings.get("intraday_ai_min_credit_per_set_rs", 500.0))),
             max_signal_age_sec=max(10.0, float(settings.get("intraday_ai_max_signal_age_sec", 180.0))),
+            preferred_bias=str(settings.get("intraday_ai_preferred_bias", "NEUTRAL")).upper(),
         )
 
 
@@ -315,6 +317,11 @@ class IntradayOptionSellingAdvisor:
         ).upper()
         if dominant_bias not in {"BULLISH", "BEARISH", "NEUTRAL"}:
             dominant_bias = "NEUTRAL"
+        preferred_bias = str(getattr(self.config, "preferred_bias", "NEUTRAL") or "NEUTRAL").upper()
+        if preferred_bias not in {"BULLISH", "BEARISH"}:
+            preferred_bias = "NEUTRAL"
+        if dominant_bias == "NEUTRAL" and preferred_bias in {"BULLISH", "BEARISH"}:
+            dominant_bias = preferred_bias
         pcr_unbalanced = bool(structure_ctx.get("pcr_unbalanced", False))
         pcr_unbalanced_side = str(structure_ctx.get("pcr_unbalanced_side") or "NEUTRAL").upper()
         vol_regime = self._vol_regime(trend_ctx, structure_ctx)

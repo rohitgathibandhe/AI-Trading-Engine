@@ -32,6 +32,7 @@ def _fw(tmp_path: Path, **cfg_kwargs) -> _StubForwarder:
         "enabled": True,
         "min_severity": "ERROR",
         "live_only": True,
+        "max_alert_age_sec": 180.0,
         "poll_interval_sec": 0.5,
         "timeout_sec": 5.0,
         "max_batch": 5,
@@ -100,3 +101,27 @@ def test_send_test_message_requires_credentials(tmp_path: Path) -> None:
         assert False, "expected RuntimeError"
     except RuntimeError as exc:
         assert "not configured" in str(exc).lower()
+
+
+def test_process_pending_skips_stale_alerts(tmp_path: Path) -> None:
+    fw = _fw(tmp_path, min_severity="CRITICAL", max_alert_age_sec=120.0)
+    alerts_path = tmp_path / "agent_alerts.jsonl"
+    alerts_path.write_text(
+        json.dumps({"timestamp": "2026-01-05T09:55:00+05:30", "severity": "CRITICAL", "code": "OLD1", "message": "old"}) + "\n"
+        + json.dumps({"timestamp": "2026-01-05T10:00:30+05:30", "severity": "CRITICAL", "code": "NEW1", "message": "new"}) + "\n"
+    )
+    creds = {"telegram_bot_token": "bot-token", "telegram_chat_id": "123456"}
+
+    out = fw.process_pending(
+        creds=creds,
+        trade_mode="live",
+        strategy_file="batman_bkm_monthly",
+        force=True,
+        when=_ist_dt(5, 10, 1),
+    )
+    assert out["ok"] is True
+    assert out["sent"] == 1
+    assert out["skipped"] == 1
+    assert len(fw.sent_messages) == 1
+    assert "NEW1" in fw.sent_messages[0]["text"]
+    assert alerts_path.stat().st_size == fw.snapshot()["last_offset"]
