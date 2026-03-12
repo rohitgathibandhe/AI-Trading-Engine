@@ -40,7 +40,7 @@ class IntradayOptionSellingAdvisorConfig:
     enabled: bool = True
     refresh_sec: float = 60.0
     market_open_time: str = "09:15"
-    entry_not_before: str = "09:25"
+    entry_not_before: str = "09:45"
     last_new_entry_time: str = "14:20"
     max_hold_till: str = "15:05"
     lot_size: int = 65
@@ -63,6 +63,10 @@ class IntradayOptionSellingAdvisorConfig:
     min_credit_per_set_rs: float = 500.0
     max_signal_age_sec: float = 180.0
     preferred_bias: str = "NEUTRAL"  # NEUTRAL|BULLISH|BEARISH
+    require_ema_alignment: bool = True
+    require_orb_confirmation: bool = True
+    require_price_action_confirmation: bool = True
+    signal_persistence_bars: int = 2
 
     @classmethod
     def from_settings(cls, settings: Dict[str, Any]) -> "IntradayOptionSellingAdvisorConfig":
@@ -71,7 +75,7 @@ class IntradayOptionSellingAdvisorConfig:
             enabled=bool(settings.get("intraday_ai_enabled", True)),
             refresh_sec=max(15.0, float(settings.get("intraday_ai_refresh_sec", 60.0))),
             market_open_time=str(settings.get("intraday_ai_market_open_time", "09:15")),
-            entry_not_before=str(settings.get("intraday_ai_entry_not_before", "09:25")),
+            entry_not_before=str(settings.get("intraday_ai_entry_not_before", "09:45")),
             last_new_entry_time=str(settings.get("intraday_ai_last_new_entry_time", "14:20")),
             max_hold_till=str(settings.get("intraday_ai_max_hold_till", "15:05")),
             lot_size=max(1, lot_size),
@@ -102,6 +106,12 @@ class IntradayOptionSellingAdvisorConfig:
             min_credit_per_set_rs=max(0.0, float(settings.get("intraday_ai_min_credit_per_set_rs", 500.0))),
             max_signal_age_sec=max(10.0, float(settings.get("intraday_ai_max_signal_age_sec", 180.0))),
             preferred_bias=str(settings.get("intraday_ai_preferred_bias", "NEUTRAL")).upper(),
+            require_ema_alignment=bool(settings.get("intraday_ai_require_ema_alignment", True)),
+            require_orb_confirmation=bool(settings.get("intraday_ai_require_orb_confirmation", True)),
+            require_price_action_confirmation=bool(
+                settings.get("intraday_ai_require_price_action_confirmation", True)
+            ),
+            signal_persistence_bars=max(1, int(settings.get("intraday_ai_signal_persistence_bars", 2) or 2)),
         )
 
 
@@ -116,14 +126,24 @@ class IntradayOptionSellingAdvisorState:
     market_bias: str = "NEUTRAL"
     trend_confidence: float = 0.0
     signal_conflict_score: float = 0.0
+    pcr_bias: str = "NEUTRAL"
+    oi_build_bias: str = "UNKNOWN"
     pcr_unbalanced: bool = False
     pcr_unbalanced_side: str = "NEUTRAL"
     volatility_regime: str = "UNKNOWN"
     breakout_confirmation: str = "NONE"
+    ema_alignment_5m: str = "NEUTRAL"
+    ema_alignment_15m: str = "NEUTRAL"
+    orb_confirmation: str = "NONE"
+    price_action_bias: str = "NEUTRAL"
+    price_action_confirmation: str = "NONE"
+    retest_status: str = "NONE"
     has_open_bkm: bool = False
     market_context: Dict[str, Any] = None  # type: ignore[assignment]
     recommendation: Dict[str, Any] = None  # type: ignore[assignment]
     reasons: List[str] = None  # type: ignore[assignment]
+    candidate_setup_signature: Optional[str] = None
+    candidate_signal_streak: int = 0
     current_session_date: str = ""
     updated_at: str = ""
 
@@ -245,9 +265,106 @@ class IntradayOptionSellingAdvisor:
         step = max(1.0, strike_step)
         return max(step, round(width / step) * step)
 
+    def _directional_thresholds(
+        self,
+        *,
+        market_bias: str,
+        breakout_confirmation: str,
+        trend_confidence: float,
+        signal_conflict_score: float,
+        tf_map: Dict[str, Any],
+        oc_ctx: Dict[str, Any],
+    ) -> Tuple[float, float, bool]:
+        min_trend_conf = float(self.config.directional_min_trend_confidence)
+        max_conflict = float(self.config.directional_max_conflict)
+        tf15 = tf_map.get("15") if isinstance(tf_map.get("15"), dict) else {}
+        tf60 = tf_map.get("60") if isinstance(tf_map.get("60"), dict) else {}
+        pat15 = str(tf15.get("pattern") or "").upper()
+        pat60 = str(tf60.get("pattern") or "").upper()
+        pcr_bias = str(oc_ctx.get("pcr_bias") or "").upper()
+        oi_build = oc_ctx.get("oi_build") if isinstance(oc_ctx.get("oi_build"), dict) else {}
+        oi_bias = str(oi_build.get("bias") or "").upper()
+
+        strong_directional_alignment = False
+        if market_bias == "BEARISH":
+            strong_directional_alignment = (
+                breakout_confirmation == "DOWN_CONFIRMED"
+                and pat15 == "DOWNTREND"
+                and pat60 == "DOWNTREND"
+                and (pcr_bias in {"", "BEARISH"} or "BEARISH" in oi_bias)
+            )
+        elif market_bias == "BULLISH":
+            strong_directional_alignment = (
+                breakout_confirmation == "UP_CONFIRMED"
+                and pat15 == "UPTREND"
+                and pat60 == "UPTREND"
+                and (pcr_bias in {"", "BULLISH"} or "BULLISH" in oi_bias)
+            )
+
+        if strong_directional_alignment:
+            min_trend_conf = max(0.50, min_trend_conf - 0.06)
+            max_conflict = min(58.0, max_conflict + 8.0)
+
+        return min_trend_conf, max_conflict, strong_directional_alignment
+
+    def _dynamic_credit_floor(
+        self,
+        *,
+        setup_type: str,
+        base_credit_floor_rs: float,
+        vol_width: float,
+        volatility_regime: str,
+        breakout_confirmation: str,
+        trend_confidence: float,
+        signal_conflict_score: float,
+        strong_directional_alignment: bool,
+    ) -> float:
+        width_ref = max(50.0, float(self.config.spread_width_points_normal_vol))
+        floor_rs = float(base_credit_floor_rs)
+        width_factor = max(0.75, min(1.30, float(vol_width) / width_ref))
+        floor_rs *= width_factor
+
+        if setup_type in {"PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"} and strong_directional_alignment:
+            if breakout_confirmation in {"UP_CONFIRMED", "DOWN_CONFIRMED"} and trend_confidence >= 0.72:
+                floor_rs *= 0.82
+            if signal_conflict_score <= 20.0:
+                floor_rs *= 0.95
+
+        if volatility_regime == "HIGH":
+            floor_rs *= 1.05
+
+        min_floor = max(250.0, float(base_credit_floor_rs) * 0.70)
+        max_floor = max(min_floor, float(base_credit_floor_rs) * 1.35)
+        return max(min_floor, min(max_floor, floor_rs))
+
+    def _candidate_signature(
+        self,
+        *,
+        setup_type: str,
+        market_bias: str,
+        orb_confirmation: str,
+        legs: List[Dict[str, Any]],
+    ) -> str:
+        legs_sig = [
+            [
+                str(leg.get("side") or "").upper(),
+                str(leg.get("option_type") or "").upper(),
+                int(round(float(leg.get("strike") or 0.0))),
+            ]
+            for leg in (legs or [])
+            if isinstance(leg, dict)
+        ]
+        payload = {
+            "setup_type": str(setup_type or ""),
+            "market_bias": str(market_bias or ""),
+            "orb_confirmation": str(orb_confirmation or "NONE"),
+            "legs": legs_sig,
+        }
+        return json.dumps(payload, sort_keys=True)
+
     def _time_ok(self, now: datetime) -> Tuple[bool, bool, str]:
         open_t = _parse_hhmm(self.config.market_open_time, dtime(9, 15))
-        not_before_t = _parse_hhmm(self.config.entry_not_before, dtime(9, 25))
+        not_before_t = _parse_hhmm(self.config.entry_not_before, dtime(9, 45))
         last_entry_t = _parse_hhmm(self.config.last_new_entry_time, dtime(14, 20))
         now_t = now.timetz().replace(tzinfo=None) if getattr(now, "tzinfo", None) else now.time()
         if now.weekday() >= 5:
@@ -274,11 +391,19 @@ class IntradayOptionSellingAdvisor:
         pcr_unbalanced_side: str,
         volatility_regime: str,
         breakout_confirmation: str,
+        price_action_bias: str = "NEUTRAL",
+        price_action_confirmation: str = "NONE",
+        retest_status: str = "NONE",
         has_open_bkm: bool,
+        pcr_bias: str = "NEUTRAL",
+        oi_build_bias: str = "UNKNOWN",
         recommendation: Optional[Dict[str, Any]] = None,
         expiry: Optional[str] = None,
         spot: Optional[float] = None,
         strategy: Optional[str] = None,
+        candidate_setup_signature: Optional[str] = None,
+        candidate_signal_streak: int = 0,
+        entry_features: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         return {
             "status": "ACTIVE",
@@ -290,14 +415,22 @@ class IntradayOptionSellingAdvisor:
             "market_bias": market_bias,
             "trend_confidence": round(float(trend_confidence or 0.0), 3),
             "signal_conflict_score": round(float(signal_conflict_score or 0.0), 1),
+            "pcr_bias": str(pcr_bias or "NEUTRAL"),
+            "oi_build_bias": str(oi_build_bias or "UNKNOWN"),
             "pcr_unbalanced": bool(pcr_unbalanced),
             "pcr_unbalanced_side": pcr_unbalanced_side,
             "volatility_regime": volatility_regime,
             "breakout_confirmation": breakout_confirmation,
+            "price_action_bias": str(price_action_bias or "NEUTRAL"),
+            "price_action_confirmation": str(price_action_confirmation or "NONE"),
+            "retest_status": str(retest_status or "NONE"),
             "has_open_bkm": bool(has_open_bkm),
             "recommendation": recommendation or {},
             "reasons": list(reasons or []),
+            "candidate_setup_signature": candidate_setup_signature,
+            "candidate_signal_streak": max(0, int(candidate_signal_streak or 0)),
             "current_session_date": now.date().isoformat(),
+            "entry_features": entry_features or {},
         }
 
     def _summarize_context(
@@ -324,16 +457,166 @@ class IntradayOptionSellingAdvisor:
             dominant_bias = preferred_bias
         pcr_unbalanced = bool(structure_ctx.get("pcr_unbalanced", False))
         pcr_unbalanced_side = str(structure_ctx.get("pcr_unbalanced_side") or "NEUTRAL").upper()
+        pcr_bias = str(oc_ctx.get("pcr_bias") or "NEUTRAL").upper()
+        oi_build_bias = str(((oc_ctx.get("oi_build") or {}) if isinstance(oc_ctx.get("oi_build"), dict) else {}).get("bias") or "UNKNOWN").upper()
         vol_regime = self._vol_regime(trend_ctx, structure_ctx)
         breakout_confirmation = str(trend_ctx.get("breakout_confirmation") or "NONE").upper()
+        price_action_bias = str(structure_ctx.get("price_action_bias") or "NEUTRAL").upper()
+        price_action_confirmation = str(structure_ctx.get("price_action_confirmation") or "NONE").upper()
+        retest_status = str(structure_ctx.get("retest_status") or "NONE").upper()
         return {
             "market_bias": dominant_bias,
             "trend_confidence": trend_conf,
             "signal_conflict_score": conflict,
+            "pcr_bias": pcr_bias,
+            "oi_build_bias": oi_build_bias,
             "pcr_unbalanced": pcr_unbalanced,
             "pcr_unbalanced_side": pcr_unbalanced_side,
             "volatility_regime": vol_regime,
             "breakout_confirmation": breakout_confirmation,
+            "price_action_bias": price_action_bias,
+            "price_action_confirmation": price_action_confirmation,
+            "retest_status": retest_status,
+        }
+
+    def _directional_chain_conflict(
+        self,
+        *,
+        setup_type: str,
+        oc_ctx: Dict[str, Any],
+        pcr_unbalanced_side: str,
+    ) -> Tuple[float, bool, List[str]]:
+        if setup_type not in {"PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"}:
+            return 0.0, False, []
+        expected_bias = "BULLISH" if setup_type == "PUT_CREDIT_SPREAD" else "BEARISH"
+        opposite_bias = "BEARISH" if expected_bias == "BULLISH" else "BULLISH"
+        pcr_bias = str(oc_ctx.get("pcr_bias") or "NEUTRAL").upper()
+        pcr_total = _safe_float(oc_ctx.get("pcr_total"))
+        pcr_near = _safe_float(oc_ctx.get("pcr_near_atm"))
+        oi_build = oc_ctx.get("oi_build") if isinstance(oc_ctx.get("oi_build"), dict) else {}
+        oi_build_bias = str(oi_build.get("bias") or "UNKNOWN").upper()
+        penalty = 0.0
+        details: List[str] = []
+
+        if pcr_bias == opposite_bias:
+            penalty += 10.0
+            details.append(f"PCR bias is {pcr_bias}, which is against the setup.")
+        if expected_bias == "BEARISH":
+            if pcr_total is not None and pcr_total >= 1.20:
+                penalty += 8.0
+                details.append(f"PCR total is elevated at {pcr_total:.2f}.")
+            if pcr_near is not None and pcr_near >= 1.18:
+                penalty += 10.0
+                details.append(f"Near-ATM PCR is elevated at {pcr_near:.2f}.")
+        else:
+            if pcr_total is not None and pcr_total <= 0.82:
+                penalty += 8.0
+                details.append(f"PCR total is weak at {pcr_total:.2f}.")
+            if pcr_near is not None and pcr_near <= 0.84:
+                penalty += 10.0
+                details.append(f"Near-ATM PCR is weak at {pcr_near:.2f}.")
+        if pcr_unbalanced_side == opposite_bias:
+            penalty += 9.0
+            details.append(f"PCR is unbalanced to the {pcr_unbalanced_side.lower()} side.")
+        if opposite_bias in oi_build_bias:
+            penalty += 9.0
+            details.append(f"OI build is showing {oi_build_bias.lower()}, against the trade.")
+
+        severe_conflict = penalty >= 24.0
+        return penalty, severe_conflict, details
+
+    def _directional_price_action_expectations(
+        self,
+        *,
+        setup_type: str,
+        structure_ctx: Dict[str, Any],
+    ) -> Tuple[bool, bool, bool, List[str]]:
+        if setup_type not in {"PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"}:
+            return True, False, False, []
+        expected_bias = "BULLISH" if setup_type == "PUT_CREDIT_SPREAD" else "BEARISH"
+        price_action_bias = str(structure_ctx.get("price_action_bias") or "NEUTRAL").upper()
+        price_action_confirmation = str(structure_ctx.get("price_action_confirmation") or "NONE").upper()
+        retest_status = str(structure_ctx.get("retest_status") or "NONE").upper()
+        retest_bias = str(structure_ctx.get("retest_bias") or "NEUTRAL").upper()
+        candle_patterns = structure_ctx.get("price_action_patterns")
+        candle_patterns = candle_patterns if isinstance(candle_patterns, list) else []
+        price_action_ok = (
+            price_action_bias == expected_bias
+            and price_action_confirmation
+            in {
+                "CANDLE_CONFIRMED",
+                "RETEST_CONFIRMED",
+                "CANDLE_AND_RETEST_CONFIRMED",
+            }
+        )
+        retest_ok = (
+            retest_bias == expected_bias
+            and retest_status
+            in {
+                "SUPPORT_HOLD",
+                "RESISTANCE_HOLD",
+                "BREAKOUT_RETEST_HOLD",
+                "BREAKDOWN_RETEST_HOLD",
+            }
+        )
+        retest_failed_against_setup = (
+            retest_status in {"RETEST_FAILED", "FAILED_BREAKOUT_RETEST"}
+            and retest_bias not in {"NEUTRAL", expected_bias}
+        )
+        details: List[str] = []
+        if candle_patterns:
+            details.append("Price action patterns: " + ", ".join(str(item) for item in candle_patterns[:4]))
+        details.append(f"Price action bias is {price_action_bias}.")
+        details.append(f"Retest status is {retest_status}.")
+        return (price_action_ok or retest_ok), price_action_ok, retest_failed_against_setup, details
+
+    def _entry_feature_snapshot(
+        self,
+        *,
+        now: datetime,
+        expiry: str,
+        spot: float,
+        strategy: Optional[str],
+        market_bias: str,
+        trend_confidence: float,
+        signal_conflict_score: float,
+        volatility_regime: str,
+        breakout_confirmation: str,
+        ema_alignment_5m: str,
+        ema_alignment_15m: str,
+        orb_confirmation: str,
+        structure_ctx: Dict[str, Any],
+        oc_ctx: Dict[str, Any],
+        recommendation: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        intraday_support = structure_ctx.get("intraday_support") if isinstance(structure_ctx.get("intraday_support"), dict) else {}
+        intraday_resistance = structure_ctx.get("intraday_resistance") if isinstance(structure_ctx.get("intraday_resistance"), dict) else {}
+        return {
+            "captured_at": now.isoformat(timespec="seconds"),
+            "expiry": str(expiry or ""),
+            "spot": round(float(spot or 0.0), 2),
+            "strategy_type": str(strategy or ""),
+            "market_bias": str(market_bias or "NEUTRAL"),
+            "trend_confidence": round(float(trend_confidence or 0.0), 3),
+            "signal_conflict_score": round(float(signal_conflict_score or 0.0), 1),
+            "volatility_regime": str(volatility_regime or "UNKNOWN"),
+            "breakout_confirmation": str(breakout_confirmation or "NONE"),
+            "ema_alignment_5m": str(ema_alignment_5m or "NEUTRAL"),
+            "ema_alignment_15m": str(ema_alignment_15m or "NEUTRAL"),
+            "orb_confirmation": str(orb_confirmation or "NONE"),
+            "price_action_bias": str(structure_ctx.get("price_action_bias") or "NEUTRAL"),
+            "price_action_confirmation": str(structure_ctx.get("price_action_confirmation") or "NONE"),
+            "price_action_patterns": list(structure_ctx.get("price_action_patterns") or []),
+            "retest_status": str(structure_ctx.get("retest_status") or "NONE"),
+            "retest_bias": str(structure_ctx.get("retest_bias") or "NEUTRAL"),
+            "pcr_total": _safe_float(oc_ctx.get("pcr_total")),
+            "pcr_near_atm": _safe_float(oc_ctx.get("pcr_near_atm")),
+            "pcr_bias": str(oc_ctx.get("pcr_bias") or "NEUTRAL"),
+            "oi_build_bias": str(((oc_ctx.get("oi_build") or {}) if isinstance(oc_ctx.get("oi_build"), dict) else {}).get("bias") or "UNKNOWN"),
+            "intraday_support": _safe_float(intraday_support.get("level")),
+            "intraday_resistance": _safe_float(intraday_resistance.get("level")),
+            "sr_alignment_hits": int(structure_ctx.get("sr_alignment_hits") or 0),
+            "legs": list(recommendation.get("legs") or []),
         }
 
     def evaluate(
@@ -353,10 +636,22 @@ class IntradayOptionSellingAdvisor:
         market_bias = str(ctx_summary["market_bias"])
         trend_confidence = float(ctx_summary["trend_confidence"])
         signal_conflict_score = float(ctx_summary["signal_conflict_score"])
+        pcr_bias = str(ctx_summary.get("pcr_bias") or "NEUTRAL")
+        oi_build_bias = str(ctx_summary.get("oi_build_bias") or "UNKNOWN")
         pcr_unbalanced = bool(ctx_summary["pcr_unbalanced"])
         pcr_unbalanced_side = str(ctx_summary["pcr_unbalanced_side"])
         volatility_regime = str(ctx_summary["volatility_regime"])
         breakout_confirmation = str(ctx_summary["breakout_confirmation"])
+        price_action_bias = str(ctx_summary.get("price_action_bias") or "NEUTRAL")
+        price_action_confirmation = str(ctx_summary.get("price_action_confirmation") or "NONE")
+        retest_status = str(ctx_summary.get("retest_status") or "NONE")
+        tf_map = trend_ctx.get("timeframes") if isinstance(trend_ctx.get("timeframes"), dict) else {}
+        tf5 = tf_map.get("5") if isinstance(tf_map.get("5"), dict) else {}
+        tf15 = tf_map.get("15") if isinstance(tf_map.get("15"), dict) else {}
+        ema_alignment_5m = str(tf5.get("ema_alignment") or "NEUTRAL").upper()
+        ema_alignment_15m = str(tf15.get("ema_alignment") or "NEUTRAL").upper()
+        orb_ctx = trend_ctx.get("orb") if isinstance(trend_ctx.get("orb"), dict) else {}
+        orb_confirmation = str(orb_ctx.get("breakout_confirmation") or "NONE").upper()
 
         market_open, entry_window_open, time_reason = self._time_ok(now)
         reasons: List[str] = []
@@ -528,31 +823,42 @@ class IntradayOptionSellingAdvisor:
         put_wall_strike = _safe_float(put_wall_below.get("strike"))
         call_wall_strike = _safe_float(call_wall_above.get("strike"))
 
-        tf_map = trend_ctx.get("timeframes") if isinstance(trend_ctx.get("timeframes"), dict) else {}
         tf15 = tf_map.get("15") if isinstance(tf_map.get("15"), dict) else {}
         atr15 = _safe_float(tf15.get("atr_like_points")) or 0.0
         dynamic_pad = max(safety_buf, round((atr15 * 0.5) / step) * step if atr15 > 0 else 0.0)
         if dynamic_pad <= 0:
             dynamic_pad = safety_buf
+        directional_min_conf, directional_max_conflict, strong_directional_alignment = self._directional_thresholds(
+            market_bias=market_bias,
+            breakout_confirmation=breakout_confirmation,
+            trend_confidence=trend_confidence,
+            signal_conflict_score=signal_conflict_score,
+            tf_map=tf_map,
+            oc_ctx=oc_ctx,
+        )
 
         setup_type: Optional[str] = None
         setup_reasons: List[str] = []
         if (
             market_bias == "BULLISH"
-            and trend_confidence >= float(self.config.directional_min_trend_confidence)
-            and signal_conflict_score <= float(self.config.directional_max_conflict)
+            and trend_confidence >= directional_min_conf
+            and signal_conflict_score <= directional_max_conflict
             and breakout_confirmation != "DOWN_CONFIRMED"
         ):
             setup_type = "PUT_CREDIT_SPREAD"
             setup_reasons.append("Bias is bullish with acceptable signal conflict.")
+            if strong_directional_alignment:
+                setup_reasons.append("Multi-timeframe trend is aligned, so the bullish spread threshold is slightly relaxed.")
         elif (
             market_bias == "BEARISH"
-            and trend_confidence >= float(self.config.directional_min_trend_confidence)
-            and signal_conflict_score <= float(self.config.directional_max_conflict)
+            and trend_confidence >= directional_min_conf
+            and signal_conflict_score <= directional_max_conflict
             and breakout_confirmation != "UP_CONFIRMED"
         ):
             setup_type = "CALL_CREDIT_SPREAD"
             setup_reasons.append("Bias is bearish with acceptable signal conflict.")
+            if strong_directional_alignment:
+                setup_reasons.append("Multi-timeframe trend is aligned, so the bearish spread threshold is slightly relaxed.")
         else:
             sr_width = None
             if support_level is not None and resistance_level is not None and resistance_level > support_level:
@@ -599,6 +905,203 @@ class IntradayOptionSellingAdvisor:
                 },
             )
 
+        chain_conflict_penalty, severe_chain_conflict, chain_conflict_details = self._directional_chain_conflict(
+            setup_type=setup_type,
+            oc_ctx=oc_ctx,
+            pcr_unbalanced_side=pcr_unbalanced_side,
+        )
+        if chain_conflict_penalty > 0:
+            signal_conflict_score = min(100.0, float(signal_conflict_score) + float(chain_conflict_penalty))
+            setup_reasons.extend(chain_conflict_details[:2])
+        if severe_chain_conflict and setup_type in {"PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"}:
+            reasons.append("OPTION_CHAIN_AGAINST_SETUP")
+            return self._base_result(
+                now=now,
+                signal="WAIT",
+                priority="INFO",
+                reasons=reasons,
+                market_bias=market_bias,
+                trend_confidence=trend_confidence,
+                signal_conflict_score=signal_conflict_score,
+                pcr_bias=pcr_bias,
+                oi_build_bias=oi_build_bias,
+                pcr_unbalanced=pcr_unbalanced,
+                pcr_unbalanced_side=pcr_unbalanced_side,
+                volatility_regime=volatility_regime,
+                breakout_confirmation=breakout_confirmation,
+                price_action_bias=price_action_bias,
+                price_action_confirmation=price_action_confirmation,
+                retest_status=retest_status,
+                has_open_bkm=has_open_bkm,
+                expiry=expiry,
+                spot=spot,
+                strategy=setup_type,
+                recommendation={
+                    "headline": "Wait: option-chain context is against the setup.",
+                    "signal_text": "Do not enter yet.",
+                    "what_to_enter": "No trade now.",
+                    "sl_text": "Not applicable",
+                    "tp_text": "Not applicable",
+                    "hold_text": "Wait for PCR and OI build-up to stop fighting the trade direction.",
+                    "why": chain_conflict_details
+                    + ["The setup looks directional, but the option chain is not supporting it cleanly enough."],
+                },
+            )
+
+        expected_ema_alignment = None
+        expected_orb_confirmation = None
+        if setup_type == "PUT_CREDIT_SPREAD":
+            expected_ema_alignment = "BULLISH"
+            expected_orb_confirmation = "UP_CONFIRMED"
+        elif setup_type == "CALL_CREDIT_SPREAD":
+            expected_ema_alignment = "BEARISH"
+            expected_orb_confirmation = "DOWN_CONFIRMED"
+
+        if expected_ema_alignment and bool(self.config.require_ema_alignment):
+            ema_15_ok = ema_alignment_15m == expected_ema_alignment
+            ema_5_not_against = ema_alignment_5m in {expected_ema_alignment, "NEUTRAL"}
+            if not (ema_15_ok and ema_5_not_against):
+                reasons.append("EMA_ALIGNMENT_MISSING")
+                return self._base_result(
+                    now=now,
+                    signal="WAIT",
+                    priority="INFO",
+                    reasons=reasons,
+                    market_bias=market_bias,
+                    trend_confidence=trend_confidence,
+                    signal_conflict_score=signal_conflict_score,
+                    pcr_unbalanced=pcr_unbalanced,
+                    pcr_unbalanced_side=pcr_unbalanced_side,
+                    volatility_regime=volatility_regime,
+                    breakout_confirmation=breakout_confirmation,
+                    has_open_bkm=has_open_bkm,
+                    expiry=expiry,
+                    spot=spot,
+                    strategy=setup_type,
+                    recommendation={
+                        "headline": "Wait: EMA trend is not aligned.",
+                        "signal_text": "Do not enter yet.",
+                        "what_to_enter": "No trade now.",
+                        "sl_text": "Not applicable",
+                        "tp_text": "Not applicable",
+                        "hold_text": "Wait until 15m EMA(5/20) aligns with the trade and 5m EMA is not fighting it.",
+                        "why": [
+                            f"5m EMA alignment is {ema_alignment_5m}.",
+                            f"15m EMA alignment is {ema_alignment_15m}.",
+                            "This filter is blocking weak early entries and reducing drawdown.",
+                        ],
+                    },
+                )
+
+        if expected_orb_confirmation and bool(self.config.require_orb_confirmation):
+            if orb_confirmation != expected_orb_confirmation:
+                reasons.append("ORB_CONFIRMATION_MISSING")
+                return self._base_result(
+                    now=now,
+                    signal="WAIT",
+                    priority="INFO",
+                    reasons=reasons,
+                    market_bias=market_bias,
+                    trend_confidence=trend_confidence,
+                    signal_conflict_score=signal_conflict_score,
+                    pcr_unbalanced=pcr_unbalanced,
+                    pcr_unbalanced_side=pcr_unbalanced_side,
+                    volatility_regime=volatility_regime,
+                    breakout_confirmation=breakout_confirmation,
+                    has_open_bkm=has_open_bkm,
+                    expiry=expiry,
+                    spot=spot,
+                    strategy=setup_type,
+                    recommendation={
+                        "headline": "Wait: 15-minute ORB is not confirmed.",
+                        "signal_text": "Do not enter yet.",
+                        "what_to_enter": "No trade now.",
+                        "sl_text": "Not applicable",
+                        "tp_text": "Not applicable",
+                        "hold_text": "Wait for a clean 15-minute ORB breakout in the same direction as the setup.",
+                        "why": [
+                            f"Current ORB confirmation is {orb_confirmation}.",
+                            "This filter is blocking first-move noise and improving entry quality.",
+                        ],
+                    },
+                )
+
+        price_action_ok, candle_confirmation_ok, retest_failed_against_setup, price_action_details = (
+            self._directional_price_action_expectations(
+                setup_type=setup_type,
+                structure_ctx=structure_ctx,
+            )
+        )
+        if retest_failed_against_setup:
+            reasons.append("RETEST_FAILED_AGAINST_SETUP")
+            return self._base_result(
+                now=now,
+                signal="WAIT",
+                priority="WARN",
+                reasons=reasons,
+                market_bias=market_bias,
+                trend_confidence=trend_confidence,
+                signal_conflict_score=signal_conflict_score,
+                pcr_unbalanced=pcr_unbalanced,
+                pcr_unbalanced_side=pcr_unbalanced_side,
+                volatility_regime=volatility_regime,
+                breakout_confirmation=breakout_confirmation,
+                price_action_bias=price_action_bias,
+                price_action_confirmation=price_action_confirmation,
+                retest_status=retest_status,
+                has_open_bkm=has_open_bkm,
+                expiry=expiry,
+                spot=spot,
+                strategy=setup_type,
+                recommendation={
+                    "headline": "Wait: retest failed against the setup.",
+                    "signal_text": "Do not enter yet.",
+                    "what_to_enter": "No trade now.",
+                    "sl_text": "Not applicable",
+                    "tp_text": "Not applicable",
+                    "hold_text": "Wait for price to reclaim structure before taking a defined-risk entry.",
+                    "why": price_action_details + [
+                        "Price tested the level and failed in the wrong direction, which increases whipsaw risk.",
+                    ],
+                },
+            )
+        if setup_type in {"PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"} and bool(
+            self.config.require_price_action_confirmation
+        ):
+            if not price_action_ok:
+                reasons.append("PRICE_ACTION_CONFIRMATION_MISSING")
+                return self._base_result(
+                    now=now,
+                    signal="WAIT",
+                    priority="INFO",
+                    reasons=reasons,
+                    market_bias=market_bias,
+                    trend_confidence=trend_confidence,
+                    signal_conflict_score=signal_conflict_score,
+                    pcr_unbalanced=pcr_unbalanced,
+                    pcr_unbalanced_side=pcr_unbalanced_side,
+                    volatility_regime=volatility_regime,
+                    breakout_confirmation=breakout_confirmation,
+                    price_action_bias=price_action_bias,
+                    price_action_confirmation=price_action_confirmation,
+                    retest_status=retest_status,
+                    has_open_bkm=has_open_bkm,
+                    expiry=expiry,
+                    spot=spot,
+                    strategy=setup_type,
+                    recommendation={
+                        "headline": "Wait: price action is not confirming the trade.",
+                        "signal_text": "Do not enter yet.",
+                        "what_to_enter": "No trade now.",
+                        "sl_text": "Not applicable",
+                        "tp_text": "Not applicable",
+                        "hold_text": "Wait for candle confirmation or a clean retest hold in the same direction.",
+                        "why": price_action_details + [
+                            "Trend, EMA, and ORB may align, but the immediate price action is still not clean enough.",
+                        ],
+                    },
+                )
+
         def _round_to_step(value: float) -> float:
             return round(float(value) / step) * step
 
@@ -609,10 +1112,13 @@ class IntradayOptionSellingAdvisor:
         invalidation_text = ""
 
         if setup_type == "PUT_CREDIT_SPREAD":
+            put_pad = dynamic_pad
+            if strong_directional_alignment and market_bias == "BULLISH" and trend_confidence >= 0.72 and signal_conflict_score <= 25.0:
+                put_pad = max(step, round((dynamic_pad * 0.80) / step) * step)
             support_ref = support_level if support_level is not None else (put_wall_strike if put_wall_strike is not None else spot - fallback_buf)
             target_short = min(
-                support_ref - dynamic_pad,
-                (put_wall_strike - step if put_wall_strike is not None and put_wall_strike < spot else support_ref - dynamic_pad),
+                support_ref - put_pad,
+                (put_wall_strike - step if put_wall_strike is not None and put_wall_strike < spot else support_ref - put_pad),
             )
             short_put = self._pick_leq(strikes, _round_to_step(target_short))
             if short_put is None:
@@ -631,17 +1137,20 @@ class IntradayOptionSellingAdvisor:
                     {"side": "SELL", "option_type": "PE", "strike": short_put, "qty_lots": 1},
                     {"side": "BUY", "option_type": "PE", "strike": hedge_put, "qty_lots": 1},
                 ]
-                invalidation_price = min(float(short_put) - dynamic_pad * 0.5, (support_level or short_put) - dynamic_pad * 0.35)
+                invalidation_price = min(float(short_put) - put_pad * 0.5, (support_level or short_put) - put_pad * 0.35)
                 invalidation_text = (
                     f"Exit if NIFTY sustains below {int(round(invalidation_price))} "
                     f"(bearish breakdown against bullish setup)."
                 )
                 setup_reasons.append("Bullish bias supports a put credit spread.")
         elif setup_type == "CALL_CREDIT_SPREAD":
+            call_pad = dynamic_pad
+            if strong_directional_alignment and market_bias == "BEARISH" and trend_confidence >= 0.72 and signal_conflict_score <= 25.0:
+                call_pad = max(step, round((dynamic_pad * 0.80) / step) * step)
             resistance_ref = resistance_level if resistance_level is not None else (call_wall_strike if call_wall_strike is not None else spot + fallback_buf)
             target_short = max(
-                resistance_ref + dynamic_pad,
-                (call_wall_strike + step if call_wall_strike is not None and call_wall_strike > spot else resistance_ref + dynamic_pad),
+                resistance_ref + call_pad,
+                (call_wall_strike + step if call_wall_strike is not None and call_wall_strike > spot else resistance_ref + call_pad),
             )
             short_call = self._pick_geq(strikes, _round_to_step(target_short))
             if short_call is None:
@@ -660,7 +1169,7 @@ class IntradayOptionSellingAdvisor:
                     {"side": "SELL", "option_type": "CE", "strike": short_call, "qty_lots": 1},
                     {"side": "BUY", "option_type": "CE", "strike": hedge_call, "qty_lots": 1},
                 ]
-                invalidation_price = max(float(short_call) + dynamic_pad * 0.5, (resistance_level or short_call) + dynamic_pad * 0.35)
+                invalidation_price = max(float(short_call) + call_pad * 0.5, (resistance_level or short_call) + call_pad * 0.35)
                 invalidation_text = (
                     f"Exit if NIFTY sustains above {int(round(invalidation_price))} "
                     f"(bullish breakout against bearish setup)."
@@ -728,7 +1237,17 @@ class IntradayOptionSellingAdvisor:
             )
 
         est_credit_rs = float(est_credit_pts) * float(self.config.lot_size)
-        if est_credit_rs < float(self.config.min_credit_per_set_rs):
+        min_credit_floor_rs = self._dynamic_credit_floor(
+            setup_type=setup_type,
+            base_credit_floor_rs=float(self.config.min_credit_per_set_rs),
+            vol_width=vol_width,
+            volatility_regime=volatility_regime,
+            breakout_confirmation=breakout_confirmation,
+            trend_confidence=trend_confidence,
+            signal_conflict_score=signal_conflict_score,
+            strong_directional_alignment=strong_directional_alignment,
+        )
+        if est_credit_rs < min_credit_floor_rs:
             reasons.append("LOW_PREMIUM_CREDIT")
             return self._base_result(
                 now=now,
@@ -752,7 +1271,10 @@ class IntradayOptionSellingAdvisor:
                     "sl_text": "Not applicable",
                     "tp_text": "Not applicable",
                     "hold_text": "Wait for better premium or clearer move.",
-                    "why": [f"Estimated credit per 1-lot set is only Rs {est_credit_rs:,.0f}."],
+                    "why": [
+                        f"Estimated credit per 1-lot set is only Rs {est_credit_rs:,.0f}.",
+                        f"Current minimum acceptable credit for this setup is about Rs {min_credit_floor_rs:,.0f}.",
+                    ],
                 },
             )
 
@@ -768,8 +1290,12 @@ class IntradayOptionSellingAdvisor:
 
         if setup_type == "PUT_CREDIT_SPREAD":
             strategy_label = "Bull Put Credit Spread"
+            setup_reasons.append("5m and 15m EMA(5/20) are aligned bullish.")
+            setup_reasons.append("15m ORB confirms bullish continuation.")
         elif setup_type == "CALL_CREDIT_SPREAD":
             strategy_label = "Bear Call Credit Spread"
+            setup_reasons.append("5m and 15m EMA(5/20) are aligned bearish.")
+            setup_reasons.append("15m ORB confirms bearish continuation.")
         else:
             strategy_label = "Iron Condor (Defined Risk)"
 
@@ -833,6 +1359,72 @@ class IntradayOptionSellingAdvisor:
                 "fear_rule": "Do not exit early if AI still says HOLD/WATCH and none of TP/SL/invalidation is hit.",
             },
         }
+        entry_features = self._entry_feature_snapshot(
+            now=now,
+            expiry=expiry,
+            spot=spot,
+            strategy=setup_type,
+            market_bias=market_bias,
+            trend_confidence=trend_confidence,
+            signal_conflict_score=signal_conflict_score,
+            volatility_regime=volatility_regime,
+            breakout_confirmation=breakout_confirmation,
+            ema_alignment_5m=ema_alignment_5m,
+            ema_alignment_15m=ema_alignment_15m,
+            orb_confirmation=orb_confirmation,
+            structure_ctx=structure_ctx,
+            oc_ctx=oc_ctx,
+            recommendation=recommendation,
+        )
+        recommendation["entry_features"] = entry_features
+        candidate_signature = self._candidate_signature(
+            setup_type=setup_type,
+            market_bias=market_bias,
+            orb_confirmation=orb_confirmation,
+            legs=legs,
+        )
+        same_session = str(self.state.current_session_date or "") == now.date().isoformat()
+        prev_signature = str(self.state.candidate_setup_signature or "") if same_session else ""
+        prev_streak = int(self.state.candidate_signal_streak or 0) if same_session else 0
+        candidate_streak = (prev_streak + 1) if (prev_signature and prev_signature == candidate_signature) else 1
+        required_streak = max(1, int(self.config.signal_persistence_bars or 1))
+        if candidate_streak < required_streak:
+            reasons.append("SIGNAL_NOT_PERSISTED_YET")
+            return self._base_result(
+                now=now,
+                signal="WAIT",
+                priority="INFO",
+                reasons=reasons,
+                market_bias=market_bias,
+                trend_confidence=trend_confidence,
+                signal_conflict_score=signal_conflict_score,
+                pcr_unbalanced=pcr_unbalanced,
+                pcr_unbalanced_side=pcr_unbalanced_side,
+                volatility_regime=volatility_regime,
+                breakout_confirmation=breakout_confirmation,
+                price_action_bias=price_action_bias,
+                price_action_confirmation=price_action_confirmation,
+                retest_status=retest_status,
+                has_open_bkm=has_open_bkm,
+                recommendation={
+                    "headline": "Wait: setup needs one more confirmation bar.",
+                    "signal_text": "Do not enter on the first qualifying tick.",
+                    "what_to_enter": what_to_enter,
+                    "sl_text": "Not applicable yet",
+                    "tp_text": "Not applicable yet",
+                    "hold_text": "If the same setup survives the next bar, the advisor can promote it to ENTER NOW.",
+                    "why": [
+                        f"Persistence streak is {candidate_streak}/{required_streak}.",
+                        "This filter reduces whipsaw entries and lowers drawdown.",
+                    ],
+                },
+                expiry=expiry,
+                spot=spot,
+                strategy=setup_type,
+                candidate_setup_signature=candidate_signature,
+                candidate_signal_streak=candidate_streak,
+                entry_features=entry_features,
+            )
         return self._base_result(
             now=now,
             signal="ENTER_NOW",
@@ -845,11 +1437,17 @@ class IntradayOptionSellingAdvisor:
             pcr_unbalanced_side=pcr_unbalanced_side,
             volatility_regime=volatility_regime,
             breakout_confirmation=breakout_confirmation,
+            price_action_bias=price_action_bias,
+            price_action_confirmation=price_action_confirmation,
+            retest_status=retest_status,
             has_open_bkm=has_open_bkm,
             recommendation=recommendation,
             expiry=expiry,
             spot=spot,
             strategy=setup_type,
+            candidate_setup_signature=candidate_signature,
+            candidate_signal_streak=candidate_streak,
+            entry_features=entry_features,
         )
 
     def update(
@@ -870,6 +1468,10 @@ class IntradayOptionSellingAdvisor:
             context=context,
             has_open_bkm=has_open_bkm,
         )
+        oc_ctx = context.get("option_chain") if isinstance(context.get("option_chain"), dict) else {}
+        oi_build_ctx = oc_ctx.get("oi_build") if isinstance(oc_ctx.get("oi_build"), dict) else {}
+        out["pcr_bias"] = str(out.get("pcr_bias") or oc_ctx.get("pcr_bias") or "NEUTRAL")
+        out["oi_build_bias"] = str(out.get("oi_build_bias") or oi_build_ctx.get("bias") or "UNKNOWN")
         prev_signal = str(self.state.signal or "NO_TRADE")
         prev_strategy = str(self.state.strategy or "")
         prev_updated = self.state.updated_at
@@ -883,14 +1485,31 @@ class IntradayOptionSellingAdvisor:
         self.state.market_bias = str(out.get("market_bias") or "NEUTRAL")
         self.state.trend_confidence = float(out.get("trend_confidence") or 0.0)
         self.state.signal_conflict_score = float(out.get("signal_conflict_score") or 0.0)
+        self.state.pcr_bias = str(out.get("pcr_bias") or "NEUTRAL")
+        self.state.oi_build_bias = str(out.get("oi_build_bias") or "UNKNOWN")
         self.state.pcr_unbalanced = bool(out.get("pcr_unbalanced", False))
         self.state.pcr_unbalanced_side = str(out.get("pcr_unbalanced_side") or "NEUTRAL")
         self.state.volatility_regime = str(out.get("volatility_regime") or "UNKNOWN")
         self.state.breakout_confirmation = str(out.get("breakout_confirmation") or "NONE")
+        self.state.price_action_bias = str(out.get("price_action_bias") or structure_ctx.get("price_action_bias") or "NEUTRAL")
+        self.state.price_action_confirmation = str(
+            out.get("price_action_confirmation") or structure_ctx.get("price_action_confirmation") or "NONE"
+        )
+        self.state.retest_status = str(out.get("retest_status") or structure_ctx.get("retest_status") or "NONE")
+        tf_map = context.get("trend", {}).get("timeframes") if isinstance(context.get("trend"), dict) else {}
+        tf5 = tf_map.get("5") if isinstance(tf_map.get("5"), dict) else {}
+        tf15 = tf_map.get("15") if isinstance(tf_map.get("15"), dict) else {}
+        orb_ctx = context.get("trend", {}).get("orb") if isinstance(context.get("trend"), dict) else {}
+        orb_ctx = orb_ctx if isinstance(orb_ctx, dict) else {}
+        self.state.ema_alignment_5m = str(tf5.get("ema_alignment") or "NEUTRAL")
+        self.state.ema_alignment_15m = str(tf15.get("ema_alignment") or "NEUTRAL")
+        self.state.orb_confirmation = str(orb_ctx.get("breakout_confirmation") or "NONE")
         self.state.has_open_bkm = bool(out.get("has_open_bkm", False))
         self.state.market_context = context if isinstance(context, dict) else {}
         self.state.recommendation = out.get("recommendation") if isinstance(out.get("recommendation"), dict) else {}
         self.state.reasons = list(out.get("reasons") or [])
+        self.state.candidate_setup_signature = out.get("candidate_setup_signature")
+        self.state.candidate_signal_streak = max(0, int(out.get("candidate_signal_streak") or 0))
         self.state.current_session_date = str(out.get("current_session_date") or now.date().isoformat())
         self._persist(now)
 

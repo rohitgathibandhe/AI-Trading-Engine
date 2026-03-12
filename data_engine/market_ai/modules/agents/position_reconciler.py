@@ -202,6 +202,39 @@ class PositionReconciler:
             c[key] += 1
         return c
 
+    def acknowledge_external_positions(
+        self,
+        *,
+        broker_legs: Iterable[Any],
+        reason: str = "BROKER_ONLY_EXTERNAL_POSITIONS",
+        when: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        now = when or _now_ist()
+        self.on_tick(now)
+        broker = self._to_counter(broker_legs)
+        self.state.status = "OK"
+        self.state.hard_lock = False
+        self.state.locked_for_date = None
+        self.state.mismatch_streak = 0
+        self.state.last_mismatch_reason = None
+        self.state.last_diff_summary = {
+            "match": True,
+            "expected_count": 0,
+            "broker_count": sum(broker.values()),
+            "external": dict(broker),
+            "reason": str(reason or "BROKER_ONLY_EXTERNAL_POSITIONS"),
+        }
+        self.state.last_ok_at = now.isoformat(timespec="seconds")
+        self._persist_state()
+        return {
+            "ok": True,
+            "skipped": False,
+            "locked": False,
+            "reason": str(reason or "BROKER_ONLY_EXTERNAL_POSITIONS"),
+            "external_positions_present": bool(broker),
+            "diff": self.state.last_diff_summary,
+        }
+
     def evaluate(
         self,
         *,

@@ -41,6 +41,8 @@ class ExecutionRecoveryConfig:
     enabled: bool = True
     hard_lock_on_issue: bool = True
     journal_lookback_days: int = 45
+    allow_external_positions_when_flat: bool = True
+    ignore_stale_failed_ops_without_footprint: bool = True
 
     @classmethod
     def from_settings(cls, settings: Dict[str, Any]) -> "ExecutionRecoveryConfig":
@@ -48,6 +50,12 @@ class ExecutionRecoveryConfig:
             enabled=bool(settings.get("live_exec_recovery_enabled", True)),
             hard_lock_on_issue=bool(settings.get("live_exec_recovery_hard_lock", True)),
             journal_lookback_days=max(1, int(settings.get("live_exec_recovery_lookback_days", 45))),
+            allow_external_positions_when_flat=bool(
+                settings.get("live_exec_recovery_allow_external_positions_when_flat", True)
+            ),
+            ignore_stale_failed_ops_without_footprint=bool(
+                settings.get("live_exec_recovery_ignore_stale_failed_ops_without_footprint", True)
+            ),
         )
 
 
@@ -365,14 +373,6 @@ class ExecutionRecoveryGuard:
         unresolved_ops = journal_summary.get("unresolved_ops") or []
         failed_ops = journal_summary.get("failed_ops") or []
         active_baskets = journal_summary.get("active_baskets") or {}
-        if unresolved_ops:
-            details = {"unresolved_ops": unresolved_ops[:5], "count": len(unresolved_ops)}
-            self.lock("EXEC_JOURNAL_UNRESOLVED_OP", details=details, when=now)
-            return {"ok": False, "locked": True, "reason": "EXEC_JOURNAL_UNRESOLVED_OP", "details": details}
-        if failed_ops:
-            details = {"failed_ops": failed_ops[:5], "count": len(failed_ops)}
-            self.lock("EXEC_JOURNAL_FAILED_OP", details=details, when=now)
-            return {"ok": False, "locked": True, "reason": "EXEC_JOURNAL_FAILED_OP", "details": details}
 
         local_open_expiries = sorted(
             str(k)
@@ -381,17 +381,79 @@ class ExecutionRecoveryGuard:
         )
         broker_expiries = sorted(
             {
-                (getattr(leg, "expiry").isoformat() if hasattr(getattr(leg, "expiry", None), "isoformat") else str(getattr(leg, "expiry", "")))
+                (
+                    getattr(leg, "expiry").isoformat()
+                    if hasattr(getattr(leg, "expiry", None), "isoformat")
+                    else str(getattr(leg, "expiry", ""))
+                )
                 for leg in (broker_legs or [])
             }
         )
         broker_expiries = [e for e in broker_expiries if e]
         journal_expiries = sorted(str(e) for e in active_baskets.keys())
 
+        if unresolved_ops:
+            details = {"unresolved_ops": unresolved_ops[:5], "count": len(unresolved_ops)}
+            self.lock("EXEC_JOURNAL_UNRESOLVED_OP", details=details, when=now)
+            return {"ok": False, "locked": True, "reason": "EXEC_JOURNAL_UNRESOLVED_OP", "details": details}
+
+        ignored_failed_details: Optional[Dict[str, Any]] = None
+        if failed_ops:
+            failed_expiries = sorted({str(op.get("expiry") or "").strip() for op in failed_ops if str(op.get("expiry") or "").strip()})
+            active_footprint_expiries = sorted(set(local_open_expiries) | set(journal_expiries) | set(broker_expiries))
+            should_ignore_failed_ops = bool(
+                self.config.ignore_stale_failed_ops_without_footprint
+                and failed_expiries
+                and not (set(failed_expiries) & set(active_footprint_expiries))
+            )
+            if should_ignore_failed_ops:
+                ignored_failed_details = {
+                    "ignored_failed_ops_count": len(failed_ops),
+                    "ignored_failed_op_expiries": failed_expiries,
+                    "active_footprint_expiries": active_footprint_expiries,
+                }
+            else:
+                details = {"failed_ops": failed_ops[:5], "count": len(failed_ops)}
+                self.lock("EXEC_JOURNAL_FAILED_OP", details=details, when=now)
+                return {"ok": False, "locked": True, "reason": "EXEC_JOURNAL_FAILED_OP", "details": details}
+
         if len(journal_expiries) > 1:
             details = {"journal_expiries": journal_expiries}
             self.lock("EXEC_RECOVERY_MULTI_EXPIRY_UNSUPPORTED", details=details, when=now)
             return {"ok": False, "locked": True, "reason": "EXEC_RECOVERY_MULTI_EXPIRY_UNSUPPORTED", "details": details}
+
+        if not journal_expiries and not local_open_expiries:
+            has_external_positions = bool(broker_expiries)
+            if has_external_positions and not self.config.allow_external_positions_when_flat:
+                details = {
+                    "local_open_expiries": local_open_expiries,
+                    "journal_active_expiries": journal_expiries,
+                    "broker_expiries": broker_expiries,
+                }
+                self.lock("EXEC_RECOVERY_BROKER_JOURNAL_MISMATCH", details=details, when=now)
+                return {"ok": False, "locked": True, "reason": "EXEC_RECOVERY_BROKER_JOURNAL_MISMATCH", "details": details}
+
+            self.state.status = "OK"
+            self.state.hard_lock = False
+            self.state.locked_for_date = None
+            self.state.last_reason = None
+            self.state.last_details = {
+                "startup": "BROKER_ONLY_EXTERNAL_POSITIONS" if has_external_positions else "CLEAN_FLAT",
+                "journal_events_scanned": int(journal_summary.get("events_scanned") or 0),
+                "broker_expiries": broker_expiries,
+                "broker_leg_count": len(list(broker_legs or [])),
+            }
+            if ignored_failed_details:
+                self.state.last_details.update(ignored_failed_details)
+            self.state.last_ok_at = now.isoformat(timespec="seconds")
+            self._persist_state()
+            return {
+                "ok": True,
+                "locked": False,
+                "reason": "BROKER_ONLY_EXTERNAL_POSITIONS" if has_external_positions else "CLEAN_FLAT",
+                "active_baskets": {},
+                "external_broker_positions_present": has_external_positions,
+            }
 
         if set(local_open_expiries) != set(journal_expiries):
             details = {
@@ -410,18 +472,6 @@ class ExecutionRecoveryGuard:
             }
             self.lock("EXEC_RECOVERY_BROKER_JOURNAL_MISMATCH", details=details, when=now)
             return {"ok": False, "locked": True, "reason": "EXEC_RECOVERY_BROKER_JOURNAL_MISMATCH", "details": details}
-
-        # If flat everywhere, startup is clean.
-        if not journal_expiries:
-            self.state.status = "OK"
-            self.state.last_reason = None
-            self.state.last_details = {
-                "startup": "CLEAN_FLAT",
-                "journal_events_scanned": int(journal_summary.get("events_scanned") or 0),
-            }
-            self.state.last_ok_at = now.isoformat(timespec="seconds")
-            self._persist_state()
-            return {"ok": True, "locked": False, "reason": "CLEAN_FLAT", "active_baskets": {}}
 
         # Exact broker-vs-journal compare for the active expiry.
         active_expiry = journal_expiries[0]
@@ -454,6 +504,8 @@ class ExecutionRecoveryGuard:
             "active_expiry": active_expiry,
             "active_legs": sum(expected_counter.values()),
         }
+        if ignored_failed_details:
+            self.state.last_details.update(ignored_failed_details)
         self.state.last_ok_at = now.isoformat(timespec="seconds")
         self._persist_state()
         return {"ok": True, "locked": False, "reason": "RESUME_READY", "active_baskets": active_baskets}

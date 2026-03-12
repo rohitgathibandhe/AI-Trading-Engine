@@ -364,6 +364,48 @@
 
       <div class="card" style="margin-top:16px;">
         <div class="card-header">
+          <div style="font-weight:700;">Intraday AI Performance</div>
+          <div>
+            <span class="chip" id="intraday-perf-count">0 trades</span>
+            <span class="chip" id="intraday-perf-winrate">Win rate: —</span>
+          </div>
+        </div>
+        <div class="summary-bar" style="margin-bottom:10px;">
+          <div class="summary-card">
+            <div class="summary-title">Realized P&L</div>
+            <div class="summary-value" id="intraday-perf-pnl">—</div>
+            <div class="summary-sub">Closed intraday paper trades</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Average Hold</div>
+            <div class="summary-value" id="intraday-perf-hold">—</div>
+            <div class="summary-sub">From entry to exit</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">W/L/F</div>
+            <div class="summary-value" id="intraday-perf-wlf">—</div>
+            <div class="summary-sub">Wins / Losses / Flat</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Most Common Exit</div>
+            <div class="summary-value" id="intraday-perf-top-exit">—</div>
+            <div class="summary-sub">Exit behavior trend</div>
+          </div>
+        </div>
+        <div class="muted" style="margin-bottom:8px;">Exit reasons</div>
+        <div id="intraday-exit-reasons" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;"></div>
+        <table id="intraday-history-table">
+          <thead>
+            <tr>
+              <th>Closed At</th><th>Strategy</th><th>Expiry</th><th>Hold</th><th>Exit</th><th>Result</th><th>P&L</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="card-header">
           <div style="font-weight:700;">Paper Positions</div>
           <div>
             <span class="chip" id="positions-count">0 legs</span>
@@ -568,6 +610,88 @@
     const TABS = ["control", "pnl", "live", "state", "logs", "settings"];
     let activeTab = "control";
     let latestControlStatus = {};
+    const fmtHoldMinutes = (v) => {
+      if (v === null || v === undefined || v === "") return "—";
+      const mins = Number(v);
+      if (!Number.isFinite(mins)) return "—";
+      if (mins < 60) return `${mins.toFixed(mins >= 10 ? 0 : 1)}m`;
+      const hrs = Math.floor(mins / 60);
+      const rem = Math.round(mins % 60);
+      return `${hrs}h ${rem}m`;
+    };
+    const humanizeReason = (v) => {
+      const raw = String(v || "").trim();
+      if (!raw) return "—";
+      return raw.split("_").map(x => x.charAt(0) + x.slice(1).toLowerCase()).join(" ");
+    };
+
+    function renderIntradayPerformance(perf) {
+      const data = perf || {};
+      const totalTrades = Number(data.total_trades || 0);
+      const realizedPnl = Number(data.realized_pnl_rs || 0);
+      const wins = Number(data.wins || 0);
+      const losses = Number(data.losses || 0);
+      const flats = Number(data.flats || 0);
+      const winRate = data.win_rate_pct;
+      const avgHold = data.avg_hold_minutes;
+      const exits = Array.isArray(data.exit_reasons) ? data.exit_reasons : [];
+      const recentTrades = Array.isArray(data.recent_trades) ? data.recent_trades : [];
+      const topExit = exits.length ? `${humanizeReason(exits[0].reason)} (${exits[0].count})` : "—";
+
+      const countEl = document.getElementById("intraday-perf-count");
+      const winRateEl = document.getElementById("intraday-perf-winrate");
+      const pnlEl = document.getElementById("intraday-perf-pnl");
+      const holdEl = document.getElementById("intraday-perf-hold");
+      const wlfEl = document.getElementById("intraday-perf-wlf");
+      const topExitEl = document.getElementById("intraday-perf-top-exit");
+      const reasonsEl = document.getElementById("intraday-exit-reasons");
+
+      if (countEl) countEl.textContent = `${totalTrades} trades`;
+      if (winRateEl) winRateEl.textContent = `Win rate: ${winRate === null || winRate === undefined ? "—" : `${Number(winRate).toFixed(1)}%`}`;
+      if (pnlEl) {
+        pnlEl.textContent = fmtMoney(realizedPnl);
+        pnlEl.classList.toggle("pos", realizedPnl > 0);
+        pnlEl.classList.toggle("neg", realizedPnl < 0);
+      }
+      if (holdEl) holdEl.textContent = fmtHoldMinutes(avgHold);
+      if (wlfEl) wlfEl.textContent = `${wins} / ${losses} / ${flats}`;
+      if (topExitEl) topExitEl.textContent = topExit;
+
+      if (reasonsEl) {
+        reasonsEl.innerHTML = "";
+        if (exits.length) {
+          exits.forEach(item => {
+            const span = document.createElement("span");
+            span.className = "chip";
+            span.textContent = `${humanizeReason(item.reason)}: ${item.count}`;
+            reasonsEl.appendChild(span);
+          });
+        } else {
+          const span = document.createElement("span");
+          span.className = "chip";
+          span.textContent = "No closed intraday trades yet";
+          reasonsEl.appendChild(span);
+        }
+      }
+
+      upsertRows(
+        "#intraday-history-table tbody",
+        recentTrades,
+        (row) => `${row.position_id || ""}-${row.closed_at || ""}`,
+        (row, tr) => {
+          const pnlClass = Number(row.pnl_rs || 0) > 0 ? "pos" : (Number(row.pnl_rs || 0) < 0 ? "neg" : "");
+          tr.innerHTML = `
+            <td>${row.closed_at || "—"}</td>
+            <td>${row.strategy_label || "—"}</td>
+            <td>${row.expiry || "—"}</td>
+            <td>${fmtHoldMinutes(row.hold_minutes)}</td>
+            <td>${humanizeReason(row.reason)}</td>
+            <td>${row.result || "—"}</td>
+            <td class="${pnlClass}">${fmtMoney(row.pnl_rs)}</td>
+          `;
+        }
+      );
+    }
 
     async function loadPnl() {
       if (inflight.pnl) return;
@@ -605,6 +729,7 @@
       if (dot) {
         if (status.includes("OPEN")) dot.classList.add("ok"); else dot.classList.remove("ok");
       }
+      renderIntradayPerformance(data.intraday_performance || {});
 
       let openTotal = 0.0;
       upsertRows(
@@ -892,9 +1017,13 @@
       const msg = deployMessage ? ` | ${deployMessage}` : "";
       chip.textContent = `Deploy: ${statusText}${msg}`;
       if (note) {
-        note.textContent = ready
-          ? "Telegram command: /deploy_intraday (same safety checks apply)"
-          : `Deploy blocked: ${reason || "waiting for valid ENTER_NOW signal"}`;
+        if (ready) {
+          note.textContent = (String((latestControlStatus || {}).trade_mode || "").toLowerCase() === "live")
+            ? "Telegram command: /deploy_intraday (same safety checks apply)"
+            : "Paper mode: deploy will place simulated intraday orders using the same AI checks.";
+        } else {
+          note.textContent = `Deploy blocked: ${reason || "waiting for valid ENTER_NOW signal"}`;
+        }
       }
     }
 
@@ -1192,14 +1321,18 @@
 
       const ctrl = latestControlStatus || {};
       const running = !!ctrl.running;
-      const liveMode = String(ctrl.trade_mode || "").toLowerCase() === "live";
-      const locked = !!ctrl.bkm_ai_entry_lock_active || String(ctrl.live_gate_status || "").toUpperCase() === "LOCKED"
-        || !!ctrl.reconcile_hard_lock || !!ctrl.execution_recovery_hard_lock;
+      const agentMode = String(ctrl.trade_mode || "").toLowerCase();
+      const liveMode = agentMode === "live";
+      const supportedMode = agentMode === "live" || agentMode === "paper";
+      const locked = !!ctrl.bkm_ai_entry_lock_active || (liveMode && (
+        String(ctrl.live_gate_status || "").toUpperCase() === "LOCKED"
+        || !!ctrl.reconcile_hard_lock || !!ctrl.execution_recovery_hard_lock
+      ));
       const pending = !!dep.pending;
       let canDeploy = signal === "ENTER_NOW";
       let blockReason = "";
       if (!running) { canDeploy = false; blockReason = "agent is not running"; }
-      else if (!liveMode) { canDeploy = false; blockReason = "agent is not in live mode"; }
+      else if (!supportedMode) { canDeploy = false; blockReason = "agent mode is unknown"; }
       else if (locked) { canDeploy = false; blockReason = "entry locks are active"; }
       else if (signal !== "ENTER_NOW") { canDeploy = false; blockReason = "AI signal is not ENTER_NOW"; }
       else { blockReason = "ready"; }

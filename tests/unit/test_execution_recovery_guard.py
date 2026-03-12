@@ -147,3 +147,41 @@ def test_guard_locks_on_broker_journal_mismatch(tmp_path: Path) -> None:
     assert out["reason"] == "EXEC_RECOVERY_BROKER_POSITION_MISMATCH"
     assert g.snapshot()["status"] == "LOCKED"
 
+
+def test_guard_allows_external_broker_positions_when_bkm_is_flat(tmp_path: Path) -> None:
+    g = _guard(tmp_path)
+    t = _ist_dt(10)
+    broker = [_broker_leg(expiry="2026-01-29", strike=23000, opt=OptionType.PUT, side=LegSide.BUY, qty=65)]
+    out = g.evaluate_startup(
+        local_bkm_state={},
+        broker_legs=broker,
+        journal_summary={"unresolved_ops": [], "failed_ops": [], "active_baskets": {}, "events_scanned": 2},
+        when=t,
+    )
+    assert out["ok"] is True
+    assert out["reason"] == "BROKER_ONLY_EXTERNAL_POSITIONS"
+    snap = g.snapshot()
+    assert snap["status"] == "OK"
+    assert snap["hard_lock"] is False
+    assert snap["last_details"]["broker_leg_count"] == 1
+
+
+def test_guard_ignores_stale_failed_ops_without_live_footprint(tmp_path: Path) -> None:
+    g = _guard(tmp_path)
+    t = _ist_dt(11)
+    out = g.evaluate_startup(
+        local_bkm_state={},
+        broker_legs=[],
+        journal_summary={
+            "unresolved_ops": [],
+            "failed_ops": [{"op_id": "c1", "expiry": "2026-01-29", "timestamp": "2026-01-05T10:00:00+05:30"}],
+            "active_baskets": {},
+            "events_scanned": 5,
+        },
+        when=t,
+    )
+    assert out["ok"] is True
+    assert out["reason"] == "CLEAN_FLAT"
+    snap = g.snapshot()
+    assert snap["status"] == "OK"
+    assert snap["last_details"]["ignored_failed_ops_count"] == 1

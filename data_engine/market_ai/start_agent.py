@@ -15,6 +15,7 @@ import logging
 import os
 import sys
 import time
+from collections import Counter
 from datetime import datetime, date as dt_date, time as dtime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -58,6 +59,8 @@ BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_FILE = STATE_DIR / "batman_bkm_ai_protect_cl
 INTRADAY_AI_ADVISOR_STATUS_FILE = STATE_DIR / "intraday_ai_advisor_status.json"
 INTRADAY_AI_DEPLOY_REQUEST_FILE = STATE_DIR / "intraday_ai_deploy_request.json"
 INTRADAY_AI_DEPLOY_STATUS_FILE = STATE_DIR / "intraday_ai_deploy_status.json"
+INTRADAY_AI_POSITION_STATUS_FILE = STATE_DIR / "intraday_ai_position_status.json"
+INTRADAY_AI_TRADE_HISTORY_FILE = STATE_DIR / "intraday_ai_trade_history.jsonl"
 INTRADAY_AI_APPROVAL_STATUS_FILE = STATE_DIR / "intraday_ai_approval_status.json"
 TELEGRAM_COMMAND_STATUS_FILE = STATE_DIR / "telegram_command_status.json"
 BLOTTER_FIELDS = [
@@ -215,7 +218,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "intraday_ai_enabled": True,
     "intraday_ai_refresh_sec": 60.0,
     "intraday_ai_market_open_time": "09:15",
-    "intraday_ai_entry_not_before": "09:25",
+    "intraday_ai_entry_not_before": "09:45",
     "intraday_ai_last_new_entry_time": "14:20",
     "intraday_ai_max_hold_till": "15:05",
     "intraday_ai_allow_parallel_with_bkm": False,
@@ -237,13 +240,21 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "intraday_ai_min_credit_per_set_rs": 500.0,
     "intraday_ai_max_signal_age_sec": 180.0,
     "intraday_ai_preferred_bias": "BEARISH",
+    "intraday_ai_require_ema_alignment": True,
+    "intraday_ai_require_orb_confirmation": True,
+    "intraday_ai_require_price_action_confirmation": True,
+    "intraday_ai_signal_persistence_bars": 2,
     "intraday_ai_deploy_enabled": True,
     "intraday_ai_deploy_lots_multiplier": 1,
     "intraday_ai_deploy_dedupe_sec": 90.0,
-    "intraday_ai_deploy_require_live_mode": True,
+    "intraday_ai_deploy_require_live_mode": False,
     "intraday_ai_deploy_require_agent_running": True,
     "intraday_ai_deploy_require_market_hours": True,
     "intraday_ai_deploy_block_if_any_live_positions": False,
+    "intraday_ai_auto_deploy_paper_enabled": True,
+    "intraday_ai_auto_deploy_live_enabled": False,
+    "intraday_ai_max_trades_per_session": 1,
+    "paper_intraday_only_mode_enabled": True,
     "telegram_intraday_plan_enabled": True,
     "telegram_intraday_plan_ttl_sec": 300.0,
     "telegram_intraday_plan_default_lots_multiplier": 1,
@@ -270,6 +281,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "live_exec_recovery_enabled": True,
     "live_exec_recovery_hard_lock": True,
     "live_exec_recovery_lookback_days": 45,
+    "live_exec_recovery_allow_external_positions_when_flat": True,
+    "live_exec_recovery_ignore_stale_failed_ops_without_footprint": True,
     "live_order_verify_enabled": True,
     "live_order_fill_wait_sec": 20,
     "live_order_fill_poll_sec": 2.0,
@@ -401,6 +414,7 @@ from market_ai.modules.agents.intraday_option_selling_advisor import (
     IntradayOptionSellingAdvisor,
     IntradayOptionSellingAdvisorConfig,
 )
+from market_ai.modules.agents.intraday_position_manager import IntradayPositionManager
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -1415,9 +1429,21 @@ def _update_blotter_summary(entry: Dict[str, Any]) -> None:
         log.warning("Failed to update blotter summary: %s", exc)
 
 
-def _log_trade_event(*, trade_mode: str, side: str, leg: OptionLeg, order_type: str, notes: str = "") -> None:
+def _log_trade_event(
+    *,
+    trade_mode: str,
+    side: str,
+    leg: OptionLeg,
+    order_type: str,
+    notes: str = "",
+    price_override: Optional[float] = None,
+) -> None:
     # In paper mode, mark events as non-executed to avoid inflating executed count.
     executed_flag = 0 if trade_mode == "paper" else 1
+    if price_override in (None, "", "-", "--"):
+        price_val = float(getattr(leg, "entry_price", 0.0) or leg.current_ltp or 0.0)
+    else:
+        price_val = float(price_override)
     entry = {
         "timestamp": datetime.now().isoformat(),
         "trade_mode": trade_mode,
@@ -1429,7 +1455,7 @@ def _log_trade_event(*, trade_mode: str, side: str, leg: OptionLeg, order_type: 
         "product_type": "MARGIN",
         "security_id": _ensure_leg_security_id(leg, leg.symbol, leg.expiry) or "",
         "quantity": leg.quantity,
-        "price": float(getattr(leg, "entry_price", 0.0) or leg.current_ltp or 0.0),
+        "price": price_val,
         "delta": getattr(leg, "delta", None),
         "expiry": getattr(leg, "expiry", "") if leg and getattr(leg, "expiry", None) is not None else "",
         "strike": leg.strike,
@@ -1679,6 +1705,16 @@ def _is_india_market_open(now: Optional[datetime] = None) -> bool:
     start = dtime(9, 15)
     end = dtime(15, 30)
     return start <= current.time() <= end
+
+
+def _paper_intraday_only_mode_enabled(settings: Dict[str, Any], trade_mode: str) -> bool:
+    if str(trade_mode or "").lower() != "paper":
+        return False
+    if not bool(settings.get("paper_intraday_only_mode_enabled", True)):
+        return False
+    if not bool(settings.get("intraday_ai_enabled", True)):
+        return False
+    return bool(settings.get("intraday_ai_auto_deploy_paper_enabled", True))
 
 
 def _default_bkm_ai_protect_status(now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -2235,6 +2271,53 @@ def _map_positions(rows: list) -> List[OptionLeg]:
     return legs
 
 
+def _looks_like_bkm_live_structure(legs: List[OptionLeg]) -> bool:
+    if len(legs or []) != 6:
+        return False
+
+    expiries = {
+        getattr(leg, "expiry").isoformat() if hasattr(getattr(leg, "expiry", None), "isoformat") else str(getattr(leg, "expiry", "") or "")
+        for leg in (legs or [])
+    }
+    expiries = {expiry for expiry in expiries if expiry}
+    if len(expiries) != 1:
+        return False
+
+    by_opt: Dict[str, List[OptionLeg]] = {"CE": [], "PE": []}
+    for leg in legs or []:
+        opt = getattr(getattr(leg, "option_type", None), "value", getattr(leg, "option_type", ""))
+        opt_u = str(opt or "").upper()
+        if opt_u not in by_opt:
+            return False
+        by_opt[opt_u].append(leg)
+    if len(by_opt["CE"]) != 3 or len(by_opt["PE"]) != 3:
+        return False
+
+    def _validate(side_legs: List[OptionLeg]) -> Optional[int]:
+        ordered = sorted(side_legs, key=lambda leg: float(getattr(leg, "strike", 0.0) or 0.0))
+        if len({round(float(getattr(leg, "strike", 0.0) or 0.0), 4) for leg in ordered}) != 3:
+            return None
+        pattern = [str(getattr(getattr(leg, "side", None), "value", getattr(leg, "side", "")) or "").upper() for leg in ordered]
+        if pattern != ["BUY", "SELL", "BUY"]:
+            return None
+        buy_qtys = [int(getattr(leg, "quantity", 0) or 0) for leg in ordered if str(getattr(getattr(leg, "side", None), "value", getattr(leg, "side", "")) or "").upper() == "BUY"]
+        sell_qtys = [int(getattr(leg, "quantity", 0) or 0) for leg in ordered if str(getattr(getattr(leg, "side", None), "value", getattr(leg, "side", "")) or "").upper() == "SELL"]
+        if len(buy_qtys) != 2 or len(sell_qtys) != 1:
+            return None
+        q_long = min(buy_qtys)
+        q_hedge = max(buy_qtys)
+        q_short = sell_qtys[0]
+        if q_long <= 0 or q_short != 3 * q_long:
+            return None
+        if q_hedge < q_long or (q_hedge % q_long) != 0:
+            return None
+        return q_long
+
+    ce_q_long = _validate(by_opt["CE"])
+    pe_q_long = _validate(by_opt["PE"])
+    return ce_q_long is not None and pe_q_long is not None and ce_q_long == pe_q_long
+
+
 def _map_chain(chain_raw: Any, expiry, symbol: str, spot: float = 0.0) -> List[dict]:
     """
     Normalize a raw DHAN option chain response into a list of rows with:
@@ -2372,9 +2455,19 @@ def _chain_row_for_option(chain_rows: List[Dict[str, Any]], *, option_type: str,
     return None
 
 
+def _intraday_strategy_type_enum(strategy_name: str) -> StrategyType:
+    name = str(strategy_name or "").upper()
+    if name == "PUT_CREDIT_SPREAD":
+        return StrategyType.BULL_PUT_SPREAD
+    if name == "CALL_CREDIT_SPREAD":
+        return StrategyType.BEAR_CALL_SPREAD
+    return StrategyType.NONE
+
+
 def _intraday_rec_leg_to_option_leg(
     *,
     rec_leg: Dict[str, Any],
+    strategy_name: str,
     expiry: dt_date,
     lot_size: int,
     deploy_lot_multiplier: int,
@@ -2409,8 +2502,191 @@ def _intraday_rec_leg_to_option_leg(
         quantity=int(qty),
         entry_price=float(ltp_f),
         security_id=sec_id,
-        strategy_type=StrategyType.NONE,
+        strategy_type=_intraday_strategy_type_enum(strategy_name),
     )
+
+
+def _detect_recent_price_action(
+    candles: List[dict],
+    *,
+    support: Optional[float],
+    resistance: Optional[float],
+    atr_like_points: float,
+) -> Dict[str, Any]:
+    default = {
+        "price_action_bias": "NEUTRAL",
+        "price_action_confirmation": "NONE",
+        "price_action_score": 0.0,
+        "primary_pattern": "NONE",
+        "price_action_patterns": [],
+        "retest_status": "NONE",
+        "retest_bias": "NEUTRAL",
+        "retest_level": None,
+        "retest_score": 0.0,
+    }
+    parsed: List[Dict[str, float]] = []
+    for candle in (candles or [])[-6:]:
+        try:
+            open_px = float(candle.get("open") or candle.get("close") or 0.0)
+            high_px = float(candle.get("high") or candle.get("close") or open_px)
+            low_px = float(candle.get("low") or candle.get("close") or open_px)
+            close_px = float(candle.get("close") or open_px)
+        except Exception:
+            continue
+        rng = max(0.01, high_px - low_px)
+        body = abs(close_px - open_px)
+        upper_wick = max(0.0, high_px - max(open_px, close_px))
+        lower_wick = max(0.0, min(open_px, close_px) - low_px)
+        close_pos = (close_px - low_px) / rng
+        parsed.append(
+            {
+                "open": open_px,
+                "high": high_px,
+                "low": low_px,
+                "close": close_px,
+                "range": rng,
+                "body": body,
+                "upper_wick": upper_wick,
+                "lower_wick": lower_wick,
+                "close_pos": close_pos,
+            }
+        )
+    if len(parsed) < 3:
+        return default
+
+    last = parsed[-1]
+    prev = parsed[-2]
+    prev2 = parsed[-3]
+    prior_rows = parsed[:-1]
+    prior_high = max(row["high"] for row in prior_rows)
+    prior_low = min(row["low"] for row in prior_rows)
+    avg_range = max(0.01, float(atr_like_points or 0.0), sum(row["range"] for row in parsed) / len(parsed))
+    level_buffer = max(8.0, avg_range * 0.25)
+
+    bullish_score = 0.0
+    bearish_score = 0.0
+    bullish_patterns: List[str] = []
+    bearish_patterns: List[str] = []
+    retest_status = "NONE"
+    retest_bias = "NEUTRAL"
+    retest_level: Optional[float] = None
+    retest_score = 0.0
+
+    def _record_retest(*, status: str, bias: str, level: Optional[float], score: float) -> None:
+        nonlocal retest_status, retest_bias, retest_level, retest_score
+        if float(score) >= float(retest_score):
+            retest_status = str(status)
+            retest_bias = str(bias)
+            retest_level = None if level is None else float(level)
+            retest_score = float(score)
+
+    if (
+        last["close"] > last["open"]
+        and prev["close"] < prev["open"]
+        and last["open"] <= prev["close"]
+        and last["close"] >= prev["open"]
+        and last["body"] >= (prev["body"] * 0.9)
+    ):
+        bullish_score += 0.85
+        bullish_patterns.append("BULLISH_ENGULFING")
+    if (
+        last["close"] < last["open"]
+        and prev["close"] > prev["open"]
+        and last["open"] >= prev["close"]
+        and last["close"] <= prev["open"]
+        and last["body"] >= (prev["body"] * 0.9)
+    ):
+        bearish_score += 0.85
+        bearish_patterns.append("BEARISH_ENGULFING")
+    if last["lower_wick"] >= max(last["body"] * 1.6, avg_range * 0.18) and last["close_pos"] >= 0.60:
+        bullish_score += 0.55
+        bullish_patterns.append("LOWER_REJECTION")
+    if last["upper_wick"] >= max(last["body"] * 1.6, avg_range * 0.18) and last["close_pos"] <= 0.40:
+        bearish_score += 0.55
+        bearish_patterns.append("UPPER_REJECTION")
+    if last["close"] > prior_high and last["close_pos"] >= 0.62:
+        bullish_score += 0.70
+        bullish_patterns.append("BREAKOUT_CONTINUATION_UP")
+    if last["close"] < prior_low and last["close_pos"] <= 0.38:
+        bearish_score += 0.70
+        bearish_patterns.append("BREAKOUT_CONTINUATION_DOWN")
+    if (
+        prev["high"] <= prev2["high"]
+        and prev["low"] >= prev2["low"]
+        and last["close"] > prev["high"] + (level_buffer * 0.05)
+        and last["close"] > last["open"]
+    ):
+        bullish_score += 0.50
+        bullish_patterns.append("INSIDE_BAR_BREAK_UP")
+    if (
+        prev["high"] <= prev2["high"]
+        and prev["low"] >= prev2["low"]
+        and last["close"] < prev["low"] - (level_buffer * 0.05)
+        and last["close"] < last["open"]
+    ):
+        bearish_score += 0.50
+        bearish_patterns.append("INSIDE_BAR_BREAK_DOWN")
+
+    if support is not None:
+        support_f = float(support)
+        if last["low"] <= support_f + level_buffer and last["close"] >= support_f + (level_buffer * 0.10) and last["close_pos"] >= 0.55:
+            _record_retest(status="SUPPORT_HOLD", bias="BULLISH", level=support_f, score=0.72)
+    if resistance is not None:
+        resistance_f = float(resistance)
+        if last["high"] >= resistance_f - level_buffer and last["close"] <= resistance_f - (level_buffer * 0.10) and last["close_pos"] <= 0.45:
+            _record_retest(status="RESISTANCE_HOLD", bias="BEARISH", level=resistance_f, score=0.72)
+    if resistance is not None:
+        resistance_f = float(resistance)
+        if prev["close"] > resistance_f and last["low"] <= resistance_f + level_buffer and last["close"] > resistance_f:
+            _record_retest(status="BREAKOUT_RETEST_HOLD", bias="BULLISH", level=resistance_f, score=0.88)
+        elif prev["close"] > resistance_f and last["close"] < resistance_f:
+            _record_retest(status="RETEST_FAILED", bias="BEARISH", level=resistance_f, score=0.82)
+    if support is not None:
+        support_f = float(support)
+        if prev["close"] < support_f and last["high"] >= support_f - level_buffer and last["close"] < support_f:
+            _record_retest(status="BREAKDOWN_RETEST_HOLD", bias="BEARISH", level=support_f, score=0.88)
+        elif prev["close"] < support_f and last["close"] > support_f:
+            _record_retest(status="RETEST_FAILED", bias="BULLISH", level=support_f, score=0.82)
+
+    price_action_bias = "NEUTRAL"
+    price_action_patterns: List[str] = []
+    price_action_score = 0.0
+    if bullish_score >= max(0.55, bearish_score + 0.20):
+        price_action_bias = "BULLISH"
+        price_action_patterns = bullish_patterns
+        price_action_score = bullish_score
+    elif bearish_score >= max(0.55, bullish_score + 0.20):
+        price_action_bias = "BEARISH"
+        price_action_patterns = bearish_patterns
+        price_action_score = bearish_score
+
+    confirmation = "NONE"
+    if price_action_bias != "NEUTRAL" and retest_bias == price_action_bias and retest_status not in {"NONE", "RETEST_FAILED"}:
+        confirmation = "CANDLE_AND_RETEST_CONFIRMED"
+    elif price_action_bias != "NEUTRAL":
+        confirmation = "CANDLE_CONFIRMED"
+    elif retest_bias != "NEUTRAL" and retest_status not in {"NONE", "RETEST_FAILED"}:
+        price_action_bias = retest_bias
+        confirmation = "RETEST_CONFIRMED"
+        price_action_patterns = [retest_status]
+        price_action_score = retest_score
+
+    unique_patterns: List[str] = []
+    for pattern in price_action_patterns:
+        text = str(pattern or "").upper()
+        if text and text not in unique_patterns:
+            unique_patterns.append(text)
+    return {
+        "price_action_bias": price_action_bias,
+        "price_action_confirmation": confirmation,
+        "price_action_score": round(float(max(price_action_score, retest_score)), 3),
+        "primary_pattern": unique_patterns[0] if unique_patterns else "NONE",
+        "price_action_patterns": unique_patterns[:4],
+        "retest_status": retest_status,
+        "retest_bias": retest_bias,
+        "retest_level": None if retest_level is None else round(float(retest_level), 2),
+        "retest_score": round(float(retest_score), 3),
+    }
 
 
 def _classify_trend_from_candles(candles: List[dict], *, interval_min: int) -> Dict[str, Any]:
@@ -2440,6 +2716,15 @@ def _classify_trend_from_candles(candles: List[dict], *, interval_min: int) -> D
             "volatility_regime": "UNKNOWN",
             "breakout_dir": "NONE",
             "breakout_confirmed": False,
+            "price_action_bias": "NEUTRAL",
+            "price_action_confirmation": "NONE",
+            "price_action_score": 0.0,
+            "primary_pattern": "NONE",
+            "price_action_patterns": [],
+            "retest_status": "NONE",
+            "retest_bias": "NEUTRAL",
+            "retest_level": None,
+            "retest_score": 0.0,
         }
 
     lookback = min(len(closes), 12 if interval_min <= 5 else (10 if interval_min <= 15 else 8))
@@ -2496,6 +2781,30 @@ def _classify_trend_from_candles(candles: List[dict], *, interval_min: int) -> D
             breakout_dir = "DOWN"
             breakout_confirmed = bool(vol_confirm)
 
+    def _ema(values: List[float], period: int) -> Optional[float]:
+        if not values:
+            return None
+        alpha = 2.0 / (float(period) + 1.0)
+        ema_val = float(values[0])
+        for value in values[1:]:
+            ema_val = (float(value) * alpha) + (ema_val * (1.0 - alpha))
+        return ema_val
+
+    ema_fast = _ema(closes, 5)
+    ema_slow = _ema(closes, 20)
+    ema_fast_prev = _ema(closes[:-1], 5) if len(closes) > 1 else ema_fast
+    ema_slow_prev = _ema(closes[:-1], 20) if len(closes) > 1 else ema_slow
+    ema_gap = None if ema_fast is None or ema_slow is None else float(ema_fast - ema_slow)
+    ema_gap_pct = None if ema_gap is None else (ema_gap / max(1.0, abs(last_close)))
+    ema_fast_slope = None if ema_fast is None or ema_fast_prev is None else float(ema_fast - ema_fast_prev)
+    ema_slow_slope = None if ema_slow is None or ema_slow_prev is None else float(ema_slow - ema_slow_prev)
+    ema_alignment = "NEUTRAL"
+    if ema_gap_pct is not None and ema_fast_slope is not None and ema_slow_slope is not None:
+        if ema_gap_pct >= 0.0008 and ema_fast_slope > 0 and ema_slow_slope >= 0:
+            ema_alignment = "BULLISH"
+        elif ema_gap_pct <= -0.0008 and ema_fast_slope < 0 and ema_slow_slope <= 0:
+            ema_alignment = "BEARISH"
+
     # Practical thresholds tuned by timeframe for simple trend/pattern labeling.
     trend_threshold_pct = 0.10 if interval_min <= 5 else (0.18 if interval_min <= 15 else 0.28)
     trend = "RANGE"
@@ -2515,6 +2824,13 @@ def _classify_trend_from_candles(candles: List[dict], *, interval_min: int) -> D
         # Preserve a small directional bias inside range.
         dir_score = round((close_pos - 0.5) * 0.6, 3)
 
+    price_action = _detect_recent_price_action(
+        rows[-max(lookback, 6):],
+        support=support,
+        resistance=resistance,
+        atr_like_points=atr_like_points,
+    )
+
     return {
         "interval_min": interval_min,
         "trend": trend,
@@ -2532,14 +2848,31 @@ def _classify_trend_from_candles(candles: List[dict], *, interval_min: int) -> D
         "distance_to_resistance": round(float(dist_resistance), 2),
         "atr_like_points": round(float(atr_like_points), 2),
         "atr_like_pct": round(float(atr_like_pct), 3),
+        "ema_fast": None if ema_fast is None else round(float(ema_fast), 2),
+        "ema_slow": None if ema_slow is None else round(float(ema_slow), 2),
+        "ema_gap_points": None if ema_gap is None else round(float(ema_gap), 2),
+        "ema_gap_pct": None if ema_gap_pct is None else round(float(ema_gap_pct), 4),
+        "ema_fast_slope": None if ema_fast_slope is None else round(float(ema_fast_slope), 2),
+        "ema_slow_slope": None if ema_slow_slope is None else round(float(ema_slow_slope), 2),
+        "ema_alignment": ema_alignment,
         "volatility_regime": vol_regime,
         "breakout_dir": breakout_dir,
         "breakout_confirmed": bool(breakout_confirmed),
+        "price_action_bias": str(price_action.get("price_action_bias") or "NEUTRAL"),
+        "price_action_confirmation": str(price_action.get("price_action_confirmation") or "NONE"),
+        "price_action_score": round(float(price_action.get("price_action_score") or 0.0), 3),
+        "primary_pattern": str(price_action.get("primary_pattern") or "NONE"),
+        "price_action_patterns": list(price_action.get("price_action_patterns") or []),
+        "retest_status": str(price_action.get("retest_status") or "NONE"),
+        "retest_bias": str(price_action.get("retest_bias") or "NEUTRAL"),
+        "retest_level": price_action.get("retest_level"),
+        "retest_score": round(float(price_action.get("retest_score") or 0.0), 3),
     }
 
 
 def _build_bkm_mtf_trend_context(dw: DhanWrapper, *, trade_day: dt_date) -> Dict[str, Any]:
     per_tf: Dict[str, Dict[str, Any]] = {}
+    candles_by_interval: Dict[int, List[dict]] = {}
     weighted_sum = 0.0
     weighted_denom = 0.0
     errors: List[str] = []
@@ -2558,6 +2891,7 @@ def _build_bkm_mtf_trend_context(dw: DhanWrapper, *, trade_day: dt_date) -> Dict
             }
             errors.append(f"{interval}m:{exc}")
             continue
+        candles_by_interval[interval] = candles
         snap = _classify_trend_from_candles(candles, interval_min=interval)
         per_tf[str(interval)] = snap
         try:
@@ -2590,12 +2924,74 @@ def _build_bkm_mtf_trend_context(dw: DhanWrapper, *, trade_day: dt_date) -> Dict
             breakout_confirmation = "UP_CONFIRMED"
         elif down > up and down >= 1:
             breakout_confirmation = "DOWN_CONFIRMED"
+
+    orb_summary: Dict[str, Any] = {
+        "timeframe_minutes": 15,
+        "breakout_confirmation": "NONE",
+        "breakout_active": False,
+        "breakout_reason": "",
+        "orb_high": None,
+        "orb_low": None,
+        "orb_mid": None,
+        "completed_at": None,
+    }
+    candles_5m = candles_by_interval.get(5) or []
+    if candles_5m:
+        latest_candle = candles_5m[-1] if candles_5m else {}
+        latest_close = float(latest_candle.get("close") or latest_candle.get("open") or 0.0)
+        latest_ts_raw = latest_candle.get("timestamp") or latest_candle.get("time")
+        latest_ts = None
+        if isinstance(latest_ts_raw, datetime):
+            latest_ts = latest_ts_raw
+        elif isinstance(latest_ts_raw, str):
+            try:
+                latest_ts = datetime.fromisoformat(latest_ts_raw)
+            except Exception:
+                latest_ts = None
+        market_open = datetime.combine(
+            trade_day,
+            dtime(9, 15),
+            tzinfo=getattr(latest_ts, "tzinfo", None),
+        )
+        try:
+            orb_cfg = ORBConfig(timeframe_minutes=15)
+            orb_levels = compute_orb_levels(candles_5m, market_open, orb_cfg)
+            if orb_levels is not None:
+                orb_summary.update(
+                    {
+                        "orb_high": round(float(orb_levels.orb_high), 2),
+                        "orb_low": round(float(orb_levels.orb_low), 2),
+                        "orb_mid": round(float(orb_levels.orb_mid), 2),
+                        "completed_at": orb_levels.completed_at.isoformat(timespec="seconds"),
+                    }
+                )
+                market_snap = MarketSnapshot(
+                    symbol="NIFTY",
+                    spot=float(latest_close or 0.0),
+                    candles_5m=candles_5m,
+                    yesterday_high=0.0,
+                    yesterday_low=0.0,
+                    yesterday_close=0.0,
+                    india_vix=0.0,
+                    now=latest_ts or market_open,
+                )
+                orb_break = detect_orb_breakout(market_snap, orb_levels, orb_cfg)
+                if orb_break.active:
+                    orb_summary["breakout_active"] = True
+                    if getattr(orb_break.direction, "name", "") == "BULL":
+                        orb_summary["breakout_confirmation"] = "UP_CONFIRMED"
+                    elif getattr(orb_break.direction, "name", "") == "BEAR":
+                        orb_summary["breakout_confirmation"] = "DOWN_CONFIRMED"
+                    orb_summary["breakout_reason"] = str(orb_break.reason or "")
+        except Exception as exc:
+            errors.append(f"orb:{exc}")
     return {
         "timeframes": per_tf,
         "bias_score": round(float(bias_score), 3),
         "bias": bias,
         "volatility_regime": volatility_regime,
         "breakout_confirmation": breakout_confirmation,
+        "orb": orb_summary,
         "errors": errors,
     }
 
@@ -2717,6 +3113,56 @@ def _build_bkm_structure_confidence_context(
         else:
             weekly_bias = "RANGE"
 
+    price_action_patterns: List[str] = []
+    price_action_weighted = 0.0
+    price_action_weight_total = 0.0
+    candle_confirm_hits = 0
+    retest_confirm_hits = 0
+    retest_status = "NONE"
+    retest_bias = "NEUTRAL"
+    retest_level = None
+    retest_score = 0.0
+    for tf_key, tf_weight in (("5", 1.0), ("15", 1.7), ("60", 0.7)):
+        tf = tf_map.get(tf_key) if isinstance(tf_map.get(tf_key), dict) else {}
+        pa_bias = str(tf.get("price_action_bias") or "NEUTRAL").upper()
+        pa_conf = str(tf.get("price_action_confirmation") or "NONE").upper()
+        if pa_bias == "BULLISH":
+            price_action_weighted += tf_weight
+            price_action_weight_total += tf_weight
+        elif pa_bias == "BEARISH":
+            price_action_weighted -= tf_weight
+            price_action_weight_total += tf_weight
+        if pa_conf in {"CANDLE_CONFIRMED", "CANDLE_AND_RETEST_CONFIRMED"}:
+            candle_confirm_hits += 1
+        if pa_conf in {"RETEST_CONFIRMED", "CANDLE_AND_RETEST_CONFIRMED"}:
+            retest_confirm_hits += 1
+        for pattern in list(tf.get("price_action_patterns") or []):
+            text = f"{tf_key}m:{str(pattern or '').upper()}"
+            if text not in price_action_patterns:
+                price_action_patterns.append(text)
+        tf_retest_score = _f(tf.get("retest_score")) or 0.0
+        if tf_retest_score >= float(retest_score):
+            retest_status = str(tf.get("retest_status") or "NONE").upper()
+            retest_bias = str(tf.get("retest_bias") or "NEUTRAL").upper()
+            retest_level = _f(tf.get("retest_level"))
+            retest_score = float(tf_retest_score)
+
+    price_action_bias = "NEUTRAL"
+    if price_action_weight_total > 0:
+        pa_score = price_action_weighted / price_action_weight_total
+        if pa_score >= 0.35:
+            price_action_bias = "BULLISH"
+        elif pa_score <= -0.35:
+            price_action_bias = "BEARISH"
+    price_action_confirmation = "NONE"
+    if candle_confirm_hits > 0 and retest_confirm_hits > 0 and price_action_bias != "NEUTRAL":
+        price_action_confirmation = "CANDLE_AND_RETEST_CONFIRMED"
+    elif candle_confirm_hits > 0 and price_action_bias != "NEUTRAL":
+        price_action_confirmation = "CANDLE_CONFIRMED"
+    elif retest_confirm_hits > 0 and retest_bias != "NEUTRAL":
+        price_action_bias = retest_bias
+        price_action_confirmation = "RETEST_CONFIRMED"
+
     # Directional signal alignment / conflict using trend + PCR + OI build + breakout.
     def _vote_from_label(label: str, bullish_tokens: Tuple[str, ...], bearish_tokens: Tuple[str, ...]) -> int:
         text = str(label or "").upper()
@@ -2732,6 +3178,8 @@ def _build_bkm_structure_confidence_context(
     oi_build_vote = _vote_from_label(oi_build.get("bias"), ("BULL", "SUPPORT"), ("BEAR", "RESISTANCE"))
     breakout_vote = _vote_from_label(trend_ctx.get("breakout_confirmation"), ("UP", "BULL"), ("DOWN", "BEAR"))
     weekly_vote = _vote_from_label(weekly_bias, ("BULL",), ("BEAR",))
+    candle_vote = 1 if (price_action_bias == "BULLISH" and candle_confirm_hits > 0) else (-1 if (price_action_bias == "BEARISH" and candle_confirm_hits > 0) else 0)
+    retest_vote = 1 if (retest_bias == "BULLISH" and retest_status not in {"NONE", "RETEST_FAILED"}) else (-1 if (retest_bias == "BEARISH" and retest_status not in {"NONE", "RETEST_FAILED"}) else 0)
 
     votes = {
         "trend": trend_vote,
@@ -2739,6 +3187,8 @@ def _build_bkm_structure_confidence_context(
         "oi_build": oi_build_vote,
         "breakout": breakout_vote,
         "weekly": weekly_vote,
+        "candle": candle_vote,
+        "retest": retest_vote,
     }
     non_zero_votes = [v for v in votes.values() if v != 0]
     bullish_votes = sum(1 for v in non_zero_votes if v > 0)
@@ -2783,6 +3233,10 @@ def _build_bkm_structure_confidence_context(
             sr_alignment_hits += 1
     if sr_alignment_hits:
         trend_confidence += 0.03 * sr_alignment_hits
+    if price_action_confirmation in {"CANDLE_CONFIRMED", "RETEST_CONFIRMED"}:
+        trend_confidence += 0.04
+    elif price_action_confirmation == "CANDLE_AND_RETEST_CONFIRMED":
+        trend_confidence += 0.07
 
     vol_regime = str(trend_ctx.get("volatility_regime") or "NORMAL").upper()
     if vol_regime == "HIGH" and conflict_ratio > 0.25:
@@ -2824,6 +3278,13 @@ def _build_bkm_structure_confidence_context(
         "pcr_extreme": None if pcr_extreme is None else round(float(pcr_extreme), 3),
         "sr_alignment_hits": sr_alignment_hits,
         "volatility_regime": vol_regime,
+        "price_action_bias": price_action_bias,
+        "price_action_confirmation": price_action_confirmation,
+        "price_action_patterns": price_action_patterns[:6],
+        "retest_status": retest_status,
+        "retest_bias": retest_bias,
+        "retest_level": None if retest_level is None else round(float(retest_level), 2),
+        "retest_score": round(float(retest_score), 3),
     }
 
 
@@ -3241,6 +3702,8 @@ def _place_leg_order(
     close: bool,
     trade_mode: str,
     live_order_executor: Optional[LiveOrderExecutor] = None,
+    blotter_notes: Optional[str] = None,
+    blotter_price: Optional[float] = None,
 ) -> Dict[str, Any]:
     side = _normalize_leg_side(leg.side)
     if close:
@@ -3249,7 +3712,14 @@ def _place_leg_order(
         order_side = side
     if trade_mode == "paper":
         # Paper: do not hit broker; log a synthetic blotter row once.
-        _log_trade_event(trade_mode=trade_mode, side=order_side.value, leg=leg, order_type="MARKET", notes="paper")
+        _log_trade_event(
+            trade_mode=trade_mode,
+            side=order_side.value,
+            leg=leg,
+            order_type="MARKET",
+            notes=str(blotter_notes or "paper"),
+            price_override=blotter_price,
+        )
         return {"ok": True, "verified": True, "paper": True, "order_side": order_side.value}
     security_id = _ensure_leg_security_id(leg, leg.symbol, leg.expiry)
     if not security_id:
@@ -3296,7 +3766,8 @@ def _place_leg_order(
             side=order_side.value,
             leg=leg,
             order_type="MARKET",
-            notes="verified" if bool(exec_result.get("verified")) else "",
+            notes=str(blotter_notes or ("verified" if bool(exec_result.get("verified")) else "")),
+            price_override=blotter_price,
         )
         return {
             "ok": True,
@@ -3314,7 +3785,14 @@ def _place_leg_order(
         product_type="MARGIN",
         order_type="MARKET",
     )
-    _log_trade_event(trade_mode=trade_mode, side=order_side.value, leg=leg, order_type="MARKET")
+    _log_trade_event(
+        trade_mode=trade_mode,
+        side=order_side.value,
+        leg=leg,
+        order_type="MARKET",
+        notes=str(blotter_notes or ""),
+        price_override=blotter_price,
+    )
     return {"ok": True, "verified": False, "order_side": order_side.value, "security_id": int(security_id)}
 
 
@@ -4360,6 +4838,33 @@ def main() -> None:
                 message="Deploy blocked: agent is not in live mode.",
                 alert_severity="WARNING",
             )
+        max_intraday_trades = max(1, int(settings.get("intraday_ai_max_trades_per_session", 1) or 1))
+        if intraday_position_manager and intraday_position_manager.has_open_position():
+            snap = intraday_position_manager.snapshot()
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="INTRADAY_POSITION_ALREADY_OPEN",
+                message="Deploy blocked: intraday AI position is already open.",
+                details={
+                    "position_id": snap.get("position_id"),
+                    "strategy": snap.get("strategy_label"),
+                    "opened_at": snap.get("opened_at"),
+                },
+                alert_severity="INFO",
+            )
+        if intraday_position_manager and not intraday_position_manager.can_open_new_position(
+            max_trades_per_session=max_intraday_trades,
+            now=now,
+        ):
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="INTRADAY_SESSION_LIMIT_REACHED",
+                message=f"Deploy blocked: max intraday trades reached for this session ({max_intraday_trades}).",
+                details={"max_trades_per_session": max_intraday_trades},
+                alert_severity="INFO",
+            )
         if approval_expires_at and now > approval_expires_at:
             return _finalize(
                 ok=False,
@@ -4377,7 +4882,7 @@ def main() -> None:
                 message="Deploy blocked: market is closed.",
                 alert_severity="WARNING",
             )
-        not_before = _parse_hhmm(settings.get("intraday_ai_entry_not_before", "09:25"), dtime(9, 25))
+        not_before = _parse_hhmm(settings.get("intraday_ai_entry_not_before", "09:45"), dtime(9, 45))
         last_entry = _parse_hhmm(settings.get("intraday_ai_last_new_entry_time", "14:20"), dtime(14, 20))
         now_time = now.timetz().replace(tzinfo=None) if getattr(now, "tzinfo", None) else now.time()
         if now_time < not_before:
@@ -4560,9 +5065,11 @@ def main() -> None:
                     alert_severity="WARNING",
                 )
         try:
+            strategy_name = str(rec.get("strategy_type") or signal_payload.get("strategy") or "")
             option_legs = [
                 _intraday_rec_leg_to_option_leg(
                     rec_leg=leg_payload if isinstance(leg_payload, dict) else {},
+                    strategy_name=strategy_name,
                     expiry=expiry_date,
                     lot_size=lot_size,
                     deploy_lot_multiplier=lot_mult,
@@ -4634,6 +5141,7 @@ def main() -> None:
                 close=False,
                 trade_mode=trade_mode,
                 live_order_executor=live_order_executor if trade_mode == "live" else None,
+                blotter_notes="OPEN" if trade_mode == "paper" else None,
             )
             if bool(out.get("ok")):
                 opened.append(leg)
@@ -4658,6 +5166,8 @@ def main() -> None:
                     close=True,
                     trade_mode=trade_mode,
                     live_order_executor=live_order_executor if trade_mode == "live" else None,
+                    blotter_notes="CLOSE" if trade_mode == "paper" else None,
+                    blotter_price=float(leg.current_ltp) if getattr(leg, "current_ltp", None) is not None else None,
                 )
                 rollback.append(
                     {
@@ -4672,6 +5182,13 @@ def main() -> None:
         strategy_label = str(rec.get("strategy_label") or rec.get("strategy_type") or signal_payload.get("strategy") or "Intraday AI")
         sl_txt = str((rec.get("sl") or {}).get("text") or rec.get("sl_text") or "")
         tp_txt = str((rec.get("tp") or {}).get("text") or rec.get("tp_text") or "")
+        tp_rs_per_set = 0.0
+        try:
+            tp_rs_per_set = max(0.0, float(((rec.get("tp") or {}) if isinstance(rec.get("tp"), dict) else {}).get("profit_rs_per_set") or 0.0))
+        except Exception:
+            tp_rs_per_set = 0.0
+        hold_payload = rec.get("hold") if isinstance(rec.get("hold"), dict) else {}
+        invalidation_payload = rec.get("invalidation") if isinstance(rec.get("invalidation"), dict) else {}
         details = {
             "strategy": strategy_label,
             "expiry": expiry_date.isoformat(),
@@ -4695,6 +5212,39 @@ def main() -> None:
                 details=details,
                 alert_severity="CRITICAL",
             )
+        if intraday_position_manager:
+            try:
+                intraday_position_manager.open_position(
+                    position_id=request_id,
+                    trade_mode=trade_mode,
+                    strategy_type=str(rec.get("strategy_type") or signal_payload.get("strategy") or strategy_label),
+                    strategy_label=strategy_label,
+                    expiry=expiry_date.isoformat(),
+                    legs=opened,
+                    entry_spot=float(spot or 0.0),
+                    sl_total_rs=rec_sl_per_set * float(lot_mult),
+                    tp_total_rs=tp_rs_per_set * float(lot_mult),
+                    invalidation_spot_level=(
+                        None
+                        if invalidation_payload.get("spot_level") in (None, "", "-", "--")
+                        else float(invalidation_payload.get("spot_level"))
+                    ),
+                    max_hold_till=str(hold_payload.get("max_hold_till") or settings.get("intraday_ai_max_hold_till", "15:05")),
+                    trailing_enabled=bool(approval_trailing_enabled),
+                    lots_multiplier=lot_mult,
+                    entry_features=(
+                        rec.get("entry_features")
+                        if isinstance(rec.get("entry_features"), dict)
+                        else (
+                            signal_payload.get("entry_features")
+                            if isinstance(signal_payload.get("entry_features"), dict)
+                            else {}
+                        )
+                    ),
+                    now=now,
+                )
+            except Exception:
+                log.exception("[IntradayPosition] failed to persist opened position state id=%s", request_id)
         return _finalize(
             ok=True,
             status="SUCCESS",
@@ -4863,6 +5413,14 @@ def main() -> None:
             status_path=INTRADAY_AI_ADVISOR_STATUS_FILE,
             logger=log,
         )
+    intraday_position_manager: Optional[IntradayPositionManager] = None
+    if selected_strategy_file == "batman_bkm_monthly" and bool(settings.get("intraday_ai_enabled", True)):
+        intraday_position_manager = IntradayPositionManager(
+            state_path=INTRADAY_AI_POSITION_STATUS_FILE,
+            history_path=INTRADAY_AI_TRADE_HISTORY_FILE,
+            logger=log,
+        )
+    paper_intraday_only_mode = _paper_intraday_only_mode_enabled(settings, trade_mode)
 
     dw = DhanWrapper(logger=logging.getLogger("dhan_wrapper"))
     startup_resume_bkm_snapshot: Optional[Dict[str, Any]] = None
@@ -5037,6 +5595,7 @@ def main() -> None:
     intraday_telegram_last_signal_sent_at: Optional[datetime] = None
     intraday_telegram_last_signal_signature: Optional[str] = None
     reconcile_lock_alert_signature: Optional[str] = None
+    reconcile_external_positions_signature: Optional[str] = None
     bkm_ai_entry_lock_active: bool = False
     bkm_ai_entry_lock_reason: Optional[str] = None
     bkm_ai_last_entry_lock_state: Optional[bool] = None
@@ -5594,6 +6153,130 @@ def main() -> None:
                                 )
                     except Exception:
                         log.exception("[IntradayApproval] plan state update failed")
+                if intraday_position_manager and intraday_position_manager.has_open_position():
+                    try:
+                        position_snap = intraday_position_manager.snapshot()
+                        active_chain_rows = list(intraday_chain_for_deploy)
+                        if not active_chain_rows:
+                            active_expiry = str(position_snap.get("expiry") or intraday_ai_last_expiry or "").strip()
+                            if active_expiry:
+                                try:
+                                    intraday_chain_raw = dw.get_option_chain(
+                                        INDEX_SECURITY_ID,
+                                        INDEX_EXCHANGE_SEG,
+                                        active_expiry,
+                                    )
+                                    active_chain_rows = _map_chain(
+                                        intraday_chain_raw,
+                                        datetime.fromisoformat(active_expiry).date(),
+                                        symbol="NIFTY",
+                                        spot=float(market.spot or 0.0),
+                                    )
+                                except Exception:
+                                    log.exception("[IntradayPosition] active chain refresh failed expiry=%s", active_expiry)
+                                    active_chain_rows = []
+                        pos_eval = intraday_position_manager.evaluate(
+                            now=now_ist,
+                            spot=float(market.spot or 0.0),
+                            chain_rows=active_chain_rows,
+                            signal_payload=intraday_out if isinstance(intraday_out, dict) else {},
+                        )
+                        if str(pos_eval.get("action") or "").upper() == "CLOSE":
+                            close_legs = intraday_position_manager.build_option_legs()
+                            _update_leg_ltps_from_chain(close_legs, active_chain_rows)
+                            close_order_legs = sorted(
+                                close_legs,
+                                key=lambda leg: 0 if _normalize_leg_side(leg.side) == LegSide.SELL else 1,
+                            )
+                            close_errors: List[Dict[str, Any]] = []
+                            for leg in close_order_legs:
+                                close_out = _place_leg_order(
+                                    dw,
+                                    leg,
+                                    close=True,
+                                    trade_mode=trade_mode,
+                                    live_order_executor=live_order_executor if trade_mode == "live" else None,
+                                    blotter_notes="CLOSE" if trade_mode == "paper" else None,
+                                    blotter_price=float(leg.current_ltp) if getattr(leg, "current_ltp", None) is not None else None,
+                                )
+                                if bool(close_out.get("ok")):
+                                    continue
+                                close_errors.append(
+                                    {
+                                        "strike": leg.strike,
+                                        "option_type": leg.option_type.value if hasattr(leg.option_type, "value") else str(leg.option_type),
+                                        "side": leg.side.value if hasattr(leg.side, "value") else str(leg.side),
+                                        "qty": leg.quantity,
+                                        "error": close_out,
+                                    }
+                                )
+                                break
+                            if close_errors:
+                                log.error(
+                                    "[IntradayPosition] close failed id=%s reason=%s errors=%s",
+                                    position_snap.get("position_id"),
+                                    pos_eval.get("reason"),
+                                    close_errors,
+                                )
+                                _ops_alert(
+                                    "CRITICAL" if trade_mode == "live" else "ERROR",
+                                    "INTRADAY_POSITION_CLOSE_FAILED",
+                                    "Intraday AI position close failed.",
+                                    details={
+                                        "position_id": position_snap.get("position_id"),
+                                        "reason": pos_eval.get("reason"),
+                                        "errors": close_errors,
+                                    },
+                                    dedupe_key="INTRADAY_POSITION_CLOSE_FAILED",
+                                    force=False,
+                                )
+                            else:
+                                intraday_position_manager.close_position(
+                                    reason=str(pos_eval.get("reason") or "CLOSED"),
+                                    pnl_rs=float(pos_eval.get("pnl_rs") or 0.0),
+                                    now=now_ist,
+                                )
+                                log.info(
+                                    "[IntradayPosition] closed id=%s reason=%s pnl_rs=%.2f",
+                                    position_snap.get("position_id"),
+                                    pos_eval.get("reason"),
+                                    float(pos_eval.get("pnl_rs") or 0.0),
+                                )
+                    except Exception:
+                        log.exception("[IntradayPosition] evaluation failed")
+                intraday_auto_enabled = bool(
+                    settings.get(
+                        "intraday_ai_auto_deploy_paper_enabled" if trade_mode == "paper" else "intraday_ai_auto_deploy_live_enabled",
+                        False,
+                    )
+                )
+                if (
+                    intraday_auto_enabled
+                    and intraday_ai_advisor
+                    and intraday_position_manager
+                    and not intraday_position_manager.has_open_position()
+                    and not intraday_deploy_request_pending
+                    and not (bkm_strategy and bkm_strategy.basket)
+                    and isinstance(intraday_out, dict)
+                    and str(intraday_out.get("signal") or "").upper() == "ENTER_NOW"
+                    and intraday_position_manager.can_open_new_position(
+                        max_trades_per_session=max(1, int(settings.get("intraday_ai_max_trades_per_session", 1) or 1)),
+                        now=now_ist,
+                    )
+                ):
+                    auto_req = _queue_intraday_deploy_request(
+                        now=now_ist,
+                        source=f"auto_{trade_mode}",
+                        note="auto_deploy_when_bkm_flat",
+                        approval=None,
+                    )
+                    intraday_deploy_request_pending = auto_req
+                    log.info(
+                        "[IntradayDeploy] auto-queued id=%s mode=%s strategy=%s",
+                        auto_req.get("request_id"),
+                        trade_mode,
+                        intraday_out.get("strategy"),
+                    )
                 intraday_deploy_request = _consume_intraday_ai_deploy_request() or None
                 if intraday_deploy_request:
                     req_id = str(intraday_deploy_request.get("request_id") or "")
@@ -5692,16 +6375,58 @@ def main() -> None:
                             except Exception:
                                 continue
                         broker_legs = [leg for leg in broker_legs_all if getattr(leg, "expiry", None) == expiry]
+                        reconcile_external_positions_signature = None
+                        reconcile_out = position_reconciler.evaluate(
+                            expected_legs=expected_bkm_legs,
+                            broker_legs=broker_legs,
+                            when=now_ist,
+                        )
                     else:
                         broker_legs = broker_legs_all
-                    reconcile_out = position_reconciler.evaluate(
-                        expected_legs=expected_bkm_legs,
-                        broker_legs=broker_legs,
-                        when=now_ist,
-                    )
+                        if broker_legs and not _looks_like_bkm_live_structure(broker_legs):
+                            broker_counter = Counter(
+                                (
+                                    getattr(leg, "expiry").isoformat()
+                                    if hasattr(getattr(leg, "expiry", None), "isoformat")
+                                    else str(getattr(leg, "expiry", "") or ""),
+                                    getattr(getattr(leg, "option_type", None), "value", getattr(leg, "option_type", "")),
+                                    str(getattr(getattr(leg, "side", None), "value", getattr(leg, "side", "")) or "").upper(),
+                                    int(round(float(getattr(leg, "strike", 0.0) or 0.0))),
+                                    int(getattr(leg, "quantity", 0) or 0),
+                                )
+                                for leg in broker_legs
+                            )
+                            external_signature = json.dumps(sorted((list(k), v) for k, v in broker_counter.items()), default=str)
+                            if external_signature != reconcile_external_positions_signature:
+                                log.warning(
+                                    "[Reconcile] external broker positions detected while no BKM basket is open; ignoring for BKM reconcile count=%s expiries=%s",
+                                    len(broker_legs),
+                                    sorted(
+                                        {
+                                            getattr(leg, "expiry").isoformat()
+                                            if hasattr(getattr(leg, "expiry", None), "isoformat")
+                                            else str(getattr(leg, "expiry", "") or "")
+                                            for leg in broker_legs
+                                        }
+                                    ),
+                                )
+                                reconcile_external_positions_signature = external_signature
+                            reconcile_out = position_reconciler.acknowledge_external_positions(
+                                broker_legs=broker_legs,
+                                reason="BROKER_ONLY_EXTERNAL_POSITIONS",
+                                when=now_ist,
+                            )
+                        else:
+                            reconcile_external_positions_signature = None
+                            reconcile_out = position_reconciler.evaluate(
+                                expected_legs=expected_bkm_legs,
+                                broker_legs=broker_legs,
+                                when=now_ist,
+                            )
                     if reconcile_out.get("skipped"):
                         log.info("[Reconcile] skipped: %s", reconcile_out.get("reason"))
                     elif not reconcile_out.get("ok"):
+                        reconcile_external_positions_signature = None
                         if reconcile_out.get("locked"):
                             reconcile_snap = position_reconciler.snapshot() if position_reconciler else {}
                             mismatch_streak = reconcile_out.get("mismatch_streak")
@@ -5757,6 +6482,8 @@ def main() -> None:
                         )
                     else:
                         reconcile_lock_alert_signature = None
+                        if str(reconcile_out.get("reason") or "") != "BROKER_ONLY_EXTERNAL_POSITIONS":
+                            reconcile_external_positions_signature = None
                 entries_locked = day_mode == "LOCKED_RED" or (
                     live_bkm_gate_enabled and live_gate and live_gate.should_block_entries(now_ist)
                 ) or (
@@ -5799,8 +6526,12 @@ def main() -> None:
                         _clear_bkm_expiry(expiry_str)
                 entry_anchor_expiry = roll_anchor_expiry or expiry
                 entry_day = _last_friday_before(entry_anchor_expiry)
-                # In paper mode, always force entry unless explicitly overridden elsewhere.
-                force_entry = True if trade_mode == "paper" else bool(settings.get("batman_bkm_force_entry", False))
+                # Paper intraday-only sessions should not force Batman entries while flat.
+                force_entry = (
+                    False
+                    if paper_intraday_only_mode
+                    else (True if trade_mode == "paper" else bool(settings.get("batman_bkm_force_entry", False)))
+                )
                 # Prevent multiple entries per expiry
                 if bkm_strategy.basket is None and entries_locked:
                     lock_payload = live_gate.snapshot() if (live_bkm_gate_enabled and live_gate) else {}
@@ -5817,6 +6548,15 @@ def main() -> None:
                         exec_recovery_payload.get("hard_lock"),
                         ai_protect_entries_locked,
                         bkm_ai_entry_lock_reason,
+                    )
+                elif bkm_strategy.basket is None and paper_intraday_only_mode:
+                    _heartbeat(
+                        phase="paper_intraday_only",
+                        extra={
+                            "day_mode": day_mode,
+                            "paper_intraday_only_mode": True,
+                            "selected_strategy_file": selected_strategy_file,
+                        },
                     )
                 elif bkm_strategy.basket is None and not _is_bkm_blocked(expiry_str):
                     log.info(

@@ -53,6 +53,8 @@ BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_JSON = STATE_DIR / "batman_bkm_ai_protect_cl
 INTRADAY_AI_ADVISOR_STATUS_JSON = STATE_DIR / "intraday_ai_advisor_status.json"
 INTRADAY_AI_DEPLOY_REQUEST_JSON = STATE_DIR / "intraday_ai_deploy_request.json"
 INTRADAY_AI_DEPLOY_STATUS_JSON = STATE_DIR / "intraday_ai_deploy_status.json"
+INTRADAY_AI_POSITION_STATUS_JSON = STATE_DIR / "intraday_ai_position_status.json"
+INTRADAY_AI_TRADE_HISTORY_JSONL = STATE_DIR / "intraday_ai_trade_history.jsonl"
 TELEGRAM_COMMAND_STATUS_JSON = STATE_DIR / "telegram_command_status.json"
 BATMAN_BKM_TUNING_ADVICE_JSON = STATE_DIR / "batman_bkm_tuning_advice.json"
 BATMAN_BKM_TUNING_HISTORY_JSONL = STATE_DIR / "batman_bkm_tuning_history.jsonl"
@@ -345,7 +347,7 @@ def load_positions(blotter_path: Path, mode: str = "paper") -> Dict[str, Any]:
                 continue
             close_side = "SELL" if side == "SELL" else "BUY"
             close_qty = qty
-            pnl = (entry_px - price) * close_qty if close_side == "SELL" else (price - entry_px) * close_qty
+            pnl = (price - entry_px) * close_qty if close_side == "SELL" else (entry_px - price) * close_qty
             closed.append(
                 {
                     "side": close_side,
@@ -359,6 +361,14 @@ def load_positions(blotter_path: Path, mode: str = "paper") -> Dict[str, Any]:
                     "timestamp": row.get("timestamp"),
                 }
             )
+            signed_close = close_qty if side == "SELL" else -close_qty
+            remaining_qty = int(leg.get("entry_qty", 0) or 0) + int(signed_close)
+            leg["entry_qty"] = remaining_qty
+            leg["qty"] = remaining_qty
+            if remaining_qty == 0:
+                leg["side"] = None
+            else:
+                leg["side"] = "SELL" if remaining_qty > 0 else "BUY"
 
     # Enrich LTP where blotter lacks MTM rows (both paper and live)
     if ltp_lookup or _LTP_CACHE:
@@ -406,6 +416,8 @@ def load_positions(blotter_path: Path, mode: str = "paper") -> Dict[str, Any]:
         if entry_px is None:
             continue
         qty = abs(int(leg.get("qty") or leg.get("entry_qty") or 0))
+        if qty <= 0:
+            continue
         side = leg.get("side")
         pnl = None
         if ltp_px is not None:
@@ -998,6 +1010,153 @@ def _load_intraday_ai_deploy_status() -> Dict[str, Any]:
     out["pending"] = bool(out.get("pending", False))
     out["details"] = out.get("details") if isinstance(out.get("details"), dict) else {}
     return out
+
+
+def _load_intraday_ai_position_status() -> Dict[str, Any]:
+    payload = _json_read(INTRADAY_AI_POSITION_STATUS_JSON)
+    if isinstance(payload, dict) and payload:
+        return payload
+    now = _ist_now()
+    return {
+        "status": "IDLE",
+        "position_id": None,
+        "trade_mode": None,
+        "strategy_type": None,
+        "strategy_label": None,
+        "expiry": None,
+        "opened_at": None,
+        "closed_at": None,
+        "current_session_date": now.date().isoformat(),
+        "last_reason": None,
+        "entry_spot": None,
+        "current_spot": None,
+        "current_pnl_rs": 0.0,
+        "peak_pnl_rs": 0.0,
+        "trail_floor_rs": None,
+        "trailing_enabled": True,
+        "trailing_active": False,
+        "sl_total_rs": 0.0,
+        "tp_total_rs": 0.0,
+        "invalidation_spot_level": None,
+        "max_hold_till": "15:05",
+        "lots_multiplier": 1,
+        "session_trade_count": 0,
+        "entry_features": {},
+        "legs": [],
+        "last_evaluated_at": None,
+        "updated_at": now.isoformat(timespec="seconds"),
+    }
+
+
+def _load_intraday_trade_history(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not INTRADAY_AI_TRADE_HISTORY_JSONL.exists():
+        return rows
+    try:
+        with INTRADAY_AI_TRADE_HISTORY_JSONL.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    rows.append(payload)
+    except Exception:
+        return []
+    rows.sort(key=lambda row: str(row.get("closed_at") or row.get("opened_at") or ""))
+    if limit is not None and limit > 0:
+        rows = rows[-limit:]
+    return rows
+
+
+def _build_intraday_performance_payload(*, trade_mode: str) -> Dict[str, Any]:
+    mode = str(trade_mode or "").strip().lower()
+    rows = [row for row in _load_intraday_trade_history() if str(row.get("trade_mode") or "").strip().lower() == mode]
+    total_trades = len(rows)
+    wins = 0
+    losses = 0
+    flats = 0
+    realized_pnl = 0.0
+    hold_values: List[float] = []
+    exit_reason_counts: Dict[str, int] = {}
+    setup_stats: Dict[str, Dict[str, Dict[str, float]]] = {
+        "strategy_type": {},
+        "market_bias": {},
+        "price_action_bias": {},
+        "retest_status": {},
+    }
+    recent_trades: List[Dict[str, Any]] = []
+
+    def _add_setup_stat(group: str, key: Any, pnl: float) -> None:
+        label = str(key or "UNKNOWN").strip().upper() or "UNKNOWN"
+        bucket = setup_stats[group].setdefault(label, {"count": 0.0, "pnl_rs": 0.0})
+        bucket["count"] += 1.0
+        bucket["pnl_rs"] += float(pnl)
+
+    for row in rows:
+        pnl = _parse_float(row.get("pnl_rs"), 0.0)
+        realized_pnl += pnl
+        if pnl > 0:
+            wins += 1
+        elif pnl < 0:
+            losses += 1
+        else:
+            flats += 1
+        hold_min = row.get("hold_minutes")
+        if hold_min not in (None, "", "-", "--"):
+            hold_values.append(_parse_float(hold_min, 0.0))
+        reason = str(row.get("reason") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        exit_reason_counts[reason] = int(exit_reason_counts.get(reason, 0)) + 1
+        entry_features = row.get("entry_features") if isinstance(row.get("entry_features"), dict) else {}
+        _add_setup_stat("strategy_type", row.get("strategy_type"), pnl)
+        _add_setup_stat("market_bias", entry_features.get("market_bias"), pnl)
+        _add_setup_stat("price_action_bias", entry_features.get("price_action_bias"), pnl)
+        _add_setup_stat("retest_status", entry_features.get("retest_status"), pnl)
+
+    rows_desc = list(reversed(rows))
+    for row in rows_desc[:10]:
+        recent_trades.append(
+            {
+                "position_id": row.get("position_id"),
+                "strategy_label": row.get("strategy_label"),
+                "closed_at": row.get("closed_at"),
+                "pnl_rs": round(_parse_float(row.get("pnl_rs"), 0.0), 2),
+                "hold_minutes": row.get("hold_minutes"),
+                "reason": row.get("reason"),
+                "result": row.get("result"),
+                "expiry": row.get("expiry"),
+            }
+        )
+
+    exit_reasons = [
+        {"reason": reason, "count": count}
+        for reason, count in sorted(exit_reason_counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    setup_breakdown = {
+        group: [
+            {"label": label, "count": int(round(values["count"])), "pnl_rs": round(float(values["pnl_rs"]), 2)}
+            for label, values in sorted(stats.items(), key=lambda item: (-item[1]["pnl_rs"], -item[1]["count"], item[0]))
+        ]
+        for group, stats in setup_stats.items()
+    }
+    avg_hold_minutes = round(sum(hold_values) / len(hold_values), 2) if hold_values else None
+    win_rate_pct = round((wins / total_trades) * 100.0, 1) if total_trades > 0 else None
+    return {
+        "trade_mode": mode,
+        "total_trades": total_trades,
+        "wins": wins,
+        "losses": losses,
+        "flats": flats,
+        "win_rate_pct": win_rate_pct,
+        "avg_hold_minutes": avg_hold_minutes,
+        "realized_pnl_rs": round(realized_pnl, 2),
+        "exit_reasons": exit_reasons,
+        "setup_breakdown": setup_breakdown,
+        "recent_trades": recent_trades,
+    }
 
 
 def _load_telegram_command_status() -> Dict[str, Any]:
@@ -1697,11 +1856,25 @@ def _start_agent_process(trade_mode: str) -> Dict[str, Any]:
                 auto_import_result = _api_error_payload(exc, code="LIVE_BKM_AUTO_IMPORT_CRASH")
             # Fail-safe: if we cannot verify/import live broker state, do not start and risk locking/orphan behavior.
             if not bool(auto_import_result.get("ok")):
-                return {
-                    "ok": False,
-                    "error": str(auto_import_result.get("error") or "LIVE_BKM_AUTO_IMPORT_FAILED"),
-                    "auto_import": auto_import_result,
+                nonfatal_auto_import_errors = {
+                    "NOT_BKM_LEG_COUNT",
+                    "NOT_BKM_CE_PE_SPLIT",
+                    "NOT_BKM_PATTERN",
                 }
+                auto_import_error = str(auto_import_result.get("error") or "").upper()
+                if auto_import_error in nonfatal_auto_import_errors:
+                    auto_import_result = {
+                        **auto_import_result,
+                        "ok": True,
+                        "imported": False,
+                        "warning": "BROKER_POSITIONS_NOT_BKM_IGNORED",
+                    }
+                else:
+                    return {
+                        "ok": False,
+                        "error": str(auto_import_result.get("error") or "LIVE_BKM_AUTO_IMPORT_FAILED"),
+                        "auto_import": auto_import_result,
+                    }
     env = os.environ.copy()
     env["TRADE_MODE"] = trade_mode
     pybin = sys.executable or "python3"
@@ -1911,7 +2084,7 @@ class PaperHandler(SimpleHTTPRequestHandler):
                             "ok": False,
                             "queued": False,
                             "error": "AGENT_NOT_RUNNING",
-                            "message": "Start the agent in live mode before deploying.",
+                            "message": "Start the agent before deploying.",
                         },
                         status=409,
                     )
@@ -2101,6 +2274,7 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 except Exception:
                     state = {}
                 payload["strategy_state"] = state
+                payload["intraday_performance"] = _build_intraday_performance_payload(trade_mode="paper")
                 self._send_json(payload)
             except Exception as exc:  # pragma: no cover - defensive
                 self._send_json({"error": str(exc)}, status=500)
@@ -2253,6 +2427,7 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 bkm_ai = _load_bkm_ai_status()
                 intraday_ai = _load_intraday_ai_status()
                 intraday_deploy = _load_intraday_ai_deploy_status()
+                intraday_position = _load_intraday_ai_position_status()
                 bkm_ai_plan = bkm_ai.get("plan") if isinstance(bkm_ai.get("plan"), dict) else {}
                 bkm_ai_ctx = bkm_ai.get("market_context") if isinstance(bkm_ai.get("market_context"), dict) else {}
                 bkm_ai_structure = bkm_ai_ctx.get("structure") if isinstance(bkm_ai_ctx.get("structure"), dict) else {}
@@ -2372,6 +2547,13 @@ class PaperHandler(SimpleHTTPRequestHandler):
                         "intraday_ai_deploy_result_code": intraday_deploy.get("result_code"),
                         "intraday_ai_deploy_message": intraday_deploy.get("message"),
                         "intraday_ai_deploy_updated_at": intraday_deploy.get("updated_at"),
+                        "intraday_ai_position_status": intraday_position.get("status"),
+                        "intraday_ai_position_id": intraday_position.get("position_id"),
+                        "intraday_ai_position_strategy": intraday_position.get("strategy_label"),
+                        "intraday_ai_position_pnl_rs": _parse_float(intraday_position.get("current_pnl_rs"), 0.0),
+                        "intraday_ai_position_opened_at": intraday_position.get("opened_at"),
+                        "intraday_ai_position_reason": intraday_position.get("last_reason"),
+                        "intraday_ai_session_trade_count": _parse_int(intraday_position.get("session_trade_count"), 0),
                         "bkm_quality_status": bkm_open_meta.get("quality_status"),
                         "bkm_quality_score": _parse_float(bkm_open_meta.get("quality_score"), None),
                         "bkm_quality_reasons": (
@@ -2415,6 +2597,12 @@ class PaperHandler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/intraday_ai/deploy_status"):
             try:
                 self._send_json({"ok": True, "deploy": _load_intraday_ai_deploy_status()})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/intraday_ai/position"):
+            try:
+                self._send_json({"ok": True, "position": _load_intraday_ai_position_status()})
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return

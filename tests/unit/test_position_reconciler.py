@@ -111,3 +111,26 @@ def test_reset_clears_lock_and_diff(tmp_path: Path) -> None:
     assert out["status"] == "OK"
     assert out["hard_lock"] is False
     assert out["mismatch_streak"] == 0
+
+
+def test_acknowledge_external_positions_clears_existing_hard_lock(tmp_path: Path) -> None:
+    r = _new_reconciler(tmp_path, mismatch_confirm_count=1, hard_lock_on_mismatch=True)
+    t = _ist_dt(10)
+    r.evaluate(
+        expected_legs=[_leg(strike=22000, opt=OptionType.CALL, side=LegSide.SELL, qty=65)],
+        broker_legs=[],
+        when=t,
+    )
+    assert r.snapshot()["hard_lock"] is True
+
+    out = r.acknowledge_external_positions(
+        broker_legs=[_leg(strike=23000, opt=OptionType.PUT, side=LegSide.BUY, qty=65)],
+        when=t + timedelta(minutes=1),
+    )
+    assert out["ok"] is True
+    assert out["reason"] == "BROKER_ONLY_EXTERNAL_POSITIONS"
+    snap = r.snapshot()
+    assert snap["status"] == "OK"
+    assert snap["hard_lock"] is False
+    assert snap["mismatch_streak"] == 0
+    assert snap["last_diff_summary"]["broker_count"] == 1
