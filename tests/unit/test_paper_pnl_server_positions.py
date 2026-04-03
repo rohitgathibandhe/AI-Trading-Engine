@@ -138,3 +138,37 @@ def test_build_intraday_performance_payload_summarizes_history(tmp_path: Path, m
         {"reason": "SL_HIT", "count": 1},
     ]
     assert len(out["recent_trades"]) == 2
+
+
+def test_fetch_ltp_lookup_includes_dhan_client_id_and_maps_401(tmp_path: Path, monkeypatch) -> None:
+    creds = tmp_path / "creds.json"
+    creds.write_text(json.dumps({"client_id": "CID123", "access_token": "TOK123"}), encoding="utf-8")
+    monkeypatch.setattr(paper_server, "CREDS_FILE", creds)
+    monkeypatch.setattr(paper_server, "_LAST_LTP_FETCH_TS", 0.0)
+    monkeypatch.setattr(paper_server, "_NEXT_LTP_ALLOWED_TS", 0.0)
+
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 401
+
+        def json(self):
+            return {"errorMessage": "Unauthorized"}
+
+    def _fake_post(url, headers=None, json=None, timeout=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return _Resp()
+
+    monkeypatch.setattr(paper_server.requests, "post", _fake_post)
+
+    lookup, status = paper_server._fetch_ltp_lookup({"NSE_FNO": [12345, 12345]})
+
+    assert lookup == {}
+    assert status == "auth-error: refresh dhan access token"
+    assert captured["headers"]["client-id"] == "CID123"
+    assert captured["headers"]["access-token"] == "TOK123"
+    assert captured["json"]["dhanClientId"] == "CID123"
+    assert captured["json"]["NSE_FNO"] == [12345]

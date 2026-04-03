@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import subprocess
 import signal
+import requests
 
 try:
     from zoneinfo import ZoneInfo
@@ -195,6 +196,66 @@ _NEXT_LTP_ALLOWED_TS: float = 0.0
 _CHAIN_CACHE: Dict[str, Dict[str, Any]] = {}  # expiry -> {"map": {sec_id: {...}}, "spot": float, "ts": float}
 
 
+def _fetch_ltp_lookup(pairs: Dict[str, List[int]]) -> Tuple[Dict[Tuple[str, str], float], str]:
+    if not pairs:
+        return {}, "skip"
+    creds = _json_read(CREDS_FILE)
+    client_id = str(creds.get("client_id") or "").strip()
+    access_token = str(creds.get("access_token") or "").strip()
+    if not client_id or not access_token:
+        return {}, "no-creds"
+
+    global _LAST_LTP_FETCH_TS, _NEXT_LTP_ALLOWED_TS
+    now_ts = time.time()
+    if now_ts < _NEXT_LTP_ALLOWED_TS or (now_ts - _LAST_LTP_FETCH_TS) < 4:
+        return {}, "cached"
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "client-id": client_id,
+        "access-token": access_token,
+    }
+    payload: Dict[str, Any] = {seg: sorted({int(i) for i in ids}) for seg, ids in pairs.items() if ids}
+    payload["dhanClientId"] = client_id
+    base = os.getenv("DHAN_API_BASE", "https://api.dhan.co").rstrip("/")
+
+    try:
+        resp = requests.post(f"{base}/v2/marketfeed/ltp", headers=headers, json=payload, timeout=8)
+        if resp.status_code == 429:
+            _NEXT_LTP_ALLOWED_TS = now_ts + 10
+            return {}, "throttled:429 (cache)"
+        if resp.status_code == 401:
+            return {}, "auth-error: refresh dhan access token"
+        if resp.status_code == 403:
+            return {}, "auth-error: check static IP / token"
+        if resp.status_code >= 400:
+            return {}, f"http{resp.status_code}"
+
+        lookup: Dict[Tuple[str, str], float] = {}
+        data = (resp.json() or {}).get("data", {})
+        if isinstance(data, dict):
+            for seg, sec_map in data.items():
+                if not isinstance(sec_map, dict):
+                    continue
+                for sid, node in sec_map.items():
+                    if not isinstance(node, dict):
+                        continue
+                    ltp = node.get("last_price")
+                    if ltp is None:
+                        continue
+                    try:
+                        key = (str(seg), str(sid))
+                        lookup[key] = float(ltp)
+                        _LTP_CACHE[key] = (float(ltp), now_ts)
+                    except Exception:
+                        continue
+        _LAST_LTP_FETCH_TS = now_ts
+        return lookup, ("ok" if lookup else "empty")
+    except Exception as exc:
+        return {}, f"error: {exc}"
+
+
 def load_positions(blotter_path: Path, mode: str = "paper") -> Dict[str, Any]:
     """
     Aggregate OPEN + latest MTM rows into per-leg positions and total P&L.
@@ -257,48 +318,9 @@ def load_positions(blotter_path: Path, mode: str = "paper") -> Dict[str, Any]:
         # dedupe sec_ids per segment to avoid API 400 on duplicates
         for seg, ids in pairs.items():
             pairs[seg] = sorted(list({int(i) for i in ids}))
-        try:
-            import requests
-            creds = _json_read(CREDS_FILE)
-            headers = {
-                "client-id": (creds.get("client_id") or "").strip(),
-                "access-token": (creds.get("access_token") or "").strip(),
-            }
-            if not headers["client-id"] or not headers["access-token"]:
-                ltp_status = "no-creds"
-                raise RuntimeError("client_id/access_token missing")
-
-            # Rate-limit with backoff to avoid 429
-            global _LAST_LTP_FETCH_TS, _NEXT_LTP_ALLOWED_TS
-            now_ts = time.time()
-            if now_ts < _NEXT_LTP_ALLOWED_TS or (now_ts - _LAST_LTP_FETCH_TS) < 4:
-                ltp_status = "cached"
-            else:
-                base = os.getenv("DHAN_API_BASE", "https://api.dhan.co").rstrip("/")
-                resp = requests.post(f"{base}/v2/marketfeed/ltp", headers=headers, json=pairs, timeout=8)
-                if resp.status_code == 429:
-                    # back off 10s on throttle
-                    _NEXT_LTP_ALLOWED_TS = now_ts + 10
-                    ltp_status = "throttled:429 (cache)"
-                elif resp.status_code >= 400:
-                    ltp_status = f"http{resp.status_code}: {resp.text[:120]}"
-                    raise RuntimeError(f"marketfeed {resp.status_code}")
-                else:
-                    data = resp.json().get("data", {})
-                    for seg, sec_map in data.items():
-                        if isinstance(sec_map, dict):
-                            for sid, payload in sec_map.items():
-                                ltp = payload.get("last_price") if isinstance(payload, dict) else None
-                                if ltp is not None:
-                                    key = (seg, str(sid))
-                                    ltp_lookup[key] = float(ltp)
-                                    _LTP_CACHE[key] = (float(ltp), now_ts)
-                    _LAST_LTP_FETCH_TS = now_ts
-                    ltp_status = "ok"
-        except Exception as exc:
-            # If creds missing or HTTP errors, mark status but continue with stale/cache prices.
-            ltp_status = f"error: {exc}"
-            print(f"[ltp_enrich] failed: {exc}")
+        ltp_lookup, ltp_status = _fetch_ltp_lookup(pairs)
+        if ltp_status.startswith("error:"):
+            print(f"[ltp_enrich] failed: {ltp_status}")
 
     for row in rows:
         if (row.get("trade_mode") or "").lower() != mode:
@@ -596,19 +618,16 @@ def _load_broker_live_positions() -> Dict[str, Any]:
 
     # Enrich LTP via marketfeed and recompute P&L
     try:
-        import requests
         if seg_map:
-            headers = {"client-id": cid, "access-token": tok}
-            base = os.getenv("DHAN_API_BASE", "https://api.dhan.co").rstrip("/")
-            resp = requests.post(f"{base}/v2/marketfeed/ltp", headers=headers, json=seg_map, timeout=8)
-            resp.raise_for_status()
-            data = resp.json().get("data", {})
+            ltp_lookup, ltp_status = _fetch_ltp_lookup(seg_map)
             for pos in positions:
                 seg = next(iter(seg_map.keys())) if len(seg_map) == 1 else "NSE_FNO"
                 sid = pos.get("sec_id")
-                ltp = data.get(seg, {}).get(str(sid), {}).get("last_price") if isinstance(data.get(seg, {}), dict) else None
+                ltp = ltp_lookup.get((seg, str(sid)))
                 if ltp is not None:
                     pos["ltp"] = float(ltp)
+            if ltp_status.startswith("auth-error"):
+                print(f"[live_ltp_fallback] {ltp_status}")
     except Exception as exc:
         print(f"[live_ltp_fallback] failed: {exc}")
 
