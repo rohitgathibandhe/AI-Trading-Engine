@@ -77,16 +77,19 @@ class LiveOrderExecutor:
             getattr(self.log, level)(msg, *args)
 
     def _get_net_qty(self, dw: Any, security_id: int) -> Optional[int]:
+        total = 0
+        matched = False
         rows = dw.get_positions_raw()
         for row in rows or []:
             try:
                 sid = _coerce_int(row.get("securityId") or row.get("security_id"))
                 if sid != int(security_id):
                     continue
-                return int(float(row.get("netQty") or row.get("netqty") or 0))
+                total += int(float(row.get("netQty") or row.get("netqty") or 0))
+                matched = True
             except Exception:
                 continue
-        return 0
+        return total if matched else 0
 
     def _side_sign(self, side: str) -> int:
         return 1 if str(side or "").upper().startswith("B") else -1

@@ -56,6 +56,9 @@ BATMAN_BKM_AI_STATUS_FILE = STATE_DIR / "batman_bkm_ai_status.json"
 BATMAN_BKM_AI_EVENTS_FILE = STATE_DIR / "batman_bkm_ai_events.jsonl"
 BATMAN_BKM_AI_PROTECT_STATUS_FILE = STATE_DIR / "batman_bkm_ai_protect_status.json"
 BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_FILE = STATE_DIR / "batman_bkm_ai_protect_clear_request.json"
+DECISION_COMMITTEE_STATUS_FILE = STATE_DIR / "decision_committee_status.json"
+DECISION_COMMITTEE_HISTORY_FILE = STATE_DIR / "decision_committee_history.jsonl"
+DECISION_COMMITTEE_OUTCOMES_FILE = STATE_DIR / "decision_committee_outcomes.jsonl"
 INTRADAY_AI_ADVISOR_STATUS_FILE = STATE_DIR / "intraday_ai_advisor_status.json"
 INTRADAY_AI_DEPLOY_REQUEST_FILE = STATE_DIR / "intraday_ai_deploy_request.json"
 INTRADAY_AI_DEPLOY_STATUS_FILE = STATE_DIR / "intraday_ai_deploy_status.json"
@@ -244,6 +247,16 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "intraday_ai_require_orb_confirmation": True,
     "intraday_ai_require_price_action_confirmation": True,
     "intraday_ai_signal_persistence_bars": 2,
+    "intraday_ai_trend_day_fast_track_enabled": True,
+    "intraday_ai_trend_day_fast_track_min_trend_confidence": 0.78,
+    "intraday_ai_trend_day_fast_track_max_conflict": 45.0,
+    "intraday_ai_directional_flip_block_enabled": True,
+    "intraday_ai_directional_flip_block_min_prev_trend_confidence": 0.72,
+    "intraday_ai_directional_flip_block_max_prev_conflict": 45.0,
+    "intraday_ai_directional_flip_override_min_trend_delta": 0.08,
+    "intraday_ai_directional_flip_override_min_conflict_improvement": 8.0,
+    "intraday_ai_high_vol_bear_call_not_before": "10:15",
+    "intraday_ai_high_vol_bull_put_enabled_for_bearish_preference": False,
     "intraday_ai_deploy_enabled": True,
     "intraday_ai_deploy_lots_multiplier": 1,
     "intraday_ai_deploy_dedupe_sec": 90.0,
@@ -415,6 +428,7 @@ from market_ai.modules.agents.intraday_option_selling_advisor import (
     IntradayOptionSellingAdvisorConfig,
 )
 from market_ai.modules.agents.intraday_position_manager import IntradayPositionManager
+from market_ai.modules.agents.decision_committee import DecisionCommittee
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -609,6 +623,23 @@ def is_monthly_strangle_open(expiry: str) -> bool:
         .get("status")
         == "OPEN"
     )
+
+
+def _current_open_bkm_expiry_from_state(state: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    payload = state if isinstance(state, dict) else load_strategy_state()
+    bkm_state = payload.get("BATMAN_BKM", {}) if isinstance(payload, dict) else {}
+    if not isinstance(bkm_state, dict):
+        return None
+    open_expiries: List[str] = []
+    for expiry, meta in bkm_state.items():
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("status") or "").upper() != "OPEN":
+            continue
+        expiry_str = str(expiry or "").strip()
+        if expiry_str:
+            open_expiries.append(expiry_str)
+    return max(open_expiries) if open_expiries else None
 
 
 def _build_monthly_basket_id(expiry: str) -> str:
@@ -1236,6 +1267,46 @@ def _flatten_bkm_basket(
                 "error": close_res,
             }
         )
+    residual_positions: List[Dict[str, Any]] = []
+    if not errors and trade_mode == "live" and hasattr(dw, "get_positions_raw"):
+        security_ids: set[int] = set()
+        for leg in option_legs:
+            try:
+                security_ids.add(int(float(leg.security_id)))
+            except Exception:
+                continue
+        if security_ids:
+            try:
+                totals: Dict[int, int] = {sid: 0 for sid in security_ids}
+                for row in dw.get_positions_raw() or []:
+                    try:
+                        sid = int(float(row.get("securityId") or row.get("security_id")))
+                    except Exception:
+                        continue
+                    if sid not in totals:
+                        continue
+                    try:
+                        totals[sid] += int(float(row.get("netQty") or row.get("netqty") or 0))
+                    except Exception:
+                        continue
+                for leg in option_legs:
+                    try:
+                        sid = int(float(leg.security_id))
+                    except Exception:
+                        continue
+                    net_qty = int(totals.get(sid, 0))
+                    if net_qty == 0:
+                        continue
+                    residual_positions.append(
+                        {
+                            "security_id": sid,
+                            "strike": leg.strike,
+                            "opt": leg.option_type.value if hasattr(leg.option_type, "value") else str(leg.option_type),
+                            "net_qty": net_qty,
+                        }
+                    )
+            except Exception as exc:
+                errors.append({"error": f"post_close_positions_check_failed:{exc}"})
     if errors:
         log.error(
             "[BatmanBKM] close verification failed reason=%s closed_ok=%s planned=%s errors=%s",
@@ -1245,6 +1316,29 @@ def _flatten_bkm_basket(
             errors,
         )
         out = {"ok": False, "closed_legs": closed_ok, "planned_legs": len(option_legs), "errors": errors, "op_id": op_id}
+        _bkm_journal_event(
+            journal=execution_journal,
+            event_type="BKM_CLOSE_FAIL",
+            op_id=op_id,
+            expiry=expiry_str,
+            payload={"reason": reason, "details": out},
+        )
+        return out
+    if residual_positions:
+        verified_closed = max(0, len(option_legs) - len(residual_positions))
+        log.error(
+            "[BatmanBKM] close verification found residual broker positions reason=%s residuals=%s",
+            reason,
+            residual_positions,
+        )
+        out = {
+            "ok": False,
+            "closed_legs": verified_closed,
+            "planned_legs": len(option_legs),
+            "errors": [{"error": "residual_broker_positions", "residual_positions": residual_positions}],
+            "residual_positions": residual_positions,
+            "op_id": op_id,
+        }
         _bkm_journal_event(
             journal=execution_journal,
             event_type="BKM_CLOSE_FAIL",
@@ -1312,8 +1406,9 @@ def _build_risk_config(settings: Dict[str, Any]) -> RiskConfig:
     strangle_offset_high = float(settings.get("strangle_offset_high", DEFAULT_SETTINGS["strangle_offset_high"]))
     spread_delta_low = float(settings.get("spread_short_delta_low", DEFAULT_SETTINGS["spread_short_delta_low"]))
     spread_delta_high = float(settings.get("spread_short_delta_high", DEFAULT_SETTINGS["spread_short_delta_high"]))
+    daily_max_loss = float(settings.get("max_intraday_loss", -3000))
     return RiskConfig(
-        max_intraday_loss=float(settings.get("max_intraday_loss", -3000)),
+        max_intraday_loss=daily_max_loss,
         intraday_target=float(settings.get("intraday_target", 4000)),
         allow_carry_forward=bool(settings.get("allow_carry_forward", False)),
         max_carry_days=int(settings.get("max_carry_days", 0)),
@@ -1333,6 +1428,7 @@ def _build_risk_config(settings: Dict[str, Any]) -> RiskConfig:
         strangle_offset_high=strangle_offset_high,
         spread_short_delta_low=spread_delta_low,
         spread_short_delta_high=spread_delta_high,
+        daily_max_loss=daily_max_loss,
     )
 
 
@@ -1843,6 +1939,159 @@ def _consume_bkm_ai_protect_clear_request() -> Optional[Dict[str, Any]]:
     except Exception:
         pass
     return payload or {}
+
+
+def _default_intraday_ai_status(now: Optional[datetime] = None) -> Dict[str, Any]:
+    ts = now or _ist_now()
+    return {
+        "status": "IDLE",
+        "signal": "NO_TRADE",
+        "priority": "INFO",
+        "strategy": None,
+        "expiry": None,
+        "spot": None,
+        "market_bias": "NEUTRAL",
+        "trend_confidence": 0.0,
+        "signal_conflict_score": 0.0,
+        "pcr_bias": "NEUTRAL",
+        "oi_build_bias": "UNKNOWN",
+        "pcr_unbalanced": False,
+        "pcr_unbalanced_side": "NEUTRAL",
+        "volatility_regime": "UNKNOWN",
+        "breakout_confirmation": "NONE",
+        "ema_alignment_5m": "NEUTRAL",
+        "ema_alignment_15m": "NEUTRAL",
+        "orb_confirmation": "NONE",
+        "price_action_bias": "NEUTRAL",
+        "price_action_confirmation": "NONE",
+        "retest_status": "NONE",
+        "has_open_bkm": False,
+        "market_context": {},
+        "recommendation": {},
+        "reasons": [],
+        "candidate_setup_signature": None,
+        "candidate_signal_streak": 0,
+        "current_session_date": ts.date().isoformat(),
+        "updated_at": ts.isoformat(timespec="seconds"),
+    }
+
+
+def _load_intraday_ai_status(now: Optional[datetime] = None) -> Dict[str, Any]:
+    default = _default_intraday_ai_status(now)
+    try:
+        if not INTRADAY_AI_ADVISOR_STATUS_FILE.exists():
+            return default
+        payload = json.loads(INTRADAY_AI_ADVISOR_STATUS_FILE.read_text())
+        if not isinstance(payload, dict):
+            return default
+        out = dict(default)
+        out.update(payload)
+        out["market_context"] = out.get("market_context") if isinstance(out.get("market_context"), dict) else {}
+        out["recommendation"] = out.get("recommendation") if isinstance(out.get("recommendation"), dict) else {}
+        out["reasons"] = out.get("reasons") if isinstance(out.get("reasons"), list) else []
+        out["has_open_bkm"] = bool(out.get("has_open_bkm", False))
+        out["pcr_unbalanced"] = bool(out.get("pcr_unbalanced", False))
+        try:
+            out["candidate_signal_streak"] = max(0, int(out.get("candidate_signal_streak") or 0))
+        except Exception:
+            out["candidate_signal_streak"] = 0
+        return out
+    except Exception:
+        return default
+
+
+def _save_intraday_ai_status(payload: Dict[str, Any]) -> None:
+    try:
+        INTRADAY_AI_ADVISOR_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        INTRADAY_AI_ADVISOR_STATUS_FILE.write_text(json.dumps(payload, indent=2, default=str))
+    except Exception:
+        log.exception("[IntradayAI] failed to persist advisor status")
+
+
+def _set_intraday_ai_runtime_status(
+    *,
+    now: Optional[datetime] = None,
+    intraday_enabled: bool,
+    has_open_bkm: bool = False,
+    allow_parallel_with_bkm: bool = False,
+    bkm_expiry: Optional[str] = None,
+) -> Dict[str, Any]:
+    ts = now or _ist_now()
+    payload = _load_intraday_ai_status(ts)
+    session_date = ts.date().isoformat()
+    payload.update(_default_intraday_ai_status(ts))
+    payload["has_open_bkm"] = bool(has_open_bkm)
+    payload["expiry"] = str(bkm_expiry or "").strip() or None
+    reasons: List[str] = []
+    recommendation: Dict[str, Any]
+    if not intraday_enabled:
+        payload["status"] = "DISABLED"
+        payload["priority"] = "INFO"
+        reasons.append("INTRADAY_AI_DISABLED")
+        recommendation = {
+            "headline": "Intraday AI is disabled.",
+            "signal_text": "No intraday trade. Batman monitoring continues.",
+            "what_to_enter": "No intraday option-selling entry now.",
+            "sl_text": "Not applicable",
+            "tp_text": "Not applicable",
+            "hold_text": "Intraday AI is disabled in settings for this runtime.",
+            "why": ["Intraday option-selling is disabled in settings."],
+        }
+        if has_open_bkm:
+            reasons.append("OPEN_BKM_POSITION_PRESENT")
+            recommendation["why"].append(
+                f"Batman BKM expiry {payload['expiry'] or 'active'} is already open and remains the only monitored trade."
+            )
+    elif has_open_bkm and not allow_parallel_with_bkm:
+        payload["status"] = "PARKED"
+        payload["priority"] = "WARN"
+        reasons.append("OPEN_BKM_POSITION_PRESENT")
+        recommendation = {
+            "headline": "Intraday AI is parked.",
+            "signal_text": "No intraday trade while Batman is already open.",
+            "what_to_enter": "No intraday option-selling entry now.",
+            "sl_text": "Not applicable",
+            "tp_text": "Not applicable",
+            "hold_text": "Parallel intraday trading is disabled while Batman BKM is open.",
+            "why": ["Batman BKM is already open, so intraday entries are parked to reduce overlap risk."],
+        }
+    else:
+        payload["status"] = "IDLE"
+        payload["priority"] = "INFO"
+        recommendation = {
+            "headline": "Intraday AI is idle.",
+            "signal_text": "No intraday trade now.",
+            "what_to_enter": "No intraday option-selling entry now.",
+            "sl_text": "Not applicable",
+            "tp_text": "Not applicable",
+            "hold_text": "Waiting for the advisor to evaluate a fresh session.",
+            "why": ["No active intraday block is present."],
+        }
+    payload["signal"] = "NO_TRADE"
+    payload["market_bias"] = "NEUTRAL"
+    payload["trend_confidence"] = 0.0
+    payload["signal_conflict_score"] = 0.0
+    payload["pcr_bias"] = "NEUTRAL"
+    payload["oi_build_bias"] = "UNKNOWN"
+    payload["pcr_unbalanced"] = False
+    payload["pcr_unbalanced_side"] = "NEUTRAL"
+    payload["volatility_regime"] = "UNKNOWN"
+    payload["breakout_confirmation"] = "NONE"
+    payload["ema_alignment_5m"] = "NEUTRAL"
+    payload["ema_alignment_15m"] = "NEUTRAL"
+    payload["orb_confirmation"] = "NONE"
+    payload["price_action_bias"] = "NEUTRAL"
+    payload["price_action_confirmation"] = "NONE"
+    payload["retest_status"] = "NONE"
+    payload["market_context"] = {}
+    payload["recommendation"] = recommendation
+    payload["reasons"] = reasons
+    payload["candidate_setup_signature"] = None
+    payload["candidate_signal_streak"] = 0
+    payload["current_session_date"] = session_date
+    payload["updated_at"] = ts.isoformat(timespec="seconds")
+    _save_intraday_ai_status(payload)
+    return payload
 
 
 def _default_intraday_ai_deploy_status(now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -5214,6 +5463,26 @@ def main() -> None:
             )
         if intraday_position_manager:
             try:
+                entry_features_payload = (
+                    rec.get("entry_features")
+                    if isinstance(rec.get("entry_features"), dict)
+                    else (
+                        signal_payload.get("entry_features")
+                        if isinstance(signal_payload.get("entry_features"), dict)
+                        else {}
+                    )
+                )
+                if not isinstance(entry_features_payload, dict):
+                    entry_features_payload = {}
+                else:
+                    entry_features_payload = dict(entry_features_payload)
+                if decision_committee:
+                    try:
+                        committee_snapshot = decision_committee.snapshot()
+                    except Exception:
+                        committee_snapshot = {}
+                    if isinstance(committee_snapshot, dict) and committee_snapshot:
+                        entry_features_payload["committee_snapshot"] = committee_snapshot
                 intraday_position_manager.open_position(
                     position_id=request_id,
                     trade_mode=trade_mode,
@@ -5232,15 +5501,7 @@ def main() -> None:
                     max_hold_till=str(hold_payload.get("max_hold_till") or settings.get("intraday_ai_max_hold_till", "15:05")),
                     trailing_enabled=bool(approval_trailing_enabled),
                     lots_multiplier=lot_mult,
-                    entry_features=(
-                        rec.get("entry_features")
-                        if isinstance(rec.get("entry_features"), dict)
-                        else (
-                            signal_payload.get("entry_features")
-                            if isinstance(signal_payload.get("entry_features"), dict)
-                            else {}
-                        )
-                    ),
+                    entry_features=entry_features_payload,
                     now=now,
                 )
             except Exception:
@@ -5418,6 +5679,14 @@ def main() -> None:
         intraday_position_manager = IntradayPositionManager(
             state_path=INTRADAY_AI_POSITION_STATUS_FILE,
             history_path=INTRADAY_AI_TRADE_HISTORY_FILE,
+            logger=log,
+        )
+    decision_committee: Optional[DecisionCommittee] = None
+    if selected_strategy_file == "batman_bkm_monthly":
+        decision_committee = DecisionCommittee(
+            status_path=DECISION_COMMITTEE_STATUS_FILE,
+            history_path=DECISION_COMMITTEE_HISTORY_FILE,
+            outcomes_path=DECISION_COMMITTEE_OUTCOMES_FILE,
             logger=log,
         )
     paper_intraday_only_mode = _paper_intraday_only_mode_enabled(settings, trade_mode)
@@ -5760,8 +6029,63 @@ def main() -> None:
                 trail_active = False
                 trail_floor = -1000.0
                 day_pnl = 0.0
+            if selected_strategy_file == "batman_bkm_monthly" and intraday_ai_advisor is None:
+                open_bkm_expiry = (
+                    bkm_strategy.basket.expiry.isoformat()
+                    if (bkm_strategy and bkm_strategy.basket)
+                    else _current_open_bkm_expiry_from_state()
+                )
+                _set_intraday_ai_runtime_status(
+                    now=now_ist,
+                    intraday_enabled=bool(settings.get("intraday_ai_enabled", True)),
+                    has_open_bkm=bool(open_bkm_expiry),
+                    allow_parallel_with_bkm=bool(settings.get("intraday_ai_allow_parallel_with_bkm", False)),
+                    bkm_expiry=open_bkm_expiry,
+                )
+                if decision_committee:
+                    committee_status = (
+                        "DISABLED" if not bool(settings.get("intraday_ai_enabled", True)) else "IDLE"
+                    )
+                    committee_reason = (
+                        "INTRADAY_AI_DISABLED" if committee_status == "DISABLED" else "INTRADAY_ADVISOR_IDLE"
+                    )
+                    decision_committee.set_inactive(
+                        now=now_ist,
+                        status=committee_status,
+                        reason=committee_reason,
+                        has_open_bkm=bool(open_bkm_expiry),
+                        expiry=open_bkm_expiry,
+                    )
             # Skip processing on weekends when the market is closed.
             if now_ist.weekday() >= 5:
+                if intraday_ai_advisor:
+                    try:
+                        intraday_snap = intraday_ai_advisor.snapshot()
+                        intraday_ctx = intraday_snap.get("market_context")
+                        intraday_ai_advisor.update(
+                            now=now_ist,
+                            expiry=str(intraday_ai_last_expiry or intraday_snap.get("expiry") or today.isoformat()),
+                            spot=float(intraday_snap.get("spot") or 0.0),
+                            chain_rows=[],
+                            context=intraday_ctx if isinstance(intraday_ctx, dict) else {},
+                            has_open_bkm=bool(bkm_strategy and bkm_strategy.basket),
+                        )
+                        intraday_ai_last_eval_at = now_ist
+                    except Exception:
+                        log.exception("[IntradayAI] failed to refresh market-closed status during weekend loop")
+                if decision_committee:
+                    open_bkm_expiry = (
+                        bkm_strategy.basket.expiry.isoformat()
+                        if (bkm_strategy and bkm_strategy.basket)
+                        else _current_open_bkm_expiry_from_state()
+                    )
+                    decision_committee.set_inactive(
+                        now=now_ist,
+                        status="IDLE",
+                        reason="MARKET_CLOSED",
+                        has_open_bkm=bool(open_bkm_expiry),
+                        expiry=open_bkm_expiry,
+                    )
                 log.info("Weekend detected; market is closed. Sleeping for %ss.", poll_sec)
                 _heartbeat(phase="weekend_sleep", extra={"loop_seq": loop_seq, "day_mode": day_mode})
                 time.sleep(poll_sec)
@@ -6153,6 +6477,17 @@ def main() -> None:
                                 )
                     except Exception:
                         log.exception("[IntradayApproval] plan state update failed")
+                    if decision_committee and isinstance(intraday_out, dict) and intraday_out:
+                        try:
+                            decision_committee.evaluate_intraday(
+                                now=now_ist,
+                                signal_payload=intraday_out,
+                                context=intraday_ctx if isinstance(intraday_ctx, dict) else {},
+                                has_open_bkm=bool(bkm_strategy and bkm_strategy.basket),
+                                allow_parallel_with_bkm=bool(settings.get("intraday_ai_allow_parallel_with_bkm", False)),
+                            )
+                        except Exception:
+                            log.exception("[DecisionCommittee] intraday evaluation failed")
                 if intraday_position_manager and intraday_position_manager.has_open_position():
                     try:
                         position_snap = intraday_position_manager.snapshot()
@@ -6231,11 +6566,20 @@ def main() -> None:
                                     force=False,
                                 )
                             else:
-                                intraday_position_manager.close_position(
+                                close_state = intraday_position_manager.close_position(
                                     reason=str(pos_eval.get("reason") or "CLOSED"),
                                     pnl_rs=float(pos_eval.get("pnl_rs") or 0.0),
                                     now=now_ist,
                                 )
+                                trade_history_row = close_state.get("history_row") if isinstance(close_state, dict) else None
+                                if decision_committee and isinstance(trade_history_row, dict) and trade_history_row:
+                                    try:
+                                        decision_committee.record_outcome(trade_row=trade_history_row, now=now_ist)
+                                    except Exception:
+                                        log.exception(
+                                            "[DecisionCommittee] failed to record trade outcome id=%s",
+                                            position_snap.get("position_id"),
+                                        )
                                 log.info(
                                     "[IntradayPosition] closed id=%s reason=%s pnl_rs=%.2f",
                                     position_snap.get("position_id"),

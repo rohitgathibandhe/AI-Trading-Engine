@@ -67,6 +67,16 @@ class IntradayOptionSellingAdvisorConfig:
     require_orb_confirmation: bool = True
     require_price_action_confirmation: bool = True
     signal_persistence_bars: int = 2
+    trend_day_fast_track_enabled: bool = True
+    trend_day_fast_track_min_trend_confidence: float = 0.78
+    trend_day_fast_track_max_conflict: float = 45.0
+    directional_flip_block_enabled: bool = True
+    directional_flip_block_min_prev_trend_confidence: float = 0.72
+    directional_flip_block_max_prev_conflict: float = 45.0
+    directional_flip_override_min_trend_delta: float = 0.08
+    directional_flip_override_min_conflict_improvement: float = 8.0
+    high_vol_bear_call_not_before: str = "10:15"
+    high_vol_bull_put_enabled_for_bearish_preference: bool = False
 
     @classmethod
     def from_settings(cls, settings: Dict[str, Any]) -> "IntradayOptionSellingAdvisorConfig":
@@ -112,6 +122,35 @@ class IntradayOptionSellingAdvisorConfig:
                 settings.get("intraday_ai_require_price_action_confirmation", True)
             ),
             signal_persistence_bars=max(1, int(settings.get("intraday_ai_signal_persistence_bars", 2) or 2)),
+            trend_day_fast_track_enabled=bool(settings.get("intraday_ai_trend_day_fast_track_enabled", True)),
+            trend_day_fast_track_min_trend_confidence=max(
+                0.0,
+                min(1.0, float(settings.get("intraday_ai_trend_day_fast_track_min_trend_confidence", 0.78))),
+            ),
+            trend_day_fast_track_max_conflict=max(
+                0.0, float(settings.get("intraday_ai_trend_day_fast_track_max_conflict", 45.0))
+            ),
+            directional_flip_block_enabled=bool(settings.get("intraday_ai_directional_flip_block_enabled", True)),
+            directional_flip_block_min_prev_trend_confidence=max(
+                0.0,
+                min(
+                    1.0,
+                    float(settings.get("intraday_ai_directional_flip_block_min_prev_trend_confidence", 0.72)),
+                ),
+            ),
+            directional_flip_block_max_prev_conflict=max(
+                0.0, float(settings.get("intraday_ai_directional_flip_block_max_prev_conflict", 45.0))
+            ),
+            directional_flip_override_min_trend_delta=max(
+                0.0, float(settings.get("intraday_ai_directional_flip_override_min_trend_delta", 0.08))
+            ),
+            directional_flip_override_min_conflict_improvement=max(
+                0.0, float(settings.get("intraday_ai_directional_flip_override_min_conflict_improvement", 8.0))
+            ),
+            high_vol_bear_call_not_before=str(settings.get("intraday_ai_high_vol_bear_call_not_before", "10:15")),
+            high_vol_bull_put_enabled_for_bearish_preference=bool(
+                settings.get("intraday_ai_high_vol_bull_put_enabled_for_bearish_preference", False)
+            ),
         )
 
 
@@ -343,24 +382,115 @@ class IntradayOptionSellingAdvisor:
         setup_type: str,
         market_bias: str,
         orb_confirmation: str,
+        expiry: str,
         legs: List[Dict[str, Any]],
     ) -> str:
-        legs_sig = [
-            [
-                str(leg.get("side") or "").upper(),
-                str(leg.get("option_type") or "").upper(),
-                int(round(float(leg.get("strike") or 0.0))),
-            ]
-            for leg in (legs or [])
-            if isinstance(leg, dict)
-        ]
         payload = {
             "setup_type": str(setup_type or ""),
             "market_bias": str(market_bias or ""),
             "orb_confirmation": str(orb_confirmation or "NONE"),
-            "legs": legs_sig,
+            "expiry": str(expiry or ""),
         }
         return json.dumps(payload, sort_keys=True)
+
+    @staticmethod
+    def _directional_bias_for_setup(setup_type: str) -> str:
+        text = str(setup_type or "").upper()
+        if text == "PUT_CREDIT_SPREAD":
+            return "BULLISH"
+        if text == "CALL_CREDIT_SPREAD":
+            return "BEARISH"
+        return "NEUTRAL"
+
+    def _trend_day_fast_track_ready(
+        self,
+        *,
+        setup_type: str,
+        market_bias: str,
+        trend_confidence: float,
+        signal_conflict_score: float,
+        strong_directional_alignment: bool,
+        price_action_confirmation: str,
+    ) -> bool:
+        if not bool(self.config.trend_day_fast_track_enabled):
+            return False
+        if setup_type not in {"PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"}:
+            return False
+        if self._directional_bias_for_setup(setup_type) != str(market_bias or "").upper():
+            return False
+        preferred_bias = str(getattr(self.config, "preferred_bias", "NEUTRAL") or "NEUTRAL").upper()
+        if preferred_bias not in {"BULLISH", "BEARISH"}:
+            return False
+        current_bias = self._directional_bias_for_setup(setup_type)
+        if current_bias != preferred_bias:
+            return False
+        if not strong_directional_alignment:
+            return False
+        if float(trend_confidence or 0.0) < float(self.config.trend_day_fast_track_min_trend_confidence):
+            return False
+        if float(signal_conflict_score or 0.0) > float(self.config.trend_day_fast_track_max_conflict):
+            return False
+        return str(price_action_confirmation or "NONE").upper() in {
+            "CANDLE_CONFIRMED",
+            "RETEST_CONFIRMED",
+            "CANDLE_AND_RETEST_CONFIRMED",
+        }
+
+    def _should_block_directional_flip(
+        self,
+        *,
+        now: datetime,
+        setup_type: str,
+        market_bias: str,
+        trend_confidence: float,
+        signal_conflict_score: float,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        if not bool(self.config.directional_flip_block_enabled):
+            return False, None
+        current_bias = self._directional_bias_for_setup(setup_type)
+        if current_bias not in {"BULLISH", "BEARISH"}:
+            return False, None
+        if current_bias != str(market_bias or "").upper():
+            return False, None
+        same_session = str(self.state.current_session_date or "") == now.date().isoformat()
+        if not same_session:
+            return False, None
+        prev_strategy = str(self.state.strategy or "")
+        prev_bias = self._directional_bias_for_setup(prev_strategy)
+        prev_signature = str(self.state.candidate_setup_signature or "")
+        prev_streak = int(self.state.candidate_signal_streak or 0)
+        if prev_bias not in {"BULLISH", "BEARISH"} or prev_bias == current_bias:
+            return False, None
+        if not prev_signature or prev_streak <= 0:
+            return False, None
+        prev_trend_conf = float(self.state.trend_confidence or 0.0)
+        prev_conflict = float(self.state.signal_conflict_score or 100.0)
+        if prev_trend_conf < float(self.config.directional_flip_block_min_prev_trend_confidence):
+            return False, None
+        if prev_conflict > float(self.config.directional_flip_block_max_prev_conflict):
+            return False, None
+        preferred_bias = str(getattr(self.config, "preferred_bias", "NEUTRAL") or "NEUTRAL").upper()
+        if preferred_bias in {"BULLISH", "BEARISH"} and current_bias == preferred_bias and prev_bias != preferred_bias:
+            return False, None
+        materially_stronger_flip = (
+            float(trend_confidence or 0.0)
+            >= prev_trend_conf + float(self.config.directional_flip_override_min_trend_delta)
+            and float(signal_conflict_score or 0.0)
+            <= max(
+                0.0,
+                prev_conflict - float(self.config.directional_flip_override_min_conflict_improvement),
+            )
+        )
+        if materially_stronger_flip:
+            return False, None
+        return True, {
+            "prev_bias": prev_bias,
+            "prev_strategy": prev_strategy,
+            "prev_signature": prev_signature,
+            "prev_streak": prev_streak,
+            "prev_trend_confidence": prev_trend_conf,
+            "prev_conflict": prev_conflict,
+        }
 
     def _time_ok(self, now: datetime) -> Tuple[bool, bool, str]:
         open_t = _parse_hhmm(self.config.market_open_time, dtime(9, 15))
@@ -569,6 +699,16 @@ class IntradayOptionSellingAdvisor:
         details.append(f"Price action bias is {price_action_bias}.")
         details.append(f"Retest status is {retest_status}.")
         return (price_action_ok or retest_ok), price_action_ok, retest_failed_against_setup, details
+
+    @staticmethod
+    def _supportive_retest_for_setup(setup_type: str, retest_status: str) -> bool:
+        status = str(retest_status or "NONE").upper()
+        setup = str(setup_type or "").upper()
+        if setup == "CALL_CREDIT_SPREAD":
+            return status in {"RESISTANCE_HOLD", "BREAKDOWN_RETEST_HOLD"}
+        if setup == "PUT_CREDIT_SPREAD":
+            return status in {"SUPPORT_HOLD", "BREAKOUT_RETEST_HOLD"}
+        return False
 
     def _entry_feature_snapshot(
         self,
@@ -905,6 +1045,96 @@ class IntradayOptionSellingAdvisor:
                 },
             )
 
+        flip_blocked, flip_context = self._should_block_directional_flip(
+            now=now,
+            setup_type=setup_type,
+            market_bias=market_bias,
+            trend_confidence=trend_confidence,
+            signal_conflict_score=signal_conflict_score,
+        )
+        if flip_blocked and flip_context is not None:
+            reasons.append("COUNTERTREND_FLIP_BLOCKED")
+            prev_bias = str(flip_context.get("prev_bias") or "NEUTRAL")
+            prev_streak = int(flip_context.get("prev_streak") or 0)
+            prev_signature = str(flip_context.get("prev_signature") or "")
+            prev_trend_conf = float(flip_context.get("prev_trend_confidence") or 0.0)
+            prev_conflict = float(flip_context.get("prev_conflict") or 0.0)
+            return self._base_result(
+                now=now,
+                signal="WAIT",
+                priority="INFO",
+                reasons=reasons,
+                market_bias=market_bias,
+                trend_confidence=trend_confidence,
+                signal_conflict_score=signal_conflict_score,
+                pcr_unbalanced=pcr_unbalanced,
+                pcr_unbalanced_side=pcr_unbalanced_side,
+                volatility_regime=volatility_regime,
+                breakout_confirmation=breakout_confirmation,
+                price_action_bias=price_action_bias,
+                price_action_confirmation=price_action_confirmation,
+                retest_status=retest_status,
+                has_open_bkm=has_open_bkm,
+                expiry=expiry,
+                spot=spot,
+                strategy=setup_type,
+                recommendation={
+                    "headline": "Wait: one opposite bar is not enough to reverse the plan.",
+                    "signal_text": "Do not flip direction yet.",
+                    "what_to_enter": "No new trade now.",
+                    "sl_text": "Not applicable",
+                    "tp_text": "Not applicable",
+                    "hold_text": "Wait for the opposite setup to prove itself with materially stronger structure.",
+                    "why": [
+                        f"Previous {prev_bias.lower()} candidate was cleaner (trend {int(round(prev_trend_conf * 100))}%, conflict {int(round(prev_conflict))}%).",
+                        f"Current opposite setup is not strong enough yet to cancel that plan.",
+                    ],
+                },
+                candidate_setup_signature=prev_signature,
+                candidate_signal_streak=prev_streak,
+            )
+
+        now_t = now.timetz().replace(tzinfo=None) if getattr(now, "tzinfo", None) else now.time()
+        high_vol_bear_call_not_before = _parse_hhmm(self.config.high_vol_bear_call_not_before, dtime(10, 15))
+        if (
+            setup_type == "CALL_CREDIT_SPREAD"
+            and volatility_regime == "HIGH"
+            and now_t < high_vol_bear_call_not_before
+        ):
+            reasons.append("HIGH_VOL_BEAR_CALL_DELAY")
+            return self._base_result(
+                now=now,
+                signal="WAIT",
+                priority="INFO",
+                reasons=reasons,
+                market_bias=market_bias,
+                trend_confidence=trend_confidence,
+                signal_conflict_score=signal_conflict_score,
+                pcr_unbalanced=pcr_unbalanced,
+                pcr_unbalanced_side=pcr_unbalanced_side,
+                volatility_regime=volatility_regime,
+                breakout_confirmation=breakout_confirmation,
+                price_action_bias=price_action_bias,
+                price_action_confirmation=price_action_confirmation,
+                retest_status=retest_status,
+                has_open_bkm=has_open_bkm,
+                expiry=expiry,
+                spot=spot,
+                strategy=setup_type,
+                recommendation={
+                    "headline": "Wait: high-volatility bear call setup is too early.",
+                    "signal_text": "Do not enter yet.",
+                    "what_to_enter": "No trade now.",
+                    "sl_text": "Not applicable",
+                    "tp_text": "Not applicable",
+                    "hold_text": "Let the first volatility burst settle before entering a bear call spread.",
+                    "why": [
+                        f"Current time is {now_t.strftime('%H:%M')}.",
+                        f"In high volatility, bearish call spreads are delayed until after {high_vol_bear_call_not_before.strftime('%H:%M')}.",
+                    ],
+                },
+            )
+
         chain_conflict_penalty, severe_chain_conflict, chain_conflict_details = self._directional_chain_conflict(
             setup_type=setup_type,
             oc_ctx=oc_ctx,
@@ -1098,6 +1328,120 @@ class IntradayOptionSellingAdvisor:
                         "hold_text": "Wait for candle confirmation or a clean retest hold in the same direction.",
                         "why": price_action_details + [
                             "Trend, EMA, and ORB may align, but the immediate price action is still not clean enough.",
+                        ],
+                    },
+                )
+
+        if setup_type in {"PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"} and volatility_regime == "HIGH":
+            supportive_retest = self._supportive_retest_for_setup(setup_type, retest_status)
+            if not supportive_retest:
+                reasons.append("HIGH_VOL_RETEST_REQUIRED")
+                return self._base_result(
+                    now=now,
+                    signal="WAIT",
+                    priority="INFO",
+                    reasons=reasons,
+                    market_bias=market_bias,
+                    trend_confidence=trend_confidence,
+                    signal_conflict_score=signal_conflict_score,
+                    pcr_unbalanced=pcr_unbalanced,
+                    pcr_unbalanced_side=pcr_unbalanced_side,
+                    volatility_regime=volatility_regime,
+                    breakout_confirmation=breakout_confirmation,
+                    price_action_bias=price_action_bias,
+                    price_action_confirmation=price_action_confirmation,
+                    retest_status=retest_status,
+                    has_open_bkm=has_open_bkm,
+                    expiry=expiry,
+                    spot=spot,
+                    strategy=setup_type,
+                    recommendation={
+                        "headline": "Wait: high-volatility setup needs a clean retest.",
+                        "signal_text": "Do not enter yet.",
+                        "what_to_enter": "No trade now.",
+                        "sl_text": "Not applicable",
+                        "tp_text": "Not applicable",
+                        "hold_text": "In high volatility, wait for a support/resistance retest before shorting premium.",
+                        "why": [
+                            f"Volatility regime is {volatility_regime}.",
+                            "Candle confirmation alone is not enough in fast markets.",
+                        ],
+                    },
+                )
+            preferred_bias = str(getattr(self.config, "preferred_bias", "NEUTRAL") or "NEUTRAL").upper()
+            if (
+                setup_type == "PUT_CREDIT_SPREAD"
+                and preferred_bias == "BEARISH"
+                and not bool(self.config.high_vol_bull_put_enabled_for_bearish_preference)
+            ):
+                reasons.append("HIGH_VOL_BULL_PUT_DISABLED")
+                return self._base_result(
+                    now=now,
+                    signal="WAIT",
+                    priority="INFO",
+                    reasons=reasons,
+                    market_bias=market_bias,
+                    trend_confidence=trend_confidence,
+                    signal_conflict_score=signal_conflict_score,
+                    pcr_unbalanced=pcr_unbalanced,
+                    pcr_unbalanced_side=pcr_unbalanced_side,
+                    volatility_regime=volatility_regime,
+                    breakout_confirmation=breakout_confirmation,
+                    price_action_bias=price_action_bias,
+                    price_action_confirmation=price_action_confirmation,
+                    retest_status=retest_status,
+                    has_open_bkm=has_open_bkm,
+                    expiry=expiry,
+                    spot=spot,
+                    strategy=setup_type,
+                    recommendation={
+                        "headline": "Wait: high-volatility bull put spread is disabled.",
+                        "signal_text": "Do not enter this setup.",
+                        "what_to_enter": "No trade now.",
+                        "sl_text": "Not applicable",
+                        "tp_text": "Not applicable",
+                        "hold_text": "Stay out of high-volatility bullish put spreads while the system is tuned for bearish preference.",
+                        "why": [
+                            "This setup family is still a major source of drawdown in the broad replay.",
+                            "The bearish side is currently more reliable than the bullish side in high volatility.",
+                        ],
+                    },
+                )
+            if (
+                setup_type == "PUT_CREDIT_SPREAD"
+                and preferred_bias == "BEARISH"
+                and (trend_confidence < 0.86 or signal_conflict_score > 20.0)
+            ):
+                reasons.append("HIGH_VOL_COUNTERTREND_FILTER")
+                return self._base_result(
+                    now=now,
+                    signal="WAIT",
+                    priority="INFO",
+                    reasons=reasons,
+                    market_bias=market_bias,
+                    trend_confidence=trend_confidence,
+                    signal_conflict_score=signal_conflict_score,
+                    pcr_unbalanced=pcr_unbalanced,
+                    pcr_unbalanced_side=pcr_unbalanced_side,
+                    volatility_regime=volatility_regime,
+                    breakout_confirmation=breakout_confirmation,
+                    price_action_bias=price_action_bias,
+                    price_action_confirmation=price_action_confirmation,
+                    retest_status=retest_status,
+                    has_open_bkm=has_open_bkm,
+                    expiry=expiry,
+                    spot=spot,
+                    strategy=setup_type,
+                    recommendation={
+                        "headline": "Wait: bullish countertrend spread is too risky in high volatility.",
+                        "signal_text": "Do not enter yet.",
+                        "what_to_enter": "No trade now.",
+                        "sl_text": "Not applicable",
+                        "tp_text": "Not applicable",
+                        "hold_text": "Wait for a much cleaner bullish structure before taking a put spread against a bearish preference.",
+                        "why": [
+                            f"Trend confidence is {int(round(trend_confidence * 100))}% and conflict is {int(round(signal_conflict_score))}%.",
+                            "High-volatility countertrend entries are a major source of drawdown.",
                         ],
                     },
                 )
@@ -1381,6 +1725,7 @@ class IntradayOptionSellingAdvisor:
             setup_type=setup_type,
             market_bias=market_bias,
             orb_confirmation=orb_confirmation,
+            expiry=expiry,
             legs=legs,
         )
         same_session = str(self.state.current_session_date or "") == now.date().isoformat()
@@ -1388,6 +1733,15 @@ class IntradayOptionSellingAdvisor:
         prev_streak = int(self.state.candidate_signal_streak or 0) if same_session else 0
         candidate_streak = (prev_streak + 1) if (prev_signature and prev_signature == candidate_signature) else 1
         required_streak = max(1, int(self.config.signal_persistence_bars or 1))
+        if self._trend_day_fast_track_ready(
+            setup_type=setup_type,
+            market_bias=market_bias,
+            trend_confidence=trend_confidence,
+            signal_conflict_score=signal_conflict_score,
+            strong_directional_alignment=strong_directional_alignment,
+            price_action_confirmation=price_action_confirmation,
+        ):
+            required_streak = 1
         if candidate_streak < required_streak:
             reasons.append("SIGNAL_NOT_PERSISTED_YET")
             return self._base_result(

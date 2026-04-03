@@ -50,6 +50,9 @@ BATMAN_BKM_AI_STATUS_JSON = STATE_DIR / "batman_bkm_ai_status.json"
 BATMAN_BKM_AI_EVENTS_JSONL = STATE_DIR / "batman_bkm_ai_events.jsonl"
 BATMAN_BKM_AI_PROTECT_STATUS_JSON = STATE_DIR / "batman_bkm_ai_protect_status.json"
 BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_JSON = STATE_DIR / "batman_bkm_ai_protect_clear_request.json"
+DECISION_COMMITTEE_STATUS_JSON = STATE_DIR / "decision_committee_status.json"
+DECISION_COMMITTEE_HISTORY_JSONL = STATE_DIR / "decision_committee_history.jsonl"
+DECISION_COMMITTEE_OUTCOMES_JSONL = STATE_DIR / "decision_committee_outcomes.jsonl"
 INTRADAY_AI_ADVISOR_STATUS_JSON = STATE_DIR / "intraday_ai_advisor_status.json"
 INTRADAY_AI_DEPLOY_REQUEST_JSON = STATE_DIR / "intraday_ai_deploy_request.json"
 INTRADAY_AI_DEPLOY_STATUS_JSON = STATE_DIR / "intraday_ai_deploy_status.json"
@@ -952,6 +955,60 @@ def _load_bkm_ai_protect_status() -> Dict[str, Any]:
     return out
 
 
+def _default_decision_committee_status() -> Dict[str, Any]:
+    now = _ist_now()
+    return {
+        "status": "IDLE",
+        "focus": "INTRADAY",
+        "verdict": "IDLE",
+        "consensus_bias": "NEUTRAL",
+        "ensemble_confidence": 0.0,
+        "advisor_signal": "NO_TRADE",
+        "advisor_strategy": None,
+        "expiry": None,
+        "spot": None,
+        "has_open_bkm": False,
+        "current_session_date": now.date().isoformat(),
+        "updated_at": now.isoformat(timespec="seconds"),
+        "components": {},
+        "reasons": [],
+    }
+
+
+def _load_decision_committee_status() -> Dict[str, Any]:
+    payload = _json_read(DECISION_COMMITTEE_STATUS_JSON)
+    if not payload or not isinstance(payload, dict):
+        return _default_decision_committee_status()
+    out = _default_decision_committee_status()
+    out.update(payload)
+    out["components"] = out.get("components") if isinstance(out.get("components"), dict) else {}
+    out["reasons"] = out.get("reasons") if isinstance(out.get("reasons"), list) else []
+    return out
+
+
+def _load_jsonl_tail(path: Path, limit: int = 50) -> List[Dict[str, Any]]:
+    if not path.exists() or limit <= 0:
+        return []
+    rows: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    rows.append(payload)
+    except Exception:
+        return []
+    if len(rows) <= limit:
+        return rows
+    return rows[-limit:]
+
+
 def _default_intraday_ai_status() -> Dict[str, Any]:
     now = _ist_now()
     return {
@@ -1156,6 +1213,77 @@ def _build_intraday_performance_payload(*, trade_mode: str) -> Dict[str, Any]:
         "exit_reasons": exit_reasons,
         "setup_breakdown": setup_breakdown,
         "recent_trades": recent_trades,
+    }
+
+
+def _build_committee_review_payload(*, trade_mode: str) -> Dict[str, Any]:
+    mode = str(trade_mode or "").strip().lower()
+    rows = [
+        row
+        for row in _load_jsonl_tail(DECISION_COMMITTEE_OUTCOMES_JSONL, limit=10000)
+        if str(row.get("trade_mode") or "").strip().lower() == mode
+    ]
+    total = len(rows)
+    wins = sum(1 for row in rows if str(row.get("result") or "").upper() == "WIN")
+    losses = sum(1 for row in rows if str(row.get("result") or "").upper() == "LOSS")
+    flats = sum(1 for row in rows if str(row.get("result") or "").upper() == "FLAT")
+    pnl = round(sum(_parse_float(row.get("pnl_rs"), 0.0) for row in rows), 2)
+    hold_values = [
+        _parse_float(row.get("hold_minutes"), 0.0)
+        for row in rows
+        if row.get("hold_minutes") not in (None, "", "-", "--")
+    ]
+    avg_hold = round(sum(hold_values) / len(hold_values), 2) if hold_values else None
+
+    def _bucket(rows_in: List[Dict[str, Any]], key_name: str) -> List[Dict[str, Any]]:
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for row in rows_in:
+            label = str(row.get(key_name) or "UNKNOWN").strip().upper() or "UNKNOWN"
+            bucket = buckets.setdefault(label, {"label": label, "count": 0, "pnl_rs": 0.0})
+            bucket["count"] += 1
+            bucket["pnl_rs"] = round(float(bucket["pnl_rs"]) + _parse_float(row.get("pnl_rs"), 0.0), 2)
+        return sorted(buckets.values(), key=lambda item: (-int(item["count"]), str(item["label"])))
+
+    by_verdict = _bucket(rows, "committee_verdict_at_entry")
+    by_bias = _bucket(rows, "committee_bias_at_entry")
+    by_exit = _bucket(rows, "exit_reason")
+
+    recent = []
+    for row in sorted(rows, key=lambda item: str(item.get("closed_at") or item.get("timestamp") or ""), reverse=True)[:10]:
+        recent.append(
+            {
+                "closed_at": row.get("closed_at"),
+                "strategy_label": row.get("strategy_label"),
+                "committee_verdict_at_entry": row.get("committee_verdict_at_entry"),
+                "committee_bias_at_entry": row.get("committee_bias_at_entry"),
+                "committee_confidence_at_entry": _parse_float(row.get("committee_confidence_at_entry"), None),
+                "exit_reason": row.get("exit_reason"),
+                "result": row.get("result"),
+                "pnl_rs": _parse_float(row.get("pnl_rs"), 0.0),
+                "hold_minutes": _parse_float(row.get("hold_minutes"), None),
+            }
+        )
+
+    best_verdict = by_verdict[0]["label"] if by_verdict else "—"
+    best_bias = "—"
+    if by_bias:
+        best_bias = sorted(by_bias, key=lambda item: (-float(item["pnl_rs"]), -int(item["count"]), str(item["label"])))[0]["label"]
+
+    return {
+        "trade_mode": mode,
+        "total_outcomes": total,
+        "wins": wins,
+        "losses": losses,
+        "flats": flats,
+        "win_rate_pct": round((wins / total) * 100.0, 2) if total else None,
+        "realized_pnl_rs": pnl,
+        "avg_hold_minutes": avg_hold,
+        "best_verdict_label": best_verdict,
+        "best_bias_label": best_bias,
+        "by_verdict": by_verdict,
+        "by_bias": by_bias,
+        "by_exit_reason": by_exit,
+        "recent_outcomes": recent,
     }
 
 
@@ -1587,8 +1715,17 @@ def _build_importable_bkm_from_broker_positions(positions: List[Dict[str, Any]],
         q_long = min(buy_qtys)
         q_hedge = max(buy_qtys)
         q_short = sell_qtys[0]
-        if q_long <= 0 or q_short != 3 * q_long:
+        if q_long <= 0 or (q_short % q_long) != 0:
             return False, {"reason": "invalid_short_ratio", "opt": opt, "q_long": q_long, "q_short": q_short}
+        short_ratio = q_short // q_long
+        if short_ratio not in {2, 3}:
+            return False, {
+                "reason": "unsupported_short_ratio",
+                "opt": opt,
+                "q_long": q_long,
+                "q_short": q_short,
+                "short_ratio": short_ratio,
+            }
         if q_hedge < q_long or (q_hedge % q_long) != 0:
             return False, {"reason": "invalid_hedge_ratio", "opt": opt, "q_long": q_long, "q_hedge": q_hedge}
         return True, {
@@ -1597,6 +1734,7 @@ def _build_importable_bkm_from_broker_positions(positions: List[Dict[str, Any]],
             "q_long": q_long,
             "q_short": q_short,
             "q_hedge": q_hedge,
+            "short_ratio": short_ratio,
         }
 
     ok_ce, ce_info = _validate_side("CE", by_opt["CE"])
@@ -1667,6 +1805,7 @@ def _build_importable_bkm_from_broker_positions(positions: List[Dict[str, Any]],
         "quality": quality,
         "quality_warning": bool(not quality_ok),
         "q_long": int(ce_info["q_long"]),
+        "short_ratio": int(ce_info.get("short_ratio") or 0),
         "ce_hedge_qty": int(ce_info["q_hedge"]),
         "pe_hedge_qty": int(pe_info["q_hedge"]),
     }
@@ -2275,6 +2414,7 @@ class PaperHandler(SimpleHTTPRequestHandler):
                     state = {}
                 payload["strategy_state"] = state
                 payload["intraday_performance"] = _build_intraday_performance_payload(trade_mode="paper")
+                payload["committee_review"] = _build_committee_review_payload(trade_mode="paper")
                 self._send_json(payload)
             except Exception as exc:  # pragma: no cover - defensive
                 self._send_json({"error": str(exc)}, status=500)
@@ -2425,6 +2565,7 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 reconcile = _load_reconcile_status()
                 exec_recovery = _load_execution_recovery_status()
                 bkm_ai = _load_bkm_ai_status()
+                committee = _load_decision_committee_status()
                 intraday_ai = _load_intraday_ai_status()
                 intraday_deploy = _load_intraday_ai_deploy_status()
                 intraday_position = _load_intraday_ai_position_status()
@@ -2554,6 +2695,15 @@ class PaperHandler(SimpleHTTPRequestHandler):
                         "intraday_ai_position_opened_at": intraday_position.get("opened_at"),
                         "intraday_ai_position_reason": intraday_position.get("last_reason"),
                         "intraday_ai_session_trade_count": _parse_int(intraday_position.get("session_trade_count"), 0),
+                        "intraday_committee": committee,
+                        "intraday_committee_status": committee.get("status"),
+                        "intraday_committee_verdict": committee.get("verdict"),
+                        "intraday_committee_bias": committee.get("consensus_bias"),
+                        "intraday_committee_confidence": _parse_float(committee.get("ensemble_confidence"), None),
+                        "intraday_committee_signal": committee.get("advisor_signal"),
+                        "intraday_committee_strategy": committee.get("advisor_strategy"),
+                        "intraday_committee_updated_at": committee.get("updated_at"),
+                        "intraday_committee_reasons": committee.get("reasons") if isinstance(committee.get("reasons"), list) else [],
                         "bkm_quality_status": bkm_open_meta.get("quality_status"),
                         "bkm_quality_score": _parse_float(bkm_open_meta.get("quality_score"), None),
                         "bkm_quality_reasons": (
@@ -2591,6 +2741,24 @@ class PaperHandler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/intraday_ai/status"):
             try:
                 self._send_json({"ok": True, "advisor": _load_intraday_ai_status()})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/intraday_ai/committee_review"):
+            try:
+                self._send_json({"ok": True, "review": _build_committee_review_payload(trade_mode="paper")})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/intraday_ai/committee"):
+            try:
+                self._send_json(
+                    {
+                        "ok": True,
+                        "committee": _load_decision_committee_status(),
+                        "history": _load_jsonl_tail(DECISION_COMMITTEE_HISTORY_JSONL, limit=25),
+                    }
+                )
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return

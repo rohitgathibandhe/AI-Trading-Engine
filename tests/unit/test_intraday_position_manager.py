@@ -188,6 +188,55 @@ def test_evaluate_closes_bear_call_spread_on_price_action_reversal_before_full_s
     assert out["reason"] == "PRICE_ACTION_REVERSAL"
 
 
+def test_evaluate_closes_high_vol_price_action_reversal_without_waiting_for_large_pnl_drawdown(tmp_path: Path) -> None:
+    mgr = _manager(tmp_path)
+    now = _ist_dt(6, 12, 0)
+    legs = [
+        _leg(strike=25500, opt=OptionType.CALL, side=LegSide.SELL, qty=65, entry_price=100.0),
+        _leg(strike=25700, opt=OptionType.CALL, side=LegSide.BUY, qty=65, entry_price=60.0),
+    ]
+    mgr.open_position(
+        position_id="POS-4B",
+        trade_mode="paper",
+        strategy_type="CALL_CREDIT_SPREAD",
+        strategy_label="Bear Call Credit Spread",
+        expiry="2026-03-10",
+        legs=legs,
+        entry_spot=25100.0,
+        sl_total_rs=1500.0,
+        tp_total_rs=700.0,
+        invalidation_spot_level=25320.0,
+        max_hold_till="15:05",
+        trailing_enabled=True,
+        lots_multiplier=1,
+        entry_features={"market_bias": "BEARISH", "price_action_bias": "BEARISH", "volatility_regime": "HIGH"},
+        now=now,
+    )
+    out = mgr.evaluate(
+        now=_ist_dt(6, 12, 5),
+        spot=25210.0,
+        chain_rows=[
+            {"option_type": "CE", "strike": 25500.0, "ltp": 100.2},
+            {"option_type": "CE", "strike": 25700.0, "ltp": 60.0},
+        ],
+        signal_payload={
+            "market_bias": "BULLISH",
+            "breakout_confirmation": "UP_CONFIRMED",
+            "trend_confidence": 0.62,
+            "signal_conflict_score": 40.0,
+            "price_action_bias": "BULLISH",
+            "price_action_confirmation": "CANDLE_AND_RETEST_CONFIRMED",
+            "retest_status": "SUPPORT_HOLD",
+            "pcr_bias": "BULLISH",
+            "oi_build_bias": "BULLISH_SUPPORT",
+            "pcr_unbalanced_side": "BULLISH",
+            "volatility_regime": "HIGH",
+        },
+    )
+    assert out["action"] == "CLOSE"
+    assert out["reason"] == "PRICE_ACTION_REVERSAL"
+
+
 def test_evaluate_closes_bull_put_spread_on_chain_conflict_when_losing(tmp_path: Path) -> None:
     mgr = _manager(tmp_path)
     now = _ist_dt(6, 12, 15)
@@ -234,6 +283,55 @@ def test_evaluate_closes_bull_put_spread_on_chain_conflict_when_losing(tmp_path:
     )
     assert out["action"] == "CLOSE"
     assert out["reason"] == "CHAIN_CONFLICT_EXIT"
+
+
+def test_evaluate_closes_high_vol_chain_conflict_earlier(tmp_path: Path) -> None:
+    mgr = _manager(tmp_path)
+    now = _ist_dt(6, 12, 15)
+    legs = [
+        _leg(strike=24800, opt=OptionType.PUT, side=LegSide.SELL, qty=65, entry_price=100.0),
+        _leg(strike=24600, opt=OptionType.PUT, side=LegSide.BUY, qty=65, entry_price=60.0),
+    ]
+    mgr.open_position(
+        position_id="POS-5B",
+        trade_mode="paper",
+        strategy_type="PUT_CREDIT_SPREAD",
+        strategy_label="Bull Put Credit Spread",
+        expiry="2026-03-10",
+        legs=legs,
+        entry_spot=25100.0,
+        sl_total_rs=1000.0,
+        tp_total_rs=500.0,
+        invalidation_spot_level=24720.0,
+        max_hold_till="15:05",
+        trailing_enabled=True,
+        lots_multiplier=1,
+        entry_features={"market_bias": "BULLISH", "price_action_bias": "BULLISH", "volatility_regime": "HIGH"},
+        now=now,
+    )
+    out = mgr.evaluate(
+        now=_ist_dt(6, 12, 20),
+        spot=24960.0,
+        chain_rows=[
+            {"option_type": "PE", "strike": 24800.0, "ltp": 101.8},
+            {"option_type": "PE", "strike": 24600.0, "ltp": 60.3},
+        ],
+        signal_payload={
+            "market_bias": "NEUTRAL",
+            "breakout_confirmation": "NONE",
+            "trend_confidence": 0.42,
+            "signal_conflict_score": 48.0,
+            "price_action_bias": "BEARISH",
+            "price_action_confirmation": "CANDLE_CONFIRMED",
+            "retest_status": "BREAKDOWN_RETEST_HOLD",
+            "pcr_bias": "BEARISH",
+            "oi_build_bias": "BEARISH_RESISTANCE",
+            "pcr_unbalanced_side": "BEARISH",
+            "volatility_regime": "HIGH",
+        },
+    )
+    assert out["action"] == "CLOSE"
+    assert out["reason"] in {"PRICE_ACTION_REVERSAL", "EARLY_RISK_OFF", "CHAIN_CONFLICT_EXIT"}
 
 
 def test_evaluate_tightens_profit_protection_after_peak_when_signal_weakens(tmp_path: Path) -> None:

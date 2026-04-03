@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from pathlib import Path
 
@@ -64,6 +65,22 @@ class _ExecDW:
             base["netQty"] = net
             rows.append(base)
         return rows
+
+
+class _DupRowDW:
+    def get_positions_raw(self):
+        return [
+            {"securityId": 3001, "netQty": 65},
+            {"securityId": 3001, "netQty": 130},
+            {"securityId": 3002, "netQty": -65},
+        ]
+
+
+class _ResidualDW:
+    def get_positions_raw(self):
+        return [
+            {"securityId": 4001, "netQty": 65},
+        ]
 
 
 def _exec_guard() -> LiveOrderExecutor:
@@ -198,3 +215,108 @@ def test_flatten_bkm_basket_keeps_state_on_close_execution_failure(monkeypatch, 
     assert out["ok"] is False
     assert out["closed_legs"] == 1
     assert strategy.basket is not None
+
+
+def test_build_risk_config_propagates_daily_max_loss_from_settings() -> None:
+    risk = start_agent._build_risk_config(
+        {
+            "max_intraday_loss": -10000.0,
+            "intraday_target": 4000.0,
+            "allow_carry_forward": True,
+        }
+    )
+
+    assert risk.max_intraday_loss == -10000.0
+    assert risk.daily_max_loss == -10000.0
+
+
+def test_exec_guard_aggregates_duplicate_position_rows() -> None:
+    assert _exec_guard()._get_net_qty(_DupRowDW(), 3001) == 195
+    assert _exec_guard()._get_net_qty(_DupRowDW(), 3002) == -65
+
+
+def test_flatten_bkm_basket_keeps_state_when_residual_broker_position_remains(
+    monkeypatch, tmp_path: Path
+) -> None:
+    blotter_path = tmp_path / "trade_blotter.csv"
+    summary_path = tmp_path / "trade_blotter_summary.json"
+    strategy_state = tmp_path / "strategy_state.json"
+    monkeypatch.setattr(start_agent, "TRADE_BLOTTER_PATH", blotter_path)
+    monkeypatch.setattr(start_agent, "TRADE_BLOTTER_SUMMARY", summary_path)
+    monkeypatch.setattr(start_agent, "STRATEGY_STATE_FILE", strategy_state)
+    monkeypatch.setattr(
+        start_agent,
+        "_place_leg_order",
+        lambda *args, **kwargs: {"ok": True, "verified": True},
+    )
+
+    cfg = BatmanBKMConfig(lot_size=65, lot_multiplier=1)
+    strategy = BatmanBKMStrategy(cfg)
+    expiry = date(2026, 1, 29)
+    strategy.basket = BatmanBKMBasket(
+        expiry=expiry,
+        legs=[
+            Leg(option_type="PE", side="BUY", strike=21000, qty=65, entry=90.0, ltp=95.0, security_id="4001", expiry=expiry.isoformat()),
+        ],
+        net_credit=650.0,
+        margin_required=1_000_000.0,
+        credit_pct=0.065,
+        entry_ts=datetime(2026, 1, 10, 10, 0),
+        hedge_qty_call=1,
+        hedge_qty_put=1,
+    )
+
+    out = start_agent._flatten_bkm_basket(
+        dw=_ResidualDW(),
+        bkm_strategy=strategy,
+        trade_mode="live",
+        reason="TEST_EXIT",
+        live_order_executor=_exec_guard(),
+    )
+
+    assert out["ok"] is False
+    assert out["closed_legs"] == 0
+    assert out["residual_positions"] == [
+        {"security_id": 4001, "strike": 21000, "opt": "PE", "net_qty": 65}
+    ]
+    assert strategy.basket is not None
+
+
+def test_set_intraday_ai_runtime_status_disabled_reflects_open_bkm(monkeypatch, tmp_path: Path) -> None:
+    status_path = tmp_path / "intraday_ai_advisor_status.json"
+    monkeypatch.setattr(start_agent, "INTRADAY_AI_ADVISOR_STATUS_FILE", status_path)
+
+    out = start_agent._set_intraday_ai_runtime_status(
+        now=datetime(2026, 3, 30, 10, 0),
+        intraday_enabled=False,
+        has_open_bkm=True,
+        allow_parallel_with_bkm=False,
+        bkm_expiry="2026-04-28",
+    )
+
+    assert out["status"] == "DISABLED"
+    assert out["signal"] == "NO_TRADE"
+    assert out["has_open_bkm"] is True
+    assert out["expiry"] == "2026-04-28"
+    assert "INTRADAY_AI_DISABLED" in out["reasons"]
+    persisted = json.loads(status_path.read_text())
+    assert persisted["status"] == "DISABLED"
+    assert persisted["recommendation"]["headline"] == "Intraday AI is disabled."
+
+
+def test_set_intraday_ai_runtime_status_parked_for_open_bkm(monkeypatch, tmp_path: Path) -> None:
+    status_path = tmp_path / "intraday_ai_advisor_status.json"
+    monkeypatch.setattr(start_agent, "INTRADAY_AI_ADVISOR_STATUS_FILE", status_path)
+
+    out = start_agent._set_intraday_ai_runtime_status(
+        now=datetime(2026, 3, 30, 10, 5),
+        intraday_enabled=True,
+        has_open_bkm=True,
+        allow_parallel_with_bkm=False,
+        bkm_expiry="2026-04-28",
+    )
+
+    assert out["status"] == "PARKED"
+    assert out["signal"] == "NO_TRADE"
+    assert out["reasons"] == ["OPEN_BKM_POSITION_PRESENT"]
+    assert out["recommendation"]["signal_text"] == "No intraday trade while Batman is already open."

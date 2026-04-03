@@ -97,6 +97,7 @@ def test_guard_locks_on_unresolved_journal_ops(tmp_path: Path) -> None:
 
 def test_guard_resume_ready_when_local_broker_and_journal_match(tmp_path: Path) -> None:
     g = _guard(tmp_path)
+    g.state.hard_lock = True
     t = _ist_dt(8)
     active = {
         "2026-01-29": {
@@ -122,6 +123,7 @@ def test_guard_resume_ready_when_local_broker_and_journal_match(tmp_path: Path) 
     assert out["reason"] == "RESUME_READY"
     snap = g.snapshot()
     assert snap["status"] == "OK"
+    assert snap["hard_lock"] is False
     assert snap["last_details"]["startup"] == "RESUME_READY"
 
 
@@ -185,3 +187,43 @@ def test_guard_ignores_stale_failed_ops_without_live_footprint(tmp_path: Path) -
     snap = g.snapshot()
     assert snap["status"] == "OK"
     assert snap["last_details"]["ignored_failed_ops_count"] == 1
+
+
+def test_guard_allows_resume_when_failed_op_exists_but_active_basket_matches(tmp_path: Path) -> None:
+    g = _guard(tmp_path)
+    g.state.hard_lock = True
+    t = _ist_dt(12)
+    active = {
+        "2026-01-29": {
+            "expiry": "2026-01-29",
+            "legs": [
+                {"expiry": "2026-01-29", "strike": 22000, "option_type": "CALL", "side": "SELL", "quantity": 130},
+                {"expiry": "2026-01-29", "strike": 22500, "option_type": "CALL", "side": "BUY", "quantity": 65},
+                {"expiry": "2026-01-29", "strike": 21000, "option_type": "PUT", "side": "BUY", "quantity": 65},
+            ],
+            "meta": {"net_credit": 650.0, "margin_required": 1000000.0, "credit_pct": 0.065},
+        }
+    }
+    broker = [
+        _broker_leg(expiry="2026-01-29", strike=22000, opt=OptionType.CALL, side=LegSide.SELL, qty=130),
+        _broker_leg(expiry="2026-01-29", strike=22500, opt=OptionType.CALL, side=LegSide.BUY, qty=65),
+        _broker_leg(expiry="2026-01-29", strike=21000, opt=OptionType.PUT, side=LegSide.BUY, qty=65),
+    ]
+    out = g.evaluate_startup(
+        local_bkm_state={"2026-01-29": {"status": "OPEN"}},
+        broker_legs=broker,
+        journal_summary={
+            "unresolved_ops": [],
+            "failed_ops": [{"op_id": "c1", "expiry": "2026-01-29", "timestamp": "2026-01-12T10:00:00+05:30"}],
+            "active_baskets": active,
+            "events_scanned": 6,
+        },
+        when=t,
+    )
+    assert out["ok"] is True
+    assert out["reason"] == "RESUME_READY"
+    snap = g.snapshot()
+    assert snap["status"] == "OK"
+    assert snap["hard_lock"] is False
+    assert snap["last_details"]["startup"] == "RESUME_READY"
+    assert snap["last_details"]["resume_override"] == "MATCHED_ACTIVE_BASKET"

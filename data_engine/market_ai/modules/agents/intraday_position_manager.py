@@ -48,7 +48,7 @@ def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
 def _profit_protect_profile(volatility_regime: str) -> Tuple[float, float, float]:
     regime = str(volatility_regime or "NORMAL").upper()
     if regime == "HIGH":
-        return (70.0, 0.30, 0.45)
+        return (45.0, 0.55, 0.72)
     if regime == "LOW":
         return (50.0, 0.45, 0.60)
     return (60.0, 0.38, 0.52)
@@ -57,7 +57,7 @@ def _profit_protect_profile(volatility_regime: str) -> Tuple[float, float, float
 def _profit_protect_min_hold_minutes(volatility_regime: str) -> float:
     regime = str(volatility_regime or "NORMAL").upper()
     if regime == "HIGH":
-        return 20.0
+        return 10.0
     if regime == "LOW":
         return 10.0
     return 15.0
@@ -299,40 +299,41 @@ class IntradayPositionManager:
         self.state.current_spot = None if self.state.current_spot is None else float(self.state.current_spot)
         self.state.last_evaluated_at = ts.isoformat(timespec="seconds")
         self._persist(ts)
-        self._append_history(
-            {
-                "position_id": self.state.position_id,
-                "trade_mode": self.state.trade_mode,
-                "strategy_type": self.state.strategy_type,
-                "strategy_label": self.state.strategy_label,
-                "expiry": self.state.expiry,
-                "opened_at": self.state.opened_at,
-                "closed_at": self.state.closed_at,
-                "current_session_date": self.state.current_session_date,
-                "entry_spot": self.state.entry_spot,
-                "exit_spot": self.state.current_spot,
-                "pnl_rs": round(float(self.state.current_pnl_rs or 0.0), 2),
-                "peak_pnl_rs": round(float(self.state.peak_pnl_rs or 0.0), 2),
-                "trail_floor_rs": None if self.state.trail_floor_rs is None else round(float(self.state.trail_floor_rs), 2),
-                "sl_total_rs": round(float(self.state.sl_total_rs or 0.0), 2),
-                "tp_total_rs": round(float(self.state.tp_total_rs or 0.0), 2),
-                "invalidation_spot_level": self.state.invalidation_spot_level,
-                "hold_minutes": hold_minutes,
-                "reason": self.state.last_reason,
-                "lots_multiplier": self.state.lots_multiplier,
-                "session_trade_count": self.state.session_trade_count,
-                "trailing_enabled": bool(self.state.trailing_enabled),
-                "trailing_active": bool(self.state.trailing_active),
-                "entry_features": dict(self.state.entry_features or {}),
-                "result": (
-                    "WIN"
-                    if float(self.state.current_pnl_rs or 0.0) > 0
-                    else ("LOSS" if float(self.state.current_pnl_rs or 0.0) < 0 else "FLAT")
-                ),
-                "legs": list(self.state.legs or []),
-            }
-        )
-        return self.snapshot()
+        history_row = {
+            "position_id": self.state.position_id,
+            "trade_mode": self.state.trade_mode,
+            "strategy_type": self.state.strategy_type,
+            "strategy_label": self.state.strategy_label,
+            "expiry": self.state.expiry,
+            "opened_at": self.state.opened_at,
+            "closed_at": self.state.closed_at,
+            "current_session_date": self.state.current_session_date,
+            "entry_spot": self.state.entry_spot,
+            "exit_spot": self.state.current_spot,
+            "pnl_rs": round(float(self.state.current_pnl_rs or 0.0), 2),
+            "peak_pnl_rs": round(float(self.state.peak_pnl_rs or 0.0), 2),
+            "trail_floor_rs": None if self.state.trail_floor_rs is None else round(float(self.state.trail_floor_rs), 2),
+            "sl_total_rs": round(float(self.state.sl_total_rs or 0.0), 2),
+            "tp_total_rs": round(float(self.state.tp_total_rs or 0.0), 2),
+            "invalidation_spot_level": self.state.invalidation_spot_level,
+            "hold_minutes": hold_minutes,
+            "reason": self.state.last_reason,
+            "lots_multiplier": self.state.lots_multiplier,
+            "session_trade_count": self.state.session_trade_count,
+            "trailing_enabled": bool(self.state.trailing_enabled),
+            "trailing_active": bool(self.state.trailing_active),
+            "entry_features": dict(self.state.entry_features or {}),
+            "result": (
+                "WIN"
+                if float(self.state.current_pnl_rs or 0.0) > 0
+                else ("LOSS" if float(self.state.current_pnl_rs or 0.0) < 0 else "FLAT")
+            ),
+            "legs": list(self.state.legs or []),
+        }
+        self._append_history(history_row)
+        snap = self.snapshot()
+        snap["history_row"] = history_row
+        return snap
 
     def reset(self, *, now: Optional[datetime] = None) -> Dict[str, Any]:
         self.state = self._default_state()
@@ -475,7 +476,10 @@ class IntradayPositionManager:
             if (
                 opposing_price_action
                 and opposing_retest
-                and current_pnl <= max(100.0, tp_total * 0.15 if tp_total > 0 else 100.0)
+                and (
+                    position_vol_regime == "HIGH"
+                    or current_pnl <= max(100.0, tp_total * 0.15 if tp_total > 0 else 100.0)
+                )
             ):
                 close_reason = "PRICE_ACTION_REVERSAL"
             elif (
@@ -485,9 +489,16 @@ class IntradayPositionManager:
                 and current_pnl <= max(giveback_floor, peak_pnl * degrade_keep_frac)
             ):
                 close_reason = "PROFIT_PROTECT"
-            elif chain_against and opposing_price_action and current_pnl < 0 and conflict >= 45.0:
+            elif chain_against and opposing_price_action and current_pnl < 0 and (
+                conflict >= 45.0 or position_vol_regime == "HIGH"
+            ):
                 close_reason = "EARLY_RISK_OFF"
-            elif chain_against and current_pnl <= -max(100.0, sl_total * 0.18 if sl_total > 0 else 100.0) and conflict >= 60.0:
+            elif chain_against and current_pnl <= -max(
+                80.0,
+                sl_total * (0.10 if position_vol_regime == "HIGH" else 0.18) if sl_total > 0 else 100.0,
+            ) and (
+                conflict >= 50.0 or position_vol_regime == "HIGH"
+            ):
                 close_reason = "CHAIN_CONFLICT_EXIT"
 
             if (

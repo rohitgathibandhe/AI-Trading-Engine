@@ -398,9 +398,11 @@ class ExecutionRecoveryGuard:
             return {"ok": False, "locked": True, "reason": "EXEC_JOURNAL_UNRESOLVED_OP", "details": details}
 
         ignored_failed_details: Optional[Dict[str, Any]] = None
+        pending_failed_lock_details: Optional[Dict[str, Any]] = None
+        failed_expiries: List[str] = []
+        active_footprint_expiries = sorted(set(local_open_expiries) | set(journal_expiries) | set(broker_expiries))
         if failed_ops:
             failed_expiries = sorted({str(op.get("expiry") or "").strip() for op in failed_ops if str(op.get("expiry") or "").strip()})
-            active_footprint_expiries = sorted(set(local_open_expiries) | set(journal_expiries) | set(broker_expiries))
             should_ignore_failed_ops = bool(
                 self.config.ignore_stale_failed_ops_without_footprint
                 and failed_expiries
@@ -413,9 +415,7 @@ class ExecutionRecoveryGuard:
                     "active_footprint_expiries": active_footprint_expiries,
                 }
             else:
-                details = {"failed_ops": failed_ops[:5], "count": len(failed_ops)}
-                self.lock("EXEC_JOURNAL_FAILED_OP", details=details, when=now)
-                return {"ok": False, "locked": True, "reason": "EXEC_JOURNAL_FAILED_OP", "details": details}
+                pending_failed_lock_details = {"failed_ops": failed_ops[:5], "count": len(failed_ops)}
 
         if len(journal_expiries) > 1:
             details = {"journal_expiries": journal_expiries}
@@ -497,7 +497,26 @@ class ExecutionRecoveryGuard:
             self.lock("EXEC_RECOVERY_BROKER_POSITION_MISMATCH", details=details, when=now)
             return {"ok": False, "locked": True, "reason": "EXEC_RECOVERY_BROKER_POSITION_MISMATCH", "details": details}
 
+        if pending_failed_lock_details:
+            if failed_expiries and set(failed_expiries).issubset(set(journal_expiries)):
+                ignored_failed_details = {
+                    "ignored_failed_ops_count": len(failed_ops),
+                    "ignored_failed_op_expiries": failed_expiries,
+                    "active_footprint_expiries": active_footprint_expiries,
+                    "resume_override": "MATCHED_ACTIVE_BASKET",
+                }
+            else:
+                self.lock("EXEC_JOURNAL_FAILED_OP", details=pending_failed_lock_details, when=now)
+                return {
+                    "ok": False,
+                    "locked": True,
+                    "reason": "EXEC_JOURNAL_FAILED_OP",
+                    "details": pending_failed_lock_details,
+                }
+
         self.state.status = "OK"
+        self.state.hard_lock = False
+        self.state.locked_for_date = None
         self.state.last_reason = None
         self.state.last_details = {
             "startup": "RESUME_READY",

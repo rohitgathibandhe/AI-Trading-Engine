@@ -291,6 +291,9 @@
             <div class="summary-sub" id="intraday-ai-hold">Hold: —</div>
             <div class="summary-sub" id="intraday-ai-why">Why: —</div>
             <div class="summary-sub" id="intraday-ai-updated">Updated: —</div>
+            <div class="summary-sub" id="intraday-committee-headline">Committee: —</div>
+            <div class="summary-sub" id="intraday-committee-components">Structure: — | Chain: — | Construction: — | Risk: —</div>
+            <div class="summary-sub" id="intraday-committee-why">Committee reasons: —</div>
             <div class="summary-sub" id="intraday-ai-deploy-note">Telegram command: /deploy_intraday</div>
           </div>
         </div>
@@ -398,6 +401,48 @@
           <thead>
             <tr>
               <th>Closed At</th><th>Strategy</th><th>Expiry</th><th>Hold</th><th>Exit</th><th>Result</th><th>P&L</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="card-header">
+          <div style="font-weight:700;">Committee Review</div>
+          <div>
+            <span class="chip" id="committee-review-count">0 outcomes</span>
+            <span class="chip" id="committee-review-winrate">Win rate: —</span>
+          </div>
+        </div>
+        <div class="summary-bar" style="margin-bottom:10px;">
+          <div class="summary-card">
+            <div class="summary-title">Labeled P&L</div>
+            <div class="summary-value" id="committee-review-pnl">—</div>
+            <div class="summary-sub">Committee-scored closed trades</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Average Hold</div>
+            <div class="summary-value" id="committee-review-hold">—</div>
+            <div class="summary-sub">Committee-labeled trades</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Best Verdict</div>
+            <div class="summary-value" id="committee-review-best-verdict">—</div>
+            <div class="summary-sub">Most productive entry verdict</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Best Bias</div>
+            <div class="summary-value" id="committee-review-best-bias">—</div>
+            <div class="summary-sub">Highest realized bias bucket</div>
+          </div>
+        </div>
+        <div class="muted" style="margin-bottom:8px;">Outcome buckets</div>
+        <div id="committee-review-buckets" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;"></div>
+        <table id="committee-review-table">
+          <thead>
+            <tr>
+              <th>Closed At</th><th>Strategy</th><th>Verdict</th><th>Bias</th><th>Confidence</th><th>Exit</th><th>P&L</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -693,6 +738,73 @@
       );
     }
 
+    function renderCommitteeReview(review) {
+      const data = review || {};
+      const total = Number(data.total_outcomes || 0);
+      const realizedPnl = Number(data.realized_pnl_rs || 0);
+      const winRate = data.win_rate_pct;
+      const avgHold = data.avg_hold_minutes;
+      const bestVerdict = data.best_verdict_label || "—";
+      const bestBias = data.best_bias_label || "—";
+      const buckets = Array.isArray(data.by_exit_reason) ? data.by_exit_reason : [];
+      const recent = Array.isArray(data.recent_outcomes) ? data.recent_outcomes : [];
+
+      const countEl = document.getElementById("committee-review-count");
+      const winRateEl = document.getElementById("committee-review-winrate");
+      const pnlEl = document.getElementById("committee-review-pnl");
+      const holdEl = document.getElementById("committee-review-hold");
+      const bestVerdictEl = document.getElementById("committee-review-best-verdict");
+      const bestBiasEl = document.getElementById("committee-review-best-bias");
+      const bucketsEl = document.getElementById("committee-review-buckets");
+
+      if (countEl) countEl.textContent = `${total} outcomes`;
+      if (winRateEl) winRateEl.textContent = `Win rate: ${winRate === null || winRate === undefined ? "—" : `${Number(winRate).toFixed(1)}%`}`;
+      if (pnlEl) {
+        pnlEl.textContent = fmtMoney(realizedPnl);
+        pnlEl.classList.toggle("pos", realizedPnl > 0);
+        pnlEl.classList.toggle("neg", realizedPnl < 0);
+      }
+      if (holdEl) holdEl.textContent = fmtHoldMinutes(avgHold);
+      if (bestVerdictEl) bestVerdictEl.textContent = humanizeReason(bestVerdict);
+      if (bestBiasEl) bestBiasEl.textContent = humanizeReason(bestBias);
+
+      if (bucketsEl) {
+        bucketsEl.innerHTML = "";
+        if (buckets.length) {
+          buckets.forEach(item => {
+            const span = document.createElement("span");
+            span.className = "chip";
+            span.textContent = `${humanizeReason(item.label)}: ${item.count}`;
+            bucketsEl.appendChild(span);
+          });
+        } else {
+          const span = document.createElement("span");
+          span.className = "chip";
+          span.textContent = "No committee-labeled outcomes yet";
+          bucketsEl.appendChild(span);
+        }
+      }
+
+      upsertRows(
+        "#committee-review-table tbody",
+        recent,
+        (row) => `${row.closed_at || ""}-${row.strategy_label || ""}-${row.exit_reason || ""}`,
+        (row, tr) => {
+          const pnlClass = Number(row.pnl_rs || 0) > 0 ? "pos" : (Number(row.pnl_rs || 0) < 0 ? "neg" : "");
+          const conf = row.committee_confidence_at_entry;
+          tr.innerHTML = `
+            <td>${row.closed_at || "—"}</td>
+            <td>${row.strategy_label || "—"}</td>
+            <td>${humanizeReason(row.committee_verdict_at_entry)}</td>
+            <td>${humanizeReason(row.committee_bias_at_entry)}</td>
+            <td>${conf === null || conf === undefined ? "—" : `${Math.round(Number(conf) * 100)}%`}</td>
+            <td>${humanizeReason(row.exit_reason)}</td>
+            <td class="${pnlClass}">${fmtMoney(row.pnl_rs)}</td>
+          `;
+        }
+      );
+    }
+
     async function loadPnl() {
       if (inflight.pnl) return;
       inflight.pnl = true;
@@ -730,6 +842,7 @@
         if (status.includes("OPEN")) dot.classList.add("ok"); else dot.classList.remove("ok");
       }
       renderIntradayPerformance(data.intraday_performance || {});
+      renderCommitteeReview(data.committee_review || {});
 
       let openTotal = 0.0;
       upsertRows(
@@ -1302,6 +1415,9 @@
       const holdEl = document.getElementById("intraday-ai-hold");
       const whyEl = document.getElementById("intraday-ai-why");
       const updatedEl = document.getElementById("intraday-ai-updated");
+      const committeeHeadlineEl = document.getElementById("intraday-committee-headline");
+      const committeeComponentsEl = document.getElementById("intraday-committee-components");
+      const committeeWhyEl = document.getElementById("intraday-committee-why");
 
       if (headlineEl) {
         headlineEl.textContent = headline;
@@ -1320,6 +1436,40 @@
       if (updatedEl) updatedEl.textContent = `Updated: ${adv.updated_at || "—"}`;
 
       const ctrl = latestControlStatus || {};
+      const committee = (ctrl && typeof ctrl.intraday_committee === "object" && ctrl.intraday_committee) ? ctrl.intraday_committee : {};
+      const committeeComponents = (committee && typeof committee.components === "object" && committee.components) ? committee.components : {};
+      const committeeVerdict = String(committee.verdict || "IDLE").toUpperCase();
+      const committeeBias = String(committee.consensus_bias || "NEUTRAL").toUpperCase();
+      const committeeConfidence = (committee.ensemble_confidence !== undefined && committee.ensemble_confidence !== null)
+        ? `${Math.round(Number(committee.ensemble_confidence) * 100)}%`
+        : "—";
+      const structureScore = (committeeComponents.market_structure && committeeComponents.market_structure.score !== undefined)
+        ? Number(committeeComponents.market_structure.score).toFixed(2)
+        : "—";
+      const chainScore = (committeeComponents.option_chain && committeeComponents.option_chain.score !== undefined)
+        ? Number(committeeComponents.option_chain.score).toFixed(2)
+        : "—";
+      const constructionScore = (committeeComponents.trade_construction && committeeComponents.trade_construction.score !== undefined)
+        ? Number(committeeComponents.trade_construction.score).toFixed(2)
+        : "—";
+      const riskScore = (committeeComponents.risk_critic && committeeComponents.risk_critic.score !== undefined)
+        ? Number(committeeComponents.risk_critic.score).toFixed(2)
+        : "—";
+      const committeeReasons = Array.isArray(committee.reasons) ? committee.reasons : [];
+      if (committeeHeadlineEl) {
+        committeeHeadlineEl.textContent = `Committee: ${committeeVerdict} | Bias: ${committeeBias} | Confidence: ${committeeConfidence}`;
+        if (committeeVerdict === "READY") committeeHeadlineEl.style.color = "var(--pos)";
+        else if (committeeVerdict === "VETO") committeeHeadlineEl.style.color = "var(--neg)";
+        else if (committeeVerdict === "WAIT") committeeHeadlineEl.style.color = "#f59e0b";
+        else committeeHeadlineEl.style.color = "var(--muted)";
+      }
+      if (committeeComponentsEl) {
+        committeeComponentsEl.textContent = `Structure: ${structureScore} | Chain: ${chainScore} | Construction: ${constructionScore} | Risk: ${riskScore}`;
+      }
+      if (committeeWhyEl) {
+        committeeWhyEl.textContent = `Committee reasons: ${committeeReasons.length ? committeeReasons.slice(0, 4).join(", ") : "—"}`;
+      }
+
       const running = !!ctrl.running;
       const agentMode = String(ctrl.trade_mode || "").toLowerCase();
       const liveMode = agentMode === "live";

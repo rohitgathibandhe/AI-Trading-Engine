@@ -75,6 +75,9 @@ def _configure_temp_state(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(server, "TELEGRAM_ALERT_STATUS_JSON", state_dir / "telegram_alert_status.json")
     monkeypatch.setattr(server, "BATMAN_BKM_TUNING_ADVICE_JSON", state_dir / "batman_bkm_tuning_advice.json")
     monkeypatch.setattr(server, "BATMAN_BKM_TUNING_HISTORY_JSONL", state_dir / "batman_bkm_tuning_history.jsonl")
+    monkeypatch.setattr(server, "DECISION_COMMITTEE_STATUS_JSON", state_dir / "decision_committee_status.json")
+    monkeypatch.setattr(server, "DECISION_COMMITTEE_HISTORY_JSONL", state_dir / "decision_committee_history.jsonl")
+    monkeypatch.setattr(server, "DECISION_COMMITTEE_OUTCOMES_JSONL", state_dir / "decision_committee_outcomes.jsonl")
     monkeypatch.setattr(server, "PID_FILE", state_dir / "agent.pid")
     monkeypatch.setattr(server, "STATIC_DIR", static_dir)
 
@@ -142,6 +145,31 @@ def test_control_status_includes_live_gate_summary(monkeypatch, tmp_path: Path) 
             }
         )
     )
+    (tmp_path / "state" / "decision_committee_status.json").write_text(
+        json.dumps(
+            {
+                "status": "ACTIVE",
+                "focus": "INTRADAY",
+                "verdict": "READY",
+                "consensus_bias": "BEARISH",
+                "ensemble_confidence": 0.82,
+                "advisor_signal": "ENTER_NOW",
+                "advisor_strategy": "CALL_CREDIT_SPREAD",
+                "expiry": "2026-04-30",
+                "spot": 22850.0,
+                "has_open_bkm": False,
+                "current_session_date": "2026-04-03",
+                "updated_at": "2026-04-03T10:15:00+05:30",
+                "components": {
+                    "market_structure": {"score": 0.81},
+                    "option_chain": {"score": 0.76},
+                    "trade_construction": {"score": 0.73},
+                    "risk_critic": {"score": 0.95, "veto": False},
+                },
+                "reasons": ["TREND_ALIGNED", "PCR_SUPPORTIVE"],
+            }
+        )
+    )
 
     code, payload = _run_get("/api/control/status")
     assert code == 200
@@ -158,6 +186,97 @@ def test_control_status_includes_live_gate_summary(monkeypatch, tmp_path: Path) 
     assert "alerts_recent_count" in payload
     assert "telegram_alerts_enabled" in payload
     assert "telegram_alerts_configured" in payload
+    assert payload["intraday_committee_status"] == "ACTIVE"
+    assert payload["intraday_committee_verdict"] == "READY"
+    assert payload["intraday_committee_bias"] == "BEARISH"
+    assert payload["intraday_committee_strategy"] == "CALL_CREDIT_SPREAD"
+    assert payload["intraday_committee_reasons"] == ["TREND_ALIGNED", "PCR_SUPPORTIVE"]
+
+
+def test_intraday_committee_endpoint_returns_status_and_history(monkeypatch, tmp_path: Path) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    state_dir = tmp_path / "state"
+    (state_dir / "decision_committee_status.json").write_text(
+        json.dumps(
+            {
+                "status": "ACTIVE",
+                "focus": "INTRADAY",
+                "verdict": "WAIT",
+                "consensus_bias": "BULLISH",
+                "ensemble_confidence": 0.61,
+                "advisor_signal": "WAIT",
+                "advisor_strategy": "PUT_CREDIT_SPREAD",
+                "expiry": "2026-04-30",
+                "spot": 22910.0,
+                "has_open_bkm": False,
+                "current_session_date": "2026-04-03",
+                "updated_at": "2026-04-03T11:05:00+05:30",
+                "components": {},
+                "reasons": ["PERSISTENCE_PENDING"],
+            }
+        )
+    )
+    (state_dir / "decision_committee_history.jsonl").write_text(
+        '{"timestamp":"2026-04-03T11:00:00+05:30","verdict":"WAIT","consensus_bias":"BULLISH"}\n'
+        '{"timestamp":"2026-04-03T11:05:00+05:30","verdict":"WAIT","consensus_bias":"BULLISH"}\n'
+    )
+
+    code, payload = _run_get("/api/intraday_ai/committee")
+    assert code == 200
+    assert payload["ok"] is True
+    assert payload["committee"]["verdict"] == "WAIT"
+    assert payload["committee"]["consensus_bias"] == "BULLISH"
+    assert len(payload["history"]) == 2
+    assert payload["history"][-1]["timestamp"] == "2026-04-03T11:05:00+05:30"
+
+
+def test_intraday_committee_review_summarizes_outcomes(monkeypatch, tmp_path: Path) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    state_dir = tmp_path / "state"
+    (state_dir / "decision_committee_outcomes.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "trade_mode": "paper",
+                        "strategy_label": "Call Credit Spread",
+                        "committee_verdict_at_entry": "READY",
+                        "committee_bias_at_entry": "BEARISH",
+                        "committee_confidence_at_entry": 0.81,
+                        "exit_reason": "PROFIT_PROTECT",
+                        "result": "WIN",
+                        "pnl_rs": 125.5,
+                        "hold_minutes": 42.0,
+                        "closed_at": "2026-04-03T11:30:00+05:30",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "trade_mode": "paper",
+                        "strategy_label": "Put Credit Spread",
+                        "committee_verdict_at_entry": "WAIT",
+                        "committee_bias_at_entry": "BULLISH",
+                        "committee_confidence_at_entry": 0.62,
+                        "exit_reason": "PRICE_ACTION_REVERSAL",
+                        "result": "LOSS",
+                        "pnl_rs": -40.0,
+                        "hold_minutes": 25.0,
+                        "closed_at": "2026-04-03T12:15:00+05:30",
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+
+    code, payload = _run_get("/api/intraday_ai/committee_review")
+    assert code == 200
+    assert payload["ok"] is True
+    assert payload["review"]["total_outcomes"] == 2
+    assert payload["review"]["wins"] == 1
+    assert payload["review"]["losses"] == 1
+    assert payload["review"]["realized_pnl_rs"] == 85.5
+    assert payload["review"]["best_bias_label"] == "BEARISH"
 
 
 def test_reconcile_status_and_reset(monkeypatch, tmp_path: Path) -> None:
@@ -417,6 +536,17 @@ def _bkm_positions_payload_skewed() -> list[dict]:
     ]
 
 
+def _bkm_positions_payload_ratio_121() -> list[dict]:
+    return [
+        {"side": "SELL", "qty": 260, "entry": 85.6, "sec_id": "1", "expiry": "2026-03-30", "strike": "NIFTY-Mar2026-22800-PE"},
+        {"side": "BUY", "qty": 130, "entry": 109.2, "sec_id": "2", "expiry": "2026-03-30", "strike": "NIFTY-Mar2026-23000-PE"},
+        {"side": "BUY", "qty": 130, "entry": 8.7, "sec_id": "3", "expiry": "2026-03-30", "strike": "NIFTY-Mar2026-20000-PE"},
+        {"side": "BUY", "qty": 130, "entry": 153.2, "sec_id": "4", "expiry": "2026-03-30", "strike": "NIFTY-Mar2026-24100-CE"},
+        {"side": "SELL", "qty": 260, "entry": 91.5, "sec_id": "5", "expiry": "2026-03-30", "strike": "NIFTY-Mar2026-24300-CE"},
+        {"side": "BUY", "qty": 130, "entry": 7.7, "sec_id": "6", "expiry": "2026-03-30", "strike": "NIFTY-Mar2026-25500-CE"},
+    ]
+
+
 def test_importable_bkm_quality_warns_on_skewed_wings(monkeypatch, tmp_path: Path) -> None:
     _configure_temp_state(monkeypatch, tmp_path)
     monkeypatch.setattr(server, "_build_chain_map", lambda expiry: {"map": {}, "spot": 25446.35, "ts": 0.0})
@@ -440,3 +570,14 @@ def test_importable_bkm_quality_can_block_when_enforced(monkeypatch, tmp_path: P
     assert out["ok"] is False
     assert out["imported"] is False
     assert out["error"] == "BKM_QUALITY_CHECK_FAILED"
+
+
+def test_importable_bkm_accepts_symmetric_ratio_121(monkeypatch, tmp_path: Path) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, "_build_chain_map", lambda expiry: {"map": {}, "spot": 23777.8, "ts": 0.0})
+    settings = json.loads((tmp_path / "state" / "agent_settings.json").read_text())
+    settings["batman_bkm_import_enforce_quality"] = False
+    out = server._build_importable_bkm_from_broker_positions(_bkm_positions_payload_ratio_121(), settings=settings)
+    assert out["ok"] is True
+    assert out["imported"] is True
+    assert out["short_ratio"] == 2

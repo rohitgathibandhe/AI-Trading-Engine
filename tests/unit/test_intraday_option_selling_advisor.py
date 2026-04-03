@@ -231,6 +231,102 @@ def test_intraday_advisor_waits_for_signal_persistence_before_enter(tmp_path: Pa
     assert second["recommendation"]["strategy_type"] == "PUT_CREDIT_SPREAD"
 
 
+def test_intraday_advisor_persistence_ignores_small_strike_shifts(tmp_path: Path) -> None:
+    adv = _advisor_with_config(tmp_path, signal_persistence_bars=2)
+    first = adv.update(
+        now=_ist_dt(26, 11, 0),
+        expiry="2026-03-03",
+        spot=25600.0,
+        chain_rows=_chain_rows(),
+        context=_context(conflict=18.0, trend_conf=0.82, bias="BULLISH"),
+        has_open_bkm=False,
+    )
+    assert first["signal"] == "WAIT"
+    second = adv.update(
+        now=_ist_dt(26, 11, 1),
+        expiry="2026-03-03",
+        spot=25580.0,
+        chain_rows=_chain_rows(),
+        context=_context(conflict=18.0, trend_conf=0.82, bias="BULLISH"),
+        has_open_bkm=False,
+    )
+    assert second["signal"] == "ENTER_NOW"
+    assert second["recommendation"]["strategy_type"] == "PUT_CREDIT_SPREAD"
+
+
+def test_intraday_advisor_fast_tracks_strong_bearish_trend_day(tmp_path: Path) -> None:
+    adv = _advisor_with_config(tmp_path, signal_persistence_bars=2, preferred_bias="BEARISH")
+    out = adv.update(
+        now=_ist_dt(26, 10, 41),
+        expiry="2026-03-03",
+        spot=25600.0,
+        chain_rows=_chain_rows(),
+        context=_context(conflict=35.0, trend_conf=0.90, bias="BEARISH"),
+        has_open_bkm=False,
+    )
+    assert out["signal"] == "ENTER_NOW"
+    assert out["recommendation"]["strategy_type"] == "CALL_CREDIT_SPREAD"
+
+
+def test_intraday_advisor_delays_high_vol_bear_call_before_1015(tmp_path: Path) -> None:
+    adv = _advisor_with_config(tmp_path, signal_persistence_bars=1, preferred_bias="BEARISH")
+    ctx = _context(conflict=24.0, trend_conf=0.95, bias="BEARISH")
+    ctx["trend"]["volatility_regime"] = "HIGH"
+    ctx["structure"]["volatility_regime"] = "HIGH"
+    out = adv.update(
+        now=_ist_dt(26, 10, 7),
+        expiry="2026-03-03",
+        spot=25600.0,
+        chain_rows=_chain_rows(),
+        context=ctx,
+        has_open_bkm=False,
+    )
+    assert out["signal"] == "WAIT"
+    assert "HIGH_VOL_BEAR_CALL_DELAY" in (out.get("reasons") or [])
+
+
+def test_intraday_advisor_blocks_one_bar_countertrend_flip_and_preserves_candidate(tmp_path: Path) -> None:
+    adv = _advisor_with_config(
+        tmp_path,
+        signal_persistence_bars=2,
+        preferred_bias="BEARISH",
+        trend_day_fast_track_min_trend_confidence=0.90,
+    )
+    first = adv.update(
+        now=_ist_dt(26, 10, 41),
+        expiry="2026-03-03",
+        spot=25600.0,
+        chain_rows=_chain_rows(),
+        context=_context(conflict=35.0, trend_conf=0.74, bias="BEARISH"),
+        has_open_bkm=False,
+    )
+    assert first["signal"] == "WAIT"
+    assert first["strategy"] == "CALL_CREDIT_SPREAD"
+    first_signature = first.get("candidate_setup_signature")
+    second = adv.update(
+        now=_ist_dt(26, 10, 43),
+        expiry="2026-03-03",
+        spot=25620.0,
+        chain_rows=_chain_rows(),
+        context=_context(conflict=52.0, trend_conf=0.79, bias="BULLISH"),
+        has_open_bkm=False,
+    )
+    assert second["signal"] == "WAIT"
+    assert "COUNTERTREND_FLIP_BLOCKED" in (second.get("reasons") or [])
+    assert second.get("candidate_setup_signature") == first_signature
+    assert second.get("candidate_signal_streak") == 1
+    third = adv.update(
+        now=_ist_dt(26, 10, 47),
+        expiry="2026-03-03",
+        spot=25570.0,
+        chain_rows=_chain_rows(),
+        context=_context(conflict=43.0, trend_conf=0.80, bias="BEARISH"),
+        has_open_bkm=False,
+    )
+    assert third["signal"] == "ENTER_NOW"
+    assert third["recommendation"]["strategy_type"] == "CALL_CREDIT_SPREAD"
+
+
 def test_intraday_advisor_blocks_directional_entry_when_ema_not_aligned(tmp_path: Path) -> None:
     adv = _advisor_with_config(tmp_path, signal_persistence_bars=1)
     ctx = _context(conflict=18.0, trend_conf=0.82, bias="BULLISH")
@@ -282,6 +378,65 @@ def test_intraday_advisor_blocks_directional_entry_when_price_action_not_confirm
     )
     assert out["signal"] == "WAIT"
     assert "PRICE_ACTION_CONFIRMATION_MISSING" in (out.get("reasons") or [])
+
+
+def test_intraday_advisor_requires_supportive_retest_in_high_volatility(tmp_path: Path) -> None:
+    adv = _advisor_with_config(tmp_path, signal_persistence_bars=1, preferred_bias="BEARISH")
+    ctx = _context(conflict=18.0, trend_conf=0.82, bias="BEARISH")
+    ctx["trend"]["volatility_regime"] = "HIGH"
+    ctx["structure"]["volatility_regime"] = "HIGH"
+    ctx["structure"]["price_action_confirmation"] = "CANDLE_CONFIRMED"
+    ctx["structure"]["retest_status"] = "NONE"
+    ctx["structure"]["retest_bias"] = "NEUTRAL"
+    out = adv.update(
+        now=_ist_dt(26, 11, 0),
+        expiry="2026-03-03",
+        spot=25600.0,
+        chain_rows=_chain_rows(),
+        context=ctx,
+        has_open_bkm=False,
+    )
+    assert out["signal"] == "WAIT"
+    assert "HIGH_VOL_RETEST_REQUIRED" in (out.get("reasons") or [])
+
+
+def test_intraday_advisor_blocks_high_vol_bullish_countertrend_put_spread_for_bearish_preference(tmp_path: Path) -> None:
+    adv = _advisor_with_config(tmp_path, signal_persistence_bars=1, preferred_bias="BEARISH")
+    ctx = _context(conflict=18.0, trend_conf=0.82, bias="BULLISH")
+    ctx["trend"]["volatility_regime"] = "HIGH"
+    ctx["structure"]["volatility_regime"] = "HIGH"
+    out = adv.update(
+        now=_ist_dt(26, 11, 0),
+        expiry="2026-03-03",
+        spot=25600.0,
+        chain_rows=_chain_rows(),
+        context=ctx,
+        has_open_bkm=False,
+    )
+    assert out["signal"] == "WAIT"
+    assert "HIGH_VOL_BULL_PUT_DISABLED" in (out.get("reasons") or [])
+
+
+def test_intraday_advisor_can_reenable_high_vol_bull_put_for_bearish_preference(tmp_path: Path) -> None:
+    adv = _advisor_with_config(
+        tmp_path,
+        signal_persistence_bars=1,
+        preferred_bias="BEARISH",
+        high_vol_bull_put_enabled_for_bearish_preference=True,
+    )
+    ctx = _context(conflict=18.0, trend_conf=0.90, bias="BULLISH")
+    ctx["trend"]["volatility_regime"] = "HIGH"
+    ctx["structure"]["volatility_regime"] = "HIGH"
+    out = adv.update(
+        now=_ist_dt(26, 11, 0),
+        expiry="2026-03-03",
+        spot=25600.0,
+        chain_rows=_chain_rows(),
+        context=ctx,
+        has_open_bkm=False,
+    )
+    assert out["signal"] == "ENTER_NOW"
+    assert out["recommendation"]["strategy_type"] == "PUT_CREDIT_SPREAD"
 
 
 def test_intraday_advisor_blocks_directional_entry_when_retest_fails_against_setup(tmp_path: Path) -> None:
