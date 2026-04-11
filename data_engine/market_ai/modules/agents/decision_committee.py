@@ -74,11 +74,13 @@ class DecisionCommittee:
         status_path: Path,
         history_path: Optional[Path] = None,
         outcomes_path: Optional[Path] = None,
+        learning_manager: Any = None,
         logger: Any = None,
     ) -> None:
         self.status_path = status_path
         self.history_path = history_path
         self.outcomes_path = outcomes_path
+        self.learning_manager = learning_manager
         self.log = logger
         self.status_path.parent.mkdir(parents=True, exist_ok=True)
         if self.history_path is not None:
@@ -243,6 +245,11 @@ class DecisionCommittee:
             "entry_features": dict(entry_features or {}),
         }
         self._append_outcome(outcome)
+        if self.learning_manager is not None:
+            try:
+                self.learning_manager.ingest_outcome(outcome, now=ts)
+            except Exception:
+                self._log("exception", "Failed to ingest intraday learning outcome")
         return outcome
 
     def set_inactive(
@@ -302,19 +309,58 @@ class DecisionCommittee:
             has_open_bkm=has_open_bkm,
             allow_parallel_with_bkm=allow_parallel_with_bkm,
         )
+        consensus_bias = self._consensus_bias(market_structure.stance, chain_component.stance, construction.stance)
+        confidence = self._ensemble_confidence(market_structure, chain_component, construction, critic)
+        learning_component = CommitteeComponent(
+            name="adaptive_learning",
+            stance="NEUTRAL",
+            score=round(confidence, 3),
+            confidence=0.0,
+            veto=False,
+            reasons=["LEARNING_NEUTRAL"],
+        )
+        if self.learning_manager is not None:
+            try:
+                learning_assessment = self.learning_manager.assess_signal(
+                    signal_payload=signal_payload,
+                    context=context,
+                    consensus_bias=consensus_bias,
+                    base_confidence=confidence,
+                )
+                comp = learning_assessment.get("component") if isinstance(learning_assessment, dict) else {}
+                if isinstance(comp, dict):
+                    learning_component = CommitteeComponent(
+                        name="adaptive_learning",
+                        stance=str(comp.get("stance") or "NEUTRAL").upper(),
+                        score=round(_clamp01(comp.get("score"), confidence), 3),
+                        confidence=round(_clamp01(comp.get("confidence"), 0.0), 3),
+                        veto=bool(comp.get("veto", False)),
+                        reasons=list(comp.get("reasons") or []),
+                    )
+                confidence = max(
+                    0.0,
+                    min(
+                        1.0,
+                        confidence + float(_safe_float((learning_assessment or {}).get("confidence_adjust"), 0.0) or 0.0),
+                    ),
+                )
+                if bool((learning_assessment or {}).get("block_entry")):
+                    critic.veto = True
+                    critic.reasons.append("ADAPTIVE_LEARNING_BLOCK")
+            except Exception:
+                self._log("exception", "Failed to evaluate adaptive learning")
 
         components = {
             "market_structure": asdict(market_structure),
             "option_chain": asdict(chain_component),
             "trade_construction": asdict(construction),
             "risk_critic": asdict(critic),
+            "adaptive_learning": asdict(learning_component),
         }
         reasons: List[str] = []
-        for comp in (market_structure, chain_component, construction, critic):
+        for comp in (market_structure, chain_component, construction, critic, learning_component):
             reasons.extend([r for r in comp.reasons if r])
 
-        consensus_bias = self._consensus_bias(market_structure.stance, chain_component.stance, construction.stance)
-        confidence = self._ensemble_confidence(market_structure, chain_component, construction, critic)
         advisor_signal = str(signal_payload.get("signal") or "NO_TRADE").upper()
         verdict = "WAIT"
         if critic.veto:
@@ -360,7 +406,7 @@ class DecisionCommittee:
         if pa_conf != "NONE":
             reasons.append(f"PRICE_ACTION_{pa_conf}")
             score += 0.10
-        if retest not in {"NONE", "RETEST_FAILED"}:
+        if retest not in {"NONE", "RETEST_FAILED", "FAILED_BREAKOUT_RETEST", "FAILED_BREAKDOWN_RETEST"}:
             reasons.append(f"RETEST_{retest}")
             score += 0.10
         return CommitteeComponent(
@@ -415,9 +461,9 @@ class DecisionCommittee:
         score = 0.0
         reasons: List[str] = []
         stance = "NEUTRAL"
-        if strategy == "PUT_CREDIT_SPREAD":
+        if strategy in {"PUT_CREDIT_SPREAD", "SHORT_PUT_WITH_HEDGE"}:
             stance = "BULLISH"
-        elif strategy == "CALL_CREDIT_SPREAD":
+        elif strategy in {"CALL_CREDIT_SPREAD", "SHORT_CALL_WITH_HEDGE"}:
             stance = "BEARISH"
         elif strategy == "IRON_CONDOR":
             stance = "NEUTRAL"

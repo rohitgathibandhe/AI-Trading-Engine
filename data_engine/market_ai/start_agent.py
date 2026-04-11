@@ -54,11 +54,14 @@ AGENT_ALERTS_FILE = STATE_DIR / "agent_alerts.jsonl"
 TELEGRAM_ALERT_STATUS_FILE = STATE_DIR / "telegram_alert_status.json"
 BATMAN_BKM_AI_STATUS_FILE = STATE_DIR / "batman_bkm_ai_status.json"
 BATMAN_BKM_AI_EVENTS_FILE = STATE_DIR / "batman_bkm_ai_events.jsonl"
+BATMAN_BKM_LEARNING_STATUS_FILE = STATE_DIR / "batman_bkm_learning_status.json"
+BATMAN_BKM_LEARNING_OUTCOMES_FILE = STATE_DIR / "batman_bkm_learning_outcomes.jsonl"
 BATMAN_BKM_AI_PROTECT_STATUS_FILE = STATE_DIR / "batman_bkm_ai_protect_status.json"
 BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_FILE = STATE_DIR / "batman_bkm_ai_protect_clear_request.json"
 DECISION_COMMITTEE_STATUS_FILE = STATE_DIR / "decision_committee_status.json"
 DECISION_COMMITTEE_HISTORY_FILE = STATE_DIR / "decision_committee_history.jsonl"
 DECISION_COMMITTEE_OUTCOMES_FILE = STATE_DIR / "decision_committee_outcomes.jsonl"
+INTRADAY_AI_LEARNING_STATUS_FILE = STATE_DIR / "intraday_ai_learning_status.json"
 INTRADAY_AI_ADVISOR_STATUS_FILE = STATE_DIR / "intraday_ai_advisor_status.json"
 INTRADAY_AI_DEPLOY_REQUEST_FILE = STATE_DIR / "intraday_ai_deploy_request.json"
 INTRADAY_AI_DEPLOY_STATUS_FILE = STATE_DIR / "intraday_ai_deploy_status.json"
@@ -217,8 +220,25 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "batman_bkm_ai_protect_auto_unlock_require_action": "HOLD",
     "batman_bkm_ai_protect_auto_unlock_market_hours_only": True,
     "batman_bkm_ai_protect_auto_unlock_require_clean_system": True,
+    # Batman BKM adaptive learning
+    "batman_bkm_learning_enabled": True,
+    "batman_bkm_learning_allow_premarket_entry": False,
+    "batman_bkm_learning_opening_range_block_minutes": 15,
+    "batman_bkm_learning_min_bucket_samples": 3,
+    "batman_bkm_learning_negative_bucket_win_rate_max": 0.45,
+    "batman_bkm_learning_negative_bucket_avg_pnl_max": -2000.0,
+    "batman_bkm_learning_positive_bucket_win_rate_min": 0.60,
+    "batman_bkm_learning_positive_bucket_avg_pnl_min": 1000.0,
+    "batman_bkm_learning_entry_block_penalty_score": 12.0,
+    "batman_bkm_learning_risk_score_penalty_per_bucket": 4.0,
+    "batman_bkm_learning_risk_score_bonus_per_bucket": 1.5,
+    "batman_bkm_learning_risk_score_adjust_cap": 15.0,
+    "batman_bkm_learning_review_window": 100,
+    # Global execution policy
+    "agent_execution_mode": "EXECUTION",
     # Intraday option-selling advisor (Phase A)
     "intraday_ai_enabled": True,
+    "intraday_ai_mode": "ADVISOR",
     "intraday_ai_refresh_sec": 60.0,
     "intraday_ai_market_open_time": "09:15",
     "intraday_ai_entry_not_before": "09:45",
@@ -241,6 +261,13 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "intraday_ai_ic_stop_credit_multiple": 1.8,
     "intraday_ai_spread_stop_credit_multiple": 1.6,
     "intraday_ai_min_credit_per_set_rs": 500.0,
+    "intraday_ai_directional_structure": "SHORT_OPTION_WITH_HEDGE",
+    "intraday_ai_emergency_hedge_distance_points_low_vol": 300,
+    "intraday_ai_emergency_hedge_distance_points_normal_vol": 400,
+    "intraday_ai_emergency_hedge_distance_points_high_vol": 500,
+    "intraday_ai_naked_operational_max_loss_rs": 3000.0,
+    "intraday_ai_naked_profit_trail_arm_rs": 5000.0,
+    "intraday_ai_naked_profit_trail_keep_pct": 0.72,
     "intraday_ai_max_signal_age_sec": 180.0,
     "intraday_ai_preferred_bias": "BEARISH",
     "intraday_ai_require_ema_alignment": True,
@@ -257,6 +284,17 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "intraday_ai_directional_flip_override_min_conflict_improvement": 8.0,
     "intraday_ai_high_vol_bear_call_not_before": "10:15",
     "intraday_ai_high_vol_bull_put_enabled_for_bearish_preference": False,
+    "intraday_ai_learning_enabled": True,
+    "intraday_ai_learning_min_bucket_samples": 3,
+    "intraday_ai_learning_negative_bucket_win_rate_max": 0.40,
+    "intraday_ai_learning_negative_bucket_avg_pnl_max": -50.0,
+    "intraday_ai_learning_positive_bucket_win_rate_min": 0.58,
+    "intraday_ai_learning_positive_bucket_avg_pnl_min": 20.0,
+    "intraday_ai_learning_confidence_penalty_per_bucket": 0.06,
+    "intraday_ai_learning_confidence_bonus_per_bucket": 0.03,
+    "intraday_ai_learning_confidence_adjust_cap": 0.18,
+    "intraday_ai_learning_entry_block_negative_bucket_hits": 3,
+    "intraday_ai_learning_review_window": 300,
     "intraday_ai_deploy_enabled": True,
     "intraday_ai_deploy_lots_multiplier": 1,
     "intraday_ai_deploy_dedupe_sec": 90.0,
@@ -400,6 +438,8 @@ from market_ai.engine.feature_extractor import FeatureExtractor
 from market_ai.engine.regime_scorer import RegimeScorer
 from market_ai.engine.policy_engine import PolicyEngine
 from market_ai.engine.learning_manager import LearningManager
+from market_ai.modules.analytics.live_trade_monitor import find_multi_tf_zones, nearest_zones
+from market_ai.modules.analytics.price_action_patterns import detect_recent_price_action
 from market_ai.modules.strategies.batman_bkm_monthly import BatmanBKMConfig, BatmanBKMStrategy
 from market_ai.modules.agents.live_gate import LiveGate, LiveGateConfig
 from market_ai.modules.agents.position_reconciler import PositionReconciler, PositionReconcilerConfig
@@ -423,12 +463,24 @@ from market_ai.modules.agents.batman_bkm_ai_manager import (
     BatmanBKMAIManager,
     BatmanBKMAIConfig,
 )
+from market_ai.modules.agents.batman_bkm_learning import (
+    BatmanBKMLearningManager,
+    BatmanBKMLearningConfig,
+)
+from market_ai.modules.agents.intraday_learning import (
+    IntradayLearningManager,
+    IntradayLearningConfig,
+)
 from market_ai.modules.agents.intraday_option_selling_advisor import (
     IntradayOptionSellingAdvisor,
     IntradayOptionSellingAdvisorConfig,
 )
 from market_ai.modules.agents.intraday_position_manager import IntradayPositionManager
 from market_ai.modules.agents.decision_committee import DecisionCommittee
+from market_ai.modules.agents.execution_policy import (
+    build_execution_policy as _shared_build_execution_policy,
+    intraday_ai_mode_name as _shared_intraday_ai_mode_name,
+)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -735,6 +787,113 @@ def _mark_bkm_closed(expiry: str, reason: str = "", pnl: Optional[float] = None)
     if pnl is not None:
         entry["pnl"] = pnl
     save_strategy_state(state)
+
+
+def _load_bkm_state_entry(expiry: str) -> Dict[str, Any]:
+    state = load_strategy_state()
+    bucket = state.get("BATMAN_BKM", {}) if isinstance(state, dict) else {}
+    payload = bucket.get(expiry, {}) if isinstance(bucket, dict) else {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _load_jsonl_dict_rows(path: Path, limit: int = 500) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    rows.append(payload)
+    except Exception:
+        return []
+    return rows[-limit:] if limit > 0 else rows
+
+
+def _build_bkm_learning_entry_snapshot(
+    *,
+    now_ist: datetime,
+    trade_mode: str,
+    expiry_str: str,
+    entry_spot: float,
+    entry_mode: str,
+    quality_report: Dict[str, Any],
+    planner_summary: Optional[Dict[str, Any]],
+    context: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    ctx = context if isinstance(context, dict) else {}
+    oc_ctx = ctx.get("option_chain") if isinstance(ctx.get("option_chain"), dict) else {}
+    trend_ctx = ctx.get("trend") if isinstance(ctx.get("trend"), dict) else {}
+    structure_ctx = ctx.get("structure") if isinstance(ctx.get("structure"), dict) else {}
+    oi_build = oc_ctx.get("oi_build") if isinstance(oc_ctx.get("oi_build"), dict) else {}
+    summary = planner_summary if isinstance(planner_summary, dict) else {}
+    return {
+        "timestamp": now_ist.isoformat(timespec="seconds"),
+        "trade_mode": str(trade_mode or "").strip().lower(),
+        "expiry": expiry_str,
+        "spot": round(float(entry_spot or 0.0), 2),
+        "entry_mode": str(entry_mode or "UNKNOWN").upper(),
+        "quality_status": str(quality_report.get("status") or summary.get("quality_status") or "UNKNOWN"),
+        "quality_score": float(quality_report.get("score") or summary.get("quality_score") or 0.0),
+        "quality_reason": str(quality_report.get("reason") or summary.get("quality_reason") or "UNKNOWN"),
+        "net_credit_rs": float(summary.get("net_credit") or 0.0),
+        "credit_pct": float(summary.get("credit_pct") or 0.0),
+        "net_delta": summary.get("net_delta"),
+        "loss_skew_abs": summary.get("loss_skew_abs"),
+        "market_bias": str(structure_ctx.get("dominant_signal_bias") or "NEUTRAL"),
+        "dominant_signal_bias": str(structure_ctx.get("dominant_signal_bias") or "NEUTRAL"),
+        "trend_confidence": structure_ctx.get("trend_confidence"),
+        "signal_conflict_score": structure_ctx.get("signal_conflict_score"),
+        "pcr_bias": str(oc_ctx.get("pcr_bias") or "NEUTRAL"),
+        "pcr_total": oc_ctx.get("pcr_total"),
+        "pcr_near_atm": oc_ctx.get("pcr_near_atm"),
+        "oi_build_bias": str(oi_build.get("bias") or "UNKNOWN"),
+        "volatility_regime": str(trend_ctx.get("volatility_regime") or "UNKNOWN"),
+        "breakout_confirmation": str(trend_ctx.get("breakout_confirmation") or "NONE"),
+        "pcr_unbalanced_side": str(structure_ctx.get("pcr_unbalanced_side") or "NEUTRAL"),
+        "intraday_support": structure_ctx.get("intraday_support"),
+        "intraday_resistance": structure_ctx.get("intraday_resistance"),
+        "weekly_support": structure_ctx.get("weekly_support"),
+        "weekly_resistance": structure_ctx.get("weekly_resistance"),
+        "context": {
+            "option_chain": oc_ctx,
+            "trend": trend_ctx,
+            "structure": structure_ctx,
+        },
+    }
+
+
+def _build_bkm_learning_close_context(
+    *,
+    ai_eval: Optional[Dict[str, Any]],
+    day_mode: str,
+    spot: float,
+    pnl: float,
+) -> Dict[str, Any]:
+    eval_payload = ai_eval if isinstance(ai_eval, dict) else {}
+    market_context = eval_payload.get("market_context") if isinstance(eval_payload.get("market_context"), dict) else {}
+    return {
+        "day_mode": str(day_mode or "UNKNOWN"),
+        "spot": round(float(spot or 0.0), 2),
+        "pnl_rs": round(float(pnl or 0.0), 2),
+        "action": str(eval_payload.get("action") or "HOLD"),
+        "severity": str(eval_payload.get("severity") or "INFO"),
+        "score": float(eval_payload.get("score") or 0.0),
+        "confidence": float(eval_payload.get("confidence") or 0.0),
+        "market_bias": str(eval_payload.get("market_bias") or "NEUTRAL"),
+        "position_risk_side": str(eval_payload.get("position_risk_side") or "UNKNOWN"),
+        "reasons": list(eval_payload.get("reasons") or []),
+        "supportive_reasons": list(market_context.get("learning", {}).get("supportive_reasons") or []),
+        "learning_status": str(market_context.get("learning", {}).get("status") or "UNKNOWN"),
+        "learning_risk_score_adjust": float(market_context.get("learning", {}).get("risk_score_adjust") or 0.0),
+    }
 
 
 def _rebuild_bkm_basket_from_blotter(expiry: datetime.date, trade_mode: str, cfg: "BatmanBKMConfig") -> Optional["BatmanBKMBasket"]:
@@ -1224,6 +1383,8 @@ def _flatten_bkm_basket(
     reason: str,
     live_order_executor: Optional[LiveOrderExecutor] = None,
     execution_journal: Optional[ExecutionJournal] = None,
+    bkm_learning_manager: Optional[BatmanBKMLearningManager] = None,
+    learning_close_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     basket = bkm_strategy.basket
     if not basket:
@@ -1351,6 +1512,24 @@ def _flatten_bkm_basket(
         _log_batman_blotter(trade_mode, basket.legs, "CLOSE")
     except Exception:
         pass
+    try:
+        if bkm_learning_manager:
+            state_entry = _load_bkm_state_entry(expiry_str)
+            bkm_learning_manager.record_outcome(
+                expiry=expiry_str,
+                trade_mode=trade_mode,
+                opened_at=state_entry.get("opened_at"),
+                closed_at=_now_iso(),
+                close_reason=reason,
+                pnl_rs=float(basket.mtm() or 0.0),
+                entry_snapshot=(state_entry.get("learning_entry") if isinstance(state_entry.get("learning_entry"), dict) else {}),
+                close_context=(learning_close_context if isinstance(learning_close_context, dict) else {}),
+                quality_status=str(state_entry.get("quality_status") or ""),
+                quality_score=float(state_entry.get("quality_score") or 0.0),
+                net_credit_rs=float(state_entry.get("net_credit") or 0.0),
+            )
+    except Exception:
+        log.exception("[BatmanBKM-Learn] failed to record basket outcome expiry=%s reason=%s", expiry_str, reason)
     _mark_bkm_closed(basket.expiry.isoformat(), reason, basket.mtm())
     _bkm_journal_event(
         journal=execution_journal,
@@ -1376,6 +1555,7 @@ def _apply_live_gate_failsafe(
     trade_mode: str,
     live_order_executor: Optional[LiveOrderExecutor] = None,
     execution_journal: Optional[ExecutionJournal] = None,
+    bkm_learning_manager: Optional[BatmanBKMLearningManager] = None,
 ) -> int:
     live_gate.trigger_failsafe(reason)
     if not bkm_strategy or not bkm_strategy.basket:
@@ -1387,6 +1567,7 @@ def _apply_live_gate_failsafe(
         reason="DATA_FAILSAFE_LOCK",
         live_order_executor=live_order_executor,
         execution_journal=execution_journal,
+        bkm_learning_manager=bkm_learning_manager,
     )
     return int(flatten_res.get("closed_legs", 0))
 
@@ -1803,14 +1984,24 @@ def _is_india_market_open(now: Optional[datetime] = None) -> bool:
     return start <= current.time() <= end
 
 
+def _intraday_ai_mode_name(settings: Dict[str, Any]) -> str:
+    return _shared_intraday_ai_mode_name(settings or {})
+
+
+def _intraday_ai_execution_mode_enabled(settings: Dict[str, Any], trade_mode: str) -> bool:
+    return bool(_shared_build_execution_policy(settings or {}, trade_mode).get("intraday_new_entries_allowed", False))
+
+
+def _execution_policy(settings: Dict[str, Any], trade_mode: str) -> Dict[str, Any]:
+    return _shared_build_execution_policy(settings or {}, trade_mode)
+
+
 def _paper_intraday_only_mode_enabled(settings: Dict[str, Any], trade_mode: str) -> bool:
     if str(trade_mode or "").lower() != "paper":
         return False
     if not bool(settings.get("paper_intraday_only_mode_enabled", True)):
         return False
-    if not bool(settings.get("intraday_ai_enabled", True)):
-        return False
-    return bool(settings.get("intraday_ai_auto_deploy_paper_enabled", True))
+    return bool(_execution_policy(settings, "paper").get("intraday_new_entries_allowed", False))
 
 
 def _default_bkm_ai_protect_status(now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -1945,6 +2136,7 @@ def _default_intraday_ai_status(now: Optional[datetime] = None) -> Dict[str, Any
     ts = now or _ist_now()
     return {
         "status": "IDLE",
+        "mode": "ADVISOR",
         "signal": "NO_TRADE",
         "priority": "INFO",
         "strategy": None,
@@ -1989,6 +2181,7 @@ def _load_intraday_ai_status(now: Optional[datetime] = None) -> Dict[str, Any]:
         out["market_context"] = out.get("market_context") if isinstance(out.get("market_context"), dict) else {}
         out["recommendation"] = out.get("recommendation") if isinstance(out.get("recommendation"), dict) else {}
         out["reasons"] = out.get("reasons") if isinstance(out.get("reasons"), list) else []
+        out["mode"] = str(out.get("mode") or "ADVISOR").strip().upper() or "ADVISOR"
         out["has_open_bkm"] = bool(out.get("has_open_bkm", False))
         out["pcr_unbalanced"] = bool(out.get("pcr_unbalanced", False))
         try:
@@ -2012,6 +2205,8 @@ def _set_intraday_ai_runtime_status(
     *,
     now: Optional[datetime] = None,
     intraday_enabled: bool,
+    settings: Optional[Dict[str, Any]] = None,
+    trade_mode: str = "paper",
     has_open_bkm: bool = False,
     allow_parallel_with_bkm: bool = False,
     bkm_expiry: Optional[str] = None,
@@ -2020,6 +2215,7 @@ def _set_intraday_ai_runtime_status(
     payload = _load_intraday_ai_status(ts)
     session_date = ts.date().isoformat()
     payload.update(_default_intraday_ai_status(ts))
+    payload["mode"] = _intraday_ai_mode_name(settings or {})
     payload["has_open_bkm"] = bool(has_open_bkm)
     payload["expiry"] = str(bkm_expiry or "").strip() or None
     reasons: List[str] = []
@@ -2706,9 +2902,9 @@ def _chain_row_for_option(chain_rows: List[Dict[str, Any]], *, option_type: str,
 
 def _intraday_strategy_type_enum(strategy_name: str) -> StrategyType:
     name = str(strategy_name or "").upper()
-    if name == "PUT_CREDIT_SPREAD":
+    if name in {"PUT_CREDIT_SPREAD", "SHORT_PUT_WITH_HEDGE"}:
         return StrategyType.BULL_PUT_SPREAD
-    if name == "CALL_CREDIT_SPREAD":
+    if name in {"CALL_CREDIT_SPREAD", "SHORT_CALL_WITH_HEDGE"}:
         return StrategyType.BEAR_CALL_SPREAD
     return StrategyType.NONE
 
@@ -2761,181 +2957,17 @@ def _detect_recent_price_action(
     support: Optional[float],
     resistance: Optional[float],
     atr_like_points: float,
+    ema_slow: Optional[float] = None,
+    ema_base: Optional[float] = None,
 ) -> Dict[str, Any]:
-    default = {
-        "price_action_bias": "NEUTRAL",
-        "price_action_confirmation": "NONE",
-        "price_action_score": 0.0,
-        "primary_pattern": "NONE",
-        "price_action_patterns": [],
-        "retest_status": "NONE",
-        "retest_bias": "NEUTRAL",
-        "retest_level": None,
-        "retest_score": 0.0,
-    }
-    parsed: List[Dict[str, float]] = []
-    for candle in (candles or [])[-6:]:
-        try:
-            open_px = float(candle.get("open") or candle.get("close") or 0.0)
-            high_px = float(candle.get("high") or candle.get("close") or open_px)
-            low_px = float(candle.get("low") or candle.get("close") or open_px)
-            close_px = float(candle.get("close") or open_px)
-        except Exception:
-            continue
-        rng = max(0.01, high_px - low_px)
-        body = abs(close_px - open_px)
-        upper_wick = max(0.0, high_px - max(open_px, close_px))
-        lower_wick = max(0.0, min(open_px, close_px) - low_px)
-        close_pos = (close_px - low_px) / rng
-        parsed.append(
-            {
-                "open": open_px,
-                "high": high_px,
-                "low": low_px,
-                "close": close_px,
-                "range": rng,
-                "body": body,
-                "upper_wick": upper_wick,
-                "lower_wick": lower_wick,
-                "close_pos": close_pos,
-            }
-        )
-    if len(parsed) < 3:
-        return default
-
-    last = parsed[-1]
-    prev = parsed[-2]
-    prev2 = parsed[-3]
-    prior_rows = parsed[:-1]
-    prior_high = max(row["high"] for row in prior_rows)
-    prior_low = min(row["low"] for row in prior_rows)
-    avg_range = max(0.01, float(atr_like_points or 0.0), sum(row["range"] for row in parsed) / len(parsed))
-    level_buffer = max(8.0, avg_range * 0.25)
-
-    bullish_score = 0.0
-    bearish_score = 0.0
-    bullish_patterns: List[str] = []
-    bearish_patterns: List[str] = []
-    retest_status = "NONE"
-    retest_bias = "NEUTRAL"
-    retest_level: Optional[float] = None
-    retest_score = 0.0
-
-    def _record_retest(*, status: str, bias: str, level: Optional[float], score: float) -> None:
-        nonlocal retest_status, retest_bias, retest_level, retest_score
-        if float(score) >= float(retest_score):
-            retest_status = str(status)
-            retest_bias = str(bias)
-            retest_level = None if level is None else float(level)
-            retest_score = float(score)
-
-    if (
-        last["close"] > last["open"]
-        and prev["close"] < prev["open"]
-        and last["open"] <= prev["close"]
-        and last["close"] >= prev["open"]
-        and last["body"] >= (prev["body"] * 0.9)
-    ):
-        bullish_score += 0.85
-        bullish_patterns.append("BULLISH_ENGULFING")
-    if (
-        last["close"] < last["open"]
-        and prev["close"] > prev["open"]
-        and last["open"] >= prev["close"]
-        and last["close"] <= prev["open"]
-        and last["body"] >= (prev["body"] * 0.9)
-    ):
-        bearish_score += 0.85
-        bearish_patterns.append("BEARISH_ENGULFING")
-    if last["lower_wick"] >= max(last["body"] * 1.6, avg_range * 0.18) and last["close_pos"] >= 0.60:
-        bullish_score += 0.55
-        bullish_patterns.append("LOWER_REJECTION")
-    if last["upper_wick"] >= max(last["body"] * 1.6, avg_range * 0.18) and last["close_pos"] <= 0.40:
-        bearish_score += 0.55
-        bearish_patterns.append("UPPER_REJECTION")
-    if last["close"] > prior_high and last["close_pos"] >= 0.62:
-        bullish_score += 0.70
-        bullish_patterns.append("BREAKOUT_CONTINUATION_UP")
-    if last["close"] < prior_low and last["close_pos"] <= 0.38:
-        bearish_score += 0.70
-        bearish_patterns.append("BREAKOUT_CONTINUATION_DOWN")
-    if (
-        prev["high"] <= prev2["high"]
-        and prev["low"] >= prev2["low"]
-        and last["close"] > prev["high"] + (level_buffer * 0.05)
-        and last["close"] > last["open"]
-    ):
-        bullish_score += 0.50
-        bullish_patterns.append("INSIDE_BAR_BREAK_UP")
-    if (
-        prev["high"] <= prev2["high"]
-        and prev["low"] >= prev2["low"]
-        and last["close"] < prev["low"] - (level_buffer * 0.05)
-        and last["close"] < last["open"]
-    ):
-        bearish_score += 0.50
-        bearish_patterns.append("INSIDE_BAR_BREAK_DOWN")
-
-    if support is not None:
-        support_f = float(support)
-        if last["low"] <= support_f + level_buffer and last["close"] >= support_f + (level_buffer * 0.10) and last["close_pos"] >= 0.55:
-            _record_retest(status="SUPPORT_HOLD", bias="BULLISH", level=support_f, score=0.72)
-    if resistance is not None:
-        resistance_f = float(resistance)
-        if last["high"] >= resistance_f - level_buffer and last["close"] <= resistance_f - (level_buffer * 0.10) and last["close_pos"] <= 0.45:
-            _record_retest(status="RESISTANCE_HOLD", bias="BEARISH", level=resistance_f, score=0.72)
-    if resistance is not None:
-        resistance_f = float(resistance)
-        if prev["close"] > resistance_f and last["low"] <= resistance_f + level_buffer and last["close"] > resistance_f:
-            _record_retest(status="BREAKOUT_RETEST_HOLD", bias="BULLISH", level=resistance_f, score=0.88)
-        elif prev["close"] > resistance_f and last["close"] < resistance_f:
-            _record_retest(status="RETEST_FAILED", bias="BEARISH", level=resistance_f, score=0.82)
-    if support is not None:
-        support_f = float(support)
-        if prev["close"] < support_f and last["high"] >= support_f - level_buffer and last["close"] < support_f:
-            _record_retest(status="BREAKDOWN_RETEST_HOLD", bias="BEARISH", level=support_f, score=0.88)
-        elif prev["close"] < support_f and last["close"] > support_f:
-            _record_retest(status="RETEST_FAILED", bias="BULLISH", level=support_f, score=0.82)
-
-    price_action_bias = "NEUTRAL"
-    price_action_patterns: List[str] = []
-    price_action_score = 0.0
-    if bullish_score >= max(0.55, bearish_score + 0.20):
-        price_action_bias = "BULLISH"
-        price_action_patterns = bullish_patterns
-        price_action_score = bullish_score
-    elif bearish_score >= max(0.55, bullish_score + 0.20):
-        price_action_bias = "BEARISH"
-        price_action_patterns = bearish_patterns
-        price_action_score = bearish_score
-
-    confirmation = "NONE"
-    if price_action_bias != "NEUTRAL" and retest_bias == price_action_bias and retest_status not in {"NONE", "RETEST_FAILED"}:
-        confirmation = "CANDLE_AND_RETEST_CONFIRMED"
-    elif price_action_bias != "NEUTRAL":
-        confirmation = "CANDLE_CONFIRMED"
-    elif retest_bias != "NEUTRAL" and retest_status not in {"NONE", "RETEST_FAILED"}:
-        price_action_bias = retest_bias
-        confirmation = "RETEST_CONFIRMED"
-        price_action_patterns = [retest_status]
-        price_action_score = retest_score
-
-    unique_patterns: List[str] = []
-    for pattern in price_action_patterns:
-        text = str(pattern or "").upper()
-        if text and text not in unique_patterns:
-            unique_patterns.append(text)
-    return {
-        "price_action_bias": price_action_bias,
-        "price_action_confirmation": confirmation,
-        "price_action_score": round(float(max(price_action_score, retest_score)), 3),
-        "primary_pattern": unique_patterns[0] if unique_patterns else "NONE",
-        "price_action_patterns": unique_patterns[:4],
-        "retest_status": retest_status,
-        "retest_bias": retest_bias,
-        "retest_level": None if retest_level is None else round(float(retest_level), 2),
-        "retest_score": round(float(retest_score), 3),
-    }
+    return detect_recent_price_action(
+        candles,
+        support=support,
+        resistance=resistance,
+        atr_like_points=atr_like_points,
+        ema_slow=ema_slow,
+        ema_base=ema_base,
+    )
 
 
 def _classify_trend_from_candles(candles: List[dict], *, interval_min: int) -> Dict[str, Any]:
@@ -3041,18 +3073,29 @@ def _classify_trend_from_candles(candles: List[dict], *, interval_min: int) -> D
 
     ema_fast = _ema(closes, 5)
     ema_slow = _ema(closes, 20)
+    ema_base = _ema(closes, 50)
     ema_fast_prev = _ema(closes[:-1], 5) if len(closes) > 1 else ema_fast
     ema_slow_prev = _ema(closes[:-1], 20) if len(closes) > 1 else ema_slow
+    ema_base_prev = _ema(closes[:-1], 50) if len(closes) > 1 else ema_base
     ema_gap = None if ema_fast is None or ema_slow is None else float(ema_fast - ema_slow)
     ema_gap_pct = None if ema_gap is None else (ema_gap / max(1.0, abs(last_close)))
     ema_fast_slope = None if ema_fast is None or ema_fast_prev is None else float(ema_fast - ema_fast_prev)
     ema_slow_slope = None if ema_slow is None or ema_slow_prev is None else float(ema_slow - ema_slow_prev)
+    ema_base_slope = None if ema_base is None or ema_base_prev is None else float(ema_base - ema_base_prev)
     ema_alignment = "NEUTRAL"
     if ema_gap_pct is not None and ema_fast_slope is not None and ema_slow_slope is not None:
         if ema_gap_pct >= 0.0008 and ema_fast_slope > 0 and ema_slow_slope >= 0:
             ema_alignment = "BULLISH"
         elif ema_gap_pct <= -0.0008 and ema_fast_slope < 0 and ema_slow_slope <= 0:
             ema_alignment = "BEARISH"
+    ema_20_50_gap = None if ema_slow is None or ema_base is None else float(ema_slow - ema_base)
+    ema_20_50_gap_pct = None if ema_20_50_gap is None else (ema_20_50_gap / max(1.0, abs(last_close)))
+    ema_20_50_alignment = "NEUTRAL"
+    if ema_20_50_gap_pct is not None and ema_slow_slope is not None and ema_base_slope is not None:
+        if ema_20_50_gap_pct >= 0.0008 and ema_slow_slope > 0 and ema_base_slope >= 0:
+            ema_20_50_alignment = "BULLISH"
+        elif ema_20_50_gap_pct <= -0.0008 and ema_slow_slope < 0 and ema_base_slope <= 0:
+            ema_20_50_alignment = "BEARISH"
 
     # Practical thresholds tuned by timeframe for simple trend/pattern labeling.
     trend_threshold_pct = 0.10 if interval_min <= 5 else (0.18 if interval_min <= 15 else 0.28)
@@ -3078,6 +3121,8 @@ def _classify_trend_from_candles(candles: List[dict], *, interval_min: int) -> D
         support=support,
         resistance=resistance,
         atr_like_points=atr_like_points,
+        ema_slow=ema_slow,
+        ema_base=ema_base,
     )
 
     return {
@@ -3099,11 +3144,15 @@ def _classify_trend_from_candles(candles: List[dict], *, interval_min: int) -> D
         "atr_like_pct": round(float(atr_like_pct), 3),
         "ema_fast": None if ema_fast is None else round(float(ema_fast), 2),
         "ema_slow": None if ema_slow is None else round(float(ema_slow), 2),
+        "ema_base": None if ema_base is None else round(float(ema_base), 2),
         "ema_gap_points": None if ema_gap is None else round(float(ema_gap), 2),
         "ema_gap_pct": None if ema_gap_pct is None else round(float(ema_gap_pct), 4),
         "ema_fast_slope": None if ema_fast_slope is None else round(float(ema_fast_slope), 2),
         "ema_slow_slope": None if ema_slow_slope is None else round(float(ema_slow_slope), 2),
+        "ema_base_slope": None if ema_base_slope is None else round(float(ema_base_slope), 2),
         "ema_alignment": ema_alignment,
+        "ema_20_50_gap_pct": None if ema_20_50_gap_pct is None else round(float(ema_20_50_gap_pct), 4),
+        "ema_20_50_alignment": ema_20_50_alignment,
         "volatility_regime": vol_regime,
         "breakout_dir": breakout_dir,
         "breakout_confirmed": bool(breakout_confirmed),
@@ -3116,6 +3165,31 @@ def _classify_trend_from_candles(candles: List[dict], *, interval_min: int) -> D
         "retest_bias": str(price_action.get("retest_bias") or "NEUTRAL"),
         "retest_level": price_action.get("retest_level"),
         "retest_score": round(float(price_action.get("retest_score") or 0.0), 3),
+        "fair_value_gap_bias": str(price_action.get("fair_value_gap_bias") or "NEUTRAL"),
+        "fair_value_gap_status": str(price_action.get("fair_value_gap_status") or "NONE"),
+        "fair_value_gap_low": price_action.get("fair_value_gap_low"),
+        "fair_value_gap_high": price_action.get("fair_value_gap_high"),
+        "fair_value_gap_active": bool(price_action.get("fair_value_gap_active")),
+        "fair_value_gap_score": round(float(price_action.get("fair_value_gap_score") or 0.0), 3),
+        "fair_value_gap_description": str(price_action.get("fair_value_gap_description") or "No fair value gap context."),
+        "fib_swing_high": price_action.get("fib_swing_high"),
+        "fib_swing_low": price_action.get("fib_swing_low"),
+        "fib_382": price_action.get("fib_382"),
+        "fib_500": price_action.get("fib_500"),
+        "fib_618": price_action.get("fib_618"),
+        "fib_bullish_zone_low": price_action.get("fib_bullish_zone_low"),
+        "fib_bullish_zone_high": price_action.get("fib_bullish_zone_high"),
+        "fib_bullish_active": bool(price_action.get("fib_bullish_active")),
+        "fib_bearish_zone_low": price_action.get("fib_bearish_zone_low"),
+        "fib_bearish_zone_high": price_action.get("fib_bearish_zone_high"),
+        "fib_bearish_active": bool(price_action.get("fib_bearish_active")),
+        "fib_description": str(price_action.get("fib_description") or "No Fibonacci pullback context."),
+        "strong_candle_bias": str(price_action.get("strong_candle_bias") or "NEUTRAL"),
+        "strong_candle_status": str(price_action.get("strong_candle_status") or "NONE"),
+        "strong_candle_confirmed": bool(price_action.get("strong_candle_confirmed")),
+        "strong_candle_score": round(float(price_action.get("strong_candle_score") or 0.0), 3),
+        "strong_candle_body_points": price_action.get("strong_candle_body_points"),
+        "strong_candle_description": str(price_action.get("strong_candle_description") or "No strong 5m confirmation candle."),
     }
 
 
@@ -3173,6 +3247,164 @@ def _build_bkm_mtf_trend_context(dw: DhanWrapper, *, trade_day: dt_date) -> Dict
             breakout_confirmation = "UP_CONFIRMED"
         elif down > up and down >= 1:
             breakout_confirmation = "DOWN_CONFIRMED"
+
+    def _candles_to_zone_frame(candles: List[dict]) -> pd.DataFrame:
+        rows: List[Dict[str, Any]] = []
+        for candle in candles or []:
+            if not isinstance(candle, dict):
+                continue
+            try:
+                ts_raw = candle.get("timestamp") or candle.get("time")
+                ts = None
+                if isinstance(ts_raw, datetime):
+                    ts = ts_raw
+                elif isinstance(ts_raw, str):
+                    ts = datetime.fromisoformat(ts_raw)
+                if ts is None:
+                    continue
+                rows.append(
+                    {
+                        "timestamp": ts,
+                        "open": float(candle.get("open") or 0.0),
+                        "high": float(candle.get("high") or candle.get("open") or 0.0),
+                        "low": float(candle.get("low") or candle.get("open") or 0.0),
+                        "close": float(candle.get("close") or candle.get("open") or 0.0),
+                    }
+                )
+            except Exception:
+                continue
+        if not rows:
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close"])
+        frame = pd.DataFrame(rows)
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+        return frame
+
+    def _summarize_swing_structure(zones: List[Any]) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {
+            "bias": "NEUTRAL",
+            "label": "RANGE",
+            "confidence": 0.0,
+            "reasons": [],
+            "timeframes": {},
+            "nearest_support": None,
+            "nearest_resistance": None,
+        }
+        if not zones:
+            return summary
+        bull_score = 0.0
+        bear_score = 0.0
+        total_weight = 0.0
+        tf_weights = {"5m": 1.0, "15m": 1.8, "60m": 2.4, "1h": 2.4}
+
+        def _trend(prices: List[float]) -> str:
+            if len(prices) < 2:
+                return "UNKNOWN"
+            delta = float(prices[-1]) - float(prices[-2])
+            threshold = max(5.0, abs(float(prices[-2])) * 0.0005)
+            if delta >= threshold:
+                return "RISING"
+            if delta <= -threshold:
+                return "FALLING"
+            return "FLAT"
+
+        for tf, weight in tf_weights.items():
+            tf_zones = [z for z in zones if str(getattr(z, "timeframe", "")) == tf]
+            supports = sorted(
+                [float(getattr(z, "price", 0.0)) for z in tf_zones if str(getattr(z, "side", "")) == "support"]
+            )
+            resistances = sorted(
+                [float(getattr(z, "price", 0.0)) for z in tf_zones if str(getattr(z, "side", "")) == "resistance"]
+            )
+            support_trend = _trend(supports[-2:])
+            resistance_trend = _trend(resistances[-2:])
+            label = "RANGE"
+            if support_trend == "RISING" and resistance_trend == "RISING":
+                bull_score += weight
+                label = "HH_HL_UPTREND"
+            elif support_trend == "FALLING" and resistance_trend == "FALLING":
+                bear_score += weight
+                label = "LH_LL_DOWNTREND"
+            elif support_trend == "RISING" or resistance_trend == "RISING":
+                bull_score += weight * 0.4
+                label = "BULLISH_TRANSITION"
+            elif support_trend == "FALLING" or resistance_trend == "FALLING":
+                bear_score += weight * 0.4
+                label = "BEARISH_TRANSITION"
+            total_weight += weight
+            summary["timeframes"][tf] = {
+                "support_trend": support_trend,
+                "resistance_trend": resistance_trend,
+                "support_count": len(supports),
+                "resistance_count": len(resistances),
+                "label": label,
+            }
+            if label not in {"RANGE", "BULLISH_TRANSITION", "BEARISH_TRANSITION"}:
+                summary["reasons"].append(f"{tf}:{label}")
+        if bull_score > bear_score and bull_score >= 0.8:
+            summary["bias"] = "BULLISH"
+            summary["label"] = "HH_HL_UPTREND" if bull_score >= bear_score + 0.5 else "BULLISH_TRANSITION"
+        elif bear_score > bull_score and bear_score >= 0.8:
+            summary["bias"] = "BEARISH"
+            summary["label"] = "LH_LL_DOWNTREND" if bear_score >= bull_score + 0.5 else "BEARISH_TRANSITION"
+        elif bull_score > 0.0 or bear_score > 0.0:
+            summary["label"] = "TRANSITION"
+        summary["confidence"] = round(
+            float(min(1.0, abs(bull_score - bear_score) / max(1.0, total_weight))),
+            3,
+        )
+        return summary
+
+    pivot_zones: List[Dict[str, Any]] = []
+    swing_structure: Dict[str, Any] = {
+        "bias": "NEUTRAL",
+        "label": "RANGE",
+        "confidence": 0.0,
+        "reasons": [],
+        "timeframes": {},
+        "nearest_support": None,
+        "nearest_resistance": None,
+    }
+    try:
+        zone_frames: Dict[str, pd.DataFrame] = {}
+        for interval, candles in candles_by_interval.items():
+            tf_label = f"{int(interval)}m"
+            frame = _candles_to_zone_frame(candles)
+            if not frame.empty:
+                zone_frames[tf_label] = frame
+        if zone_frames:
+            swing_zones = find_multi_tf_zones(zone_frames)
+            spot_ref = float(
+                (per_tf.get("5", {}) if isinstance(per_tf.get("5"), dict) else {}).get("close")
+                or (per_tf.get("15", {}) if isinstance(per_tf.get("15"), dict) else {}).get("close")
+                or 0.0
+            )
+            nearest_support, nearest_resistance = nearest_zones(swing_zones, spot_ref)
+            pivot_zones = [
+                {
+                    "side": str(getattr(zone, "side", "")),
+                    "price": round(float(getattr(zone, "price", 0.0)), 2),
+                    "timeframe": str(getattr(zone, "timeframe", "")),
+                    "timestamp": getattr(zone, "timestamp", datetime.now()).isoformat(timespec="seconds"),
+                }
+                for zone in swing_zones[-24:]
+            ]
+            swing_structure = _summarize_swing_structure(swing_zones)
+            if nearest_support is not None:
+                swing_structure["nearest_support"] = {
+                    "side": str(getattr(nearest_support, "side", "")),
+                    "price": round(float(getattr(nearest_support, "price", 0.0)), 2),
+                    "timeframe": str(getattr(nearest_support, "timeframe", "")),
+                    "timestamp": getattr(nearest_support, "timestamp", datetime.now()).isoformat(timespec="seconds"),
+                }
+            if nearest_resistance is not None:
+                swing_structure["nearest_resistance"] = {
+                    "side": str(getattr(nearest_resistance, "side", "")),
+                    "price": round(float(getattr(nearest_resistance, "price", 0.0)), 2),
+                    "timeframe": str(getattr(nearest_resistance, "timeframe", "")),
+                    "timestamp": getattr(nearest_resistance, "timestamp", datetime.now()).isoformat(timespec="seconds"),
+                }
+    except Exception as exc:
+        errors.append(f"swing:{exc}")
 
     orb_summary: Dict[str, Any] = {
         "timeframe_minutes": 15,
@@ -3240,6 +3472,8 @@ def _build_bkm_mtf_trend_context(dw: DhanWrapper, *, trade_day: dt_date) -> Dict
         "bias": bias,
         "volatility_regime": volatility_regime,
         "breakout_confirmation": breakout_confirmation,
+        "pivot_zones": pivot_zones,
+        "swing_structure": swing_structure,
         "orb": orb_summary,
         "errors": errors,
     }
@@ -3295,6 +3529,8 @@ def _build_bkm_structure_confidence_context(
 
     intraday_support_cands: List[Dict[str, Any]] = []
     intraday_resistance_cands: List[Dict[str, Any]] = []
+    swing_support_cands: List[Dict[str, Any]] = []
+    swing_resistance_cands: List[Dict[str, Any]] = []
     for tf_key, tf_weight in (("5", 1.0), ("15", 1.5), ("60", 2.0)):
         tf = tf_map.get(tf_key) if isinstance(tf_map.get(tf_key), dict) else {}
         sup = _f(tf.get("support"))
@@ -3303,6 +3539,25 @@ def _build_bkm_structure_confidence_context(
             intraday_support_cands.append({"level": sup, "source": f"{tf_key}m_price", "strength": tf_weight})
         if res is not None:
             intraday_resistance_cands.append({"level": res, "source": f"{tf_key}m_price", "strength": tf_weight})
+
+    pivot_zones = trend_ctx.get("pivot_zones") if isinstance(trend_ctx.get("pivot_zones"), list) else []
+    pivot_tf_weights = {"5m": 1.2, "15m": 1.9, "60m": 2.5, "1h": 2.5}
+    for zone in pivot_zones:
+        if not isinstance(zone, dict):
+            continue
+        level = _f(zone.get("price"))
+        side = str(zone.get("side") or "").lower()
+        tf_label = str(zone.get("timeframe") or "")
+        strength = float(pivot_tf_weights.get(tf_label, 1.0))
+        payload = {"level": level, "source": f"swing_{tf_label}_{side}", "strength": strength}
+        if level is None:
+            continue
+        if side == "support":
+            swing_support_cands.append(payload)
+            intraday_support_cands.append(payload)
+        elif side == "resistance":
+            swing_resistance_cands.append(payload)
+            intraday_resistance_cands.append(payload)
 
     put_wall_below = oc_ctx.get("put_wall_below") if isinstance(oc_ctx.get("put_wall_below"), dict) else {}
     call_wall_above = oc_ctx.get("call_wall_above") if isinstance(oc_ctx.get("call_wall_above"), dict) else {}
@@ -3326,6 +3581,8 @@ def _build_bkm_structure_confidence_context(
 
     intraday_support_1, intraday_support_2 = _pick_nearest_support(intraday_support_cands)
     intraday_res_1, intraday_res_2 = _pick_nearest_resistance(intraday_resistance_cands)
+    swing_support_1, swing_support_2 = _pick_nearest_support(swing_support_cands)
+    swing_res_1, swing_res_2 = _pick_nearest_resistance(swing_resistance_cands)
 
     # Weekly structure from recent daily candles (trading days).
     dc = [c for c in (daily_candles or []) if isinstance(c, dict)]
@@ -3342,6 +3599,9 @@ def _build_bkm_structure_confidence_context(
             )
         except Exception:
             continue
+    daily_window = daily_rows[-3:] if len(daily_rows) >= 3 else daily_rows
+    daily_support = min((r["low"] for r in daily_window), default=None)
+    daily_resistance = max((r["high"] for r in daily_window), default=None)
     weekly_window = daily_rows[-5:] if len(daily_rows) >= 5 else daily_rows
     weekly_support = min((r["low"] for r in weekly_window), default=None)
     weekly_resistance = max((r["high"] for r in weekly_window), default=None)
@@ -3367,6 +3627,8 @@ def _build_bkm_structure_confidence_context(
     price_action_weight_total = 0.0
     candle_confirm_hits = 0
     retest_confirm_hits = 0
+    reversal_confirm_hits = 0
+    breakout_confirm_hits = 0
     retest_status = "NONE"
     retest_bias = "NEUTRAL"
     retest_level = None
@@ -3381,10 +3643,14 @@ def _build_bkm_structure_confidence_context(
         elif pa_bias == "BEARISH":
             price_action_weighted -= tf_weight
             price_action_weight_total += tf_weight
-        if pa_conf in {"CANDLE_CONFIRMED", "CANDLE_AND_RETEST_CONFIRMED"}:
+        if pa_conf in {"CANDLE_CONFIRMED", "CANDLE_AND_RETEST_CONFIRMED", "REVERSAL_CONFIRMED", "BREAKOUT_CONFIRMED"}:
             candle_confirm_hits += 1
         if pa_conf in {"RETEST_CONFIRMED", "CANDLE_AND_RETEST_CONFIRMED"}:
             retest_confirm_hits += 1
+        if pa_conf == "REVERSAL_CONFIRMED":
+            reversal_confirm_hits += 1
+        elif pa_conf == "BREAKOUT_CONFIRMED":
+            breakout_confirm_hits += 1
         for pattern in list(tf.get("price_action_patterns") or []):
             text = f"{tf_key}m:{str(pattern or '').upper()}"
             if text not in price_action_patterns:
@@ -3406,6 +3672,10 @@ def _build_bkm_structure_confidence_context(
     price_action_confirmation = "NONE"
     if candle_confirm_hits > 0 and retest_confirm_hits > 0 and price_action_bias != "NEUTRAL":
         price_action_confirmation = "CANDLE_AND_RETEST_CONFIRMED"
+    elif reversal_confirm_hits > 0 and price_action_bias != "NEUTRAL":
+        price_action_confirmation = "REVERSAL_CONFIRMED"
+    elif breakout_confirm_hits > 0 and price_action_bias != "NEUTRAL":
+        price_action_confirmation = "BREAKOUT_CONFIRMED"
     elif candle_confirm_hits > 0 and price_action_bias != "NEUTRAL":
         price_action_confirmation = "CANDLE_CONFIRMED"
     elif retest_confirm_hits > 0 and retest_bias != "NEUTRAL":
@@ -3427,8 +3697,13 @@ def _build_bkm_structure_confidence_context(
     oi_build_vote = _vote_from_label(oi_build.get("bias"), ("BULL", "SUPPORT"), ("BEAR", "RESISTANCE"))
     breakout_vote = _vote_from_label(trend_ctx.get("breakout_confirmation"), ("UP", "BULL"), ("DOWN", "BEAR"))
     weekly_vote = _vote_from_label(weekly_bias, ("BULL",), ("BEAR",))
+    swing_structure = trend_ctx.get("swing_structure") if isinstance(trend_ctx.get("swing_structure"), dict) else {}
+    swing_bias = str(swing_structure.get("bias") or "NEUTRAL").upper()
+    swing_confidence = float(_f(swing_structure.get("confidence")) or 0.0)
+    swing_vote = _vote_from_label(swing_bias, ("BULL",), ("BEAR",))
     candle_vote = 1 if (price_action_bias == "BULLISH" and candle_confirm_hits > 0) else (-1 if (price_action_bias == "BEARISH" and candle_confirm_hits > 0) else 0)
-    retest_vote = 1 if (retest_bias == "BULLISH" and retest_status not in {"NONE", "RETEST_FAILED"}) else (-1 if (retest_bias == "BEARISH" and retest_status not in {"NONE", "RETEST_FAILED"}) else 0)
+    retest_fail_statuses = {"NONE", "RETEST_FAILED", "FAILED_BREAKOUT_RETEST", "FAILED_BREAKDOWN_RETEST"}
+    retest_vote = 1 if (retest_bias == "BULLISH" and retest_status not in retest_fail_statuses) else (-1 if (retest_bias == "BEARISH" and retest_status not in retest_fail_statuses) else 0)
 
     votes = {
         "trend": trend_vote,
@@ -3436,6 +3711,7 @@ def _build_bkm_structure_confidence_context(
         "oi_build": oi_build_vote,
         "breakout": breakout_vote,
         "weekly": weekly_vote,
+        "swing": swing_vote,
         "candle": candle_vote,
         "retest": retest_vote,
     }
@@ -3482,7 +3758,9 @@ def _build_bkm_structure_confidence_context(
             sr_alignment_hits += 1
     if sr_alignment_hits:
         trend_confidence += 0.03 * sr_alignment_hits
-    if price_action_confirmation in {"CANDLE_CONFIRMED", "RETEST_CONFIRMED"}:
+    if swing_vote != 0 and swing_confidence > 0:
+        trend_confidence += 0.05 * min(1.0, swing_confidence)
+    if price_action_confirmation in {"CANDLE_CONFIRMED", "RETEST_CONFIRMED", "REVERSAL_CONFIRMED", "BREAKOUT_CONFIRMED"}:
         trend_confidence += 0.04
     elif price_action_confirmation == "CANDLE_AND_RETEST_CONFIRMED":
         trend_confidence += 0.07
@@ -3508,6 +3786,26 @@ def _build_bkm_structure_confidence_context(
         "intraday_support_secondary": _level_payload(intraday_support_2),
         "intraday_resistance": _level_payload(intraday_res_1),
         "intraday_resistance_secondary": _level_payload(intraday_res_2),
+        "swing_support": _level_payload(swing_support_1),
+        "swing_support_secondary": _level_payload(swing_support_2),
+        "swing_resistance": _level_payload(swing_res_1),
+        "swing_resistance_secondary": _level_payload(swing_res_2),
+        "swing_structure_bias": swing_bias,
+        "swing_structure_label": str(swing_structure.get("label") or "RANGE"),
+        "swing_structure_confidence": round(float(swing_confidence), 3),
+        "swing_structure_reasons": list(swing_structure.get("reasons") or [])[:6],
+        "daily_support": {
+            "level": None if daily_support is None else round(float(daily_support), 2),
+            "source": "daily_3d_low",
+            "strength": 1.8,
+            "distance_from_spot": None if daily_support is None else round(abs(float(daily_support) - spot_f), 2),
+        },
+        "daily_resistance": {
+            "level": None if daily_resistance is None else round(float(daily_resistance), 2),
+            "source": "daily_3d_high",
+            "strength": 1.8,
+            "distance_from_spot": None if daily_resistance is None else round(abs(float(daily_resistance) - spot_f), 2),
+        },
         "weekly_support": None if weekly_support is None else round(float(weekly_support), 2),
         "weekly_resistance": None if weekly_resistance is None else round(float(weekly_resistance), 2),
         "weekly_mid": None if weekly_mid is None else round(float(weekly_mid), 2),
@@ -3529,6 +3827,7 @@ def _build_bkm_structure_confidence_context(
         "volatility_regime": vol_regime,
         "price_action_bias": price_action_bias,
         "price_action_confirmation": price_action_confirmation,
+        "primary_pattern": price_action_patterns[0] if price_action_patterns else "NONE",
         "price_action_patterns": price_action_patterns[:6],
         "retest_status": retest_status,
         "retest_bias": retest_bias,
@@ -5079,6 +5378,39 @@ def main() -> None:
                 )
             return {"ok": ok, "status": payload}
 
+        execution_policy = _execution_policy(settings, trade_mode)
+        intraday_mode = str(execution_policy.get("intraday_ai_mode") or _intraday_ai_mode_name(settings))
+        if not bool(execution_policy.get("new_entries_allowed", False)):
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="EXECUTION_MODE_BLOCKS_NEW_ENTRIES",
+                message=f"Deploy blocked: agent execution mode is {execution_policy.get('mode')}, not EXECUTION.",
+                details={"agent_execution_mode": execution_policy.get("mode")},
+                alert_severity="INFO",
+            )
+        if intraday_mode != "EXECUTION":
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="MODE_NOT_EXECUTION",
+                message=f"Deploy blocked: intraday AI mode is {intraday_mode}, not EXECUTION.",
+                details={"intraday_ai_mode": intraday_mode},
+                alert_severity="INFO",
+            )
+        if not bool(execution_policy.get("intraday_new_entries_allowed", False)):
+            return _finalize(
+                ok=False,
+                status="REJECTED",
+                code="EXECUTION_DISABLED_FOR_MODE",
+                message=f"Deploy blocked: intraday execution is disabled for {str(trade_mode or '').lower() or 'this'} mode.",
+                details={
+                    "intraday_ai_mode": intraday_mode,
+                    "trade_mode": trade_mode,
+                    "agent_execution_mode": execution_policy.get("mode"),
+                },
+                alert_severity="INFO",
+            )
         if bool(settings.get("intraday_ai_deploy_require_live_mode", True)) and trade_mode != "live":
             return _finalize(
                 ok=False,
@@ -5667,6 +5999,22 @@ def main() -> None:
             events_path=BATMAN_BKM_AI_EVENTS_FILE,
             logger=log,
         )
+    bkm_learning_manager: Optional[BatmanBKMLearningManager] = None
+    if selected_strategy_file == "batman_bkm_monthly" and bool(settings.get("batman_bkm_learning_enabled", True)):
+        bkm_learning_manager = BatmanBKMLearningManager(
+            config=BatmanBKMLearningConfig.from_settings(settings),
+            status_path=BATMAN_BKM_LEARNING_STATUS_FILE,
+            outcomes_path=BATMAN_BKM_LEARNING_OUTCOMES_FILE,
+            logger=log,
+        )
+        try:
+            bkm_learning_manager.backfill_closed_baskets(
+                strategy_state=load_strategy_state(),
+                ai_events=_load_jsonl_dict_rows(BATMAN_BKM_AI_EVENTS_FILE, limit=1000),
+                trade_mode=trade_mode,
+            )
+        except Exception:
+            log.exception("[BatmanBKM-Learn] backfill failed")
     intraday_ai_advisor: Optional[IntradayOptionSellingAdvisor] = None
     if selected_strategy_file == "batman_bkm_monthly" and bool(settings.get("intraday_ai_enabled", True)):
         intraday_ai_advisor = IntradayOptionSellingAdvisor(
@@ -5681,14 +6029,24 @@ def main() -> None:
             history_path=INTRADAY_AI_TRADE_HISTORY_FILE,
             logger=log,
         )
+    intraday_learning_manager: Optional[IntradayLearningManager] = None
+    if selected_strategy_file == "batman_bkm_monthly":
+        intraday_learning_manager = IntradayLearningManager(
+            config=IntradayLearningConfig.from_settings(settings),
+            status_path=INTRADAY_AI_LEARNING_STATUS_FILE,
+            outcomes_path=DECISION_COMMITTEE_OUTCOMES_FILE,
+            logger=log,
+        )
     decision_committee: Optional[DecisionCommittee] = None
     if selected_strategy_file == "batman_bkm_monthly":
         decision_committee = DecisionCommittee(
             status_path=DECISION_COMMITTEE_STATUS_FILE,
             history_path=DECISION_COMMITTEE_HISTORY_FILE,
             outcomes_path=DECISION_COMMITTEE_OUTCOMES_FILE,
+            learning_manager=intraday_learning_manager,
             logger=log,
         )
+    execution_policy = _execution_policy(settings, trade_mode)
     paper_intraday_only_mode = _paper_intraday_only_mode_enabled(settings, trade_mode)
 
     dw = DhanWrapper(logger=logging.getLogger("dhan_wrapper"))
@@ -5803,6 +6161,23 @@ def main() -> None:
             float(settings.get("batman_bkm_ai_flatten_score", 80.0)),
         )
     log.info(
+        "[ExecutionPolicy] mode=%s new_entries=%s manage_existing=%s paper_exec=%s live_exec=%s intraday_entries=%s batman_entries=%s",
+        str(execution_policy.get("mode") or "EXECUTION"),
+        bool(execution_policy.get("new_entries_allowed", False)),
+        bool(execution_policy.get("manage_existing_allowed", False)),
+        bool(execution_policy.get("paper_execution_allowed", False)),
+        bool(execution_policy.get("live_execution_allowed", False)),
+        bool(execution_policy.get("intraday_new_entries_allowed", False)),
+        bool(execution_policy.get("batman_new_entries_allowed", False)),
+    )
+    log.info(
+        "[IntradayAI] enabled=%s mode=%s auto_paper=%s auto_live=%s",
+        bool(settings.get("intraday_ai_enabled", True)),
+        str(execution_policy.get("intraday_ai_mode") or _intraday_ai_mode_name(settings)),
+        bool(settings.get("intraday_ai_auto_deploy_paper_enabled", True)),
+        bool(settings.get("intraday_ai_auto_deploy_live_enabled", False)),
+    )
+    log.info(
         "[OpsMonitor] heartbeat_interval=%ss watchdog_stale_after=%ss alert_dedupe=%ss",
         float(settings.get("ops_heartbeat_interval_sec", 10.0)),
         float(settings.get("ops_watchdog_stale_after_sec", 45.0)),
@@ -5833,6 +6208,12 @@ def main() -> None:
             "execution_recovery_status": execution_recovery_guard.snapshot().get("status") if execution_recovery_guard else None,
             "bkm_ai_status": bkm_ai_manager.snapshot().get("status") if bkm_ai_manager else None,
             "bkm_ai_action": bkm_ai_manager.snapshot().get("action") if bkm_ai_manager else None,
+            "agent_execution_mode": execution_policy.get("mode"),
+            "execution_new_entries_allowed": bool(execution_policy.get("new_entries_allowed", False)),
+            "execution_manage_existing_allowed": bool(execution_policy.get("manage_existing_allowed", False)),
+            "intraday_ai_mode": execution_policy.get("intraday_ai_mode"),
+            "intraday_ai_execution_enabled": bool(execution_policy.get("intraday_new_entries_allowed", False)),
+            "batman_entry_execution_enabled": bool(execution_policy.get("batman_new_entries_allowed", False)),
         },
     )
     _telegram_pump(force=True)
@@ -6038,6 +6419,8 @@ def main() -> None:
                 _set_intraday_ai_runtime_status(
                     now=now_ist,
                     intraday_enabled=bool(settings.get("intraday_ai_enabled", True)),
+                    settings=settings,
+                    trade_mode=trade_mode,
                     has_open_bkm=bool(open_bkm_expiry),
                     allow_parallel_with_bkm=bool(settings.get("intraday_ai_allow_parallel_with_bkm", False)),
                     bkm_expiry=open_bkm_expiry,
@@ -6058,6 +6441,7 @@ def main() -> None:
                     )
             # Skip processing on weekends when the market is closed.
             if now_ist.weekday() >= 5:
+                committee_out: Dict[str, Any] = {}
                 if intraday_ai_advisor:
                     try:
                         intraday_snap = intraday_ai_advisor.snapshot()
@@ -6479,7 +6863,7 @@ def main() -> None:
                         log.exception("[IntradayApproval] plan state update failed")
                     if decision_committee and isinstance(intraday_out, dict) and intraday_out:
                         try:
-                            decision_committee.evaluate_intraday(
+                            committee_out = decision_committee.evaluate_intraday(
                                 now=now_ist,
                                 signal_payload=intraday_out,
                                 context=intraday_ctx if isinstance(intraday_ctx, dict) else {},
@@ -6517,6 +6901,26 @@ def main() -> None:
                             signal_payload=intraday_out if isinstance(intraday_out, dict) else {},
                         )
                         if str(pos_eval.get("action") or "").upper() == "CLOSE":
+                            if not bool(execution_policy.get("intraday_manage_existing_allowed", False)):
+                                log.error(
+                                    "[IntradayPosition] close signal suppressed by execution mode=%s id=%s reason=%s",
+                                    execution_policy.get("mode"),
+                                    position_snap.get("position_id"),
+                                    pos_eval.get("reason"),
+                                )
+                                _ops_alert(
+                                    "CRITICAL" if trade_mode == "live" else "ERROR",
+                                    "INTRADAY_MANAGEMENT_BLOCKED_CLOSE",
+                                    "Intraday AI position wants to close, but execution mode does not allow auto-management.",
+                                    details={
+                                        "agent_execution_mode": execution_policy.get("mode"),
+                                        "position_id": position_snap.get("position_id"),
+                                        "reason": pos_eval.get("reason"),
+                                    },
+                                    dedupe_key="INTRADAY_MANAGEMENT_BLOCKED_CLOSE",
+                                    force=False,
+                                )
+                                continue
                             close_legs = intraday_position_manager.build_option_legs()
                             _update_leg_ltps_from_chain(close_legs, active_chain_rows)
                             close_order_legs = sorted(
@@ -6588,12 +6992,7 @@ def main() -> None:
                                 )
                     except Exception:
                         log.exception("[IntradayPosition] evaluation failed")
-                intraday_auto_enabled = bool(
-                    settings.get(
-                        "intraday_ai_auto_deploy_paper_enabled" if trade_mode == "paper" else "intraday_ai_auto_deploy_live_enabled",
-                        False,
-                    )
-                )
+                intraday_auto_enabled = bool(execution_policy.get("intraday_new_entries_allowed", False))
                 if (
                     intraday_auto_enabled
                     and intraday_ai_advisor
@@ -6603,6 +7002,18 @@ def main() -> None:
                     and not (bkm_strategy and bkm_strategy.basket)
                     and isinstance(intraday_out, dict)
                     and str(intraday_out.get("signal") or "").upper() == "ENTER_NOW"
+                    and (
+                        not decision_committee
+                        or str(
+                            (
+                                committee_out
+                                if isinstance(committee_out, dict) and committee_out
+                                else decision_committee.snapshot()
+                            ).get("verdict")
+                            or "WAIT"
+                        ).upper()
+                        == "READY"
+                    )
                     and intraday_position_manager.can_open_new_position(
                         max_trades_per_session=max(1, int(settings.get("intraday_ai_max_trades_per_session", 1) or 1)),
                         now=now_ist,
@@ -6893,6 +7304,20 @@ def main() -> None:
                         ai_protect_entries_locked,
                         bkm_ai_entry_lock_reason,
                     )
+                elif bkm_strategy.basket is None and not bool(execution_policy.get("batman_new_entries_allowed", False)):
+                    _heartbeat(
+                        phase="execution_mode_blocks_entries",
+                        extra={
+                            "day_mode": day_mode,
+                            "agent_execution_mode": execution_policy.get("mode"),
+                            "execution_new_entries_allowed": False,
+                            "execution_manage_existing_allowed": bool(
+                                execution_policy.get("manage_existing_allowed", False)
+                            ),
+                            "paper_intraday_only_mode": bool(paper_intraday_only_mode),
+                            "selected_strategy_file": selected_strategy_file,
+                        },
+                    )
                 elif bkm_strategy.basket is None and paper_intraday_only_mode:
                     _heartbeat(
                         phase="paper_intraday_only",
@@ -6930,7 +7355,19 @@ def main() -> None:
                             settings.get("batman_bkm_catchup_not_before", "09:30"),
                             dtime(9, 30),
                         )
-                        if force_entry:
+                        if force_entry and not market_open_now:
+                            log.info("[BatmanBKM] force entry blocked while market closed now=%s", now_ist.time().isoformat(timespec="seconds"))
+                            time.sleep(poll_sec)
+                            continue
+                        elif force_entry and now_ist.time() < catchup_not_before:
+                            log.info(
+                                "[BatmanBKM] force entry waiting for opening buffer now=%s not_before=%s",
+                                now_ist.time().isoformat(timespec="seconds"),
+                                catchup_not_before.isoformat(timespec="minutes"),
+                            )
+                            time.sleep(poll_sec)
+                            continue
+                        elif force_entry:
                             log.info("[BatmanBKM] force_entry enabled (paper=%s)", trade_mode)
                         elif not market_open_now:
                             log.info("[BatmanBKM] market closed; skipping entry check")
@@ -7162,7 +7599,76 @@ def main() -> None:
                             if not chain:
                                 time.sleep(poll_sec)
                                 continue
-                        basket, reason = bkm_strategy.maybe_enter(entry_spot, chain, expiry)
+                        construction_context: Optional[Dict[str, Any]] = None
+                        construction_learning_assessment: Optional[Dict[str, Any]] = None
+                        prebuilt_learning_entry_snapshot: Optional[Dict[str, Any]] = None
+                        try:
+                            construction_chain_ctx, _ = _summarize_bkm_option_chain_context(
+                                chain,
+                                spot=float(entry_spot or 0.0),
+                                near_atm_band_points=float(settings.get("batman_bkm_ai_near_atm_oi_band_points", 500.0)),
+                                prev_oi_by_key=None,
+                            )
+                            construction_trend_ctx = _build_bkm_mtf_trend_context(dw, trade_day=now_ist.date())
+                            try:
+                                construction_daily_candles = _fetch_daily_candles(dw, days=50)
+                            except Exception:
+                                construction_daily_candles = []
+                            construction_structure_ctx = _build_bkm_structure_confidence_context(
+                                spot=float(entry_spot or 0.0),
+                                trend_ctx=construction_trend_ctx,
+                                oc_ctx=construction_chain_ctx,
+                                daily_candles=construction_daily_candles,
+                            )
+                            construction_context = {
+                                "option_chain": construction_chain_ctx,
+                                "trend": construction_trend_ctx,
+                                "structure": construction_structure_ctx,
+                            }
+                            if bkm_learning_manager:
+                                entry_mode = "FORCE" if force_entry else ("CATCHUP" if catchup_window else "SCHEDULED")
+                                prebuilt_learning_entry_snapshot = _build_bkm_learning_entry_snapshot(
+                                    now_ist=now_ist,
+                                    trade_mode=trade_mode,
+                                    expiry_str=expiry_str,
+                                    entry_spot=float(entry_spot or 0.0),
+                                    entry_mode=entry_mode,
+                                    quality_report={},
+                                    planner_summary=planner_summary,
+                                    context=construction_context,
+                                )
+                                construction_learning_assessment = bkm_learning_manager.assess_entry(
+                                    prebuilt_learning_entry_snapshot,
+                                    when=now_ist,
+                                )
+                                if bool(construction_learning_assessment.get("block_entry")):
+                                    log.warning(
+                                        "[BatmanBKM-Learn] entry blocked expiry=%s status=%s reasons=%s risk_score_adjust=%s",
+                                        expiry_str,
+                                        construction_learning_assessment.get("status"),
+                                        construction_learning_assessment.get("reasons"),
+                                        construction_learning_assessment.get("risk_score_adjust"),
+                                    )
+                                    _heartbeat(
+                                        phase="bkm_learning_blocked",
+                                        extra={
+                                            "day_mode": day_mode,
+                                            "bkm_learning_block_reason": ",".join(list(construction_learning_assessment.get("reasons") or [])),
+                                            "bkm_pretrade_expiry": expiry_str,
+                                        },
+                                    )
+                                    time.sleep(poll_sec)
+                                    continue
+                        except Exception:
+                            log.exception("[BatmanBKM] adaptive construction context build failed")
+
+                        basket, reason = bkm_strategy.maybe_enter(
+                            entry_spot,
+                            chain,
+                            expiry,
+                            market_context=construction_context,
+                            learning_assessment=construction_learning_assessment,
+                        )
                         quality_report = dict(getattr(bkm_strategy, "last_quality_report", {}) or {})
                         log.info(
                             "[BatmanBKM] attempt reason=%s expiry=%s quality_status=%s quality_reason=%s quality_score=%s",
@@ -7173,6 +7679,27 @@ def main() -> None:
                             quality_report.get("score"),
                         )
                         if basket and reason == "ENTER":
+                            learning_entry_snapshot: Optional[Dict[str, Any]] = None
+                            if bkm_learning_manager:
+                                try:
+                                    entry_mode = "FORCE" if force_entry else ("CATCHUP" if catchup_window else "SCHEDULED")
+                                    learning_entry_snapshot = _build_bkm_learning_entry_snapshot(
+                                        now_ist=now_ist,
+                                        trade_mode=trade_mode,
+                                        expiry_str=expiry_str,
+                                        entry_spot=float(entry_spot or 0.0),
+                                        entry_mode=entry_mode,
+                                        quality_report=quality_report,
+                                        planner_summary=planner_summary,
+                                        context=construction_context,
+                                    )
+                                    learning_assessment = construction_learning_assessment or bkm_learning_manager.assess_entry(
+                                        learning_entry_snapshot,
+                                        when=now_ist,
+                                    )
+                                    learning_entry_snapshot["assessment"] = learning_assessment
+                                except Exception:
+                                    log.exception("[BatmanBKM-Learn] entry assessment failed")
                             if trade_mode == "live":
                                 open_exec = _execute_bkm_open_live(
                                     dw=dw,
@@ -7227,6 +7754,7 @@ def main() -> None:
                                     "quality_score": float(getattr(basket, "quality_score", 0.0) or 0.0),
                                     "quality_reasons": list(getattr(basket, "quality_reasons", []) or []),
                                     "quality_metrics": dict(getattr(basket, "quality_metrics", {}) or {}),
+                                    "learning_entry": learning_entry_snapshot or {},
                                 },
                             )
                             try:
@@ -7350,6 +7878,35 @@ def main() -> None:
                             bkm_ai_context = bkm_ai_context_cache
                     if bkm_ai_manager and basket_ref:
                         try:
+                            if bkm_learning_manager:
+                                try:
+                                    state_entry = _load_bkm_state_entry(expiry_str)
+                                    learning_entry = state_entry.get("learning_entry") if isinstance(state_entry.get("learning_entry"), dict) else {}
+                                    current_learning_snapshot = _build_bkm_learning_entry_snapshot(
+                                        now_ist=now_ist,
+                                        trade_mode=trade_mode,
+                                        expiry_str=expiry_str,
+                                        entry_spot=float(market.spot or 0.0),
+                                        entry_mode=str(learning_entry.get("entry_mode") or "OPEN_POSITION"),
+                                        quality_report={
+                                            "status": state_entry.get("quality_status"),
+                                            "score": state_entry.get("quality_score"),
+                                            "reason": (list(state_entry.get("quality_reasons") or ["UNKNOWN"])[0] if isinstance(state_entry.get("quality_reasons"), list) and state_entry.get("quality_reasons") else state_entry.get("quality_reason")),
+                                        },
+                                        planner_summary={
+                                            "net_credit": state_entry.get("net_credit"),
+                                            "credit_pct": state_entry.get("credit_pct"),
+                                        },
+                                        context=bkm_ai_context,
+                                    )
+                                    learning_monitor = bkm_learning_manager.assess_open_context(
+                                        current_learning_snapshot,
+                                        when=now_ist,
+                                    )
+                                    bkm_ai_context = dict(bkm_ai_context or {})
+                                    bkm_ai_context["learning"] = learning_monitor
+                                except Exception:
+                                    log.exception("[BatmanBKM-Learn] monitor assessment failed")
                             ai_eval = bkm_ai_manager.update_open(
                                 basket=basket_ref,
                                 spot=float(market.spot or 0.0),
@@ -7634,6 +8191,26 @@ def main() -> None:
                         day_mode = "LOCKED_RED"
                         if live_bkm_gate_enabled and live_gate:
                             live_gate.mark_daily_lock("DAILY_LOCK_RED", when=_ist_now())
+                        if not bool(execution_policy.get("batman_manage_existing_allowed", False)):
+                            log.error(
+                                "[BatmanBKM] daily loss cap reached but management is disabled by execution mode=%s pnl=%.2f cap=%.2f",
+                                execution_policy.get("mode"),
+                                pnl,
+                                risk.daily_max_loss,
+                            )
+                            _ops_alert(
+                                "CRITICAL",
+                                "BKM_MANAGEMENT_BLOCKED_DAILY_LOCK",
+                                "Batman BKM crossed the daily loss cap, but execution mode does not allow auto-management.",
+                                details={
+                                    "agent_execution_mode": execution_policy.get("mode"),
+                                    "pnl": float(pnl),
+                                    "daily_max_loss": float(risk.daily_max_loss),
+                                },
+                                dedupe_key="BKM_MANAGEMENT_BLOCKED_DAILY_LOCK",
+                            )
+                            time.sleep(poll_sec)
+                            continue
                         flatten_res = _flatten_bkm_basket(
                             dw=dw,
                             bkm_strategy=bkm_strategy,
@@ -7641,6 +8218,13 @@ def main() -> None:
                             reason="DAILY_LOCK_RED",
                             live_order_executor=live_order_executor if trade_mode == "live" else None,
                             execution_journal=execution_journal if trade_mode == "live" else None,
+                            bkm_learning_manager=bkm_learning_manager,
+                            learning_close_context=_build_bkm_learning_close_context(
+                                ai_eval=ai_eval,
+                                day_mode=day_mode,
+                                spot=float(market.spot or 0.0),
+                                pnl=float(pnl or 0.0),
+                            ),
                         )
                         closed_legs = int(flatten_res.get("closed_legs", 0))
                         if trade_mode == "live" and not bool(flatten_res.get("ok")):
@@ -7670,8 +8254,33 @@ def main() -> None:
                         )
                         time.sleep(poll_sec)
                         continue
-                    decision = bkm_strategy.maybe_exit(pnl, _ist_now())
+                    decision = bkm_strategy.maybe_exit(
+                        pnl,
+                        _ist_now(),
+                        spot=float(market.spot or 0.0),
+                        context=bkm_ai_context,
+                    )
                     if decision:
+                        if not bool(execution_policy.get("batman_manage_existing_allowed", False)):
+                            log.error(
+                                "[BatmanBKM] exit signal=%s suppressed by execution mode=%s pnl=%.2f",
+                                decision,
+                                execution_policy.get("mode"),
+                                pnl,
+                            )
+                            _ops_alert(
+                                "CRITICAL",
+                                "BKM_MANAGEMENT_BLOCKED_EXIT",
+                                "Batman BKM exit signal fired, but execution mode does not allow auto-management.",
+                                details={
+                                    "agent_execution_mode": execution_policy.get("mode"),
+                                    "decision": decision,
+                                    "pnl": float(pnl),
+                                },
+                                dedupe_key="BKM_MANAGEMENT_BLOCKED_EXIT",
+                            )
+                            time.sleep(poll_sec)
+                            continue
                         flatten_res = _flatten_bkm_basket(
                             dw=dw,
                             bkm_strategy=bkm_strategy,
@@ -7679,6 +8288,13 @@ def main() -> None:
                             reason=decision,
                             live_order_executor=live_order_executor if trade_mode == "live" else None,
                             execution_journal=execution_journal if trade_mode == "live" else None,
+                            bkm_learning_manager=bkm_learning_manager,
+                            learning_close_context=_build_bkm_learning_close_context(
+                                ai_eval=ai_eval,
+                                day_mode=day_mode,
+                                spot=float(market.spot or 0.0),
+                                pnl=float(pnl or 0.0),
+                            ),
                         )
                         closed_legs = int(flatten_res.get("closed_legs", 0))
                         if trade_mode == "live" and not bool(flatten_res.get("ok")):
@@ -8165,6 +8781,14 @@ def main() -> None:
                     legs=legs_to_log,
                 )
             if decision.action_type.startswith("OPEN"):
+                if not bool(execution_policy.get("new_entries_allowed", False)):
+                    log.warning(
+                        "Open action blocked by execution mode=%s action=%s strategy=%s",
+                        execution_policy.get("mode"),
+                        decision.action_type,
+                        decision.strategy_type.value,
+                    )
+                    continue
                 if _is_india_market_open():
                     for leg in decision.legs_to_open:
                         leg.opened_at = _ist_now()
@@ -8175,6 +8799,14 @@ def main() -> None:
                 else:
                     log.warning("Market closed; skipping OPEN action (%s)", decision.action_type)
             elif decision.action_type.startswith("CLOSE"):
+                if not bool(execution_policy.get("manage_existing_allowed", False)):
+                    log.warning(
+                        "Close action blocked by execution mode=%s action=%s strategy=%s",
+                        execution_policy.get("mode"),
+                        decision.action_type,
+                        decision.strategy_type.value,
+                    )
+                    continue
                 target_legs = decision.legs_to_close or legs
                 for leg in target_legs:
                     _place_leg_order(dw, leg, close=True, trade_mode=trade_mode)

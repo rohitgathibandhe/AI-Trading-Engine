@@ -37,6 +37,10 @@ DEFAULT_REQUIRED_DATA: tuple[str, ...] = (
     "strike",
     "timestamp",
     "expiryDate",
+    "delta",
+    "gamma",
+    "theta",
+    "vega",
 )
 
 

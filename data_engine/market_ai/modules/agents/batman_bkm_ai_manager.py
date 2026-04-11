@@ -448,6 +448,7 @@ class BatmanBKMAIManager:
         oc_ctx = ctx.get("option_chain") if isinstance(ctx.get("option_chain"), dict) else {}
         trend_ctx = ctx.get("trend") if isinstance(ctx.get("trend"), dict) else {}
         structure_ctx = ctx.get("structure") if isinstance(ctx.get("structure"), dict) else {}
+        learning_ctx = ctx.get("learning") if isinstance(ctx.get("learning"), dict) else {}
         trend_bias = str(trend_ctx.get("bias") or "NEUTRAL").upper()
         trend_bias_score = 0.0
         try:
@@ -587,6 +588,20 @@ class BatmanBKMAIManager:
             context_score_adjust = max(-cap, min(cap, context_score_adjust))
             score += context_score_adjust
 
+        learning_score_adjust = 0.0
+        try:
+            learning_score_adjust = float(learning_ctx.get("risk_score_adjust") or 0.0)
+        except Exception:
+            learning_score_adjust = 0.0
+        if learning_score_adjust != 0.0:
+            cap = max(0.0, float(self.config.context_risk_score_cap))
+            learning_score_adjust = max(-cap, min(cap, learning_score_adjust))
+            score += learning_score_adjust
+            for reason in list(learning_ctx.get("reasons") or [])[:4]:
+                reasons.append(str(reason))
+            for reason in list(learning_ctx.get("supportive_reasons") or [])[:3]:
+                reasons.append(str(reason))
+
         # Volatility / breakout modifiers (Phase 3 chart features).
         if trend_vol_regime == "HIGH" and risk_side in {"CALL", "PUT"} and dist_near_short <= near_buf * 1.5:
             score += 5.0
@@ -653,6 +668,7 @@ class BatmanBKMAIManager:
             "in_open_grace": in_grace,
             "position_risk_side": risk_side,
             "context_score_adjust": round(float(context_score_adjust), 2),
+            "learning_score_adjust": round(float(learning_score_adjust), 2),
             "market_context": {
                 "trend_bias": trend_bias,
                 "trend_bias_score": round(float(trend_bias_score), 3),
@@ -674,6 +690,7 @@ class BatmanBKMAIManager:
                 "structure": structure_ctx,
                 "trend": trend_ctx,
                 "option_chain": oc_ctx,
+                "learning": learning_ctx,
             },
         }
         if not reasons:

@@ -21,6 +21,15 @@ def _round_strike(spot: float, step: int) -> float:
     return round(spot / step) * step
 
 
+def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    if value in (None, "", "-", "--"):
+        return default
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
 @dataclass
 class Leg:
     option_type: str  # "CE" / "PE"
@@ -83,6 +92,20 @@ class BatmanBKMConfig:
     max_tail_loss_imbalance_ratio: float = 0.35
     max_worst_loss_to_credit_ratio: float = 25.0
     quality_block_on_fail: bool = True
+    adaptive_construction_enabled: bool = True
+    adaptive_min_base_distance_points: int = 250
+    adaptive_max_base_distance_points: int = 650
+    adaptive_min_inner_step_points: int = 150
+    adaptive_max_inner_step_points: int = 300
+    adaptive_min_outer_step_points: int = 600
+    adaptive_max_outer_step_points: int = 1000
+    adaptive_center_shift_max_points: int = 250
+    low_premium_atm_threshold: float = 120.0
+    high_premium_atm_threshold: float = 240.0
+    defense_enabled: bool = True
+    defense_loss_buffer_ratio: float = 0.62
+    defense_near_short_buffer_points: float = 180.0
+    defense_outside_short_loss_buffer_ratio: float = 0.48
 
 
 @dataclass
@@ -103,6 +126,8 @@ class BatmanBKMBasket:
     quality_score: float = 0.0
     quality_reasons: List[str] = field(default_factory=list)
     quality_metrics: Dict[str, Any] = field(default_factory=dict)
+    construction_context: Dict[str, Any] = field(default_factory=dict)
+    defense_stage: str = "NONE"
 
     def mtm(self) -> float:
         total = 0.0
@@ -122,14 +147,24 @@ class BatmanBKMStrategy:
         self.last_quality_report: Dict[str, Any] = {}
 
     # ── Strike and premium helpers ──────────────────────────────────────────
-    def _build_strikes(self, spot: float, base_d: int) -> Dict[str, float]:
-        atm = _round_strike(spot, self.cfg.strike_rounding)
+    def _build_strikes(
+        self,
+        spot: float,
+        base_d: int,
+        *,
+        inner_step: Optional[int] = None,
+        outer_step: Optional[int] = None,
+        center_shift: float = 0.0,
+    ) -> Dict[str, float]:
+        atm = _round_strike(float(spot) + float(center_shift or 0.0), self.cfg.strike_rounding)
+        inner = int(inner_step if inner_step is not None else self.cfg.inner_step_points)
+        outer = int(outer_step if outer_step is not None else self.cfg.outer_step_points)
         ce_buy = atm + base_d
-        ce_sell = ce_buy + self.cfg.inner_step_points
-        ce_hedge = ce_sell + self.cfg.outer_step_points
+        ce_sell = ce_buy + inner
+        ce_hedge = ce_sell + outer
         pe_buy = atm - base_d
-        pe_sell = pe_buy - self.cfg.inner_step_points
-        pe_hedge = pe_sell - self.cfg.outer_step_points
+        pe_sell = pe_buy - inner
+        pe_hedge = pe_sell - outer
         return {
             "ce_buy": ce_buy,
             "ce_sell": ce_sell,
@@ -138,6 +173,177 @@ class BatmanBKMStrategy:
             "pe_sell": pe_sell,
             "pe_hedge": pe_hedge,
             "atm": atm,
+        }
+
+    def _context_signal_profile(
+        self,
+        *,
+        market_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        ctx = market_context if isinstance(market_context, dict) else {}
+        oc_ctx = ctx.get("option_chain") if isinstance(ctx.get("option_chain"), dict) else {}
+        trend_ctx = ctx.get("trend") if isinstance(ctx.get("trend"), dict) else {}
+        structure_ctx = ctx.get("structure") if isinstance(ctx.get("structure"), dict) else {}
+        oi_build = oc_ctx.get("oi_build") if isinstance(oc_ctx.get("oi_build"), dict) else {}
+        bullish = 0
+        bearish = 0
+        trend_bias = str(trend_ctx.get("bias") or structure_ctx.get("dominant_signal_bias") or "NEUTRAL").upper()
+        pcr_bias = str(oc_ctx.get("pcr_bias") or "NEUTRAL").upper()
+        oi_bias = str(oi_build.get("bias") or "UNKNOWN").upper()
+        breakout = str(trend_ctx.get("breakout_confirmation") or "NONE").upper()
+        vol_regime = str(trend_ctx.get("volatility_regime") or "NORMAL").upper()
+        bias_score = 0.0
+        try:
+            bias_score = float(trend_ctx.get("bias_score") or 0.0)
+        except Exception:
+            bias_score = 0.0
+        if trend_bias == "BULLISH" or bias_score >= 0.20:
+            bullish += 1
+        elif trend_bias == "BEARISH" or bias_score <= -0.20:
+            bearish += 1
+        if pcr_bias == "BULLISH":
+            bullish += 1
+        elif pcr_bias == "BEARISH":
+            bearish += 1
+        if oi_bias.startswith("BULLISH"):
+            bullish += 1
+        elif oi_bias.startswith("BEARISH"):
+            bearish += 1
+        if breakout == "UP_CONFIRMED":
+            bullish += 1
+        elif breakout == "DOWN_CONFIRMED":
+            bearish += 1
+        dominant_bias = "NEUTRAL"
+        if bullish >= bearish + 1:
+            dominant_bias = "BULLISH"
+        elif bearish >= bullish + 1:
+            dominant_bias = "BEARISH"
+        return {
+            "dominant_bias": dominant_bias,
+            "bullish_signals": bullish,
+            "bearish_signals": bearish,
+            "pcr_bias": pcr_bias,
+            "oi_build_bias": oi_bias,
+            "breakout_confirmation": breakout,
+            "volatility_regime": vol_regime,
+        }
+
+    def _chain_step(self, chain: List[Dict[str, Any]]) -> int:
+        strikes = sorted(
+            {
+                float(row.get("strike") or 0.0)
+                for row in chain
+                if _safe_float(row.get("strike")) not in (None, 0.0)
+            }
+        )
+        if len(strikes) < 2:
+            return max(50, int(self.cfg.strike_rounding or 50))
+        diffs = [int(round(strikes[idx + 1] - strikes[idx])) for idx in range(len(strikes) - 1) if (strikes[idx + 1] - strikes[idx]) > 0]
+        positive = [diff for diff in diffs if diff > 0]
+        if not positive:
+            return max(50, int(self.cfg.strike_rounding or 50))
+        return max(50, min(positive))
+
+    def _atm_combined_premium(self, chain: List[Dict[str, Any]], spot: float) -> Optional[float]:
+        ce_rows = sorted(
+            [row for row in chain if str(row.get("option_type") or "").upper() == "CE" and _safe_float(row.get("ltp")) not in (None, 0.0)],
+            key=lambda row: abs(float(row.get("strike") or 0.0) - float(spot)),
+        )
+        pe_rows = sorted(
+            [row for row in chain if str(row.get("option_type") or "").upper() == "PE" and _safe_float(row.get("ltp")) not in (None, 0.0)],
+            key=lambda row: abs(float(row.get("strike") or 0.0) - float(spot)),
+        )
+        if not ce_rows or not pe_rows:
+            return None
+        ce_ltp = _safe_float(ce_rows[0].get("ltp"))
+        pe_ltp = _safe_float(pe_rows[0].get("ltp"))
+        if ce_ltp is None or pe_ltp is None:
+            return None
+        return float(ce_ltp) + float(pe_ltp)
+
+    def _adaptive_construction(
+        self,
+        *,
+        spot: float,
+        chain: List[Dict[str, Any]],
+        market_context: Optional[Dict[str, Any]] = None,
+        learning_assessment: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        step = max(50, self._chain_step(chain))
+        base_d = int(self.cfg.base_distance_points)
+        inner = int(self.cfg.inner_step_points)
+        outer = int(self.cfg.outer_step_points)
+        center_shift = 0
+        if not isinstance(market_context, dict) and not isinstance(learning_assessment, dict):
+            return {
+                "base_distance_points": int(base_d),
+                "inner_step_points": int(inner),
+                "outer_step_points": int(outer),
+                "center_shift_points": 0,
+                "atm_combined_premium": None,
+                "low_premium_regime": False,
+                "high_premium_regime": False,
+                "dominant_bias": "NEUTRAL",
+                "bullish_signals": 0,
+                "bearish_signals": 0,
+                "volatility_regime": "NORMAL",
+                "learning_risk_score_adjust": 0.0,
+            }
+        profile = self._context_signal_profile(market_context=market_context)
+        atm_premium = self._atm_combined_premium(chain, spot)
+        learning_adjust = 0.0
+        try:
+            learning_adjust = float((learning_assessment or {}).get("risk_score_adjust") or 0.0)
+        except Exception:
+            learning_adjust = 0.0
+
+        low_premium_regime = bool(
+            atm_premium is not None and float(atm_premium) <= float(self.cfg.low_premium_atm_threshold)
+        ) or profile["volatility_regime"] == "LOW"
+        high_premium_regime = bool(
+            atm_premium is not None and float(atm_premium) >= float(self.cfg.high_premium_atm_threshold)
+        ) or profile["volatility_regime"] == "HIGH"
+
+        if bool(self.cfg.adaptive_construction_enabled):
+            if low_premium_regime:
+                base_d -= step * 2
+                inner -= step
+                outer -= step * 2
+            elif high_premium_regime:
+                base_d += step
+                inner += step
+                outer += step * 2
+
+            if profile["dominant_bias"] == "BEARISH":
+                center_shift -= step * max(1, min(4, int(profile["bearish_signals"])))
+            elif profile["dominant_bias"] == "BULLISH":
+                center_shift += step * max(1, min(4, int(profile["bullish_signals"])))
+
+            if learning_adjust <= -2.0:
+                base_d -= step
+                inner -= step
+            elif learning_adjust >= 4.0:
+                base_d += step
+                outer += step
+
+        base_d = max(int(self.cfg.adaptive_min_base_distance_points), min(int(self.cfg.adaptive_max_base_distance_points), int(round(base_d / step) * step)))
+        inner = max(int(self.cfg.adaptive_min_inner_step_points), min(int(self.cfg.adaptive_max_inner_step_points), int(round(inner / step) * step)))
+        outer = max(int(self.cfg.adaptive_min_outer_step_points), min(int(self.cfg.adaptive_max_outer_step_points), int(round(outer / step) * step)))
+        center_shift = max(-int(self.cfg.adaptive_center_shift_max_points), min(int(self.cfg.adaptive_center_shift_max_points), int(round(center_shift / step) * step)))
+
+        return {
+            "base_distance_points": int(base_d),
+            "inner_step_points": int(inner),
+            "outer_step_points": int(outer),
+            "center_shift_points": int(center_shift),
+            "atm_combined_premium": None if atm_premium is None else round(float(atm_premium), 2),
+            "low_premium_regime": bool(low_premium_regime),
+            "high_premium_regime": bool(high_premium_regime),
+            "dominant_bias": profile["dominant_bias"],
+            "bullish_signals": int(profile["bullish_signals"]),
+            "bearish_signals": int(profile["bearish_signals"]),
+            "volatility_regime": profile["volatility_regime"],
+            "learning_risk_score_adjust": round(float(learning_adjust), 2),
         }
 
     def _price_lookup(self, chain: List[Dict[str, Any]], strike: float, opt: str) -> Tuple[Optional[float], Optional[str]]:
@@ -398,17 +604,41 @@ class BatmanBKMStrategy:
                     leg.qty = hedge_q_pe * self.cfg.lot_size
 
     # ── Public API ──────────────────────────────────────────────────────────
-    def maybe_enter(self, spot: float, chain: List[Dict[str, Any]], expiry: date) -> Tuple[Optional[BatmanBKMBasket], str]:
+    def maybe_enter(
+        self,
+        spot: float,
+        chain: List[Dict[str, Any]],
+        expiry: date,
+        *,
+        market_context: Optional[Dict[str, Any]] = None,
+        learning_assessment: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[BatmanBKMBasket], str]:
         # No re-entry same expiry
         if expiry in self.entered_expiries:
             return None, "ALREADY_ENTERED"
 
-        base_d = self.cfg.base_distance_points
+        construction = self._adaptive_construction(
+            spot=float(spot or 0.0),
+            chain=chain,
+            market_context=market_context,
+            learning_assessment=learning_assessment,
+        )
+        base_d = int(construction.get("base_distance_points") or self.cfg.base_distance_points)
+        inner_step = int(construction.get("inner_step_points") or self.cfg.inner_step_points)
+        outer_step = int(construction.get("outer_step_points") or self.cfg.outer_step_points)
+        center_shift = float(construction.get("center_shift_points") or 0.0)
         iterations = 0
         basket: Optional[BatmanBKMBasket] = None
         last_quality_reason = "QUALITY_UNKNOWN"
+        low_credit_retry_used = False
         while iterations <= self.cfg.max_widen_iterations:
-            strikes = self._build_strikes(spot, base_d)
+            strikes = self._build_strikes(
+                spot,
+                base_d,
+                inner_step=inner_step,
+                outer_step=outer_step,
+                center_shift=center_shift,
+            )
             legs = self._build_legs(
                 strikes,
                 chain,
@@ -436,6 +666,13 @@ class BatmanBKMStrategy:
                 self.last_quality_report = quality
                 if not bool(quality.get("ok", False)) and bool(self.cfg.quality_block_on_fail):
                     last_quality_reason = str(quality.get("reason") or "QUALITY_BLOCKED")
+                    if last_quality_reason == "CREDIT_TOO_LOW" and bool(construction.get("low_premium_regime")) and not low_credit_retry_used:
+                        low_credit_retry_used = True
+                        base_d = max(int(self.cfg.adaptive_min_base_distance_points), base_d - int(self.cfg.credit_step_points))
+                        inner_step = max(int(self.cfg.adaptive_min_inner_step_points), inner_step - int(self.cfg.strike_rounding))
+                        outer_step = max(int(self.cfg.adaptive_min_outer_step_points), outer_step - int(self.cfg.credit_step_points))
+                        iterations += 1
+                        continue
                     if last_quality_reason == "CREDIT_TOO_LOW":
                         return None, "CREDIT_TOO_LOW"
                     iterations += 1
@@ -456,6 +693,7 @@ class BatmanBKMStrategy:
                     quality_score=float(quality.get("score") or 0.0),
                     quality_reasons=list(quality.get("reasons") or []),
                     quality_metrics=dict(quality.get("metrics") or {}),
+                    construction_context=dict(construction),
                 )
                 self.basket = basket
                 self.entered_expiries.add(expiry)
@@ -474,11 +712,52 @@ class BatmanBKMStrategy:
             leg.ltp = ltp if ltp is not None else leg.ltp
         return self.basket.mtm()
 
-    def maybe_exit(self, pnl: float, as_of: datetime) -> Optional[str]:
+    def maybe_exit(
+        self,
+        pnl: float,
+        as_of: datetime,
+        *,
+        spot: Optional[float] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         if not self.basket:
             return None
         tp = self.cfg.tp_pct * self.basket.margin_required
         sl = self.cfg.sl_pct * self.basket.margin_required
+        if bool(self.cfg.defense_enabled) and spot is not None:
+            struct = self._extract_structure(self.basket.legs)
+            if struct:
+                short_put = float(struct["short_put"])
+                short_call = float(struct["short_call"])
+                short_width = max(1.0, short_call - short_put)
+                dist_to_put_short = abs(float(spot) - short_put)
+                dist_to_call_short = abs(short_call - float(spot))
+                dist_near_short = min(dist_to_put_short, dist_to_call_short)
+                risk_side = "CALL" if dist_to_call_short < dist_to_put_short else "PUT"
+                profile = self._context_signal_profile(market_context=context)
+                adverse_context = bool(
+                    (risk_side == "CALL" and profile["dominant_bias"] == "BULLISH")
+                    or (risk_side == "PUT" and profile["dominant_bias"] == "BEARISH")
+                )
+                defense_loss = max(
+                    1.0,
+                    abs(float(sl)) * float(self.cfg.defense_loss_buffer_ratio),
+                )
+                outside_short = bool(float(spot) < short_put or float(spot) > short_call)
+                near_short_buffer = max(
+                    float(self.cfg.defense_near_short_buffer_points),
+                    short_width * 0.18,
+                )
+                if adverse_context and float(pnl) <= -defense_loss and dist_near_short <= near_short_buffer:
+                    self.basket.exit_reason = "DEFENSE_EXIT"
+                    self.basket.defense_stage = "PRE_SL_EXIT"
+                elif adverse_context and outside_short and float(pnl) <= -(abs(float(sl)) * float(self.cfg.defense_outside_short_loss_buffer_ratio)):
+                    self.basket.exit_reason = "DEFENSE_EXIT"
+                    self.basket.defense_stage = "OUTSIDE_SHORT_EXIT"
+        if self.basket.exit_reason == "DEFENSE_EXIT":
+            self.basket.exit_ts = as_of
+            self.basket.pnl_exit = pnl
+            return self.basket.exit_reason
         if pnl >= tp:
             self.basket.exit_reason = "TP"
         elif pnl <= -sl:

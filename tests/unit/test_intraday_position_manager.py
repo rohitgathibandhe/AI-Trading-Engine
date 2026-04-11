@@ -285,6 +285,86 @@ def test_evaluate_closes_bull_put_spread_on_chain_conflict_when_losing(tmp_path:
     assert out["reason"] == "CHAIN_CONFLICT_EXIT"
 
 
+def test_evaluate_trails_short_call_with_hedge_after_reaching_min_profit(tmp_path: Path) -> None:
+    mgr = _manager(tmp_path)
+    now = _ist_dt(6, 12, 45)
+    legs = [
+        _leg(strike=25500, opt=OptionType.CALL, side=LegSide.SELL, qty=65, entry_price=100.0),
+        _leg(strike=26000, opt=OptionType.CALL, side=LegSide.BUY, qty=65, entry_price=10.0),
+    ]
+    mgr.open_position(
+        position_id="POS-TRAIL-1",
+        trade_mode="paper",
+        strategy_type="SHORT_CALL_WITH_HEDGE",
+        strategy_label="Short Call With Emergency Hedge",
+        expiry="2026-03-10",
+        legs=legs,
+        entry_spot=25100.0,
+        sl_total_rs=3000.0,
+        tp_total_rs=0.0,
+        invalidation_spot_level=25320.0,
+        max_hold_till="15:05",
+        trailing_enabled=True,
+        lots_multiplier=1,
+        entry_features={
+            "market_bias": "BEARISH",
+            "price_action_bias": "BEARISH",
+            "unlimited_profit_trailing": True,
+            "profit_trail_arm_rs": 5000.0,
+            "trail_floor_min_profit_rs": 5000.0,
+            "trail_keep_pct": 0.72,
+            "intraday_resistance": 25220.0,
+            "daily_resistance": 25320.0,
+            "weekly_resistance": 25500.0,
+        },
+        now=now,
+    )
+    first = mgr.evaluate(
+        now=_ist_dt(6, 13, 5),
+        spot=24740.0,
+        chain_rows=[
+            {"option_type": "CE", "strike": 25500.0, "ltp": 7.0},
+            {"option_type": "CE", "strike": 26000.0, "ltp": 1.0},
+        ],
+        signal_payload={
+            "market_bias": "BEARISH",
+            "breakout_confirmation": "DOWN_CONFIRMED",
+            "trend_confidence": 0.82,
+            "signal_conflict_score": 18.0,
+            "entry_features": {
+                "intraday_resistance": 25180.0,
+                "daily_resistance": 25310.0,
+                "weekly_resistance": 25480.0,
+            },
+        },
+    )
+    assert first["action"] == "HOLD"
+    assert first["trailing_active"] is True
+    assert first["trail_floor_rs"] == 5000.0
+
+    second = mgr.evaluate(
+        now=_ist_dt(6, 13, 12),
+        spot=24810.0,
+        chain_rows=[
+            {"option_type": "CE", "strike": 25500.0, "ltp": 16.0},
+            {"option_type": "CE", "strike": 26000.0, "ltp": 2.0},
+        ],
+        signal_payload={
+            "market_bias": "BEARISH",
+            "breakout_confirmation": "DOWN_CONFIRMED",
+            "trend_confidence": 0.78,
+            "signal_conflict_score": 20.0,
+            "entry_features": {
+                "intraday_resistance": 25190.0,
+                "daily_resistance": 25310.0,
+                "weekly_resistance": 25480.0,
+            },
+        },
+    )
+    assert second["action"] == "CLOSE"
+    assert second["reason"] == "PROFIT_TRAIL_HIT"
+
+
 def test_evaluate_closes_high_vol_chain_conflict_earlier(tmp_path: Path) -> None:
     mgr = _manager(tmp_path)
     now = _ist_dt(6, 12, 15)

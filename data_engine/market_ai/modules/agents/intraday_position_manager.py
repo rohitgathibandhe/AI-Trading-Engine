@@ -99,6 +99,57 @@ def _payload_to_leg(payload: Dict[str, Any]) -> OptionLeg:
     )
 
 
+def _is_bullish_short_premium_strategy(strategy_type: str) -> bool:
+    return str(strategy_type or "").upper() in {"PUT_CREDIT_SPREAD", "SHORT_PUT_WITH_HEDGE"}
+
+
+def _is_bearish_short_premium_strategy(strategy_type: str) -> bool:
+    return str(strategy_type or "").upper() in {"CALL_CREDIT_SPREAD", "SHORT_CALL_WITH_HEDGE"}
+
+
+def _current_structure_level(
+    *,
+    strategy_type: str,
+    spot: float,
+    live_features: Dict[str, Any],
+    entry_features: Dict[str, Any],
+) -> Optional[float]:
+    features = dict(entry_features or {})
+    if isinstance(live_features, dict):
+        for key in (
+            "intraday_support",
+            "intraday_resistance",
+            "swing_support",
+            "swing_resistance",
+            "daily_support",
+            "daily_resistance",
+            "weekly_support",
+            "weekly_resistance",
+        ):
+            if live_features.get(key) not in (None, "", "-", "--"):
+                features[key] = live_features.get(key)
+    spot_f = float(spot or 0.0)
+    if _is_bullish_short_premium_strategy(strategy_type):
+        supports = [
+            _safe_float(features.get("intraday_support")),
+            _safe_float(features.get("swing_support")),
+            _safe_float(features.get("daily_support")),
+            _safe_float(features.get("weekly_support")),
+        ]
+        valid = [float(level) for level in supports if level is not None and float(level) <= spot_f]
+        return max(valid) if valid else None
+    if _is_bearish_short_premium_strategy(strategy_type):
+        resistances = [
+            _safe_float(features.get("intraday_resistance")),
+            _safe_float(features.get("swing_resistance")),
+            _safe_float(features.get("daily_resistance")),
+            _safe_float(features.get("weekly_resistance")),
+        ]
+        valid = [float(level) for level in resistances if level is not None and float(level) >= spot_f]
+        return min(valid) if valid else None
+    return None
+
+
 @dataclass
 class IntradayPositionState:
     status: str = "IDLE"  # IDLE|OPEN|CLOSED
@@ -388,6 +439,11 @@ class IntradayPositionManager:
         close_reason: Optional[str] = None
         strategy_type = str(self.state.strategy_type or "").upper()
         entry_features = self.state.entry_features if isinstance(self.state.entry_features, dict) else {}
+        live_entry_features = (
+            signal_payload.get("entry_features")
+            if isinstance(signal_payload, dict) and isinstance(signal_payload.get("entry_features"), dict)
+            else {}
+        )
         invalidation = _safe_float(self.state.invalidation_spot_level)
         tp_total = max(0.0, float(self.state.tp_total_rs or 0.0))
         sl_total = max(0.0, float(self.state.sl_total_rs or 0.0))
@@ -407,17 +463,57 @@ class IntradayPositionManager:
         position_vol_regime = signal_vol_regime or str(entry_features.get("volatility_regime") or "NORMAL").upper()
         arm_threshold, keep_frac, degrade_keep_frac = _profit_protect_profile(position_vol_regime)
         min_arm_hold_minutes = _profit_protect_min_hold_minutes(position_vol_regime)
+        unlimited_profit_mode = bool(entry_features.get("unlimited_profit_trailing"))
+        trail_arm_profit_rs = max(
+            0.0,
+            float(_safe_float(entry_features.get("profit_trail_arm_rs"), 0.0) or 0.0),
+        )
+        trail_floor_min_profit_rs = max(
+            0.0,
+            float(_safe_float(entry_features.get("trail_floor_min_profit_rs"), trail_arm_profit_rs) or trail_arm_profit_rs or 0.0),
+        )
+        configured_keep_pct = _safe_float(entry_features.get("trail_keep_pct"))
+        if configured_keep_pct is not None:
+            keep_frac = max(0.25, min(0.95, float(configured_keep_pct)))
+        effective_arm_threshold = trail_arm_profit_rs if unlimited_profit_mode and trail_arm_profit_rs > 0 else arm_threshold
+        live_structure_level = _current_structure_level(
+            strategy_type=strategy_type,
+            spot=float(spot or 0.0),
+            live_features=live_entry_features if isinstance(live_entry_features, dict) else {},
+            entry_features=entry_features,
+        )
+        structure_buffer = max(
+            12.0,
+            float(_safe_float(entry_features.get("trade_plan_pullback_zone_high")) or 0.0) * 0.0004,
+            float(_safe_float(entry_features.get("trade_plan_pullback_zone_low")) or 0.0) * 0.0004,
+        )
 
         if sl_total > 0 and self.state.current_pnl_rs <= -sl_total:
             close_reason = "SL_HIT"
 
         if close_reason is None and invalidation is not None:
-            if strategy_type == "CALL_CREDIT_SPREAD" and float(spot or 0.0) >= invalidation:
+            if _is_bearish_short_premium_strategy(strategy_type) and float(spot or 0.0) >= invalidation:
                 close_reason = "SPOT_INVALIDATION"
-            elif strategy_type == "PUT_CREDIT_SPREAD" and float(spot or 0.0) <= invalidation:
+            elif _is_bullish_short_premium_strategy(strategy_type) and float(spot or 0.0) <= invalidation:
                 close_reason = "SPOT_INVALIDATION"
 
-        if close_reason is None and tp_total > 0:
+        if close_reason is None and unlimited_profit_mode and self.state.trailing_enabled:
+            if peak_pnl >= trail_arm_profit_rs > 0 and hold_minutes_live >= min_arm_hold_minutes:
+                self.state.trailing_active = True
+            if self.state.trailing_active:
+                candidate_floor = max(trail_floor_min_profit_rs, peak_pnl * keep_frac)
+                prev_floor = _safe_float(self.state.trail_floor_rs)
+                self.state.trail_floor_rs = (
+                    candidate_floor if prev_floor is None else max(float(prev_floor), candidate_floor)
+                )
+                if live_structure_level is not None:
+                    if _is_bearish_short_premium_strategy(strategy_type) and float(spot or 0.0) >= float(live_structure_level) + structure_buffer:
+                        close_reason = "STRUCTURE_TRAIL_BREAK"
+                    elif _is_bullish_short_premium_strategy(strategy_type) and float(spot or 0.0) <= float(live_structure_level) - structure_buffer:
+                        close_reason = "STRUCTURE_TRAIL_BREAK"
+                if close_reason is None and current_pnl <= float(self.state.trail_floor_rs or 0.0):
+                    close_reason = "PROFIT_TRAIL_HIT"
+        elif close_reason is None and tp_total > 0:
             if self.state.trailing_enabled:
                 dynamic_arm = max(arm_threshold, min(220.0, tp_total * 0.05 if tp_total > 0 else arm_threshold))
                 if current_pnl >= dynamic_arm and hold_minutes_live >= min_arm_hold_minutes:
@@ -434,7 +530,7 @@ class IntradayPositionManager:
                 close_reason = "TARGET_HIT"
 
         if close_reason is None and signal_payload:
-            expected_bias = "BEARISH" if strategy_type == "CALL_CREDIT_SPREAD" else ("BULLISH" if strategy_type == "PUT_CREDIT_SPREAD" else "NEUTRAL")
+            expected_bias = "BEARISH" if _is_bearish_short_premium_strategy(strategy_type) else ("BULLISH" if _is_bullish_short_premium_strategy(strategy_type) else "NEUTRAL")
             opposite_bias = "BULLISH" if expected_bias == "BEARISH" else ("BEARISH" if expected_bias == "BULLISH" else "NEUTRAL")
             market_bias = str(signal_payload.get("market_bias") or "NEUTRAL").upper()
             breakout = str(signal_payload.get("breakout_confirmation") or "NONE").upper()
@@ -450,12 +546,19 @@ class IntradayPositionManager:
             opposing_price_action = (
                 expected_bias in {"BULLISH", "BEARISH"}
                 and price_action_bias == opposite_bias
-                and price_action_confirmation in {"CANDLE_CONFIRMED", "RETEST_CONFIRMED", "CANDLE_AND_RETEST_CONFIRMED"}
+                and price_action_confirmation
+                in {
+                    "CANDLE_CONFIRMED",
+                    "RETEST_CONFIRMED",
+                    "CANDLE_AND_RETEST_CONFIRMED",
+                    "REVERSAL_CONFIRMED",
+                    "BREAKOUT_CONFIRMED",
+                }
             )
             opposing_retest = False
-            if strategy_type == "CALL_CREDIT_SPREAD":
+            if _is_bearish_short_premium_strategy(strategy_type):
                 opposing_retest = retest_status in {"SUPPORT_HOLD", "BREAKOUT_RETEST_HOLD"}
-            elif strategy_type == "PUT_CREDIT_SPREAD":
+            elif _is_bullish_short_premium_strategy(strategy_type):
                 opposing_retest = retest_status in {"RESISTANCE_HOLD", "BREAKDOWN_RETEST_HOLD"}
             chain_against = (
                 expected_bias in {"BULLISH", "BEARISH"}
@@ -472,6 +575,8 @@ class IntradayPositionManager:
                 or chain_against
             )
             giveback_floor = max(25.0, peak_pnl * keep_frac) if peak_pnl > 0 else 0.0
+            if unlimited_profit_mode and trail_floor_min_profit_rs > 0:
+                giveback_floor = max(giveback_floor, trail_floor_min_profit_rs)
 
             if (
                 opposing_price_action
@@ -483,7 +588,7 @@ class IntradayPositionManager:
             ):
                 close_reason = "PRICE_ACTION_REVERSAL"
             elif (
-                peak_pnl >= arm_threshold
+                peak_pnl >= effective_arm_threshold
                 and hold_minutes_live >= min_arm_hold_minutes
                 and weakening_signal
                 and current_pnl <= max(giveback_floor, peak_pnl * degrade_keep_frac)
@@ -504,11 +609,13 @@ class IntradayPositionManager:
             if (
                 close_reason is None
                 and self.state.trailing_enabled
-                and peak_pnl >= arm_threshold
+                and peak_pnl >= effective_arm_threshold
                 and hold_minutes_live >= min_arm_hold_minutes
                 and weakening_signal
             ):
                 tightened_floor = max(15.0, peak_pnl * degrade_keep_frac)
+                if unlimited_profit_mode and trail_floor_min_profit_rs > 0:
+                    tightened_floor = max(tightened_floor, trail_floor_min_profit_rs)
                 prev_floor = _safe_float(self.state.trail_floor_rs)
                 self.state.trail_floor_rs = tightened_floor if prev_floor is None else max(float(prev_floor), tightened_floor)
                 self.state.trailing_active = True
@@ -520,9 +627,9 @@ class IntradayPositionManager:
             breakout = str(signal_payload.get("breakout_confirmation") or "NONE").upper()
             trend_conf = _safe_float(signal_payload.get("trend_confidence"), 0.0) or 0.0
             conflict = _safe_float(signal_payload.get("signal_conflict_score"), 100.0) or 100.0
-            if strategy_type == "CALL_CREDIT_SPREAD" and market_bias == "BULLISH" and breakout == "UP_CONFIRMED" and trend_conf >= 0.70 and conflict <= 43.5:
+            if _is_bearish_short_premium_strategy(strategy_type) and market_bias == "BULLISH" and breakout == "UP_CONFIRMED" and trend_conf >= 0.70 and conflict <= 43.5:
                 close_reason = "SIGNAL_REVERSAL"
-            elif strategy_type == "PUT_CREDIT_SPREAD" and market_bias == "BEARISH" and breakout == "DOWN_CONFIRMED" and trend_conf >= 0.70 and conflict <= 43.5:
+            elif _is_bullish_short_premium_strategy(strategy_type) and market_bias == "BEARISH" and breakout == "DOWN_CONFIRMED" and trend_conf >= 0.70 and conflict <= 43.5:
                 close_reason = "SIGNAL_REVERSAL"
 
         hold_till = _parse_hhmm(self.state.max_hold_till, dtime(15, 5))

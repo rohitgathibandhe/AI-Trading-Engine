@@ -9,4 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 package-dir = {"" = "data_engine"}
-packages = ["market_ai"]
+
+[tool.setuptools.packages.find]
+where = ["data_engine"]
+include = ["market_ai*"]

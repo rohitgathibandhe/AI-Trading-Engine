@@ -7,6 +7,10 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Dict, List, Optional, Tuple
 
+from market_ai.modules.analytics.intraday_trade_planner import (
+    build_trade_plan_from_runtime_context,
+)
+
 try:
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover
@@ -38,6 +42,7 @@ def _safe_float(value: Any) -> Optional[float]:
 @dataclass
 class IntradayOptionSellingAdvisorConfig:
     enabled: bool = True
+    mode: str = "ADVISOR"
     refresh_sec: float = 60.0
     market_open_time: str = "09:15"
     entry_not_before: str = "09:45"
@@ -61,6 +66,13 @@ class IntradayOptionSellingAdvisorConfig:
     ic_stop_credit_multiple: float = 1.8
     spread_stop_credit_multiple: float = 1.6
     min_credit_per_set_rs: float = 500.0
+    directional_structure: str = "CREDIT_SPREAD"  # CREDIT_SPREAD|SHORT_OPTION_WITH_HEDGE
+    emergency_hedge_distance_points_low_vol: int = 300
+    emergency_hedge_distance_points_normal_vol: int = 400
+    emergency_hedge_distance_points_high_vol: int = 500
+    naked_operational_max_loss_rs: float = 3000.0
+    naked_profit_trail_arm_rs: float = 5000.0
+    naked_profit_trail_keep_pct: float = 0.72
     max_signal_age_sec: float = 180.0
     preferred_bias: str = "NEUTRAL"  # NEUTRAL|BULLISH|BEARISH
     require_ema_alignment: bool = True
@@ -83,6 +95,7 @@ class IntradayOptionSellingAdvisorConfig:
         lot_size = int(settings.get("nifty_lot_size", settings.get("lot_size", 65)) or 65)
         return cls(
             enabled=bool(settings.get("intraday_ai_enabled", True)),
+            mode=str(settings.get("intraday_ai_mode", "ADVISOR")).strip().upper() or "ADVISOR",
             refresh_sec=max(15.0, float(settings.get("intraday_ai_refresh_sec", 60.0))),
             market_open_time=str(settings.get("intraday_ai_market_open_time", "09:15")),
             entry_not_before=str(settings.get("intraday_ai_entry_not_before", "09:45")),
@@ -114,6 +127,32 @@ class IntradayOptionSellingAdvisorConfig:
                 0.5, float(settings.get("intraday_ai_spread_stop_credit_multiple", 1.6))
             ),
             min_credit_per_set_rs=max(0.0, float(settings.get("intraday_ai_min_credit_per_set_rs", 500.0))),
+            directional_structure=str(
+                settings.get("intraday_ai_directional_structure", "CREDIT_SPREAD")
+            ).strip().upper()
+            or "CREDIT_SPREAD",
+            emergency_hedge_distance_points_low_vol=max(
+                100,
+                int(settings.get("intraday_ai_emergency_hedge_distance_points_low_vol", 300) or 300),
+            ),
+            emergency_hedge_distance_points_normal_vol=max(
+                100,
+                int(settings.get("intraday_ai_emergency_hedge_distance_points_normal_vol", 400) or 400),
+            ),
+            emergency_hedge_distance_points_high_vol=max(
+                100,
+                int(settings.get("intraday_ai_emergency_hedge_distance_points_high_vol", 500) or 500),
+            ),
+            naked_operational_max_loss_rs=max(
+                500.0, float(settings.get("intraday_ai_naked_operational_max_loss_rs", 3000.0))
+            ),
+            naked_profit_trail_arm_rs=max(
+                500.0, float(settings.get("intraday_ai_naked_profit_trail_arm_rs", 5000.0))
+            ),
+            naked_profit_trail_keep_pct=max(
+                0.35,
+                min(0.95, float(settings.get("intraday_ai_naked_profit_trail_keep_pct", 0.72))),
+            ),
             max_signal_age_sec=max(10.0, float(settings.get("intraday_ai_max_signal_age_sec", 180.0))),
             preferred_bias=str(settings.get("intraday_ai_preferred_bias", "NEUTRAL")).upper(),
             require_ema_alignment=bool(settings.get("intraday_ai_require_ema_alignment", True)),
@@ -157,6 +196,7 @@ class IntradayOptionSellingAdvisorConfig:
 @dataclass
 class IntradayOptionSellingAdvisorState:
     status: str = "IDLE"  # IDLE|ACTIVE
+    mode: str = "ADVISOR"
     signal: str = "NO_TRADE"  # ENTER_NOW|WAIT|NO_TRADE
     priority: str = "INFO"  # INFO|WARN|CRITICAL
     strategy: Optional[str] = None
@@ -393,14 +433,38 @@ class IntradayOptionSellingAdvisor:
         }
         return json.dumps(payload, sort_keys=True)
 
+    def _uses_short_option_with_hedge(self) -> bool:
+        return str(getattr(self.config, "directional_structure", "CREDIT_SPREAD") or "CREDIT_SPREAD").upper() == "SHORT_OPTION_WITH_HEDGE"
+
+    def _directional_strategy_name(self, setup_type: str) -> str:
+        text = str(setup_type or "").upper()
+        if not self._uses_short_option_with_hedge():
+            return text
+        if text == "PUT_CREDIT_SPREAD":
+            return "SHORT_PUT_WITH_HEDGE"
+        if text == "CALL_CREDIT_SPREAD":
+            return "SHORT_CALL_WITH_HEDGE"
+        return text
+
     @staticmethod
     def _directional_bias_for_setup(setup_type: str) -> str:
         text = str(setup_type or "").upper()
-        if text == "PUT_CREDIT_SPREAD":
+        if text in {"PUT_CREDIT_SPREAD", "SHORT_PUT_WITH_HEDGE"}:
             return "BULLISH"
-        if text == "CALL_CREDIT_SPREAD":
+        if text in {"CALL_CREDIT_SPREAD", "SHORT_CALL_WITH_HEDGE"}:
             return "BEARISH"
         return "NEUTRAL"
+
+    def _emergency_hedge_distance(self, volatility_regime: str, strike_step: float) -> float:
+        regime = str(volatility_regime or "NORMAL").upper()
+        if regime == "HIGH":
+            width = float(self.config.emergency_hedge_distance_points_high_vol)
+        elif regime == "LOW":
+            width = float(self.config.emergency_hedge_distance_points_low_vol)
+        else:
+            width = float(self.config.emergency_hedge_distance_points_normal_vol)
+        step = max(1.0, float(strike_step or 50.0))
+        return max(step, round(width / step) * step)
 
     def _trend_day_fast_track_ready(
         self,
@@ -434,6 +498,8 @@ class IntradayOptionSellingAdvisor:
             "CANDLE_CONFIRMED",
             "RETEST_CONFIRMED",
             "CANDLE_AND_RETEST_CONFIRMED",
+            "REVERSAL_CONFIRMED",
+            "BREAKOUT_CONFIRMED",
         }
 
     def _should_block_directional_flip(
@@ -537,6 +603,7 @@ class IntradayOptionSellingAdvisor:
     ) -> Dict[str, Any]:
         return {
             "status": "ACTIVE",
+            "mode": str(self.config.mode or "ADVISOR").upper(),
             "signal": signal,
             "priority": priority,
             "strategy": strategy,
@@ -594,6 +661,9 @@ class IntradayOptionSellingAdvisor:
         price_action_bias = str(structure_ctx.get("price_action_bias") or "NEUTRAL").upper()
         price_action_confirmation = str(structure_ctx.get("price_action_confirmation") or "NONE").upper()
         retest_status = str(structure_ctx.get("retest_status") or "NONE").upper()
+        swing_structure_bias = str(structure_ctx.get("swing_structure_bias") or "NEUTRAL").upper()
+        swing_structure_label = str(structure_ctx.get("swing_structure_label") or "RANGE").upper()
+        swing_structure_confidence = float(_safe_float(structure_ctx.get("swing_structure_confidence")) or 0.0)
         return {
             "market_bias": dominant_bias,
             "trend_confidence": trend_conf,
@@ -607,6 +677,9 @@ class IntradayOptionSellingAdvisor:
             "price_action_bias": price_action_bias,
             "price_action_confirmation": price_action_confirmation,
             "retest_status": retest_status,
+            "swing_structure_bias": swing_structure_bias,
+            "swing_structure_label": swing_structure_label,
+            "swing_structure_confidence": swing_structure_confidence,
         }
 
     def _directional_chain_conflict(
@@ -660,9 +733,16 @@ class IntradayOptionSellingAdvisor:
         *,
         setup_type: str,
         structure_ctx: Dict[str, Any],
-    ) -> Tuple[bool, bool, bool, List[str]]:
+    ) -> Dict[str, Any]:
         if setup_type not in {"PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"}:
-            return True, False, False, []
+            return {
+                "price_action_ok": True,
+                "candle_confirmation_ok": False,
+                "retest_failed_against_setup": False,
+                "hard_block_pattern_against_setup": False,
+                "hard_block_patterns": [],
+                "details": [],
+            }
         expected_bias = "BULLISH" if setup_type == "PUT_CREDIT_SPREAD" else "BEARISH"
         price_action_bias = str(structure_ctx.get("price_action_bias") or "NEUTRAL").upper()
         price_action_confirmation = str(structure_ctx.get("price_action_confirmation") or "NONE").upper()
@@ -670,14 +750,21 @@ class IntradayOptionSellingAdvisor:
         retest_bias = str(structure_ctx.get("retest_bias") or "NEUTRAL").upper()
         candle_patterns = structure_ctx.get("price_action_patterns")
         candle_patterns = candle_patterns if isinstance(candle_patterns, list) else []
+        normalized_patterns = {
+            str(item or "").upper().split(":")[-1]
+            for item in candle_patterns
+            if str(item or "").strip()
+        }
+        supportive_confirmations = {
+            "CANDLE_CONFIRMED",
+            "RETEST_CONFIRMED",
+            "CANDLE_AND_RETEST_CONFIRMED",
+            "REVERSAL_CONFIRMED",
+            "BREAKOUT_CONFIRMED",
+        }
         price_action_ok = (
             price_action_bias == expected_bias
-            and price_action_confirmation
-            in {
-                "CANDLE_CONFIRMED",
-                "RETEST_CONFIRMED",
-                "CANDLE_AND_RETEST_CONFIRMED",
-            }
+            and price_action_confirmation in supportive_confirmations
         )
         retest_ok = (
             retest_bias == expected_bias
@@ -687,18 +774,37 @@ class IntradayOptionSellingAdvisor:
                 "RESISTANCE_HOLD",
                 "BREAKOUT_RETEST_HOLD",
                 "BREAKDOWN_RETEST_HOLD",
+                "DOUBLE_BOTTOM_NECKLINE_BREAK",
+                "DOUBLE_TOP_NECKLINE_BREAK",
             }
         )
         retest_failed_against_setup = (
-            retest_status in {"RETEST_FAILED", "FAILED_BREAKOUT_RETEST"}
+            retest_status in {"RETEST_FAILED", "FAILED_BREAKOUT_RETEST", "FAILED_BREAKDOWN_RETEST"}
             and retest_bias not in {"NEUTRAL", expected_bias}
         )
+        if expected_bias == "BULLISH":
+            hard_block_patterns = sorted(
+                normalized_patterns.intersection({"DOUBLE_TOP_M_CONFIRMED", "FAKE_BREAKOUT_UP"})
+            )
+        else:
+            hard_block_patterns = sorted(
+                normalized_patterns.intersection({"DOUBLE_BOTTOM_W_CONFIRMED", "FAKE_BREAKDOWN_DOWN"})
+            )
         details: List[str] = []
         if candle_patterns:
             details.append("Price action patterns: " + ", ".join(str(item) for item in candle_patterns[:4]))
         details.append(f"Price action bias is {price_action_bias}.")
         details.append(f"Retest status is {retest_status}.")
-        return (price_action_ok or retest_ok), price_action_ok, retest_failed_against_setup, details
+        if hard_block_patterns:
+            details.append("Pattern is reversing against the setup: " + ", ".join(hard_block_patterns) + ".")
+        return {
+            "price_action_ok": bool(price_action_ok or retest_ok),
+            "candle_confirmation_ok": bool(price_action_ok),
+            "retest_failed_against_setup": bool(retest_failed_against_setup),
+            "hard_block_pattern_against_setup": bool(hard_block_patterns),
+            "hard_block_patterns": hard_block_patterns,
+            "details": details,
+        }
 
     @staticmethod
     def _supportive_retest_for_setup(setup_type: str, retest_status: str) -> bool:
@@ -709,6 +815,28 @@ class IntradayOptionSellingAdvisor:
         if setup == "PUT_CREDIT_SPREAD":
             return status in {"SUPPORT_HOLD", "BREAKOUT_RETEST_HOLD"}
         return False
+
+    @staticmethod
+    def _swing_structure_supports_setup(
+        *,
+        setup_type: str,
+        structure_ctx: Dict[str, Any],
+    ) -> Tuple[bool, List[str]]:
+        if setup_type not in {"PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"}:
+            return True, []
+        expected_bias = "BULLISH" if setup_type == "PUT_CREDIT_SPREAD" else "BEARISH"
+        opposite_bias = "BEARISH" if expected_bias == "BULLISH" else "BULLISH"
+        swing_bias = str(structure_ctx.get("swing_structure_bias") or "NEUTRAL").upper()
+        swing_label = str(structure_ctx.get("swing_structure_label") or "RANGE").upper()
+        swing_conf = float(_safe_float(structure_ctx.get("swing_structure_confidence")) or 0.0)
+        details = [
+            f"Swing structure bias is {swing_bias}.",
+            f"Swing structure label is {swing_label}.",
+        ]
+        if swing_bias == opposite_bias and swing_conf >= 0.55:
+            details.append("The current swing structure is materially against the setup.")
+            return False, details
+        return True, details
 
     def _entry_feature_snapshot(
         self,
@@ -728,9 +856,14 @@ class IntradayOptionSellingAdvisor:
         structure_ctx: Dict[str, Any],
         oc_ctx: Dict[str, Any],
         recommendation: Dict[str, Any],
+        trade_plan: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         intraday_support = structure_ctx.get("intraday_support") if isinstance(structure_ctx.get("intraday_support"), dict) else {}
         intraday_resistance = structure_ctx.get("intraday_resistance") if isinstance(structure_ctx.get("intraday_resistance"), dict) else {}
+        swing_support = structure_ctx.get("swing_support") if isinstance(structure_ctx.get("swing_support"), dict) else {}
+        swing_resistance = structure_ctx.get("swing_resistance") if isinstance(structure_ctx.get("swing_resistance"), dict) else {}
+        daily_support = structure_ctx.get("daily_support") if isinstance(structure_ctx.get("daily_support"), dict) else {}
+        daily_resistance = structure_ctx.get("daily_resistance") if isinstance(structure_ctx.get("daily_resistance"), dict) else {}
         return {
             "captured_at": now.isoformat(timespec="seconds"),
             "expiry": str(expiry or ""),
@@ -746,6 +879,7 @@ class IntradayOptionSellingAdvisor:
             "orb_confirmation": str(orb_confirmation or "NONE"),
             "price_action_bias": str(structure_ctx.get("price_action_bias") or "NEUTRAL"),
             "price_action_confirmation": str(structure_ctx.get("price_action_confirmation") or "NONE"),
+            "primary_pattern": str(structure_ctx.get("primary_pattern") or "NONE"),
             "price_action_patterns": list(structure_ctx.get("price_action_patterns") or []),
             "retest_status": str(structure_ctx.get("retest_status") or "NONE"),
             "retest_bias": str(structure_ctx.get("retest_bias") or "NEUTRAL"),
@@ -755,8 +889,26 @@ class IntradayOptionSellingAdvisor:
             "oi_build_bias": str(((oc_ctx.get("oi_build") or {}) if isinstance(oc_ctx.get("oi_build"), dict) else {}).get("bias") or "UNKNOWN"),
             "intraday_support": _safe_float(intraday_support.get("level")),
             "intraday_resistance": _safe_float(intraday_resistance.get("level")),
+            "swing_support": _safe_float(swing_support.get("level")),
+            "swing_resistance": _safe_float(swing_resistance.get("level")),
+            "daily_support": _safe_float(daily_support.get("level")),
+            "daily_resistance": _safe_float(daily_resistance.get("level")),
+            "weekly_support": _safe_float(structure_ctx.get("weekly_support")),
+            "weekly_resistance": _safe_float(structure_ctx.get("weekly_resistance")),
+            "swing_structure_bias": str(structure_ctx.get("swing_structure_bias") or "NEUTRAL"),
+            "swing_structure_label": str(structure_ctx.get("swing_structure_label") or "RANGE"),
+            "swing_structure_confidence": float(_safe_float(structure_ctx.get("swing_structure_confidence")) or 0.0),
             "sr_alignment_hits": int(structure_ctx.get("sr_alignment_hits") or 0),
             "legs": list(recommendation.get("legs") or []),
+            "trade_plan_posture": str((trade_plan or {}).get("posture") or "UNKNOWN"),
+            "trade_plan_setup_type": str((trade_plan or {}).get("setup_type") or ""),
+            "trade_plan_pullback_zone_low": _safe_float((trade_plan or {}).get("pullback_zone_low")),
+            "trade_plan_pullback_zone_high": _safe_float((trade_plan or {}).get("pullback_zone_high")),
+            "trade_plan_invalidation_spot": _safe_float((trade_plan or {}).get("invalidation_spot")),
+            "unlimited_profit_trailing": bool((recommendation.get("trail") or {}).get("unlimited_profit_mode")),
+            "profit_trail_arm_rs": _safe_float((recommendation.get("trail") or {}).get("arm_profit_rs_per_set")),
+            "trail_floor_min_profit_rs": _safe_float((recommendation.get("trail") or {}).get("min_locked_profit_rs_per_set")),
+            "trail_keep_pct": _safe_float((recommendation.get("trail") or {}).get("keep_pct")),
         }
 
     def evaluate(
@@ -785,6 +937,8 @@ class IntradayOptionSellingAdvisor:
         price_action_bias = str(ctx_summary.get("price_action_bias") or "NEUTRAL")
         price_action_confirmation = str(ctx_summary.get("price_action_confirmation") or "NONE")
         retest_status = str(ctx_summary.get("retest_status") or "NONE")
+        swing_structure_bias = str(ctx_summary.get("swing_structure_bias") or "NEUTRAL")
+        swing_structure_label = str(ctx_summary.get("swing_structure_label") or "RANGE")
         tf_map = trend_ctx.get("timeframes") if isinstance(trend_ctx.get("timeframes"), dict) else {}
         tf5 = tf_map.get("5") if isinstance(tf_map.get("5"), dict) else {}
         tf15 = tf_map.get("15") if isinstance(tf_map.get("15"), dict) else {}
@@ -910,6 +1064,61 @@ class IntradayOptionSellingAdvisor:
                 },
             )
 
+        plan = build_trade_plan_from_runtime_context(
+            spot=spot,
+            trend_ctx=trend_ctx,
+            oc_ctx=oc_ctx,
+            structure_ctx=structure_ctx,
+            market_bias=market_bias,
+            bias_confidence=trend_confidence,
+        )
+
+        def _planner_wait_result(
+            *,
+            reason_code: str,
+            headline: str,
+            signal_text: str,
+            hold_text: str,
+            why_extra: Optional[List[str]] = None,
+        ) -> Dict[str, Any]:
+            plan_reasons = list(plan.get("reason_summary") or [])
+            why = list(why_extra or [])
+            why.extend(plan_reasons[:4])
+            if not why:
+                why.append("The shared chart plan is not ready for a disciplined entry yet.")
+            return self._base_result(
+                now=now,
+                signal="WAIT",
+                priority="INFO",
+                reasons=[reason_code],
+                market_bias=market_bias,
+                trend_confidence=trend_confidence,
+                signal_conflict_score=signal_conflict_score,
+                pcr_bias=pcr_bias,
+                oi_build_bias=oi_build_bias,
+                pcr_unbalanced=pcr_unbalanced,
+                pcr_unbalanced_side=pcr_unbalanced_side,
+                volatility_regime=volatility_regime,
+                breakout_confirmation=breakout_confirmation,
+                price_action_bias=price_action_bias,
+                price_action_confirmation=price_action_confirmation,
+                retest_status=retest_status,
+                has_open_bkm=has_open_bkm,
+                expiry=expiry,
+                spot=spot,
+                strategy=str(plan.get("setup_type") or "") or None,
+                recommendation={
+                    "headline": headline,
+                    "signal_text": signal_text,
+                    "what_to_enter": str(plan.get("strike_hint") or "No trade now."),
+                    "sl_text": "Not applicable yet",
+                    "tp_text": "Not applicable yet",
+                    "hold_text": hold_text,
+                    "why": why,
+                    "plan": plan,
+                },
+            )
+
         chain_rows = [r for r in (chain_rows or []) if isinstance(r, dict)]
         strikes = sorted(
             {
@@ -979,26 +1188,74 @@ class IntradayOptionSellingAdvisor:
 
         setup_type: Optional[str] = None
         setup_reasons: List[str] = []
+        planned_setup_type = str(plan.get("setup_type") or "").upper()
+        planned_setup_family = str(plan.get("setup_family") or "PULLBACK").upper()
+        planner_confirmation_score = float(_safe_float(plan.get("confirmation_score")) or 0.0)
+        planner_structure_conflict = float(_safe_float(plan.get("structure_conflict_score")) or 0.0)
+        planner_option_chain_conflict = float(_safe_float(plan.get("option_chain_conflict_score")) or 0.0)
+        planner_reversal_conflict = float(_safe_float(plan.get("reversal_conflict_score")) or 0.0)
+        planner_total_conflict = float(_safe_float(plan.get("total_conflict_score")) or 0.0) * 100.0
+        family_min_conf = planner_relaxed_min_conf = max(0.42, directional_min_conf - 0.20)
+        family_max_conflict = planner_relaxed_max_conflict = min(58.0, directional_max_conflict + 5.0)
+        if planned_setup_family == "CONTINUATION":
+            family_min_conf = max(0.38, directional_min_conf - 0.12)
+            family_max_conflict = min(64.0, planner_relaxed_max_conflict + 4.0)
+        elif planned_setup_family == "REVERSAL":
+            family_min_conf = max(0.48, directional_min_conf - 0.06)
+            family_max_conflict = min(52.0, planner_relaxed_max_conflict)
+        planner_confirmed_directional = bool(
+            planned_setup_type in {"PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"}
+            and bool(plan.get("entry_ready"))
+            and bool(plan.get("confirmation_ready"))
+            and planner_confirmation_score >= 0.66
+            and (
+                bool(plan.get("higher_tf_ok"))
+                or float(_safe_float(plan.get("higher_tf_score")) or 0.0) >= 0.02
+            )
+            and bool(plan.get("buyer_seller_ok"))
+            and bool(plan.get("divergence_supportive"))
+            and not bool(plan.get("fake_breakout_conflict"))
+            and planner_total_conflict <= family_max_conflict
+        )
+        planner_weighted_htf_score = float(_safe_float(plan.get("higher_tf_score")) or 0.0)
         if (
-            market_bias == "BULLISH"
-            and trend_confidence >= directional_min_conf
-            and signal_conflict_score <= directional_max_conflict
-            and breakout_confirmation != "DOWN_CONFIRMED"
+            planned_setup_type in {"PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"}
+            and not (
+                planned_setup_type == "PUT_CREDIT_SPREAD" and breakout_confirmation == "DOWN_CONFIRMED" and planned_setup_family != "REVERSAL"
+            )
+            and not (
+                planned_setup_type == "CALL_CREDIT_SPREAD" and breakout_confirmation == "UP_CONFIRMED" and planned_setup_family != "REVERSAL"
+            )
+            and (
+                (
+                    trend_confidence >= family_min_conf
+                    and max(signal_conflict_score, planner_total_conflict) <= family_max_conflict
+                )
+                or (
+                    planner_confirmed_directional
+                    and trend_confidence >= family_min_conf
+                    and max(signal_conflict_score, planner_total_conflict) <= family_max_conflict
+                    and planner_weighted_htf_score >= 0.02
+                )
+            )
         ):
-            setup_type = "PUT_CREDIT_SPREAD"
-            setup_reasons.append("Bias is bullish with acceptable signal conflict.")
+            setup_type = planned_setup_type
+            setup_reasons.append(
+                f"Shared chart plan and market context agree on a {planned_setup_family.lower()} defined-risk spread."
+            )
             if strong_directional_alignment:
-                setup_reasons.append("Multi-timeframe trend is aligned, so the bullish spread threshold is slightly relaxed.")
-        elif (
-            market_bias == "BEARISH"
-            and trend_confidence >= directional_min_conf
-            and signal_conflict_score <= directional_max_conflict
-            and breakout_confirmation != "UP_CONFIRMED"
-        ):
-            setup_type = "CALL_CREDIT_SPREAD"
-            setup_reasons.append("Bias is bearish with acceptable signal conflict.")
-            if strong_directional_alignment:
-                setup_reasons.append("Multi-timeframe trend is aligned, so the bearish spread threshold is slightly relaxed.")
+                setup_reasons.append(
+                    "Multi-timeframe trend is aligned, so the directional spread threshold is slightly relaxed."
+                )
+            elif planner_confirmed_directional and trend_confidence < directional_min_conf:
+                setup_reasons.append(
+                    "Planner-confirmed confluence is strong enough to allow a slightly lower trend-confidence threshold."
+                )
+            if planner_total_conflict > 0:
+                setup_reasons.append(
+                    "Conflict split: structure="
+                    f"{planner_structure_conflict:.2f}, chain={planner_option_chain_conflict:.2f}, reversal={planner_reversal_conflict:.2f}."
+                )
         else:
             sr_width = None
             if support_level is not None and resistance_level is not None and resistance_level > support_level:
@@ -1010,7 +1267,7 @@ class IntradayOptionSellingAdvisor:
                 and sr_width is not None
                 and sr_width >= max(2 * min_sr_dist, 4 * step)
             )
-            if range_ok:
+            if range_ok and planned_setup_type not in {"PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"}:
                 setup_type = "IRON_CONDOR"
                 setup_reasons.append("Range conditions look acceptable for a defined-risk option selling setup.")
 
@@ -1034,14 +1291,16 @@ class IntradayOptionSellingAdvisor:
                 recommendation={
                     "headline": "Wait: no clean setup yet.",
                     "signal_text": "Do not enter now.",
-                    "what_to_enter": "No trade recommendation at this moment.",
+                    "what_to_enter": str(plan.get("strike_hint") or "No trade recommendation at this moment."),
                     "sl_text": "Not applicable",
                     "tp_text": "Not applicable",
-                    "hold_text": "Wait for clearer trend/range structure and lower signal conflict.",
+                    "hold_text": str(plan.get("trigger_window") or "Wait for clearer trend/range structure and lower signal conflict."),
                     "why": [
                         f"Bias={market_bias}, trend confidence={int(round(trend_confidence*100))}%, conflict={int(round(signal_conflict_score))}%.",
                         "Setup quality is not high enough for a disciplined intraday short option entry.",
-                    ],
+                    ]
+                    + list(plan.get("reason_summary") or [])[:3],
+                    "plan": plan,
                 },
             )
 
@@ -1093,6 +1352,115 @@ class IntradayOptionSellingAdvisor:
                 candidate_setup_signature=prev_signature,
                 candidate_signal_streak=prev_streak,
             )
+
+        if setup_type in {"PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"}:
+            continuation_ready = bool(plan.get("continuation_ready", False))
+            reversal_ready = bool(plan.get("reversal_ready", False))
+            pullback_ok = bool(plan.get("pullback_ok", plan.get("pullback_touched"))) or continuation_ready
+            pullback_score = float(_safe_float(plan.get("pullback_score")) or 0.0)
+            pullback_tolerance = _safe_float(plan.get("pullback_tolerance_points"))
+            higher_tf_score = float(_safe_float(plan.get("higher_tf_score")) or 0.0)
+            confirmation_score = float(_safe_float(plan.get("confirmation_score")) or 0.0)
+            strong_candle_ok = bool(plan.get("strong_candle_ok"))
+            strong_candle_text = str(plan.get("strong_candle_text") or "No strong 5m confirmation candle yet.")
+            ema2050_ok = bool(plan.get("ema_2050_ok"))
+            ema2050_5m = str(plan.get("ema_2050_alignment_5m") or "NEUTRAL")
+            ema2050_15m = str(plan.get("ema_2050_alignment_15m") or "NEUTRAL")
+            if not pullback_ok:
+                return _planner_wait_result(
+                    reason_code="PULLBACK_ZONE_NOT_REACHED",
+                    headline="Wait: price is still outside the ATR-tolerant pullback zone.",
+                    signal_text="Do not sell premium before price gets close enough to the planned zone.",
+                    hold_text=str(plan.get("trigger_window") or "Wait for the planned pullback zone."),
+                    why_extra=[
+                        (
+                            f"Pullback quality is only {int(round(pullback_score * 100))}%"
+                            + (
+                                f" within an ATR-tolerant buffer of {float(pullback_tolerance):.0f} points."
+                                if pullback_tolerance is not None
+                                else "."
+                            )
+                        ),
+                    ],
+                )
+            if continuation_ready:
+                reasons.append("TREND_CONTINUATION_READY")
+            if reversal_ready:
+                reasons.append("REVERSAL_SETUP_READY")
+            if not continuation_ready and not ema2050_ok:
+                return _planner_wait_result(
+                    reason_code="EMA2050_CONFIRMATION_MISSING",
+                    headline="Wait: 20/50 EMA trend is not aligned.",
+                    signal_text="Do not enter until the 20/50 EMA trend agrees with the setup.",
+                    hold_text="Wait for 5m EMA20/50 alignment and non-opposing 15m EMA20/50 trend.",
+                    why_extra=[
+                        f"5m EMA20/50 alignment is {ema2050_5m}.",
+                        f"15m EMA20/50 alignment is {ema2050_15m}.",
+                    ],
+                )
+            if not continuation_ready and not strong_candle_ok:
+                return _planner_wait_result(
+                    reason_code="STRONG_5M_CANDLE_MISSING",
+                    headline="Wait: strong 5-minute confirmation candle is missing.",
+                    signal_text="Do not enter until a strong 5m candle confirms the pullback.",
+                    hold_text="Wait for a decisive red/green 5m candle in the trade direction after the pullback.",
+                    why_extra=[strong_candle_text],
+                )
+            if reversal_ready and not bool(plan.get("divergence_supportive")):
+                return _planner_wait_result(
+                    reason_code="RSI_DIVERGENCE_AGAINST_SETUP",
+                    headline="Wait: reversal setup is fighting RSI divergence.",
+                    signal_text="Do not enter the reversal while divergence is still against it.",
+                    hold_text="Wait for RSI divergence to stop fighting the reversal setup.",
+                    why_extra=["Reversal entries need supportive divergence or a neutral RSI read."],
+                )
+            if bool(plan.get("confirmation_ready")) and not bool(plan.get("buyer_seller_ok")):
+                reason_code = (
+                    "SELLER_ZONE_UNCONFIRMED" if setup_type == "CALL_CREDIT_SPREAD" else "BUYER_ZONE_UNCONFIRMED"
+                )
+                return _planner_wait_result(
+                    reason_code=reason_code,
+                    headline="Wait: participation is not visible at the decision zone.",
+                    signal_text="Do not enter until buyers/sellers show up at the planned level.",
+                    hold_text="Wait for clear buyer/seller defense at the pullback zone.",
+                    why_extra=[
+                        "The chart plan requires visible participation at support/resistance before entry.",
+                    ],
+                )
+            if bool(plan.get("confirmation_ready")) and not bool(plan.get("higher_tf_ok")) and confirmation_score < 0.67:
+                return _planner_wait_result(
+                    reason_code="HTF_CONFLUENCE_MISSING",
+                    headline="Wait: higher timeframe structure is not aligned enough.",
+                    signal_text="Do not enter until 15m/60m structure agrees with the trade.",
+                    hold_text="Wait for stronger multi-timeframe confluence.",
+                    why_extra=[
+                        f"Current weighted higher-timeframe score is {higher_tf_score:+.2f}; the setup needs stronger 15m/60m alignment.",
+                    ],
+                )
+            if planner_total_conflict > family_max_conflict:
+                return _planner_wait_result(
+                    reason_code="SIGNAL_CONFLICT_HIGH",
+                    headline="Wait: split conflicts are still too high.",
+                    signal_text="Do not enter while structure/chain/reversal conflicts are elevated.",
+                    hold_text="Wait for cleaner alignment between chart structure, option chain, and reversal context.",
+                    why_extra=[
+                        f"Structure conflict={planner_structure_conflict:.2f}, option-chain conflict={planner_option_chain_conflict:.2f}, reversal conflict={planner_reversal_conflict:.2f}.",
+                    ],
+                )
+            if planned_setup_family == "REVERSAL":
+                against_breakout = (
+                    setup_type == "PUT_CREDIT_SPREAD" and breakout_confirmation == "DOWN_CONFIRMED"
+                ) or (
+                    setup_type == "CALL_CREDIT_SPREAD" and breakout_confirmation == "UP_CONFIRMED"
+                )
+                if against_breakout and not reversal_ready:
+                    return _planner_wait_result(
+                        reason_code="REVERSAL_NOT_CONFIRMED",
+                        headline="Wait: reversal setup is still fighting the active breakout.",
+                        signal_text="Do not fade the breakout until the reversal confirmation is stronger.",
+                        hold_text="Wait for M/W confirmation, failed breakout retest, and supportive divergence together.",
+                        why_extra=["Countertrend reversals need stronger confirmation than continuation trades."],
+                    )
 
         now_t = now.timetz().replace(tzinfo=None) if getattr(now, "tzinfo", None) else now.time()
         high_vol_bear_call_not_before = _parse_hhmm(self.config.high_vol_bear_call_not_before, dtime(10, 15))
@@ -1256,12 +1624,15 @@ class IntradayOptionSellingAdvisor:
                     },
                 )
 
-        price_action_ok, candle_confirmation_ok, retest_failed_against_setup, price_action_details = (
-            self._directional_price_action_expectations(
-                setup_type=setup_type,
-                structure_ctx=structure_ctx,
-            )
+        price_action_eval = self._directional_price_action_expectations(
+            setup_type=setup_type,
+            structure_ctx=structure_ctx,
         )
+        price_action_ok = bool(price_action_eval.get("price_action_ok"))
+        retest_failed_against_setup = bool(price_action_eval.get("retest_failed_against_setup"))
+        hard_block_pattern_against_setup = bool(price_action_eval.get("hard_block_pattern_against_setup"))
+        hard_block_patterns = list(price_action_eval.get("hard_block_patterns") or [])
+        price_action_details = list(price_action_eval.get("details") or [])
         if retest_failed_against_setup:
             reasons.append("RETEST_FAILED_AGAINST_SETUP")
             return self._base_result(
@@ -1292,6 +1663,41 @@ class IntradayOptionSellingAdvisor:
                     "hold_text": "Wait for price to reclaim structure before taking a defined-risk entry.",
                     "why": price_action_details + [
                         "Price tested the level and failed in the wrong direction, which increases whipsaw risk.",
+                    ],
+                },
+            )
+        if hard_block_pattern_against_setup:
+            reasons.append("REVERSAL_PATTERN_AGAINST_SETUP")
+            return self._base_result(
+                now=now,
+                signal="WAIT",
+                priority="WARN",
+                reasons=reasons,
+                market_bias=market_bias,
+                trend_confidence=trend_confidence,
+                signal_conflict_score=signal_conflict_score,
+                pcr_unbalanced=pcr_unbalanced,
+                pcr_unbalanced_side=pcr_unbalanced_side,
+                volatility_regime=volatility_regime,
+                breakout_confirmation=breakout_confirmation,
+                price_action_bias=price_action_bias,
+                price_action_confirmation=price_action_confirmation,
+                retest_status=retest_status,
+                has_open_bkm=has_open_bkm,
+                expiry=expiry,
+                spot=spot,
+                strategy=setup_type,
+                recommendation={
+                    "headline": "Wait: reversal pattern is against the trade.",
+                    "signal_text": "Do not enter yet.",
+                    "what_to_enter": "No trade now.",
+                    "sl_text": "Not applicable",
+                    "tp_text": "Not applicable",
+                    "hold_text": "Wait for the fake break or reversal pattern to resolve before taking a credit spread.",
+                    "why": price_action_details + [
+                        "The chart is showing a confirmed reversal/fake-break pattern against this setup: "
+                        + ", ".join(hard_block_patterns)
+                        + ".",
                     ],
                 },
             )
@@ -1331,6 +1737,44 @@ class IntradayOptionSellingAdvisor:
                         ],
                     },
                 )
+
+        swing_structure_ok, swing_structure_details = self._swing_structure_supports_setup(
+            setup_type=setup_type,
+            structure_ctx=structure_ctx,
+        )
+        if not swing_structure_ok:
+            reasons.append("SWING_STRUCTURE_AGAINST_SETUP")
+            return self._base_result(
+                now=now,
+                signal="WAIT",
+                priority="INFO",
+                reasons=reasons,
+                market_bias=market_bias,
+                trend_confidence=trend_confidence,
+                signal_conflict_score=signal_conflict_score,
+                pcr_unbalanced=pcr_unbalanced,
+                pcr_unbalanced_side=pcr_unbalanced_side,
+                volatility_regime=volatility_regime,
+                breakout_confirmation=breakout_confirmation,
+                price_action_bias=price_action_bias,
+                price_action_confirmation=price_action_confirmation,
+                retest_status=retest_status,
+                has_open_bkm=has_open_bkm,
+                expiry=expiry,
+                spot=spot,
+                strategy=setup_type,
+                recommendation={
+                    "headline": "Wait: swing structure is against the trade.",
+                    "signal_text": "Do not enter yet.",
+                    "what_to_enter": "No trade now.",
+                    "sl_text": "Not applicable",
+                    "tp_text": "Not applicable",
+                    "hold_text": "Wait until the NIFTY swing structure aligns with the setup.",
+                    "why": swing_structure_details + [
+                        f"Current structure is {swing_structure_label} with {swing_structure_bias} bias.",
+                    ],
+                },
+            )
 
         if setup_type in {"PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"} and volatility_regime == "HIGH":
             supportive_retest = self._supportive_retest_for_setup(setup_type, retest_status)
@@ -1446,14 +1890,57 @@ class IntradayOptionSellingAdvisor:
                     },
                 )
 
+        if setup_type in {"PUT_CREDIT_SPREAD", "CALL_CREDIT_SPREAD"} and not bool(plan.get("divergence_supportive")):
+            reasons.append("RSI_DIVERGENCE_AGAINST_SETUP")
+            return self._base_result(
+                now=now,
+                signal="WAIT",
+                priority="INFO",
+                reasons=reasons,
+                market_bias=market_bias,
+                trend_confidence=trend_confidence,
+                signal_conflict_score=signal_conflict_score,
+                pcr_bias=pcr_bias,
+                oi_build_bias=oi_build_bias,
+                pcr_unbalanced=pcr_unbalanced,
+                pcr_unbalanced_side=pcr_unbalanced_side,
+                volatility_regime=volatility_regime,
+                breakout_confirmation=breakout_confirmation,
+                price_action_bias=price_action_bias,
+                price_action_confirmation=price_action_confirmation,
+                retest_status=retest_status,
+                has_open_bkm=has_open_bkm,
+                expiry=expiry,
+                spot=spot,
+                strategy=setup_type,
+                recommendation={
+                    "headline": "Wait: RSI divergence is against the setup.",
+                    "signal_text": "Do not enter while momentum divergence is fighting the trade.",
+                    "what_to_enter": str(plan.get("strike_hint") or "No trade now."),
+                    "sl_text": "Not applicable yet",
+                    "tp_text": "Not applicable yet",
+                    "hold_text": "Wait for divergence to align with the planned direction or neutralize.",
+                    "why": [
+                        "The execution engine now treats RSI divergence as a hard confluence filter.",
+                    ]
+                    + list(plan.get("reason_summary") or [])[:4],
+                    "plan": plan,
+                },
+            )
+
         def _round_to_step(value: float) -> float:
             return round(float(value) / step) * step
 
         strategy = setup_type
+        strategy_emit = self._directional_strategy_name(setup_type)
         legs: List[Dict[str, Any]] = []
         est_credit_pts = 0.0
         invalidation_price: Optional[float] = None
         invalidation_text = ""
+        planned_short_hint = _safe_float(plan.get("short_strike_hint"))
+        planned_hedge_hint = _safe_float(plan.get("hedge_strike_hint"))
+        planned_invalidation = _safe_float(plan.get("invalidation_spot"))
+        emergency_hedge_width = self._emergency_hedge_distance(volatility_regime, step)
 
         if setup_type == "PUT_CREDIT_SPREAD":
             put_pad = dynamic_pad
@@ -1464,12 +1951,46 @@ class IntradayOptionSellingAdvisor:
                 support_ref - put_pad,
                 (put_wall_strike - step if put_wall_strike is not None and put_wall_strike < spot else support_ref - put_pad),
             )
-            short_put = self._pick_leq(strikes, _round_to_step(target_short))
-            if short_put is None:
-                short_put = self._pick_leq(strikes, spot - fallback_buf)
-            if short_put is None:
-                short_put = self._pick_leq(strikes, spot - (4 * step))
-            hedge_put = self._pick_leq(strikes, float(short_put or 0.0) - vol_width) if short_put is not None else None
+            heuristic_short_put = self._pick_leq(strikes, _round_to_step(target_short))
+            if heuristic_short_put is None:
+                heuristic_short_put = self._pick_leq(
+                    strikes, planned_short_hint if planned_short_hint is not None else (spot - fallback_buf)
+                )
+            if heuristic_short_put is None:
+                heuristic_short_put = self._pick_leq(strikes, spot - (4 * step))
+            hedge_width = emergency_hedge_width if self._uses_short_option_with_hedge() else vol_width
+            heuristic_hedge_put = (
+                self._pick_leq(strikes, float(heuristic_short_put or 0.0) - hedge_width)
+                if heuristic_short_put is not None
+                else None
+            )
+            planned_short_put = self._pick_leq(strikes, planned_short_hint) if planned_short_hint is not None else None
+            planned_hedge_put = (
+                self._pick_leq(strikes, planned_hedge_hint)
+                if planned_hedge_hint is not None
+                else (
+                    self._pick_leq(strikes, float(planned_short_put or 0.0) - hedge_width)
+                    if planned_short_put is not None
+                    else None
+                )
+            )
+            candidates: List[Tuple[float, float, float]] = []
+            for cand_short, cand_hedge in (
+                (heuristic_short_put, heuristic_hedge_put),
+                (planned_short_put, planned_hedge_put),
+            ):
+                if cand_short is None or cand_hedge is None or cand_hedge >= cand_short:
+                    continue
+                credit = max(
+                    0.0,
+                    (self._ltp(lookup, "PE", cand_short) or 0.0) - (self._ltp(lookup, "PE", cand_hedge) or 0.0),
+                )
+                candidates.append((credit, cand_short, cand_hedge))
+            if candidates:
+                _, short_put, hedge_put = max(candidates, key=lambda item: (item[0], -item[1]))
+            else:
+                short_put = None
+                hedge_put = None
             if short_put is None or hedge_put is None or hedge_put >= short_put:
                 reasons.append("STRIKE_SELECTION_FAILED_PUT_SPREAD")
                 setup_type = ""
@@ -1481,12 +2002,18 @@ class IntradayOptionSellingAdvisor:
                     {"side": "SELL", "option_type": "PE", "strike": short_put, "qty_lots": 1},
                     {"side": "BUY", "option_type": "PE", "strike": hedge_put, "qty_lots": 1},
                 ]
-                invalidation_price = min(float(short_put) - put_pad * 0.5, (support_level or short_put) - put_pad * 0.35)
+                strategy_emit = self._directional_strategy_name(setup_type)
+                invalidation_price = planned_invalidation
+                if invalidation_price is None:
+                    invalidation_price = min(float(short_put) - put_pad * 0.5, (support_level or short_put) - put_pad * 0.35)
                 invalidation_text = (
                     f"Exit if NIFTY sustains below {int(round(invalidation_price))} "
                     f"(bearish breakdown against bullish setup)."
                 )
-                setup_reasons.append("Bullish bias supports a put credit spread.")
+                if strategy_emit == "SHORT_PUT_WITH_HEDGE":
+                    setup_reasons.append("Bullish bias supports short put selling with a far emergency hedge.")
+                else:
+                    setup_reasons.append("Bullish bias supports a put credit spread.")
         elif setup_type == "CALL_CREDIT_SPREAD":
             call_pad = dynamic_pad
             if strong_directional_alignment and market_bias == "BEARISH" and trend_confidence >= 0.72 and signal_conflict_score <= 25.0:
@@ -1496,12 +2023,46 @@ class IntradayOptionSellingAdvisor:
                 resistance_ref + call_pad,
                 (call_wall_strike + step if call_wall_strike is not None and call_wall_strike > spot else resistance_ref + call_pad),
             )
-            short_call = self._pick_geq(strikes, _round_to_step(target_short))
-            if short_call is None:
-                short_call = self._pick_geq(strikes, spot + fallback_buf)
-            if short_call is None:
-                short_call = self._pick_geq(strikes, spot + (4 * step))
-            hedge_call = self._pick_geq(strikes, float(short_call or 0.0) + vol_width) if short_call is not None else None
+            heuristic_short_call = self._pick_geq(strikes, _round_to_step(target_short))
+            if heuristic_short_call is None:
+                heuristic_short_call = self._pick_geq(
+                    strikes, planned_short_hint if planned_short_hint is not None else (spot + fallback_buf)
+                )
+            if heuristic_short_call is None:
+                heuristic_short_call = self._pick_geq(strikes, spot + (4 * step))
+            hedge_width = emergency_hedge_width if self._uses_short_option_with_hedge() else vol_width
+            heuristic_hedge_call = (
+                self._pick_geq(strikes, float(heuristic_short_call or 0.0) + hedge_width)
+                if heuristic_short_call is not None
+                else None
+            )
+            planned_short_call = self._pick_geq(strikes, planned_short_hint) if planned_short_hint is not None else None
+            planned_hedge_call = (
+                self._pick_geq(strikes, planned_hedge_hint)
+                if planned_hedge_hint is not None
+                else (
+                    self._pick_geq(strikes, float(planned_short_call or 0.0) + hedge_width)
+                    if planned_short_call is not None
+                    else None
+                )
+            )
+            candidates = []
+            for cand_short, cand_hedge in (
+                (heuristic_short_call, heuristic_hedge_call),
+                (planned_short_call, planned_hedge_call),
+            ):
+                if cand_short is None or cand_hedge is None or cand_hedge <= cand_short:
+                    continue
+                credit = max(
+                    0.0,
+                    (self._ltp(lookup, "CE", cand_short) or 0.0) - (self._ltp(lookup, "CE", cand_hedge) or 0.0),
+                )
+                candidates.append((credit, cand_short, cand_hedge))
+            if candidates:
+                _, short_call, hedge_call = max(candidates, key=lambda item: (item[0], item[1]))
+            else:
+                short_call = None
+                hedge_call = None
             if short_call is None or hedge_call is None or hedge_call <= short_call:
                 reasons.append("STRIKE_SELECTION_FAILED_CALL_SPREAD")
                 setup_type = ""
@@ -1513,12 +2074,18 @@ class IntradayOptionSellingAdvisor:
                     {"side": "SELL", "option_type": "CE", "strike": short_call, "qty_lots": 1},
                     {"side": "BUY", "option_type": "CE", "strike": hedge_call, "qty_lots": 1},
                 ]
-                invalidation_price = max(float(short_call) + call_pad * 0.5, (resistance_level or short_call) + call_pad * 0.35)
+                strategy_emit = self._directional_strategy_name(setup_type)
+                invalidation_price = planned_invalidation
+                if invalidation_price is None:
+                    invalidation_price = max(float(short_call) + call_pad * 0.5, (resistance_level or short_call) + call_pad * 0.35)
                 invalidation_text = (
                     f"Exit if NIFTY sustains above {int(round(invalidation_price))} "
                     f"(bullish breakout against bearish setup)."
                 )
-                setup_reasons.append("Bearish bias supports a call credit spread.")
+                if strategy_emit == "SHORT_CALL_WITH_HEDGE":
+                    setup_reasons.append("Bearish bias supports short call selling with a far emergency hedge.")
+                else:
+                    setup_reasons.append("Bearish bias supports a call credit spread.")
         elif setup_type == "IRON_CONDOR":
             sup_ref = support_level if support_level is not None else (spot - fallback_buf)
             res_ref = resistance_level if resistance_level is not None else (spot + fallback_buf)
@@ -1622,17 +2189,45 @@ class IntradayOptionSellingAdvisor:
                 },
             )
 
+        trail_payload: Dict[str, Any] = {}
+        unlimited_profit_mode = strategy_emit in {"SHORT_PUT_WITH_HEDGE", "SHORT_CALL_WITH_HEDGE"}
         if setup_type == "IRON_CONDOR":
             tp_capture = float(self.config.ic_target_capture_pct)
             sl_multiple = float(self.config.ic_stop_credit_multiple)
+            tp_rs = max(0.0, est_credit_rs * tp_capture)
+            sl_rs = max(0.0, est_credit_rs * sl_multiple)
         else:
-            tp_capture = float(self.config.spread_target_capture_pct)
-            sl_multiple = float(self.config.spread_stop_credit_multiple)
-        tp_rs = max(0.0, est_credit_rs * tp_capture)
-        sl_rs = max(0.0, est_credit_rs * sl_multiple)
+            if unlimited_profit_mode:
+                tp_capture = 0.0
+                sl_multiple = 0.0
+                tp_rs = 0.0
+                sl_rs = float(self.config.naked_operational_max_loss_rs)
+                trail_payload = {
+                    "unlimited_profit_mode": True,
+                    "arm_profit_rs_per_set": round(float(self.config.naked_profit_trail_arm_rs), 2),
+                    "min_locked_profit_rs_per_set": round(float(self.config.naked_profit_trail_arm_rs), 2),
+                    "keep_pct": round(float(self.config.naked_profit_trail_keep_pct), 3),
+                    "text": (
+                        f"No fixed cap. Once profit reaches about Rs {float(self.config.naked_profit_trail_arm_rs):,.0f} "
+                        "per 1-lot set, trail it using live structure."
+                    ),
+                }
+            else:
+                tp_capture = float(self.config.spread_target_capture_pct)
+                sl_multiple = float(self.config.spread_stop_credit_multiple)
+                tp_rs = max(0.0, est_credit_rs * tp_capture)
+                sl_rs = max(0.0, est_credit_rs * sl_multiple)
         hold_till = _parse_hhmm(self.config.max_hold_till, dtime(15, 5))
 
-        if setup_type == "PUT_CREDIT_SPREAD":
+        if strategy_emit == "SHORT_PUT_WITH_HEDGE":
+            strategy_label = "Short Put With Emergency Hedge"
+            setup_reasons.append("Trend, structure, and support are aligned for bullish premium selling.")
+            setup_reasons.append("Emergency hedge is kept far to preserve credit; operational risk is controlled by MTM stop.")
+        elif strategy_emit == "SHORT_CALL_WITH_HEDGE":
+            strategy_label = "Short Call With Emergency Hedge"
+            setup_reasons.append("Trend, structure, and resistance are aligned for bearish premium selling.")
+            setup_reasons.append("Emergency hedge is kept far to preserve credit; operational risk is controlled by MTM stop.")
+        elif setup_type == "PUT_CREDIT_SPREAD":
             strategy_label = "Bull Put Credit Spread"
             setup_reasons.append("5m and 15m EMA(5/20) are aligned bullish.")
             setup_reasons.append("15m ORB confirms bullish continuation.")
@@ -1652,6 +2247,8 @@ class IntradayOptionSellingAdvisor:
         what_to_enter = f"{strategy_label} ({expiry}) -> {legs_txt}"
         signal_text = "ENTER NOW" if entry_window_open else "WAIT"
         headline = f"{signal_text}: {strategy_label}"
+        entry_not_before = _parse_hhmm(self.config.entry_not_before, dtime(9, 45))
+        last_entry_time = _parse_hhmm(self.config.last_new_entry_time, dtime(14, 20))
         risk_notes = [
             "Scale lots only after your first set is working. Avoid adding size immediately.",
             "Do not exit early out of fear unless SL / invalidation is hit.",
@@ -1665,24 +2262,45 @@ class IntradayOptionSellingAdvisor:
             "signal": "ENTER_NOW",
             "headline": headline,
             "signal_text": signal_text,
-            "strategy_type": setup_type,
+            "strategy_type": strategy_emit,
             "strategy_label": strategy_label,
             "expiry": expiry,
             "what_to_enter": what_to_enter,
+            "entry": {
+                "window_text": (
+                    f"Entry window: {entry_not_before.strftime('%H:%M')} to {last_entry_time.strftime('%H:%M')} IST."
+                ),
+                "trigger_text": str(plan.get("entry_trigger_text") or plan.get("trigger_window") or ""),
+                "pullback_zone_low": _safe_float(plan.get("pullback_zone_low")),
+                "pullback_zone_high": _safe_float(plan.get("pullback_zone_high")),
+                "entry_zone_mid": _safe_float(plan.get("entry_zone_mid")),
+            },
             "legs": legs,
             "est_credit_points_per_set": round(est_credit_pts, 2),
             "est_credit_rs_per_set": round(est_credit_rs, 2),
             "sl": {
                 "kind": "POSITION_PNL_OR_INVALIDATION",
                 "loss_rs_per_set": round(sl_rs, 2),
-                "text": f"SL: Exit if loss on 1-lot set reaches about Rs {sl_rs:,.0f}, or invalidation is hit.",
+                "text": (
+                    f"SL: Exit if loss on 1-lot set reaches about Rs {sl_rs:,.0f}, or invalidation is hit."
+                    if not unlimited_profit_mode
+                    else (
+                        f"Operational SL: kill the trade near Rs {sl_rs:,.0f} loss on 1-lot set, "
+                        "or exit earlier if structure invalidates."
+                    )
+                ),
             },
             "tp": {
-                "kind": "PREMIUM_CAPTURE",
+                "kind": "UNLIMITED_TRAIL" if unlimited_profit_mode else "PREMIUM_CAPTURE",
                 "profit_rs_per_set": round(tp_rs, 2),
                 "capture_pct": round(tp_capture * 100.0, 1),
-                "text": f"TP: Book around Rs {tp_rs:,.0f} profit on 1-lot set (about {int(round(tp_capture*100))}% premium capture).",
+                "text": (
+                    trail_payload.get("text")
+                    if unlimited_profit_mode
+                    else f"TP: Book around Rs {tp_rs:,.0f} profit on 1-lot set (about {int(round(tp_capture*100))}% premium capture)."
+                ),
             },
+            "trail": trail_payload,
             "hold": {
                 "max_hold_till": hold_till.strftime("%H:%M"),
                 "text": (
@@ -1702,12 +2320,20 @@ class IntradayOptionSellingAdvisor:
                 "avoid_overtrading": "Take only one setup unless this one is closed and conditions are still valid.",
                 "fear_rule": "Do not exit early if AI still says HOLD/WATCH and none of TP/SL/invalidation is hit.",
             },
+            "plan": plan,
         }
+        if unlimited_profit_mode:
+            recommendation["risk_notes"].append(
+                "The far hedge is tail protection, not a mathematical guarantee. The real control is the operational MTM stop."
+            )
+            recommendation["risk_notes"].append(
+                f"Once profit reaches about Rs {float(self.config.naked_profit_trail_arm_rs):,.0f}, the agent will trail it instead of using a fixed TP cap."
+            )
         entry_features = self._entry_feature_snapshot(
             now=now,
             expiry=expiry,
             spot=spot,
-            strategy=setup_type,
+            strategy=strategy_emit,
             market_bias=market_bias,
             trend_confidence=trend_confidence,
             signal_conflict_score=signal_conflict_score,
@@ -1719,10 +2345,11 @@ class IntradayOptionSellingAdvisor:
             structure_ctx=structure_ctx,
             oc_ctx=oc_ctx,
             recommendation=recommendation,
+            trade_plan=plan,
         )
         recommendation["entry_features"] = entry_features
         candidate_signature = self._candidate_signature(
-            setup_type=setup_type,
+            setup_type=strategy_emit,
             market_bias=market_bias,
             orb_confirmation=orb_confirmation,
             expiry=expiry,
@@ -1774,7 +2401,7 @@ class IntradayOptionSellingAdvisor:
                 },
                 expiry=expiry,
                 spot=spot,
-                strategy=setup_type,
+                strategy=strategy_emit,
                 candidate_setup_signature=candidate_signature,
                 candidate_signal_streak=candidate_streak,
                 entry_features=entry_features,
@@ -1798,7 +2425,7 @@ class IntradayOptionSellingAdvisor:
             recommendation=recommendation,
             expiry=expiry,
             spot=spot,
-            strategy=setup_type,
+            strategy=strategy_emit,
             candidate_setup_signature=candidate_signature,
             candidate_signal_streak=candidate_streak,
             entry_features=entry_features,

@@ -350,6 +350,11 @@
           <div class="summary-sub">Open positions MTM</div>
         </div>
         <div class="summary-card">
+          <div class="summary-title">Realized P&L</div>
+          <div class="summary-value" id="paper-realized-pnl">₹ 0.00</div>
+          <div class="summary-sub">Closed paper positions</div>
+        </div>
+        <div class="summary-card">
           <div class="summary-title">Open Positions</div>
           <div class="summary-value" id="paper-open-count">0</div>
         </div>
@@ -363,6 +368,82 @@
           <div class="summary-value" id="state-text">State: —</div>
           <div class="summary-sub"><span class="chip" id="paper-ltp-chip">LTP feed: —</span></div>
         </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="card-header">
+          <div style="font-weight:700;">Latest Batman Basket Review</div>
+          <div>
+            <span class="chip" id="batman-review-expiry">No basket</span>
+            <span class="chip" id="batman-review-status">—</span>
+          </div>
+        </div>
+        <div class="summary-bar" style="margin-bottom:10px;">
+          <div class="summary-card">
+            <div class="summary-title">Realized P&L</div>
+            <div class="summary-value" id="batman-review-pnl">—</div>
+            <div class="summary-sub" id="batman-review-window">Opened — | Closed —</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Held For</div>
+            <div class="summary-value" id="batman-review-hold">—</div>
+            <div class="summary-sub">Basket lifetime</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Close Reason</div>
+            <div class="summary-value" id="batman-review-reason">—</div>
+            <div class="summary-sub">Final exit trigger</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Quality</div>
+            <div class="summary-value" id="batman-review-quality">—</div>
+            <div class="summary-sub" id="batman-review-quality-sub">—</div>
+          </div>
+        </div>
+        <div class="muted" style="margin-bottom:8px;">What the agent learned</div>
+        <div id="batman-review-lessons" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;"></div>
+        <div class="muted" style="margin-bottom:8px;">What to improve next</div>
+        <div id="batman-review-improvements" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;"></div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="card-header">
+          <div style="font-weight:700;">Batman Learning</div>
+          <div>
+            <span class="chip" id="batman-learning-status">Status: —</span>
+            <span class="chip" id="batman-learning-count">0 outcomes</span>
+          </div>
+        </div>
+        <div class="summary-bar" style="margin-bottom:10px;">
+          <div class="summary-card">
+            <div class="summary-title">Realized P&L</div>
+            <div class="summary-value" id="batman-learning-pnl">—</div>
+            <div class="summary-sub">Learned Batman outcomes</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Last Assessment</div>
+            <div class="summary-value" id="batman-learning-last-status">—</div>
+            <div class="summary-sub" id="batman-learning-last-time">Updated —</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Risk Adjust</div>
+            <div class="summary-value" id="batman-learning-risk-adjust">—</div>
+            <div class="summary-sub">Adaptive score adjustment</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Last Outcome</div>
+            <div class="summary-value" id="batman-learning-last-outcome">—</div>
+            <div class="summary-sub">Most recent basket close</div>
+          </div>
+        </div>
+        <div class="muted" style="margin-bottom:8px;">Negative buckets the engine is penalizing</div>
+        <div id="batman-learning-negative" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;"></div>
+        <div class="muted" style="margin-bottom:8px;">Positive buckets the engine is favoring</div>
+        <div id="batman-learning-positive" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;"></div>
+        <div class="muted" style="margin-bottom:8px;">Last assessment reasons</div>
+        <div id="batman-learning-reasons" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;"></div>
+        <div class="muted" style="margin-bottom:8px;">Supportive reasons</div>
+        <div id="batman-learning-supportive" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;"></div>
       </div>
 
       <div class="card" style="margin-top:16px;">
@@ -451,6 +532,44 @@
 
       <div class="card" style="margin-top:16px;">
         <div class="card-header">
+          <div style="font-weight:700;">Intraday Learning</div>
+          <div>
+            <span class="chip" id="intraday-learning-status">Status: —</span>
+            <span class="chip" id="intraday-learning-count">0 outcomes</span>
+          </div>
+        </div>
+        <div class="summary-bar" style="margin-bottom:10px;">
+          <div class="summary-card">
+            <div class="summary-title">Realized P&L</div>
+            <div class="summary-value" id="intraday-learning-pnl">—</div>
+            <div class="summary-sub">Committee-labeled intraday outcomes</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Last Outcome</div>
+            <div class="summary-value" id="intraday-learning-last-outcome">—</div>
+            <div class="summary-sub" id="intraday-learning-last-time">Updated —</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Confidence Adjust</div>
+            <div class="summary-value" id="intraday-learning-confidence">—</div>
+            <div class="summary-sub">Adaptive committee adjustment</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Entry Block</div>
+            <div class="summary-value" id="intraday-learning-block">—</div>
+            <div class="summary-sub">Last learning verdict</div>
+          </div>
+        </div>
+        <div class="muted" style="margin-bottom:8px;">Negative buckets the engine is penalizing</div>
+        <div id="intraday-learning-negative" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;"></div>
+        <div class="muted" style="margin-bottom:8px;">Positive buckets the engine is favoring</div>
+        <div id="intraday-learning-positive" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;"></div>
+        <div class="muted" style="margin-bottom:8px;">Last assessment reasons</div>
+        <div id="intraday-learning-reasons" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;"></div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="card-header">
           <div style="font-weight:700;">Paper Positions</div>
           <div>
             <span class="chip" id="positions-count">0 legs</span>
@@ -496,6 +615,57 @@
           </div>
         </div>
       </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="card-header">
+          <div style="font-weight:700;">NIFTY Index Structure Map</div>
+          <div>
+            <span class="chip" id="intraday-chart-headline">Loading…</span>
+            <span class="chip" id="intraday-chart-updated">Updated: —</span>
+          </div>
+        </div>
+        <div class="grid" style="grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr); align-items:start;">
+          <div class="summary-card" style="padding:10px 12px;">
+            <div style="height:290px;"><canvas id="intraday-index-chart" height="250"></canvas></div>
+            <div class="summary-sub" id="intraday-chart-meta" style="margin-top:8px;">Price / EMA20 / ORB / nearest structure levels</div>
+          </div>
+          <div>
+            <div class="summary-bar" style="margin-bottom:10px;">
+              <div class="summary-card" style="min-width:150px;">
+                <div class="summary-title">Market Regime</div>
+                <div class="summary-value" id="intraday-chart-regime" style="font-size:16px;">—</div>
+                <div class="summary-sub" id="intraday-chart-bias">Bias: —</div>
+              </div>
+              <div class="summary-card" style="min-width:150px;">
+                <div class="summary-title">Price</div>
+                <div class="summary-value" id="intraday-chart-spot" style="font-size:16px;">—</div>
+                <div class="summary-sub" id="intraday-chart-range">Range: —</div>
+              </div>
+            </div>
+            <div class="summary-card" style="padding:10px 12px; margin-bottom:10px;">
+              <div class="summary-title">Structure Read</div>
+              <div class="summary-sub" id="intraday-chart-levels">Support / Resistance: —</div>
+              <div class="summary-sub" id="intraday-chart-orb">ORB: —</div>
+              <div class="summary-sub" id="intraday-chart-pattern">Pattern: —</div>
+              <div class="summary-sub" id="intraday-chart-confirm">Confirmation: —</div>
+              <div class="summary-sub" id="intraday-chart-flow">Buyers / Sellers: —</div>
+              <div class="summary-sub" id="intraday-chart-rsi">RSI divergence: —</div>
+              <div class="summary-sub" id="intraday-chart-htf">Higher timeframe: —</div>
+            </div>
+            <div class="summary-card" style="padding:10px 12px;">
+              <div class="summary-title">Trade Plan After Pullback</div>
+              <div class="summary-value" id="intraday-plan-posture" style="font-size:16px;">—</div>
+              <div class="summary-sub" id="intraday-plan-entry">Entry zone: —</div>
+              <div class="summary-sub" id="intraday-plan-confirmation">Confirmation: —</div>
+              <div class="summary-sub" id="intraday-plan-invalidation">Invalidation: —</div>
+              <div class="summary-sub" id="intraday-plan-strikes">Strike idea: —</div>
+              <div class="summary-sub" id="intraday-plan-trade-idea">Trade idea: —</div>
+              <div class="summary-sub" id="intraday-plan-confluences">Confluences: —</div>
+              <div id="intraday-plan-reasons" style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;"></div>
+            </div>
+          </div>
+        </div>
+      </div>
     </section>
 
     <!-- Strategy State -->
@@ -534,6 +704,7 @@
     const fmtMoney = (v) => v === null || v === undefined ? "—" : "₹ " + Number(v).toFixed(2);
     const fmtSign = (v) => v > 0 ? "+" + v.toFixed(2) : v.toFixed(2);
     const payoffChart = { chart: null };
+    const intradayIndexChart = { chart: null };
 
     function setStatus(text, ok=true) {
       const pill = document.getElementById("status-pill");
@@ -619,6 +790,258 @@
           scales: {
             x: { display: true, title: { display: true, text: "Spot" }, ticks: { maxTicksLimit: 8 } },
             y: { display: true, title: { display: true, text: "P/L" } },
+          },
+        },
+      });
+    }
+
+    function _constantLine(length, value) {
+      if (!Number.isFinite(Number(value))) return [];
+      return Array.from({ length }, () => Number(value));
+    }
+
+    function _paintReasonChips(containerId, reasons) {
+      const el = document.getElementById(containerId);
+      if (!el) return;
+      el.innerHTML = "";
+      const items = Array.isArray(reasons) ? reasons.filter(Boolean) : [];
+      if (!items.length) {
+        const chip = document.createElement("span");
+        chip.className = "chip";
+        chip.textContent = "No active reasons";
+        el.appendChild(chip);
+        return;
+      }
+      items.slice(0, 5).forEach((item) => {
+        const chip = document.createElement("span");
+        chip.className = "chip";
+        const text = String(item || "");
+        chip.textContent = /^[A-Z0-9_]+$/.test(text) ? humanizeReason(text) : text;
+        el.appendChild(chip);
+      });
+    }
+
+    function renderIntradayIndexChart(wrap) {
+      const data = (wrap && wrap.chart) ? wrap.chart : (wrap || {});
+      const headlineEl = document.getElementById("intraday-chart-headline");
+      const updatedEl = document.getElementById("intraday-chart-updated");
+      const metaEl = document.getElementById("intraday-chart-meta");
+      const regimeEl = document.getElementById("intraday-chart-regime");
+      const biasEl = document.getElementById("intraday-chart-bias");
+      const spotEl = document.getElementById("intraday-chart-spot");
+      const rangeEl = document.getElementById("intraday-chart-range");
+      const levelsEl = document.getElementById("intraday-chart-levels");
+      const orbEl = document.getElementById("intraday-chart-orb");
+      const patternEl = document.getElementById("intraday-chart-pattern");
+      const confirmEl = document.getElementById("intraday-chart-confirm");
+      const flowEl = document.getElementById("intraday-chart-flow");
+      const rsiEl = document.getElementById("intraday-chart-rsi");
+      const htfEl = document.getElementById("intraday-chart-htf");
+      const postureEl = document.getElementById("intraday-plan-posture");
+      const entryEl = document.getElementById("intraday-plan-entry");
+      const confirmationEl = document.getElementById("intraday-plan-confirmation");
+      const invalidationEl = document.getElementById("intraday-plan-invalidation");
+      const strikesEl = document.getElementById("intraday-plan-strikes");
+      const tradeIdeaEl = document.getElementById("intraday-plan-trade-idea");
+      const confluencesEl = document.getElementById("intraday-plan-confluences");
+
+      const structure = (data && typeof data.structure === "object" && data.structure) ? data.structure : {};
+      const levels = (data && typeof data.levels === "object" && data.levels) ? data.levels : {};
+      const orb = (data && typeof data.orb === "object" && data.orb) ? data.orb : {};
+      const plan = (data && typeof data.plan === "object" && data.plan) ? data.plan : {};
+      const candles = Array.isArray(data.candles) ? data.candles : [];
+      const labels = Array.isArray(data.labels) ? data.labels : candles.map((row) => String(row.timestamp || ""));
+
+      if (headlineEl) headlineEl.textContent = data.headline || "NIFTY chart unavailable";
+      if (updatedEl) updatedEl.textContent = `Updated: ${data.updated_at || "—"}`;
+      if (regimeEl) regimeEl.textContent = humanizeReason(structure.regime || "UNKNOWN");
+      if (biasEl) biasEl.textContent = `Bias: ${humanizeReason(structure.market_bias || "NEUTRAL")} | Confidence: ${structure.bias_confidence !== undefined && structure.bias_confidence !== null ? `${Math.round(Number(structure.bias_confidence) * 100)}%` : "—"}`;
+      if (spotEl) spotEl.textContent = structure.spot !== undefined && structure.spot !== null ? Number(structure.spot).toFixed(2) : "—";
+      if (rangeEl) rangeEl.textContent = `Session range: ${structure.session_low !== undefined && structure.session_high !== undefined ? `${Number(structure.session_low).toFixed(0)} - ${Number(structure.session_high).toFixed(0)}` : "—"}`;
+      if (levelsEl) {
+        const sup = levels.nearest_support && levels.nearest_support.price !== undefined ? `${Number(levels.nearest_support.price).toFixed(0)} (${levels.nearest_support.timeframe || "—"})` : "—";
+        const res = levels.nearest_resistance && levels.nearest_resistance.price !== undefined ? `${Number(levels.nearest_resistance.price).toFixed(0)} (${levels.nearest_resistance.timeframe || "—"})` : "—";
+        levelsEl.textContent = `Nearest support / resistance: ${sup} / ${res}`;
+      }
+      if (orbEl) {
+        orbEl.textContent = `ORB: ${orb.orb_low !== null && orb.orb_low !== undefined && orb.orb_high !== null && orb.orb_high !== undefined ? `${Number(orb.orb_low).toFixed(0)} - ${Number(orb.orb_high).toFixed(0)}` : "—"} | Breakout: ${humanizeReason(orb.breakout_confirmation || "NONE")}`;
+      }
+      if (patternEl) {
+        const patterns = Array.isArray(structure.price_action_patterns) ? structure.price_action_patterns : [];
+        patternEl.textContent = `Pattern: ${humanizeReason(structure.primary_pattern || "NONE")} | 5m/15m EMA: ${structure.ema_alignment_5m || "—"} / ${structure.ema_alignment_15m || "—"}${patterns.length ? ` | Patterns: ${patterns.slice(0, 3).map(humanizeReason).join(", ")}` : ""}`;
+      }
+      if (confirmEl) {
+        confirmEl.textContent = `Confirmation: ${humanizeReason(structure.price_action_confirmation || "NONE")} | Retest: ${humanizeReason(structure.retest_status || "NONE")}`;
+      }
+      if (flowEl) {
+        const buyers = (levels && typeof levels.buyers === "object" && levels.buyers) ? levels.buyers : {};
+        const sellers = (levels && typeof levels.sellers === "object" && levels.sellers) ? levels.sellers : {};
+        const buyerText = buyers.active ? `buyers active near ${Number(buyers.level).toFixed(0)}` : "buyers not obvious";
+        const sellerText = sellers.active ? `sellers active near ${Number(sellers.level).toFixed(0)}` : "sellers not obvious";
+        flowEl.textContent = `Buyers / Sellers: ${buyerText} | ${sellerText}`;
+      }
+      if (rsiEl) {
+        const rsiDiv = (structure && typeof structure.rsi_divergence === "object" && structure.rsi_divergence) ? structure.rsi_divergence : {};
+        rsiEl.textContent = `RSI divergence: ${humanizeReason(rsiDiv.status || "NONE")} | ${rsiDiv.description || "No RSI divergence."}`;
+      }
+      if (htfEl) {
+        const htf = (structure && typeof structure.higher_tf_confluence === "object" && structure.higher_tf_confluence) ? structure.higher_tf_confluence : {};
+        const notes = Array.isArray(htf.notes) ? htf.notes : [];
+        htfEl.textContent = `Higher timeframe: ${humanizeReason(htf.status || "MIXED")} | ${notes.length ? notes.slice(0, 2).join("; ") : "No clear confluence."}`;
+      }
+      if (postureEl) {
+        const posture = String(plan.posture || "NO_TRADE").toUpperCase();
+        postureEl.textContent = humanizeReason(posture);
+        if (posture.includes("READY")) postureEl.style.color = "var(--pos)";
+        else if (posture.includes("WAIT")) postureEl.style.color = "#f59e0b";
+        else postureEl.style.color = "var(--muted)";
+      }
+      if (entryEl) entryEl.textContent = `Entry zone: ${plan.trigger_window || "—"}`;
+      if (confirmationEl) confirmationEl.textContent = `Confirmation: ${plan.confirmation || "—"}`;
+      if (invalidationEl) invalidationEl.textContent = `Invalidation: ${plan.invalidation || "—"}`;
+      if (strikesEl) strikesEl.textContent = `Strike idea: ${plan.strike_hint || "—"}`;
+      if (tradeIdeaEl) tradeIdeaEl.textContent = `Trade idea: ${plan.trade_idea || "—"}`;
+      if (confluencesEl) {
+        const items = Array.isArray(plan.required_confluences) ? plan.required_confluences : [];
+        confluencesEl.textContent = `Confluences: ${items.length ? items.slice(0, 4).join(" | ") : "—"}`;
+      }
+      _paintReasonChips("intraday-plan-reasons", plan.reason_summary || []);
+
+      if (!candles.length) {
+        if (metaEl) metaEl.textContent = data.error || "No chart data available.";
+        if (intradayIndexChart.chart) {
+          intradayIndexChart.chart.destroy();
+          intradayIndexChart.chart = null;
+        }
+        return;
+      }
+
+      const closeSeries = candles.map((row) => Number(row.close));
+      const emaSeries = Array.isArray(data.ema20) ? data.ema20.map((v) => v === null || v === undefined ? null : Number(v)) : [];
+      const resistancePx = levels.nearest_resistance && levels.nearest_resistance.price !== undefined ? Number(levels.nearest_resistance.price) : null;
+      const supportPx = levels.nearest_support && levels.nearest_support.price !== undefined ? Number(levels.nearest_support.price) : null;
+      const orbHigh = orb.orb_high !== undefined && orb.orb_high !== null ? Number(orb.orb_high) : null;
+      const orbLow = orb.orb_low !== undefined && orb.orb_low !== null ? Number(orb.orb_low) : null;
+      const pullbackHigh = plan.pullback_zone_high !== undefined && plan.pullback_zone_high !== null ? Number(plan.pullback_zone_high) : null;
+      const pullbackLow = plan.pullback_zone_low !== undefined && plan.pullback_zone_low !== null ? Number(plan.pullback_zone_low) : null;
+
+      if (metaEl) {
+        metaEl.textContent = `Close / EMA20 / ORB / swing structure / buyer-seller zones / RSI divergence. Current plan: ${humanizeReason(plan.posture || "NO_TRADE")}.`;
+      }
+
+      const ctx = document.getElementById("intraday-index-chart").getContext("2d");
+      const datasets = [
+        {
+          label: "NIFTY Close",
+          data: closeSeries,
+          borderColor: "rgba(56,189,248,0.95)",
+          tension: 0.18,
+          pointRadius: 0,
+          borderWidth: 2,
+        },
+        {
+          label: "EMA20",
+          data: emaSeries,
+          borderColor: "rgba(245,158,11,0.95)",
+          tension: 0.18,
+          pointRadius: 0,
+          borderWidth: 1.8,
+        },
+      ];
+      if (resistancePx !== null) {
+        datasets.push({
+          label: "Resistance",
+          data: _constantLine(labels.length, resistancePx),
+          borderColor: "rgba(239,68,68,0.65)",
+          tension: 0,
+          pointRadius: 0,
+          borderDash: [6, 6],
+          borderWidth: 1.3,
+        });
+      }
+      if (supportPx !== null) {
+        datasets.push({
+          label: "Support",
+          data: _constantLine(labels.length, supportPx),
+          borderColor: "rgba(34,197,94,0.65)",
+          tension: 0,
+          pointRadius: 0,
+          borderDash: [6, 6],
+          borderWidth: 1.3,
+        });
+      }
+      if (orbHigh !== null) {
+        datasets.push({
+          label: "ORB High",
+          data: _constantLine(labels.length, orbHigh),
+          borderColor: "rgba(168,85,247,0.55)",
+          tension: 0,
+          pointRadius: 0,
+          borderDash: [4, 4],
+          borderWidth: 1.1,
+        });
+      }
+      if (orbLow !== null) {
+        datasets.push({
+          label: "ORB Low",
+          data: _constantLine(labels.length, orbLow),
+          borderColor: "rgba(168,85,247,0.55)",
+          tension: 0,
+          pointRadius: 0,
+          borderDash: [4, 4],
+          borderWidth: 1.1,
+        });
+      }
+      if (pullbackHigh !== null) {
+        datasets.push({
+          label: "Pullback Zone High",
+          data: _constantLine(labels.length, pullbackHigh),
+          borderColor: "rgba(251,191,36,0.55)",
+          tension: 0,
+          pointRadius: 0,
+          borderDash: [2, 4],
+          borderWidth: 1.0,
+        });
+      }
+      if (pullbackLow !== null) {
+        datasets.push({
+          label: "Pullback Zone Low",
+          data: _constantLine(labels.length, pullbackLow),
+          borderColor: "rgba(251,191,36,0.55)",
+          tension: 0,
+          pointRadius: 0,
+          borderDash: [2, 4],
+          borderWidth: 1.0,
+        });
+      }
+
+      if (intradayIndexChart.chart) {
+        intradayIndexChart.chart.data.labels = labels;
+        intradayIndexChart.chart.data.datasets = datasets;
+        intradayIndexChart.chart.update();
+        return;
+      }
+      intradayIndexChart.chart = new Chart(ctx, {
+        type: "line",
+        data: { labels, datasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: "index", intersect: false },
+          plugins: {
+            legend: {
+              labels: { color: "#cbd5e1", boxWidth: 10, boxHeight: 10, usePointStyle: true },
+            },
+          },
+          scales: {
+            x: {
+              ticks: { color: "#94a3b8", maxTicksLimit: 10 },
+              grid: { color: "rgba(148,163,184,0.08)" },
+            },
+            y: {
+              ticks: { color: "#94a3b8" },
+              grid: { color: "rgba(148,163,184,0.08)" },
+            },
           },
         },
       });
@@ -805,6 +1228,228 @@
       );
     }
 
+    function renderIntradayLearning(payload) {
+      const data = payload || {};
+      const statusEl = document.getElementById("intraday-learning-status");
+      const countEl = document.getElementById("intraday-learning-count");
+      const pnlEl = document.getElementById("intraday-learning-pnl");
+      const lastOutcomeEl = document.getElementById("intraday-learning-last-outcome");
+      const lastTimeEl = document.getElementById("intraday-learning-last-time");
+      const confidenceEl = document.getElementById("intraday-learning-confidence");
+      const blockEl = document.getElementById("intraday-learning-block");
+      const negativeEl = document.getElementById("intraday-learning-negative");
+      const positiveEl = document.getElementById("intraday-learning-positive");
+      const reasonsEl = document.getElementById("intraday-learning-reasons");
+
+      const total = Number(data.total_outcomes || 0);
+      const pnl = Number(data.realized_pnl_rs || 0);
+      const assessment = (data && typeof data.last_assessment === "object" && data.last_assessment) ? data.last_assessment : {};
+      const confidenceAdjust = Number(assessment.confidence_adjust || 0);
+      const blockEntry = Boolean(assessment.block_entry);
+      const negatives = Array.isArray(data.top_negative_buckets) ? data.top_negative_buckets : [];
+      const positives = Array.isArray(data.top_positive_buckets) ? data.top_positive_buckets : [];
+      const reasons = Array.isArray(assessment.reasons) ? assessment.reasons : [];
+
+      const addChips = (targetEl, items, emptyText, formatFn) => {
+        if (!targetEl) return;
+        targetEl.innerHTML = "";
+        const rows = Array.isArray(items) ? items : [];
+        if (rows.length) {
+          rows.forEach(item => {
+            const chip = document.createElement("span");
+            chip.className = "chip";
+            chip.textContent = formatFn(item);
+            targetEl.appendChild(chip);
+          });
+          return;
+        }
+        const chip = document.createElement("span");
+        chip.className = "chip";
+        chip.textContent = emptyText;
+        targetEl.appendChild(chip);
+      };
+
+      if (statusEl) statusEl.textContent = `Status: ${humanizeReason(data.status || "IDLE")}`;
+      if (countEl) countEl.textContent = `${total} outcomes`;
+      if (pnlEl) {
+        pnlEl.textContent = fmtMoney(pnl);
+        pnlEl.classList.toggle("pos", pnl > 0);
+        pnlEl.classList.toggle("neg", pnl < 0);
+      }
+      if (lastOutcomeEl) lastOutcomeEl.textContent = humanizeReason(assessment.strategy_type || "—");
+      if (lastTimeEl) lastTimeEl.textContent = `Updated ${data.last_outcome_at || data.updated_at || "—"}`;
+      if (confidenceEl) {
+        confidenceEl.textContent = `${confidenceAdjust >= 0 ? "+" : ""}${confidenceAdjust.toFixed(2)}`;
+        confidenceEl.classList.toggle("pos", confidenceAdjust > 0);
+        confidenceEl.classList.toggle("neg", confidenceAdjust < 0);
+      }
+      if (blockEl) {
+        blockEl.textContent = blockEntry ? "Blocked" : "Allowed";
+        blockEl.classList.toggle("neg", blockEntry);
+        blockEl.classList.toggle("pos", !blockEntry);
+      }
+      addChips(
+        negativeEl,
+        negatives,
+        "No negative learned buckets yet",
+        (item) => `${humanizeReason(item.bucket)}:${humanizeReason(item.label)} | n=${item.count} | pnl=${fmtMoney(item.avg_pnl_rs)}`
+      );
+      addChips(
+        positiveEl,
+        positives,
+        "No positive learned buckets yet",
+        (item) => `${humanizeReason(item.bucket)}:${humanizeReason(item.label)} | n=${item.count} | pnl=${fmtMoney(item.avg_pnl_rs)}`
+      );
+      addChips(reasonsEl, reasons, "No current learning assessment", (item) => humanizeReason(item));
+    }
+
+    function renderBatmanReview(reviewPayload) {
+      const payload = reviewPayload || {};
+      const latest = payload.latest_closed || null;
+      const summary = payload.summary || {};
+
+      const expiryEl = document.getElementById("batman-review-expiry");
+      const statusEl = document.getElementById("batman-review-status");
+      const pnlEl = document.getElementById("batman-review-pnl");
+      const windowEl = document.getElementById("batman-review-window");
+      const holdEl = document.getElementById("batman-review-hold");
+      const reasonEl = document.getElementById("batman-review-reason");
+      const qualityEl = document.getElementById("batman-review-quality");
+      const qualitySubEl = document.getElementById("batman-review-quality-sub");
+      const lessonsEl = document.getElementById("batman-review-lessons");
+      const improvementsEl = document.getElementById("batman-review-improvements");
+
+      const addChips = (targetEl, items, emptyText) => {
+        if (!targetEl) return;
+        targetEl.innerHTML = "";
+        const rows = Array.isArray(items) ? items : [];
+        if (rows.length) {
+          rows.forEach(item => {
+            const chip = document.createElement("span");
+            chip.className = "chip";
+            chip.textContent = humanizeReason(item);
+            targetEl.appendChild(chip);
+          });
+          return;
+        }
+        const chip = document.createElement("span");
+        chip.className = "chip";
+        chip.textContent = emptyText;
+        targetEl.appendChild(chip);
+      };
+
+      if (!latest) {
+        if (expiryEl) expiryEl.textContent = "No closed basket";
+        if (statusEl) statusEl.textContent = "—";
+        if (pnlEl) {
+          pnlEl.textContent = fmtMoney(summary.realized_pnl_rs || 0);
+          pnlEl.classList.remove("pos", "neg");
+        }
+        if (windowEl) windowEl.textContent = "Opened — | Closed —";
+        if (holdEl) holdEl.textContent = "—";
+        if (reasonEl) reasonEl.textContent = "—";
+        if (qualityEl) qualityEl.textContent = "—";
+        if (qualitySubEl) qualitySubEl.textContent = "No closed Batman basket yet";
+        addChips(lessonsEl, [], "No lessons yet");
+        addChips(improvementsEl, [], "No improvements yet");
+        return;
+      }
+
+      const pnl = Number(latest.pnl_rs || 0);
+      if (expiryEl) expiryEl.textContent = latest.expiry || "—";
+      if (statusEl) statusEl.textContent = humanizeReason(latest.status || "—");
+      if (pnlEl) {
+        pnlEl.textContent = fmtMoney(pnl);
+        pnlEl.classList.toggle("pos", pnl > 0);
+        pnlEl.classList.toggle("neg", pnl < 0);
+      }
+      if (windowEl) windowEl.textContent = `Opened ${latest.opened_at || "—"} | Closed ${latest.closed_at || "—"}`;
+      if (holdEl) holdEl.textContent = fmtHoldMinutes(latest.held_minutes);
+      if (reasonEl) reasonEl.textContent = humanizeReason(latest.reason || "—");
+      if (qualityEl) qualityEl.textContent = `${humanizeReason(latest.quality_status || "—")} (${Number(latest.quality_score || 0).toFixed(0)})`;
+      if (qualitySubEl) {
+        const parts = [];
+        if (latest.opened_pre_market) parts.push("Entered before 09:15");
+        if (latest.short_distance_min_pts !== undefined && latest.short_distance_min_pts !== null) parts.push(`Short gap ${Number(latest.short_distance_min_pts).toFixed(0)} pts`);
+        if (latest.center_offset_pts !== undefined && latest.center_offset_pts !== null) parts.push(`Center offset ${Number(latest.center_offset_pts).toFixed(0)} pts`);
+        qualitySubEl.textContent = parts.join(" | ") || "No additional quality notes";
+      }
+      addChips(lessonsEl, latest.lessons, "No lessons recorded");
+      addChips(improvementsEl, latest.improvements, "No improvements recorded");
+    }
+
+    function renderBatmanLearning(learningPayload) {
+      const payload = learningPayload || {};
+      const summary = payload.summary || {};
+      const assessment = payload.last_entry_assessment || {};
+      const negatives = Array.isArray(payload.top_negative_buckets) ? payload.top_negative_buckets : [];
+      const positives = Array.isArray(payload.top_positive_buckets) ? payload.top_positive_buckets : [];
+
+      const statusEl = document.getElementById("batman-learning-status");
+      const countEl = document.getElementById("batman-learning-count");
+      const pnlEl = document.getElementById("batman-learning-pnl");
+      const lastStatusEl = document.getElementById("batman-learning-last-status");
+      const lastTimeEl = document.getElementById("batman-learning-last-time");
+      const riskAdjustEl = document.getElementById("batman-learning-risk-adjust");
+      const lastOutcomeEl = document.getElementById("batman-learning-last-outcome");
+      const negativeEl = document.getElementById("batman-learning-negative");
+      const positiveEl = document.getElementById("batman-learning-positive");
+      const reasonsEl = document.getElementById("batman-learning-reasons");
+      const supportiveEl = document.getElementById("batman-learning-supportive");
+
+      const addChips = (targetEl, items, emptyText, formatter) => {
+        if (!targetEl) return;
+        targetEl.innerHTML = "";
+        const rows = Array.isArray(items) ? items : [];
+        if (!rows.length) {
+          const chip = document.createElement("span");
+          chip.className = "chip";
+          chip.textContent = emptyText;
+          targetEl.appendChild(chip);
+          return;
+        }
+        rows.forEach(item => {
+          const chip = document.createElement("span");
+          chip.className = "chip";
+          chip.textContent = formatter ? formatter(item) : String(item || "—");
+          targetEl.appendChild(chip);
+        });
+      };
+
+      if (statusEl) statusEl.textContent = `Status: ${humanizeReason(payload.status || "IDLE")}`;
+      if (countEl) countEl.textContent = `${Number(summary.total_outcomes || 0)} outcomes`;
+      if (pnlEl) {
+        const pnl = Number(summary.realized_pnl_rs || 0);
+        pnlEl.textContent = fmtMoney(pnl);
+        pnlEl.classList.toggle("pos", pnl > 0);
+        pnlEl.classList.toggle("neg", pnl < 0);
+      }
+      if (lastStatusEl) lastStatusEl.textContent = humanizeReason(assessment.status || "—");
+      if (lastTimeEl) lastTimeEl.textContent = `Updated ${assessment.timestamp || summary.updated_at || "—"}`;
+      if (riskAdjustEl) {
+        const adjust = Number(assessment.risk_score_adjust || 0);
+        riskAdjustEl.textContent = adjust > 0 ? `+${adjust.toFixed(2)}` : adjust.toFixed(2);
+        riskAdjustEl.classList.toggle("pos", adjust < 0);
+        riskAdjustEl.classList.toggle("neg", adjust > 0);
+      }
+      if (lastOutcomeEl) lastOutcomeEl.textContent = summary.last_outcome_at || "—";
+
+      addChips(
+        negativeEl,
+        negatives,
+        "No negative learned buckets yet",
+        (item) => `${humanizeReason(item.bucket)}:${humanizeReason(item.label)} | n=${item.count} | pnl=${fmtMoney(item.avg_pnl_rs)}`
+      );
+      addChips(
+        positiveEl,
+        positives,
+        "No positive learned buckets yet",
+        (item) => `${humanizeReason(item.bucket)}:${humanizeReason(item.label)} | n=${item.count} | pnl=${fmtMoney(item.avg_pnl_rs)}`
+      );
+      addChips(reasonsEl, assessment.reasons || [], "No current assessment reasons", (item) => humanizeReason(item));
+      addChips(supportiveEl, assessment.supportive_reasons || [], "No supportive signals learned yet", (item) => humanizeReason(item));
+    }
+
     async function loadPnl() {
       if (inflight.pnl) return;
       inflight.pnl = true;
@@ -814,6 +1459,13 @@
       pnlEl.textContent = fmtMoney(data.total_pnl);
       pnlEl.classList.toggle("pos", data.total_pnl > 0);
       pnlEl.classList.toggle("neg", data.total_pnl < 0);
+      const realizedEl = document.getElementById("paper-realized-pnl");
+      if (realizedEl) {
+        const realized = Number(data.realized_pnl || 0);
+        realizedEl.textContent = fmtMoney(realized);
+        realizedEl.classList.toggle("pos", realized > 0);
+        realizedEl.classList.toggle("neg", realized < 0);
+      }
       document.getElementById("last-refresh").textContent = "Updated: " + new Date().toLocaleTimeString();
       const ltpChip = document.getElementById("paper-ltp-chip");
       if (ltpChip) {
@@ -832,7 +1484,7 @@
         const st = bkm[exp].status || "?";
         status = `BATMAN_BKM ${exp}: ${st}`;
         const expEl = document.getElementById("expiry-tag");
-        if (expEl) expEl.textContent = `Expiry: ${exp}`;
+        if (expEl) expEl.textContent = exp;
         const briefEl = document.getElementById("strategy-brief");
         if (briefEl) briefEl.textContent = JSON.stringify(bkm[exp], null, 2);
       }
@@ -843,6 +1495,9 @@
       }
       renderIntradayPerformance(data.intraday_performance || {});
       renderCommitteeReview(data.committee_review || {});
+      renderIntradayLearning(data.intraday_learning || {});
+      renderBatmanReview(data.batman_bkm_review || {});
+      renderBatmanLearning(data.batman_bkm_learning || {});
 
       let openTotal = 0.0;
       upsertRows(
@@ -869,6 +1524,7 @@
       );
       document.getElementById("positions-count").textContent = `${(data.positions || []).length} legs`;
       document.getElementById("paper-open-count").textContent = (data.positions || []).length;
+      document.getElementById("paper-closed-count").textContent = `${(data.closed || []).length} legs`;
       document.getElementById("paper-positions-pnl").textContent = `Total P&L: ${fmtMoney(openTotal)}`;
       document.getElementById("paper-open-totalcell").textContent = fmtMoney(openTotal);
       document.getElementById("total-pnl").textContent = fmtMoney(openTotal);
@@ -1425,8 +2081,11 @@
         else if (signal === "WAIT") headlineEl.style.color = "#f59e0b";
         else headlineEl.style.color = "var(--muted)";
       }
+      const ctrl = latestControlStatus || {};
+      const intradayAiMode = String(ctrl.intraday_ai_mode || adv.mode || "ADVISOR").toUpperCase();
+      const intradayExecutionEnabled = !!ctrl.intraday_ai_execution_enabled;
       if (metaEl) {
-        metaEl.textContent = `Signal: ${signal} | Strategy: ${strategy} | Bias: ${bias} | Trend: ${trendConf} | Conflict: ${conflict}`;
+        metaEl.textContent = `Mode: ${intradayAiMode} | Signal: ${signal} | Strategy: ${strategy} | Bias: ${bias} | Trend: ${trendConf} | Conflict: ${conflict}`;
       }
       if (whatEl) whatEl.textContent = `What to enter: ${whatToEnter}`;
       if (slEl) slEl.textContent = `${slText.startsWith("SL:") ? slText : `SL: ${slText}`}`;
@@ -1435,7 +2094,6 @@
       if (whyEl) whyEl.textContent = `Why: ${whyText}`;
       if (updatedEl) updatedEl.textContent = `Updated: ${adv.updated_at || "—"}`;
 
-      const ctrl = latestControlStatus || {};
       const committee = (ctrl && typeof ctrl.intraday_committee === "object" && ctrl.intraday_committee) ? ctrl.intraday_committee : {};
       const committeeComponents = (committee && typeof committee.components === "object" && committee.components) ? committee.components : {};
       const committeeVerdict = String(committee.verdict || "IDLE").toUpperCase();
@@ -1483,6 +2141,7 @@
       let blockReason = "";
       if (!running) { canDeploy = false; blockReason = "agent is not running"; }
       else if (!supportedMode) { canDeploy = false; blockReason = "agent mode is unknown"; }
+      else if (!intradayExecutionEnabled) { canDeploy = false; blockReason = `AI mode is ${intradayAiMode}, not EXECUTION`; }
       else if (locked) { canDeploy = false; blockReason = "entry locks are active"; }
       else if (signal !== "ENTER_NOW") { canDeploy = false; blockReason = "AI signal is not ENTER_NOW"; }
       else { blockReason = "ready"; }
@@ -1521,14 +2180,16 @@
       if (inflight.live) return;
       inflight.live = true;
       try {
-        const [data, aiData, intradayAiData, intradayDeployData] = await Promise.all([
+        const [data, aiData, intradayAiData, intradayDeployData, intradayChartData] = await Promise.all([
           fetchJSON("/api/live_positions"),
           fetchJSON("/api/bkm/ai_status").catch(() => ({ ok: false, ai: {} })),
           fetchJSON("/api/intraday_ai/status").catch(() => ({ ok: false, advisor: {} })),
           fetchJSON("/api/intraday_ai/deploy_status").catch(() => ({ ok: false, deploy: {} })),
+          fetchJSON("/api/intraday_ai/index_chart").catch(() => ({ ok: false, chart: { status: "ERROR", headline: "Chart unavailable", candles: [], ema20: [], levels: {}, structure: {}, plan: { reason_summary: ["Unable to load chart context."] } } })),
         ]);
       renderBkmAI(aiData);
       renderIntradayAdvisor(intradayAiData, intradayDeployData);
+      renderIntradayIndexChart(intradayChartData);
       let openTotal = 0.0;
       upsertRows(
         "#live-legs-table tbody",

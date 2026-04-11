@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import sys
@@ -27,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import subprocess
 import signal
 import requests
+import pandas as pd
 
 try:
     from zoneinfo import ZoneInfo
@@ -49,11 +51,14 @@ AGENT_ALERTS_JSONL = STATE_DIR / "agent_alerts.jsonl"
 TELEGRAM_ALERT_STATUS_JSON = STATE_DIR / "telegram_alert_status.json"
 BATMAN_BKM_AI_STATUS_JSON = STATE_DIR / "batman_bkm_ai_status.json"
 BATMAN_BKM_AI_EVENTS_JSONL = STATE_DIR / "batman_bkm_ai_events.jsonl"
+BATMAN_BKM_LEARNING_STATUS_JSON = STATE_DIR / "batman_bkm_learning_status.json"
+BATMAN_BKM_LEARNING_OUTCOMES_JSONL = STATE_DIR / "batman_bkm_learning_outcomes.jsonl"
 BATMAN_BKM_AI_PROTECT_STATUS_JSON = STATE_DIR / "batman_bkm_ai_protect_status.json"
 BATMAN_BKM_AI_PROTECT_CLEAR_REQUEST_JSON = STATE_DIR / "batman_bkm_ai_protect_clear_request.json"
 DECISION_COMMITTEE_STATUS_JSON = STATE_DIR / "decision_committee_status.json"
 DECISION_COMMITTEE_HISTORY_JSONL = STATE_DIR / "decision_committee_history.jsonl"
 DECISION_COMMITTEE_OUTCOMES_JSONL = STATE_DIR / "decision_committee_outcomes.jsonl"
+INTRADAY_AI_LEARNING_STATUS_JSON = STATE_DIR / "intraday_ai_learning_status.json"
 INTRADAY_AI_ADVISOR_STATUS_JSON = STATE_DIR / "intraday_ai_advisor_status.json"
 INTRADAY_AI_DEPLOY_REQUEST_JSON = STATE_DIR / "intraday_ai_deploy_request.json"
 INTRADAY_AI_DEPLOY_STATUS_JSON = STATE_DIR / "intraday_ai_deploy_status.json"
@@ -97,6 +102,20 @@ from data_engine.market_ai.modules.agents.telegram_alerts import (  # type: igno
     TelegramAlertForwarder,
     TelegramAlertConfig,
 )
+from data_engine.market_ai.modules.agents.execution_policy import (  # type: ignore
+    build_execution_policy as _shared_build_execution_policy,
+    intraday_ai_mode_name as _shared_intraday_ai_mode_name,
+)
+from data_engine.market_ai.modules.analytics.live_trade_monitor import (  # type: ignore
+    find_multi_tf_zones,
+    nearest_zones,
+)
+from data_engine.market_ai.modules.analytics.price_action_patterns import (  # type: ignore
+    detect_recent_price_action,
+)
+from data_engine.market_ai.modules.analytics.intraday_trade_planner import (  # type: ignore
+    build_trade_plan as _shared_build_trade_plan,
+)
 
 
 def _parse_float(val: Any, default: float = 0.0) -> float:
@@ -111,6 +130,18 @@ def _parse_int(val: Any, default: int = 0) -> int:
         return int(float(val))
     except Exception:
         return default
+
+
+def _intraday_ai_mode_name(settings: Dict[str, Any]) -> str:
+    return _shared_intraday_ai_mode_name(settings or {})
+
+
+def _intraday_ai_execution_enabled(settings: Dict[str, Any], trade_mode: str) -> bool:
+    return bool(_shared_build_execution_policy(settings or {}, trade_mode).get("intraday_new_entries_allowed", False))
+
+
+def _execution_policy(settings: Dict[str, Any], trade_mode: str) -> Dict[str, Any]:
+    return _shared_build_execution_policy(settings or {}, trade_mode)
 
 
 def _build_chain_map(expiry: str) -> Dict[str, Any]:
@@ -194,6 +225,7 @@ _LTP_CACHE: Dict[Tuple[str, str], Tuple[float, float]] = {}  # (seg,sid) -> (ltp
 _LAST_LTP_FETCH_TS: float = 0.0
 _NEXT_LTP_ALLOWED_TS: float = 0.0
 _CHAIN_CACHE: Dict[str, Dict[str, Any]] = {}  # expiry -> {"map": {sec_id: {...}}, "spot": float, "ts": float}
+_INDEX_CHART_CACHE: Dict[Tuple[str, int], Dict[str, Any]] = {}  # (session_date, interval) -> {"ts": float, "payload": {...}}
 
 
 def _fetch_ltp_lookup(pairs: Dict[str, List[int]]) -> Tuple[Dict[Tuple[str, str], float], str]:
@@ -946,6 +978,36 @@ def _load_bkm_ai_status() -> Dict[str, Any]:
     return payload if isinstance(payload, dict) and payload else _default_bkm_ai_status()
 
 
+def _default_bkm_learning_status() -> Dict[str, Any]:
+    now = _ist_now()
+    return {
+        "status": "IDLE",
+        "total_outcomes": 0,
+        "wins": 0,
+        "losses": 0,
+        "flats": 0,
+        "realized_pnl_rs": 0.0,
+        "last_outcome_at": None,
+        "last_outcome_id": None,
+        "last_entry_assessment": {},
+        "top_negative_buckets": [],
+        "top_positive_buckets": [],
+        "updated_at": now.isoformat(timespec="seconds"),
+    }
+
+
+def _load_bkm_learning_status() -> Dict[str, Any]:
+    payload = _json_read(BATMAN_BKM_LEARNING_STATUS_JSON)
+    if not payload or not isinstance(payload, dict):
+        return _default_bkm_learning_status()
+    out = _default_bkm_learning_status()
+    out.update(payload)
+    out["last_entry_assessment"] = out.get("last_entry_assessment") if isinstance(out.get("last_entry_assessment"), dict) else {}
+    out["top_negative_buckets"] = out.get("top_negative_buckets") if isinstance(out.get("top_negative_buckets"), list) else []
+    out["top_positive_buckets"] = out.get("top_positive_buckets") if isinstance(out.get("top_positive_buckets"), list) else []
+    return out
+
+
 def _default_bkm_ai_protect_status() -> Dict[str, Any]:
     now = _ist_now()
     return {
@@ -1002,6 +1064,35 @@ def _load_decision_committee_status() -> Dict[str, Any]:
     out.update(payload)
     out["components"] = out.get("components") if isinstance(out.get("components"), dict) else {}
     out["reasons"] = out.get("reasons") if isinstance(out.get("reasons"), list) else []
+    return out
+
+
+def _default_intraday_learning_status() -> Dict[str, Any]:
+    now = _ist_now()
+    return {
+        "status": "IDLE",
+        "total_outcomes": 0,
+        "wins": 0,
+        "losses": 0,
+        "flats": 0,
+        "realized_pnl_rs": 0.0,
+        "last_outcome_at": None,
+        "last_assessment": {},
+        "top_negative_buckets": [],
+        "top_positive_buckets": [],
+        "updated_at": now.isoformat(timespec="seconds"),
+    }
+
+
+def _load_intraday_learning_status() -> Dict[str, Any]:
+    payload = _json_read(INTRADAY_AI_LEARNING_STATUS_JSON)
+    if not payload or not isinstance(payload, dict):
+        return _default_intraday_learning_status()
+    out = _default_intraday_learning_status()
+    out.update(payload)
+    out["last_assessment"] = out.get("last_assessment") if isinstance(out.get("last_assessment"), dict) else {}
+    out["top_negative_buckets"] = out.get("top_negative_buckets") if isinstance(out.get("top_negative_buckets"), list) else []
+    out["top_positive_buckets"] = out.get("top_positive_buckets") if isinstance(out.get("top_positive_buckets"), list) else []
     return out
 
 
@@ -1122,6 +1213,829 @@ def _load_intraday_ai_position_status() -> Dict[str, Any]:
         "last_evaluated_at": None,
         "updated_at": now.isoformat(timespec="seconds"),
     }
+
+
+def _init_dhan_wrapper() -> Any:
+    creds = _json_read(CREDS_FILE)
+    client_id = str(creds.get("client_id") or "").strip()
+    access_token = str(creds.get("access_token") or "").strip()
+    if not client_id or not access_token:
+        raise RuntimeError("DHAN_CREDS_MISSING")
+    os.environ["DHAN_CLIENT_ID"] = client_id
+    os.environ["DHAN_ACCESS_TOKEN"] = access_token
+    from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
+
+    return DhanWrapper(logger=None)
+
+
+def _parse_candle_timestamp(raw: Any) -> Optional[datetime]:
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw
+    if isinstance(raw, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(raw))
+        except Exception:
+            return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _normalize_intraday_candles(raw: List[dict], *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for candle in raw or []:
+        if not isinstance(candle, dict):
+            continue
+        ts = _parse_candle_timestamp(candle.get("timestamp") or candle.get("time"))
+        if ts is None:
+            continue
+        open_px = _parse_float(candle.get("open"), None)
+        high_px = _parse_float(candle.get("high"), None)
+        low_px = _parse_float(candle.get("low"), None)
+        close_px = _parse_float(candle.get("close"), None)
+        if None in (open_px, high_px, low_px, close_px):
+            continue
+        rows.append(
+            {
+                "timestamp": ts,
+                "open": float(open_px),
+                "high": float(high_px),
+                "low": float(low_px),
+                "close": float(close_px),
+                "volume": _parse_float(candle.get("volume"), 0.0),
+            }
+        )
+    rows.sort(key=lambda row: row["timestamp"])
+    if limit is not None and limit > 0:
+        rows = rows[-limit:]
+    return rows
+
+
+def _ema_series(values: List[float], period: int) -> List[Optional[float]]:
+    if not values:
+        return []
+    alpha = 2.0 / (float(period) + 1.0)
+    out: List[Optional[float]] = []
+    ema_val: Optional[float] = None
+    for value in values:
+        try:
+            numeric = float(value)
+        except Exception:
+            out.append(None)
+            continue
+        ema_val = numeric if ema_val is None else ((numeric * alpha) + (ema_val * (1.0 - alpha)))
+        out.append(round(float(ema_val), 2))
+    return out
+
+
+def _round_strike(value: Optional[float], *, direction: str) -> Optional[int]:
+    if value is None:
+        return None
+    step = 50.0
+    numeric = float(value)
+    if direction == "up":
+        return int(math.ceil(numeric / step) * step)
+    if direction == "down":
+        return int(math.floor(numeric / step) * step)
+    return int(round(numeric / step) * step)
+
+
+def _price_action_snapshot(candles: List[dict], *, interval_min: int) -> Dict[str, Any]:
+    rows = [c for c in candles if c]
+    closes = [float(c.get("close") or 0.0) for c in rows if c.get("close") not in (None, "")]
+    highs = [float(c.get("high") or c.get("close") or 0.0) for c in rows if c.get("high") is not None or c.get("close") is not None]
+    lows = [float(c.get("low") or c.get("close") or 0.0) for c in rows if c.get("low") is not None or c.get("close") is not None]
+    vols = [float(c.get("volume") or 0.0) for c in rows if c.get("volume") not in (None, "")]
+    if len(closes) < 2:
+        return {
+            "interval_min": interval_min,
+            "trend": "UNKNOWN",
+            "pattern": "UNKNOWN",
+            "bars": len(closes),
+            "change_points": None,
+            "change_pct": None,
+            "range_points": None,
+            "close_position_in_range": None,
+            "dir_score": 0.0,
+            "close": closes[-1] if closes else None,
+            "support": None,
+            "resistance": None,
+            "distance_to_support": None,
+            "distance_to_resistance": None,
+            "atr_like_points": None,
+            "atr_like_pct": None,
+            "ema_fast": None,
+            "ema_slow": None,
+            "ema_alignment": "NEUTRAL",
+            "volatility_regime": "UNKNOWN",
+            "breakout_dir": "NONE",
+            "breakout_confirmed": False,
+            "price_action_bias": "NEUTRAL",
+            "price_action_confirmation": "NONE",
+            "price_action_score": 0.0,
+            "primary_pattern": "NONE",
+            "price_action_patterns": [],
+            "retest_status": "NONE",
+            "retest_bias": "NEUTRAL",
+            "retest_level": None,
+            "retest_score": 0.0,
+        }
+
+    lookback = min(len(closes), 12 if interval_min <= 5 else (10 if interval_min <= 15 else 8))
+    window = closes[-lookback:]
+    window_vols = vols[-lookback:] if vols else []
+    first_close = float(window[0])
+    last_close = float(window[-1])
+    change_points = last_close - first_close
+    change_pct = (change_points / max(1.0, abs(first_close))) * 100.0
+    window_high = max(highs[-lookback:]) if highs else max(window)
+    window_low = min(lows[-lookback:]) if lows else min(window)
+    range_points = max(0.0, float(window_high - window_low))
+    close_pos = ((last_close - window_low) / range_points) if range_points > 0 else None
+    support = round(float(window_low), 2)
+    resistance = round(float(window_high), 2)
+    dist_support = max(0.0, float(last_close - window_low))
+    dist_resistance = max(0.0, float(window_high - last_close))
+
+    bar_ranges: List[float] = []
+    for candle in rows[-lookback:]:
+        try:
+            high_px = float(candle.get("high") or candle.get("close") or 0.0)
+            low_px = float(candle.get("low") or candle.get("close") or 0.0)
+            bar_ranges.append(max(0.0, high_px - low_px))
+        except Exception:
+            continue
+    atr_like_points = (sum(bar_ranges) / len(bar_ranges)) if bar_ranges else 0.0
+    atr_like_pct = ((atr_like_points / max(1.0, abs(last_close))) * 100.0) if last_close else 0.0
+    if atr_like_pct >= (0.32 if interval_min <= 5 else (0.45 if interval_min <= 15 else 0.65)):
+        vol_regime = "HIGH"
+    elif atr_like_pct <= (0.14 if interval_min <= 5 else (0.20 if interval_min <= 15 else 0.30)):
+        vol_regime = "LOW"
+    else:
+        vol_regime = "NORMAL"
+
+    prior_high = max(window[:-1]) if len(window) >= 2 else last_close
+    prior_low = min(window[:-1]) if len(window) >= 2 else last_close
+    breakout_dir = "NONE"
+    breakout_confirmed = False
+    if len(window) >= 3:
+        vol_avg = (sum(window_vols[:-1]) / len(window_vols[:-1])) if len(window_vols) >= 2 else 0.0
+        vol_last = float(window_vols[-1]) if window_vols else 0.0
+        vol_confirm = True if vol_avg <= 0 else (vol_last >= (1.15 * vol_avg))
+        if last_close > prior_high:
+            breakout_dir = "UP"
+            breakout_confirmed = bool(vol_confirm)
+        elif last_close < prior_low:
+            breakout_dir = "DOWN"
+            breakout_confirmed = bool(vol_confirm)
+
+    ema_fast_series = _ema_series(closes, 5)
+    ema_slow_series = _ema_series(closes, 20)
+    ema_fast = ema_fast_series[-1] if ema_fast_series else None
+    ema_slow = ema_slow_series[-1] if ema_slow_series else None
+    ema_fast_prev = ema_fast_series[-2] if len(ema_fast_series) >= 2 else ema_fast
+    ema_slow_prev = ema_slow_series[-2] if len(ema_slow_series) >= 2 else ema_slow
+    ema_gap_pct = None
+    ema_alignment = "NEUTRAL"
+    if ema_fast is not None and ema_slow is not None and ema_fast_prev is not None and ema_slow_prev is not None:
+        ema_gap = float(ema_fast - ema_slow)
+        ema_gap_pct = ema_gap / max(1.0, abs(last_close))
+        ema_fast_slope = float(ema_fast - ema_fast_prev)
+        ema_slow_slope = float(ema_slow - ema_slow_prev)
+        if ema_gap_pct >= 0.0008 and ema_fast_slope > 0 and ema_slow_slope >= 0:
+            ema_alignment = "BULLISH"
+        elif ema_gap_pct <= -0.0008 and ema_fast_slope < 0 and ema_slow_slope <= 0:
+            ema_alignment = "BEARISH"
+
+    trend_threshold_pct = 0.10 if interval_min <= 5 else (0.18 if interval_min <= 15 else 0.28)
+    trend = "RANGE"
+    if change_pct >= trend_threshold_pct:
+        trend = "UP"
+    elif change_pct <= -trend_threshold_pct:
+        trend = "DOWN"
+    pattern = "RANGE"
+    if trend == "UP":
+        pattern = "UPTREND" if (close_pos is not None and close_pos >= 0.65) else "UP_BIAS"
+    elif trend == "DOWN":
+        pattern = "DOWNTREND" if (close_pos is not None and close_pos <= 0.35) else "DOWN_BIAS"
+
+    dir_score = 1.0 if trend == "UP" else (-1.0 if trend == "DOWN" else 0.0)
+    if trend == "RANGE" and close_pos is not None:
+        dir_score = round((close_pos - 0.5) * 0.6, 3)
+
+    price_action = detect_recent_price_action(
+        rows[-max(lookback, 6):],
+        support=support,
+        resistance=resistance,
+        atr_like_points=atr_like_points,
+        ema_slow=ema_slow,
+    )
+    return {
+        "interval_min": interval_min,
+        "trend": trend,
+        "pattern": pattern,
+        "bars": len(window),
+        "change_points": round(float(change_points), 2),
+        "change_pct": round(float(change_pct), 3),
+        "range_points": round(float(range_points), 2),
+        "close_position_in_range": None if close_pos is None else round(float(close_pos), 3),
+        "dir_score": round(float(dir_score), 3),
+        "close": round(float(last_close), 2),
+        "support": support,
+        "resistance": resistance,
+        "distance_to_support": round(float(dist_support), 2),
+        "distance_to_resistance": round(float(dist_resistance), 2),
+        "atr_like_points": round(float(atr_like_points), 2),
+        "atr_like_pct": round(float(atr_like_pct), 3),
+        "ema_fast": None if ema_fast is None else round(float(ema_fast), 2),
+        "ema_slow": None if ema_slow is None else round(float(ema_slow), 2),
+        "ema_alignment": ema_alignment,
+        "volatility_regime": vol_regime,
+        "breakout_dir": breakout_dir,
+        "breakout_confirmed": bool(breakout_confirmed),
+        "price_action_bias": str(price_action.get("price_action_bias") or "NEUTRAL"),
+        "price_action_confirmation": str(price_action.get("price_action_confirmation") or "NONE"),
+        "price_action_score": round(float(price_action.get("price_action_score") or 0.0), 3),
+        "primary_pattern": str(price_action.get("primary_pattern") or "NONE"),
+        "price_action_patterns": list(price_action.get("price_action_patterns") or []),
+        "retest_status": str(price_action.get("retest_status") or "NONE"),
+        "retest_bias": str(price_action.get("retest_bias") or "NEUTRAL"),
+        "retest_level": price_action.get("retest_level"),
+        "retest_score": round(float(price_action.get("retest_score") or 0.0), 3),
+    }
+
+
+def _candles_to_zone_frame(candles: List[dict], *, timeframe: str) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for candle in candles or []:
+        ts = _parse_candle_timestamp(candle.get("timestamp"))
+        if ts is None:
+            continue
+        rows.append(
+            {
+                "timestamp": ts,
+                "open": float(candle.get("open") or 0.0),
+                "high": float(candle.get("high") or candle.get("open") or 0.0),
+                "low": float(candle.get("low") or candle.get("open") or 0.0),
+                "close": float(candle.get("close") or candle.get("open") or 0.0),
+            }
+        )
+    frame = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close"])
+    frame.attrs["timeframe"] = timeframe
+    return frame
+
+
+def _zone_to_payload(zone: Any) -> Optional[Dict[str, Any]]:
+    if zone is None:
+        return None
+    timestamp = getattr(zone, "timestamp", None)
+    return {
+        "side": getattr(zone, "side", None),
+        "price": round(float(getattr(zone, "price", 0.0)), 2),
+        "timeframe": getattr(zone, "timeframe", None),
+        "timestamp": timestamp.isoformat() if isinstance(timestamp, datetime) else None,
+    }
+
+
+def _compute_orb_state(candles_5m: List[dict], *, orb_minutes: int = 15) -> Dict[str, Any]:
+    if not candles_5m:
+        return {
+            "timeframe_minutes": orb_minutes,
+            "orb_high": None,
+            "orb_low": None,
+            "orb_mid": None,
+            "completed_at": None,
+            "breakout_confirmation": "NONE",
+            "breakout_active": False,
+            "breakout_reason": None,
+        }
+    first_ts = candles_5m[0]["timestamp"]
+    session_start = first_ts.replace(hour=9, minute=15, second=0, microsecond=0)
+    opening_bars = [
+        candle
+        for candle in candles_5m
+        if isinstance(candle.get("timestamp"), datetime)
+        and session_start <= candle["timestamp"] < (session_start + pd.Timedelta(minutes=orb_minutes))
+    ]
+    if not opening_bars:
+        opening_bars = candles_5m[: max(1, orb_minutes // 5)]
+    orb_high = max(float(candle.get("high") or 0.0) for candle in opening_bars) if opening_bars else None
+    orb_low = min(float(candle.get("low") or 0.0) for candle in opening_bars) if opening_bars else None
+    orb_mid = None if orb_high is None or orb_low is None else round((orb_high + orb_low) / 2.0, 2)
+    completed_at = opening_bars[-1]["timestamp"].isoformat() if opening_bars else None
+    last_close = float(candles_5m[-1].get("close") or 0.0) if candles_5m else None
+    avg_range = sum(max(0.0, float(c.get("high") or 0.0) - float(c.get("low") or 0.0)) for c in candles_5m[-6:]) / max(1, len(candles_5m[-6:]))
+    buffer = max(5.0, avg_range * 0.15)
+    breakout_confirmation = "NONE"
+    breakout_reason = None
+    if last_close is not None and orb_high is not None and last_close >= orb_high + buffer:
+        breakout_confirmation = "UP_CONFIRMED"
+        breakout_reason = "price accepted above opening range high"
+    elif last_close is not None and orb_low is not None and last_close <= orb_low - buffer:
+        breakout_confirmation = "DOWN_CONFIRMED"
+        breakout_reason = "price accepted below opening range low"
+    return {
+        "timeframe_minutes": orb_minutes,
+        "orb_high": None if orb_high is None else round(float(orb_high), 2),
+        "orb_low": None if orb_low is None else round(float(orb_low), 2),
+        "orb_mid": orb_mid,
+        "completed_at": completed_at,
+        "breakout_confirmation": breakout_confirmation,
+        "breakout_active": breakout_confirmation != "NONE",
+        "breakout_reason": breakout_reason,
+    }
+
+
+def _rsi_series(values: List[float], period: int = 14) -> List[Optional[float]]:
+    if not values:
+        return []
+    out: List[Optional[float]] = [None] * len(values)
+    if len(values) <= period:
+        return out
+    gains: List[float] = []
+    losses: List[float] = []
+    for idx in range(1, len(values)):
+        change = float(values[idx]) - float(values[idx - 1])
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+    avg_gain = sum(gains[:period]) / float(period)
+    avg_loss = sum(losses[:period]) / float(period)
+    rs = avg_gain / avg_loss if avg_loss > 0 else float("inf")
+    out[period] = round(100.0 - (100.0 / (1.0 + rs)), 2)
+    for idx in range(period + 1, len(values)):
+        gain = gains[idx - 1]
+        loss = losses[idx - 1]
+        avg_gain = ((avg_gain * (period - 1)) + gain) / float(period)
+        avg_loss = ((avg_loss * (period - 1)) + loss) / float(period)
+        rs = avg_gain / avg_loss if avg_loss > 0 else float("inf")
+        out[idx] = round(100.0 - (100.0 / (1.0 + rs)), 2)
+    return out
+
+
+def _last_two_price_pivots(candles: List[dict], *, side: str) -> List[Tuple[int, float]]:
+    if len(candles) < 5:
+        return []
+    out: List[Tuple[int, float]] = []
+    for idx in range(1, len(candles) - 1):
+        prev_row = candles[idx - 1]
+        row = candles[idx]
+        next_row = candles[idx + 1]
+        if side == "low":
+            if float(row["low"]) <= float(prev_row["low"]) and float(row["low"]) <= float(next_row["low"]):
+                out.append((idx, float(row["low"])))
+        else:
+            if float(row["high"]) >= float(prev_row["high"]) and float(row["high"]) >= float(next_row["high"]):
+                out.append((idx, float(row["high"])))
+    return out[-2:]
+
+
+def _detect_rsi_divergence(candles: List[dict], rsi_values: List[Optional[float]]) -> Dict[str, Any]:
+    default = {
+        "status": "NONE",
+        "bias": "NEUTRAL",
+        "strength": 0.0,
+        "description": "No RSI divergence.",
+    }
+    if len(candles) < 5 or len(rsi_values) != len(candles):
+        return default
+
+    lows = _last_two_price_pivots(candles, side="low")
+    if len(lows) == 2:
+        (idx1, low1), (idx2, low2) = lows
+        rsi1 = rsi_values[idx1]
+        rsi2 = rsi_values[idx2]
+        if rsi1 is not None and rsi2 is not None and low2 < low1 and rsi2 > rsi1 + 1.0:
+            strength = min(1.0, max(0.0, ((rsi2 - rsi1) / 12.0)))
+            return {
+                "status": "BULLISH_DIVERGENCE",
+                "bias": "BULLISH",
+                "strength": round(strength, 3),
+                "description": "Price made a lower low while RSI made a higher low.",
+            }
+
+    highs = _last_two_price_pivots(candles, side="high")
+    if len(highs) == 2:
+        (idx1, high1), (idx2, high2) = highs
+        rsi1 = rsi_values[idx1]
+        rsi2 = rsi_values[idx2]
+        if rsi1 is not None and rsi2 is not None and high2 > high1 and rsi2 < rsi1 - 1.0:
+            strength = min(1.0, max(0.0, ((rsi1 - rsi2) / 12.0)))
+            return {
+                "status": "BEARISH_DIVERGENCE",
+                "bias": "BEARISH",
+                "strength": round(strength, 3),
+                "description": "Price made a higher high while RSI made a lower high.",
+            }
+    return default
+
+
+def _detect_orderflow_zones(
+    *,
+    candles_5m: List[dict],
+    spot: float,
+    nearest_support: Optional[Dict[str, Any]],
+    nearest_resistance: Optional[Dict[str, Any]],
+    snap_5m: Dict[str, Any],
+) -> Dict[str, Any]:
+    default_zone = {"active": False, "level": None, "strength": 0.0, "summary": "No clear participation zone yet."}
+    if not candles_5m:
+        return {"buyers": dict(default_zone), "sellers": dict(default_zone)}
+    last = candles_5m[-1]
+    avg_volume = sum(float(c.get("volume") or 0.0) for c in candles_5m[-6:]) / max(1, len(candles_5m[-6:]))
+    volume_ratio = (float(last.get("volume") or 0.0) / avg_volume) if avg_volume > 0 else 1.0
+    body = abs(float(last["close"]) - float(last["open"]))
+    lower_wick = max(0.0, min(float(last["open"]), float(last["close"])) - float(last["low"]))
+    upper_wick = max(0.0, float(last["high"]) - max(float(last["open"]), float(last["close"])))
+    atr = max(10.0, float(snap_5m.get("atr_like_points") or 0.0))
+    support_level = _parse_float(nearest_support.get("price"), None) if nearest_support else None
+    resistance_level = _parse_float(nearest_resistance.get("price"), None) if nearest_resistance else None
+    buyers = dict(default_zone)
+    sellers = dict(default_zone)
+
+    if support_level is not None:
+        near_support = abs(spot - support_level) <= max(15.0, atr * 0.55)
+        strong_lower_rejection = lower_wick >= max(body * 1.2, atr * 0.22)
+        if near_support and strong_lower_rejection:
+            strength = min(1.0, 0.45 + max(0.0, min(0.35, (volume_ratio - 1.0) * 0.4)) + 0.15)
+            buyers = {
+                "active": True,
+                "level": round(float(support_level), 2),
+                "strength": round(strength, 3),
+                "summary": f"Buyers defended near {support_level:.0f} with lower-wick rejection.",
+            }
+
+    if resistance_level is not None:
+        near_resistance = abs(resistance_level - spot) <= max(15.0, atr * 0.55)
+        strong_upper_rejection = upper_wick >= max(body * 1.2, atr * 0.22)
+        if near_resistance and strong_upper_rejection:
+            strength = min(1.0, 0.45 + max(0.0, min(0.35, (volume_ratio - 1.0) * 0.4)) + 0.15)
+            sellers = {
+                "active": True,
+                "level": round(float(resistance_level), 2),
+                "strength": round(strength, 3),
+                "summary": f"Sellers rejected price near {resistance_level:.0f} with upper-wick supply.",
+            }
+    return {"buyers": buyers, "sellers": sellers}
+
+
+def _build_higher_tf_confluence(
+    *,
+    snap_15m: Dict[str, Any],
+    snap_60m: Dict[str, Any],
+    market_bias: str,
+    rsi_divergence: Dict[str, Any],
+) -> Dict[str, Any]:
+    alignments: List[str] = []
+    score = 0.0
+    patterns = [str(snap_15m.get("pattern") or "UNKNOWN"), str(snap_60m.get("pattern") or "UNKNOWN")]
+    ema_alignments = [str(snap_15m.get("ema_alignment") or "NEUTRAL"), str(snap_60m.get("ema_alignment") or "NEUTRAL")]
+    price_action = [str(snap_15m.get("price_action_confirmation") or "NONE"), str(snap_60m.get("price_action_confirmation") or "NONE")]
+    if market_bias == "BEARISH":
+        if str(snap_15m.get("pattern") or "").upper() in {"DOWNTREND", "DOWN_BIAS"}:
+            score += 0.35
+            alignments.append("15m trend supports bearish idea")
+        if str(snap_60m.get("pattern") or "").upper() in {"DOWNTREND", "DOWN_BIAS"}:
+            score += 0.4
+            alignments.append("60m structure is also bearish")
+        if str(snap_15m.get("ema_alignment") or "").upper() == "BEARISH":
+            score += 0.2
+            alignments.append("15m EMA(5/20) is bearish")
+        if str(snap_60m.get("ema_alignment") or "").upper() == "BEARISH":
+            score += 0.2
+            alignments.append("60m EMA slope is bearish")
+        if str(rsi_divergence.get("bias") or "").upper() == "BEARISH":
+            score += 0.2
+            alignments.append("RSI bearish divergence agrees with short idea")
+    elif market_bias == "BULLISH":
+        if str(snap_15m.get("pattern") or "").upper() in {"UPTREND", "UP_BIAS"}:
+            score += 0.35
+            alignments.append("15m trend supports bullish idea")
+        if str(snap_60m.get("pattern") or "").upper() in {"UPTREND", "UP_BIAS"}:
+            score += 0.4
+            alignments.append("60m structure is also bullish")
+        if str(snap_15m.get("ema_alignment") or "").upper() == "BULLISH":
+            score += 0.2
+            alignments.append("15m EMA(5/20) is bullish")
+        if str(snap_60m.get("ema_alignment") or "").upper() == "BULLISH":
+            score += 0.2
+            alignments.append("60m EMA slope is bullish")
+        if str(rsi_divergence.get("bias") or "").upper() == "BULLISH":
+            score += 0.2
+            alignments.append("RSI bullish divergence agrees with long-supportive idea")
+    if not alignments:
+        alignments.append("Higher timeframe structure is mixed.")
+    return {
+        "status": "ALIGNED" if score >= 0.75 else ("PARTIAL" if score >= 0.35 else "MIXED"),
+        "score": round(min(1.0, score), 3),
+        "patterns": patterns,
+        "ema_alignments": ema_alignments,
+        "price_action_confirmations": price_action,
+        "notes": alignments[:4],
+    }
+
+
+def _market_bias_from_snapshot(snap_5m: Dict[str, Any], snap_15m: Dict[str, Any], snap_60m: Dict[str, Any], advisor: Dict[str, Any]) -> Tuple[str, float]:
+    bias_score = 0.0
+    bias_score += float(snap_5m.get("dir_score") or 0.0) * 1.0
+    bias_score += float(snap_15m.get("dir_score") or 0.0) * 2.0
+    bias_score += float(snap_60m.get("dir_score") or 0.0) * 3.0
+    pcr_bias = str(advisor.get("pcr_bias") or "").upper()
+    oi_bias = str(advisor.get("oi_build_bias") or "").upper()
+    if pcr_bias == "BULLISH":
+        bias_score += 0.8
+    elif pcr_bias == "BEARISH":
+        bias_score -= 0.8
+    if oi_bias == "BULLISH":
+        bias_score += 0.4
+    elif oi_bias == "BEARISH":
+        bias_score -= 0.4
+    primary_pattern = str(snap_5m.get("primary_pattern") or snap_15m.get("primary_pattern") or "NONE").upper()
+    if primary_pattern in {"DOUBLE_BOTTOM_W_CONFIRMED", "FAKE_BREAKDOWN_DOWN"}:
+        bias_score += 0.6
+    elif primary_pattern in {"DOUBLE_TOP_M_CONFIRMED", "FAKE_BREAKOUT_UP"}:
+        bias_score -= 0.6
+    if bias_score >= 1.0:
+        return "BULLISH", round(min(1.0, abs(bias_score) / 4.5), 3)
+    if bias_score <= -1.0:
+        return "BEARISH", round(min(1.0, abs(bias_score) / 4.5), 3)
+    return "NEUTRAL", round(min(1.0, abs(bias_score) / 4.5), 3)
+
+
+def _build_structure_regime(
+    *,
+    spot: float,
+    snap_5m: Dict[str, Any],
+    snap_15m: Dict[str, Any],
+    snap_60m: Dict[str, Any],
+    orb: Dict[str, Any],
+    market_bias: str,
+) -> str:
+    breakout = str(orb.get("breakout_confirmation") or "NONE").upper()
+    if market_bias == "BEARISH" and breakout == "DOWN_CONFIRMED":
+        return "SWING_DOWN"
+    if market_bias == "BULLISH" and breakout == "UP_CONFIRMED":
+        return "SWING_UP"
+    close_pos = snap_15m.get("close_position_in_range")
+    range_points = float(snap_15m.get("range_points") or 0.0)
+    atr = float(snap_15m.get("atr_like_points") or 0.0)
+    if range_points > 0 and atr > 0 and range_points <= (atr * 4.0) and close_pos is not None and 0.35 <= float(close_pos) <= 0.65:
+        return "RANGE"
+    if market_bias == "BEARISH":
+        return "BEARISH_DRIFT"
+    if market_bias == "BULLISH":
+        return "BULLISH_DRIFT"
+    return "TRANSITION"
+
+
+def _build_trade_plan(
+    *,
+    spot: float,
+    snap_5m: Dict[str, Any],
+    snap_15m: Dict[str, Any],
+    snap_60m: Dict[str, Any],
+    market_bias: str,
+    bias_confidence: float,
+    orb: Dict[str, Any],
+    nearest_support: Optional[Dict[str, Any]],
+    nearest_resistance: Optional[Dict[str, Any]],
+    advisor: Dict[str, Any],
+    buyer_seller_zones: Dict[str, Any],
+    rsi_divergence: Dict[str, Any],
+    higher_tf_confluence: Dict[str, Any],
+) -> Dict[str, Any]:
+    return _shared_build_trade_plan(
+        spot=spot,
+        snap_5m=snap_5m,
+        snap_15m=snap_15m,
+        snap_60m=snap_60m,
+        market_bias=market_bias,
+        bias_confidence=bias_confidence,
+        orb=orb,
+        nearest_support=nearest_support,
+        nearest_resistance=nearest_resistance,
+        advisor=advisor,
+        buyer_seller_zones=buyer_seller_zones,
+        rsi_divergence=rsi_divergence,
+        higher_tf_confluence=higher_tf_confluence,
+    )
+
+
+def _build_intraday_index_chart_payload_from_candles(
+    *,
+    candles_5m: List[dict],
+    candles_15m: List[dict],
+    candles_60m: List[dict],
+    advisor_status: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    advisor = advisor_status if isinstance(advisor_status, dict) else _load_intraday_ai_status()
+    candles_5m = _normalize_intraday_candles(candles_5m, limit=96)
+    candles_15m = _normalize_intraday_candles(candles_15m, limit=64)
+    candles_60m = _normalize_intraday_candles(candles_60m, limit=48)
+    now = _ist_now()
+    if not candles_5m:
+        return {
+            "status": "NO_DATA",
+            "symbol": "NIFTY",
+            "interval_min": 5,
+            "current_session_date": now.date().isoformat(),
+            "updated_at": now.isoformat(timespec="seconds"),
+            "headline": "No NIFTY intraday chart data available.",
+            "candles": [],
+            "ema20": [],
+            "levels": {},
+            "structure": {"regime": "UNKNOWN", "market_bias": "NEUTRAL"},
+            "plan": {
+                "trade_idea": "No trade plan",
+                "posture": "NO_DATA",
+                "trigger_window": "Waiting for intraday data.",
+                "confirmation": "No confirmation possible without candles.",
+                "invalidation": "No data.",
+                "strike_hint": "No strike hint.",
+                "reason_summary": ["Live chart data is unavailable."],
+            },
+        }
+
+    closes = [float(candle["close"]) for candle in candles_5m]
+    ema20 = _ema_series(closes, 20)
+    snap_5m = _price_action_snapshot(candles_5m, interval_min=5)
+    snap_15m = _price_action_snapshot(candles_15m or candles_5m, interval_min=15)
+    snap_60m = _price_action_snapshot(candles_60m or candles_15m or candles_5m, interval_min=60)
+    spot = float(candles_5m[-1]["close"])
+    orb = _compute_orb_state(candles_5m)
+
+    frame_5m = _candles_to_zone_frame(candles_5m, timeframe="5m")
+    frame_15m = _candles_to_zone_frame(candles_15m or candles_5m, timeframe="15m")
+    frame_60m = _candles_to_zone_frame(candles_60m or candles_15m or candles_5m, timeframe="1h")
+    zones = find_multi_tf_zones({"5m": frame_5m, "15m": frame_15m, "1h": frame_60m})
+    nearest_support_zone, nearest_resistance_zone = nearest_zones(zones, spot)
+    supports = sorted([zone for zone in zones if zone.side == "support"], key=lambda zone: abs(zone.price - spot))[:4]
+    resistances = sorted([zone for zone in zones if zone.side == "resistance"], key=lambda zone: abs(zone.price - spot))[:4]
+    nearest_support = _zone_to_payload(nearest_support_zone)
+    nearest_resistance = _zone_to_payload(nearest_resistance_zone)
+    rsi_5m_series = _rsi_series(closes, 14)
+    rsi_divergence = _detect_rsi_divergence(candles_5m, rsi_5m_series)
+    buyer_seller_zones = _detect_orderflow_zones(
+        candles_5m=candles_5m,
+        spot=spot,
+        nearest_support=nearest_support,
+        nearest_resistance=nearest_resistance,
+        snap_5m=snap_5m,
+    )
+
+    market_bias, bias_confidence = _market_bias_from_snapshot(snap_5m, snap_15m, snap_60m, advisor)
+    higher_tf_confluence = _build_higher_tf_confluence(
+        snap_15m=snap_15m,
+        snap_60m=snap_60m,
+        market_bias=market_bias,
+        rsi_divergence=rsi_divergence,
+    )
+    regime = _build_structure_regime(
+        spot=spot,
+        snap_5m=snap_5m,
+        snap_15m=snap_15m,
+        snap_60m=snap_60m,
+        orb=orb,
+        market_bias=market_bias,
+    )
+    plan = _build_trade_plan(
+        spot=spot,
+        snap_5m=snap_5m,
+        snap_15m=snap_15m,
+        snap_60m=snap_60m,
+        market_bias=market_bias,
+        bias_confidence=bias_confidence,
+        orb=orb,
+        nearest_support=nearest_support,
+        nearest_resistance=nearest_resistance,
+        advisor=advisor,
+        buyer_seller_zones=buyer_seller_zones,
+        rsi_divergence=rsi_divergence,
+        higher_tf_confluence=higher_tf_confluence,
+    )
+
+    weekly_structure = (advisor.get("market_context") or {}).get("structure") if isinstance(advisor.get("market_context"), dict) else {}
+    weekly_structure = weekly_structure if isinstance(weekly_structure, dict) else {}
+    labels = [candle["timestamp"].strftime("%H:%M") for candle in candles_5m]
+    candle_payload = [
+        {
+            "timestamp": candle["timestamp"].isoformat(),
+            "open": round(float(candle["open"]), 2),
+            "high": round(float(candle["high"]), 2),
+            "low": round(float(candle["low"]), 2),
+            "close": round(float(candle["close"]), 2),
+            "volume": round(float(candle.get("volume") or 0.0), 2),
+        }
+        for candle in candles_5m
+    ]
+    latest_primary_pattern = str(snap_5m.get("primary_pattern") or snap_15m.get("primary_pattern") or "NONE")
+    headline = f"{market_bias.title()} {regime.replace('_', ' ').title()} | {plan.get('posture', 'NO_TRADE').replace('_', ' ').title()}"
+    return {
+        "status": "OK",
+        "symbol": "NIFTY",
+        "interval_min": 5,
+        "current_session_date": candles_5m[-1]["timestamp"].date().isoformat(),
+        "updated_at": now.isoformat(timespec="seconds"),
+        "headline": headline,
+        "labels": labels,
+        "candles": candle_payload,
+        "ema20": ema20,
+        "rsi14": rsi_5m_series,
+        "orb": orb,
+        "levels": {
+            "nearest_support": nearest_support,
+            "nearest_resistance": nearest_resistance,
+            "supports": [_zone_to_payload(zone) for zone in supports],
+            "resistances": [_zone_to_payload(zone) for zone in resistances],
+            "weekly_support": _parse_float(weekly_structure.get("weekly_support"), None),
+            "weekly_resistance": _parse_float(weekly_structure.get("weekly_resistance"), None),
+            "buyers": buyer_seller_zones.get("buyers") or {},
+            "sellers": buyer_seller_zones.get("sellers") or {},
+        },
+        "structure": {
+            "regime": regime,
+            "market_bias": market_bias,
+            "bias_confidence": round(float(bias_confidence), 3),
+            "spot": round(float(spot), 2),
+            "session_high": round(max(float(candle["high"]) for candle in candles_5m), 2),
+            "session_low": round(min(float(candle["low"]) for candle in candles_5m), 2),
+            "range_points": round(max(float(candle["high"]) for candle in candles_5m) - min(float(candle["low"]) for candle in candles_5m), 2),
+            "ema20": _parse_float(ema20[-1], None),
+            "ema_alignment_5m": snap_5m.get("ema_alignment"),
+            "ema_alignment_15m": snap_15m.get("ema_alignment"),
+            "price_action_confirmation": snap_5m.get("price_action_confirmation") or "NONE",
+            "primary_pattern": latest_primary_pattern,
+            "price_action_patterns": list(snap_5m.get("price_action_patterns") or []),
+            "retest_status": snap_5m.get("retest_status") or "NONE",
+            "breakout_confirmation": orb.get("breakout_confirmation") or "NONE",
+            "rsi_divergence": rsi_divergence,
+            "higher_tf_confluence": higher_tf_confluence,
+            "timeframes": {"5": snap_5m, "15": snap_15m, "60": snap_60m},
+        },
+        "plan": plan,
+        "advisor_overlay": {
+            "signal": advisor.get("signal"),
+            "strategy": advisor.get("strategy"),
+            "market_bias": advisor.get("market_bias"),
+            "trend_confidence": advisor.get("trend_confidence"),
+            "signal_conflict_score": advisor.get("signal_conflict_score"),
+            "pcr_bias": advisor.get("pcr_bias"),
+            "oi_build_bias": advisor.get("oi_build_bias"),
+            "breakout_confirmation": advisor.get("breakout_confirmation"),
+            "orb_confirmation": advisor.get("orb_confirmation"),
+            "updated_at": advisor.get("updated_at"),
+        },
+    }
+
+
+def _load_intraday_index_chart_payload(interval_min: int = 5) -> Dict[str, Any]:
+    now = _ist_now()
+    cache_key = (now.date().isoformat(), interval_min)
+    cached = _INDEX_CHART_CACHE.get(cache_key)
+    if cached and (time.time() - cached.get("ts", 0.0)) < 45:
+        return cached["payload"]
+    advisor = _load_intraday_ai_status()
+    try:
+        dw = _init_dhan_wrapper()
+        candles_5m = dw.get_intraday_candles(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, interval=5, from_date=now.date().isoformat(), to_date=now.date().isoformat())
+        candles_15m = dw.get_intraday_candles(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, interval=15, from_date=now.date().isoformat(), to_date=now.date().isoformat())
+        candles_60m = dw.get_intraday_candles(INDEX_SECURITY_ID, INDEX_EXCHANGE_SEG, interval=60, from_date=now.date().isoformat(), to_date=now.date().isoformat())
+    except Exception as exc:
+        return {
+            "status": "ERROR",
+            "symbol": "NIFTY",
+            "interval_min": interval_min,
+            "current_session_date": now.date().isoformat(),
+            "updated_at": now.isoformat(timespec="seconds"),
+            "headline": "Unable to build NIFTY chart context.",
+            "error": str(exc),
+            "candles": [],
+            "ema20": [],
+            "levels": {},
+            "structure": {"regime": "UNKNOWN", "market_bias": advisor.get("market_bias") or "NEUTRAL"},
+            "plan": {
+                "trade_idea": "No trade plan",
+                "posture": "NO_DATA",
+                "trigger_window": "Chart fetch failed.",
+                "confirmation": "Resolve feed/credential issue first.",
+                "invalidation": "No data.",
+                "strike_hint": "No strike hint.",
+                "reason_summary": [str(exc)],
+            },
+        }
+    payload = _build_intraday_index_chart_payload_from_candles(
+        candles_5m=candles_5m,
+        candles_15m=candles_15m,
+        candles_60m=candles_60m,
+        advisor_status=advisor,
+    )
+    _INDEX_CHART_CACHE[cache_key] = {"ts": time.time(), "payload": payload}
+    return payload
 
 
 def _load_intraday_trade_history(limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -1303,6 +2217,181 @@ def _build_committee_review_payload(*, trade_mode: str) -> Dict[str, Any]:
         "by_bias": by_bias,
         "by_exit_reason": by_exit,
         "recent_outcomes": recent,
+    }
+
+
+def _parse_iso_dt(value: Any) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except Exception:
+        return None
+
+
+def _load_batman_bkm_event_history(limit: int = 500) -> List[Dict[str, Any]]:
+    rows = _load_jsonl_tail(BATMAN_BKM_AI_EVENTS_JSONL, limit=limit)
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _build_batman_bkm_review_payload(*, trade_mode: str) -> Dict[str, Any]:
+    state = _json_read(STRATEGY_STATE)
+    bucket = (state.get("BATMAN_BKM") if isinstance(state, dict) else {}) or {}
+    if not isinstance(bucket, dict):
+        bucket = {}
+
+    event_rows = _load_batman_bkm_event_history(limit=1000)
+    event_rows.sort(key=lambda row: str(row.get("timestamp") or row.get("updated_at") or ""))
+
+    open_baskets: List[Dict[str, Any]] = []
+    closed_baskets: List[Dict[str, Any]] = []
+
+    market_open_hour = 9
+    market_open_minute = 15
+
+    for expiry, payload in bucket.items():
+        if not isinstance(payload, dict):
+            continue
+        status = str(payload.get("status") or "").upper() or "UNKNOWN"
+        opened_at = str(payload.get("opened_at") or "") or None
+        closed_at = str(payload.get("closed_at") or "") or None
+        opened_dt = _parse_iso_dt(opened_at)
+        closed_dt = _parse_iso_dt(closed_at)
+        held_minutes = None
+        if opened_dt and closed_dt:
+            held_minutes = round(max((closed_dt - opened_dt).total_seconds(), 0.0) / 60.0, 2)
+
+        metrics = payload.get("quality_metrics") if isinstance(payload.get("quality_metrics"), dict) else {}
+        latest_event = None
+        for row in reversed(event_rows):
+            if str(row.get("basket_expiry") or "") != str(expiry):
+                continue
+            latest_event = row
+            break
+
+        review = {
+            "expiry": str(expiry),
+            "status": status,
+            "opened_at": opened_at,
+            "closed_at": closed_at,
+            "held_minutes": held_minutes,
+            "reason": str(payload.get("reason") or ""),
+            "pnl_rs": round(_parse_float(payload.get("pnl"), 0.0), 2),
+            "net_credit_rs": round(_parse_float(payload.get("net_credit"), 0.0), 2),
+            "credit_pct": round(_parse_float(payload.get("credit_pct"), 0.0), 4),
+            "quality_status": str(payload.get("quality_status") or "UNKNOWN"),
+            "quality_score": round(_parse_float(payload.get("quality_score"), 0.0), 2),
+            "opened_pre_market": bool(
+                opened_dt
+                and ((opened_dt.hour, opened_dt.minute) < (market_open_hour, market_open_minute))
+            ),
+            "daily_lock_triggered": str(payload.get("reason") or "").upper() == "DAILY_LOCK_RED",
+            "center_offset_pts": round(_parse_float(metrics.get("center_offset"), 0.0), 2),
+            "short_distance_min_pts": round(_parse_float(metrics.get("short_distance_min"), 0.0), 2),
+            "short_width_pts": round(_parse_float(metrics.get("short_width"), 0.0), 2),
+            "outer_distance_ratio": round(_parse_float(metrics.get("outer_distance_ratio"), 0.0), 2),
+            "loss_to_credit_ratio": None,
+            "lessons": [],
+            "improvements": [],
+            "close_context": {
+                "market_bias": str((latest_event or {}).get("market_bias") or ""),
+                "position_risk_side": str((latest_event or {}).get("position_risk_side") or ""),
+                "ai_reasons": list((latest_event or {}).get("reasons") or []),
+                "ai_confidence": _parse_float((latest_event or {}).get("confidence"), None),
+                "ai_score": _parse_float((latest_event or {}).get("score"), None),
+            },
+        }
+
+        pnl_rs = float(review["pnl_rs"])
+        net_credit = float(review["net_credit_rs"])
+        if net_credit > 0 and pnl_rs < 0:
+            review["loss_to_credit_ratio"] = round(abs(pnl_rs) / net_credit, 2)
+
+        lessons: List[str] = []
+        improvements: List[str] = []
+
+        if review["quality_status"] == "PASS" and review["quality_score"] >= 90:
+            lessons.append("STRUCTURE_SHAPE_WAS_GOOD")
+        if review["opened_pre_market"]:
+            lessons.append("ENTRY_HAPPENED_PRE_MARKET")
+            improvements.append("BLOCK_BATMAN_ENTRY_BEFORE_09_15")
+        if review["daily_lock_triggered"]:
+            lessons.append("BASKET_HIT_DAILY_LOSS_LOCK")
+            improvements.append("REQUIRE_MARKET_OPEN_CONFIRMATION_BEFORE_FIRST_DEPLOY")
+        if held_minutes is not None and held_minutes <= 30:
+            lessons.append("LOSS_CAME_EARLY_AFTER_ENTRY")
+            improvements.append("ADD_OPENING_RANGE_STABILIZATION_5_TO_15_MIN")
+        if review["close_context"]["market_bias"]:
+            lessons.append(f"CLOSE_BIAS_{review['close_context']['market_bias']}")
+        ai_reasons = review["close_context"]["ai_reasons"]
+        if ai_reasons:
+            if any(str(reason).upper() == "LOSS_BUILDING" for reason in ai_reasons):
+                improvements.append("TIGHTEN_EARLY_LOSS_ACCELERATION_CHECK")
+            if any("DRAWDOWN" in str(reason).upper() for reason in ai_reasons):
+                improvements.append("USE_OI_PCR_RECHECK_BEFORE_HOLDING_OPENING_DRIFT")
+
+        # De-duplicate while keeping order.
+        dedup_lessons: List[str] = []
+        for item in lessons:
+            if item not in dedup_lessons:
+                dedup_lessons.append(item)
+        dedup_improvements: List[str] = []
+        for item in improvements:
+            if item not in dedup_improvements:
+                dedup_improvements.append(item)
+        review["lessons"] = dedup_lessons
+        review["improvements"] = dedup_improvements
+
+        if status == "OPEN":
+            open_baskets.append(review)
+        else:
+            closed_baskets.append(review)
+
+    open_baskets.sort(key=lambda row: str(row.get("opened_at") or row.get("expiry") or ""))
+    closed_baskets.sort(key=lambda row: str(row.get("closed_at") or row.get("opened_at") or row.get("expiry") or ""))
+    latest_closed = closed_baskets[-1] if closed_baskets else None
+
+    return {
+        "trade_mode": str(trade_mode or "").strip().lower(),
+        "open_baskets": open_baskets,
+        "closed_baskets": list(reversed(closed_baskets[-10:])),
+        "latest_closed": latest_closed,
+        "summary": {
+            "open_count": len(open_baskets),
+            "closed_count": len(closed_baskets),
+            "realized_pnl_rs": round(sum(_parse_float(item.get("pnl_rs"), 0.0) for item in closed_baskets), 2),
+        },
+    }
+
+
+def _build_batman_bkm_learning_payload(*, trade_mode: str) -> Dict[str, Any]:
+    status = _load_bkm_learning_status()
+    last_assessment = status.get("last_entry_assessment") if isinstance(status.get("last_entry_assessment"), dict) else {}
+    return {
+        "trade_mode": str(trade_mode or "").strip().lower(),
+        "status": str(status.get("status") or "IDLE"),
+        "summary": {
+            "total_outcomes": _parse_int(status.get("total_outcomes"), 0),
+            "wins": _parse_int(status.get("wins"), 0),
+            "losses": _parse_int(status.get("losses"), 0),
+            "flats": _parse_int(status.get("flats"), 0),
+            "realized_pnl_rs": round(_parse_float(status.get("realized_pnl_rs"), 0.0), 2),
+            "last_outcome_at": status.get("last_outcome_at"),
+            "last_outcome_id": status.get("last_outcome_id"),
+            "updated_at": status.get("updated_at"),
+        },
+        "last_entry_assessment": {
+            "mode": last_assessment.get("mode"),
+            "status": last_assessment.get("status"),
+            "block_entry": bool(last_assessment.get("block_entry", False)),
+            "risk_score_adjust": round(_parse_float(last_assessment.get("risk_score_adjust"), 0.0), 2),
+            "reasons": list(last_assessment.get("reasons") or []),
+            "supportive_reasons": list(last_assessment.get("supportive_reasons") or []),
+            "timestamp": last_assessment.get("timestamp"),
+        },
+        "top_negative_buckets": list(status.get("top_negative_buckets") or []),
+        "top_positive_buckets": list(status.get("top_positive_buckets") or []),
     }
 
 
@@ -1925,11 +3014,45 @@ def _load_agent_heartbeat() -> Dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _write_agent_heartbeat_stub(*, status: str, phase: str, pid: Optional[int], trade_mode: Optional[str]) -> None:
+    payload: Dict[str, Any] = {
+        "status": str(status or "UNKNOWN").upper(),
+        "phase": str(phase or "unknown"),
+        "pid": None if not pid else int(pid),
+        "trade_mode": str(trade_mode or "").lower() or None,
+        "timestamp": _ist_now().isoformat(timespec="seconds"),
+    }
+    _json_write(AGENT_HEARTBEAT_JSON, payload)
+
+
+def _clear_agent_heartbeat() -> None:
+    try:
+        if AGENT_HEARTBEAT_JSON.exists():
+            AGENT_HEARTBEAT_JSON.unlink()
+    except Exception:
+        pass
+
+
 def _watchdog_health_status() -> Dict[str, Any]:
     settings = _json_read(SETTINGS_JSON)
     stale_after = _parse_float(settings.get("ops_watchdog_stale_after_sec"), 45.0) if isinstance(settings, dict) else 45.0
     hb = _load_agent_heartbeat()
-    return compute_watchdog_status(heartbeat_payload=hb, stale_after_sec=stale_after)
+    watchdog = compute_watchdog_status(heartbeat_payload=hb, stale_after_sec=stale_after)
+    pid_data = _json_read(PID_FILE)
+    active_pid = int(pid_data.get("pid", 0)) if isinstance(pid_data, dict) else 0
+    active_running = bool(active_pid and _is_process_alive(active_pid))
+    hb_pid = _parse_int(hb.get("pid"), 0) if isinstance(hb, dict) else 0
+    hb_status = str(hb.get("status") or "").upper() if isinstance(hb, dict) else ""
+    if hb_status == "STOPPED":
+        watchdog["status"] = "STOPPED"
+    elif hb_pid and not _is_process_alive(hb_pid) and not active_running:
+        watchdog["status"] = "STOPPED"
+    elif hb_status == "STARTING" and active_running and hb_pid == active_pid:
+        watchdog["status"] = "STARTING"
+    watchdog["pid_alive"] = bool(hb_pid and _is_process_alive(hb_pid))
+    watchdog["active_pid"] = active_pid or None
+    watchdog["active_pid_running"] = active_running
+    return watchdog
 
 
 def _load_alerts_tail(limit: int = 100) -> List[Dict[str, Any]]:
@@ -2045,6 +3168,7 @@ def _start_agent_process(trade_mode: str) -> Dict[str, Any]:
     )
     pid_payload = {"pid": proc.pid, "trade_mode": trade_mode, "started_at": datetime.now().isoformat()}
     _json_write(PID_FILE, pid_payload)
+    _write_agent_heartbeat_stub(status="STARTING", phase="launch_requested", pid=proc.pid, trade_mode=trade_mode)
     out = {"ok": True, "pid": proc.pid, "trade_mode": trade_mode}
     if auto_import_result is not None:
         out["auto_import"] = auto_import_result
@@ -2054,6 +3178,7 @@ def _start_agent_process(trade_mode: str) -> Dict[str, Any]:
 def _stop_agent_process(*, auto_cleanup_bkm: bool = True, graceful_wait_sec: float = 5.0) -> Dict[str, Any]:
     pid_data = _json_read(PID_FILE)
     pid = int(pid_data.get("pid", 0)) if pid_data else 0
+    trade_mode = str(pid_data.get("trade_mode") or "").lower() if isinstance(pid_data, dict) else None
     still_running = False
     if pid and _is_process_alive(pid):
         os.kill(pid, signal.SIGTERM)
@@ -2064,6 +3189,10 @@ def _stop_agent_process(*, auto_cleanup_bkm: bool = True, graceful_wait_sec: flo
             time.sleep(0.2)
         still_running = _is_process_alive(pid)
     _json_write(PID_FILE, {})
+    if still_running:
+        _write_agent_heartbeat_stub(status="STOPPING", phase="stop_requested", pid=pid or None, trade_mode=trade_mode)
+    else:
+        _write_agent_heartbeat_stub(status="STOPPED", phase="api_stop", pid=pid or None, trade_mode=trade_mode)
     cleanup: Dict[str, Any] = {"attempted": False, "performed": False, "reason": "AUTO_CLEANUP_DISABLED_OR_SKIPPED"}
     if auto_cleanup_bkm and not still_running:
         cleanup = _safe_autocleanup_bkm_after_stop()
@@ -2078,6 +3207,8 @@ def _batman_bkm_tuning_paths() -> BatmanBKMTuningPaths:
         strategy_state_path=STRATEGY_STATE,
         live_gate_status_path=LIVE_GATE_STATUS_JSON,
         live_gate_sessions_path=LIVE_GATE_SESSIONS_JSONL,
+        learning_status_path=BATMAN_BKM_LEARNING_STATUS_JSON,
+        learning_outcomes_path=BATMAN_BKM_LEARNING_OUTCOMES_JSONL,
         advice_path=BATMAN_BKM_TUNING_ADVICE_JSON,
         history_path=BATMAN_BKM_TUNING_HISTORY_JSONL,
     )
@@ -2249,6 +3380,60 @@ class PaperHandler(SimpleHTTPRequestHandler):
                     return
                 require_live_mode = bool((settings or {}).get("intraday_ai_deploy_require_live_mode", True))
                 active_mode = str((pid_data or {}).get("trade_mode") or "").strip().lower()
+                execution_policy = _execution_policy(
+                    settings,
+                    active_mode or str((settings or {}).get("trade_mode") or "").strip().lower(),
+                )
+                intraday_mode = str(execution_policy.get("intraday_ai_mode") or _intraday_ai_mode_name(settings))
+                if not bool((settings or {}).get("intraday_ai_enabled", True)):
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "queued": False,
+                            "error": "INTRADAY_AI_DISABLED",
+                            "message": "Intraday AI is disabled.",
+                        },
+                        status=409,
+                    )
+                    return
+                if not bool(execution_policy.get("new_entries_allowed", False)):
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "queued": False,
+                            "error": "AGENT_EXECUTION_MODE_BLOCKS_NEW_ENTRIES",
+                            "message": f"Agent execution mode is {execution_policy.get('mode')}; new entries are blocked.",
+                            "agent_execution_mode": execution_policy.get("mode"),
+                        },
+                        status=409,
+                    )
+                    return
+                if intraday_mode != "EXECUTION":
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "queued": False,
+                            "error": "INTRADAY_AI_NOT_EXECUTION_MODE",
+                            "message": f"Intraday AI mode is {intraday_mode}. Switch it to EXECUTION before deploying.",
+                            "intraday_ai_mode": intraday_mode,
+                        },
+                        status=409,
+                    )
+                    return
+                if not bool(execution_policy.get("intraday_new_entries_allowed", False)):
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "queued": False,
+                            "error": "INTRADAY_AI_EXECUTION_DISABLED",
+                            "message": f"Intraday execution is disabled for {active_mode or str((settings or {}).get('trade_mode') or '').strip().lower() or 'this'} mode.",
+                            "intraday_ai_mode": intraday_mode,
+                            "trade_mode": active_mode or None,
+                            "agent_execution_mode": execution_policy.get("mode"),
+                        },
+                        status=409,
+                    )
+                    return
                 if require_live_mode and active_mode != "live":
                     self._send_json(
                         {
@@ -2434,6 +3619,9 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 payload["strategy_state"] = state
                 payload["intraday_performance"] = _build_intraday_performance_payload(trade_mode="paper")
                 payload["committee_review"] = _build_committee_review_payload(trade_mode="paper")
+                payload["intraday_learning"] = _load_intraday_learning_status()
+                payload["batman_bkm_review"] = _build_batman_bkm_review_payload(trade_mode="paper")
+                payload["batman_bkm_learning"] = _build_batman_bkm_learning_payload(trade_mode="paper")
                 self._send_json(payload)
             except Exception as exc:  # pragma: no cover - defensive
                 self._send_json({"error": str(exc)}, status=500)
@@ -2577,6 +3765,7 @@ class PaperHandler(SimpleHTTPRequestHandler):
             return
         if self.path.startswith("/api/control/status"):
             try:
+                settings = _json_read(SETTINGS_JSON)
                 pid_data = _json_read(PID_FILE)
                 pid = int(pid_data.get("pid", 0)) if pid_data else 0
                 running = pid and _is_process_alive(pid)
@@ -2584,7 +3773,9 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 reconcile = _load_reconcile_status()
                 exec_recovery = _load_execution_recovery_status()
                 bkm_ai = _load_bkm_ai_status()
+                bkm_learning = _load_bkm_learning_status()
                 committee = _load_decision_committee_status()
+                intraday_learning = _load_intraday_learning_status()
                 intraday_ai = _load_intraday_ai_status()
                 intraday_deploy = _load_intraday_ai_deploy_status()
                 intraday_position = _load_intraday_ai_position_status()
@@ -2593,6 +3784,16 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 bkm_ai_structure = bkm_ai_ctx.get("structure") if isinstance(bkm_ai_ctx.get("structure"), dict) else {}
                 bkm_ai_protect = _load_bkm_ai_protect_status()
                 intraday_ai_rec = intraday_ai.get("recommendation") if isinstance(intraday_ai.get("recommendation"), dict) else {}
+                runtime_trade_mode = (
+                    str(pid_data.get("trade_mode") or "").strip().lower()
+                    if isinstance(pid_data, dict)
+                    else ""
+                ) or str((settings or {}).get("trade_mode") or "").strip().lower()
+                execution_policy = _execution_policy(settings, runtime_trade_mode)
+                intraday_ai_mode = str(
+                    intraday_ai.get("mode") or execution_policy.get("intraday_ai_mode") or _intraday_ai_mode_name(settings)
+                ).upper()
+                intraday_ai_execution_enabled = bool(execution_policy.get("intraday_new_entries_allowed", False))
                 today_ist = _ist_now().date().isoformat()
                 ai_mode_name = str(bkm_ai.get("mode") or "ADVISOR").upper()
                 ai_mode_protect = ai_mode_name in {"AUTO_PROTECT", "PROTECTIVE"}
@@ -2638,6 +3839,11 @@ class PaperHandler(SimpleHTTPRequestHandler):
                         "running": bool(running),
                         "pid": pid,
                         "trade_mode": (str(pid_data.get("trade_mode") or "").lower() if isinstance(pid_data, dict) else None),
+                        "agent_execution_mode": execution_policy.get("mode"),
+                        "execution_new_entries_allowed": bool(execution_policy.get("new_entries_allowed", False)),
+                        "execution_manage_existing_allowed": bool(execution_policy.get("manage_existing_allowed", False)),
+                        "paper_execution_allowed": bool(execution_policy.get("paper_execution_allowed", False)),
+                        "live_execution_allowed": bool(execution_policy.get("live_execution_allowed", False)),
                         "watchdog_status": watchdog.get("status"),
                         "heartbeat_age_sec": watchdog.get("age_sec"),
                         "last_heartbeat_at": watchdog.get("last_heartbeat_at"),
@@ -2664,6 +3870,15 @@ class PaperHandler(SimpleHTTPRequestHandler):
                         "bkm_ai_basket_expiry": bkm_ai.get("basket_expiry"),
                         "bkm_ai_market_bias": bkm_ai.get("market_bias"),
                         "bkm_ai_position_risk_side": bkm_ai.get("position_risk_side"),
+                        "bkm_learning_status": bkm_learning.get("status"),
+                        "bkm_learning_total_outcomes": _parse_int(bkm_learning.get("total_outcomes"), 0),
+                        "bkm_learning_realized_pnl_rs": _parse_float(bkm_learning.get("realized_pnl_rs"), 0.0),
+                        "bkm_learning_last_outcome_at": bkm_learning.get("last_outcome_at"),
+                        "bkm_learning_last_entry_assessment": (
+                            bkm_learning.get("last_entry_assessment")
+                            if isinstance(bkm_learning.get("last_entry_assessment"), dict)
+                            else {}
+                        ),
                         "bkm_ai_trend_confidence": _parse_float(
                             (bkm_ai_structure.get("trend_confidence") if isinstance(bkm_ai_structure, dict) else None),
                             None,
@@ -2689,9 +3904,14 @@ class PaperHandler(SimpleHTTPRequestHandler):
                         "bkm_ai_protect_lock_active": protect_active,
                         "bkm_ai_protect_lock_reason": bkm_ai_protect.get("reason") if protect_active else None,
                         "bkm_ai_protect_lock_updated_at": bkm_ai_protect.get("updated_at") if protect_active else None,
+                        "batman_entry_execution_enabled": bool(execution_policy.get("batman_new_entries_allowed", False)),
+                        "batman_manage_existing_enabled": bool(execution_policy.get("batman_manage_existing_allowed", False)),
                         "bkm_ai_plan_next_course": bkm_ai_plan.get("next_course"),
                         "bkm_ai_updated_at": bkm_ai.get("updated_at"),
                         "intraday_ai_status": intraday_ai.get("status"),
+                        "intraday_ai_mode": intraday_ai_mode,
+                        "intraday_ai_execution_enabled": bool(intraday_ai_execution_enabled),
+                        "intraday_manage_existing_enabled": bool(execution_policy.get("intraday_manage_existing_allowed", False)),
                         "intraday_ai_signal": intraday_ai.get("signal"),
                         "intraday_ai_priority": intraday_ai.get("priority"),
                         "intraday_ai_strategy": intraday_ai.get("strategy"),
@@ -2723,6 +3943,16 @@ class PaperHandler(SimpleHTTPRequestHandler):
                         "intraday_committee_strategy": committee.get("advisor_strategy"),
                         "intraday_committee_updated_at": committee.get("updated_at"),
                         "intraday_committee_reasons": committee.get("reasons") if isinstance(committee.get("reasons"), list) else [],
+                        "intraday_learning": intraday_learning,
+                        "intraday_learning_status": intraday_learning.get("status"),
+                        "intraday_learning_total_outcomes": _parse_int(intraday_learning.get("total_outcomes"), 0),
+                        "intraday_learning_realized_pnl_rs": _parse_float(intraday_learning.get("realized_pnl_rs"), 0.0),
+                        "intraday_learning_last_outcome_at": intraday_learning.get("last_outcome_at"),
+                        "intraday_learning_last_assessment": (
+                            intraday_learning.get("last_assessment")
+                            if isinstance(intraday_learning.get("last_assessment"), dict)
+                            else {}
+                        ),
                         "bkm_quality_status": bkm_open_meta.get("quality_status"),
                         "bkm_quality_score": _parse_float(bkm_open_meta.get("quality_score"), None),
                         "bkm_quality_reasons": (
@@ -2778,6 +4008,18 @@ class PaperHandler(SimpleHTTPRequestHandler):
                         "history": _load_jsonl_tail(DECISION_COMMITTEE_HISTORY_JSONL, limit=25),
                     }
                 )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/intraday_ai/index_chart"):
+            try:
+                self._send_json({"ok": True, "chart": _load_intraday_index_chart_payload()})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/intraday_ai/learning"):
+            try:
+                self._send_json({"ok": True, "learning": _load_intraday_learning_status()})
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return

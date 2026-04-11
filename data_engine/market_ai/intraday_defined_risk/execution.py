@@ -1,0 +1,414 @@
+from __future__ import annotations
+
+from dataclasses import asdict
+from datetime import datetime, time
+
+from .data_models import (
+    DecisionOutput,
+    ExitDecision,
+    MarketSnapshot,
+    OpenPosition,
+    RegimeLabel,
+    RegimeState,
+    StrategyLeg,
+    StrategyType,
+    TradeStructure,
+)
+from .features import compute_vwap, last_n_closes_above, last_n_closes_below, latest_pivot_high, latest_pivot_low, session_bars
+from .features import bullish_reversal_structure, bearish_reversal_structure, closes, ema_value
+
+
+TIME_EXIT = time(15, 15)
+LATEST_DIRECTIONAL_ENTRY = time(14, 0)
+DIRECTIONAL_TP_CAPTURE = 0.65
+CONDOR_TP_CAPTURE = 0.50
+DIRECTIONAL_DELTA_SL = 0.40
+BULLISH_PLAYBOOK_DELTA_SL = 0.50
+CONDOR_DELTA_SL = 0.25
+PREMIUM_SL_MULTIPLIER = 2.0
+DAILY_PROFIT_TRAIL_ARM_RUPEES = 5000.0
+DAILY_PROFIT_TRAIL_GIVEBACK_RUPEES = 1500.0
+BULLISH_PLAYBOOK_PROFIT_TRAIL_ARM_RUPEES = 6500.0
+BULLISH_PLAYBOOK_PROFIT_TRAIL_GIVEBACK_RUPEES = 2000.0
+PROFIT_TRAIL_CAPTURE_ARM = 0.35
+PROFIT_TRAIL_GIVEBACK_POINTS = 6.0
+
+
+def validate_entry_time(strategy: StrategyType, now: datetime) -> tuple[bool, str | None]:
+    if now.time() < time(9, 15):
+        return False, "Entries are not allowed before 09:15 IST."
+    if strategy in {StrategyType.BEAR_CALL_CREDIT_SPREAD, StrategyType.BULL_PUT_CREDIT_SPREAD} and now.time() < time(9, 30):
+        return False, "Directional entries prefer time >= 09:30 IST."
+    if strategy in {StrategyType.BEAR_CALL_CREDIT_SPREAD, StrategyType.BULL_PUT_CREDIT_SPREAD} and now.time() > LATEST_DIRECTIONAL_ENTRY:
+        return False, "Directional entries are blocked after 14:00 IST to avoid low-quality late-session deployment."
+    if strategy == StrategyType.IRON_CONDOR and now.time() < time(10, 0):
+        return False, "Iron Condor entries are allowed only after 10:00 IST."
+    if now.time() >= TIME_EXIT:
+        return False, "No new entries are allowed after the 15:15 IST flattening cut-off."
+    return True, None
+
+
+def simulate_entry_credit(structure: TradeStructure, slippage_points: float) -> float:
+    return max(structure.credit_points - slippage_points, 0.0)
+
+
+def build_open_position(
+    structure: TradeStructure,
+    lots: int,
+    lot_size: int,
+    entry_time: datetime,
+    entry_credit_points: float,
+    max_loss_rupees_per_lot: float,
+    extra_metadata: dict[str, object] | None = None,
+) -> OpenPosition:
+    tp_capture = DIRECTIONAL_TP_CAPTURE if structure.strategy != StrategyType.IRON_CONDOR else CONDOR_TP_CAPTURE
+    target_value = entry_credit_points * (1.0 - tp_capture)
+    stop_value = entry_credit_points * PREMIUM_SL_MULTIPLIER
+    metadata = {
+        "time_exit": entry_time.replace(hour=15, minute=15, second=0, microsecond=0).isoformat(),
+        "session_profit_peak_rupees": 0.0,
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    return OpenPosition(
+        structure=structure,
+        lots=lots,
+        lot_size=lot_size,
+        entry_time=entry_time,
+        entry_credit_points=entry_credit_points,
+        target_value_points=target_value,
+        stop_value_points=stop_value,
+        max_loss_rupees_per_lot=max_loss_rupees_per_lot,
+        take_profit_capture_pct=tp_capture,
+        metadata=metadata,
+    )
+
+
+def build_trade_decision(
+    structure: TradeStructure,
+    regime: RegimeLabel | str,
+    rationale: list[str],
+    confidence_score: float,
+    entry_time: datetime,
+    lots: int,
+    lot_size: int,
+    max_loss_rupees_per_lot: float,
+    slippage_points: float,
+    extra_metadata: dict[str, object] | None = None,
+) -> DecisionOutput:
+    regime_label = regime if isinstance(regime, RegimeLabel) else RegimeLabel(regime)
+    entry_credit_points = simulate_entry_credit(structure, slippage_points=slippage_points)
+    tp_capture = DIRECTIONAL_TP_CAPTURE if structure.strategy != StrategyType.IRON_CONDOR else CONDOR_TP_CAPTURE
+    delta_sl = DIRECTIONAL_DELTA_SL if structure.strategy != StrategyType.IRON_CONDOR else CONDOR_DELTA_SL
+    playbook = str(extra_metadata.get("playbook")) if extra_metadata else ""
+    if structure.strategy == StrategyType.BULL_PUT_CREDIT_SPREAD and playbook in {
+        "OPEN_DRIVE_BULLISH",
+        "HIGH_CONFLUENCE_BULLISH_CONTINUATION",
+        "EARLY_BALANCE_BULLISH_RECLAIM",
+        "SIDEWAYS_TO_BULLISH_RECLAIM",
+        "GAP_UP_BULLISH_CONTINUATION",
+        "GAP_DOWN_BULLISH_RECOVERY",
+    }:
+        delta_sl = BULLISH_PLAYBOOK_DELTA_SL
+    legs = [_serialize_leg(leg, lots=lots, lot_size=lot_size) for leg in structure.legs]
+    metadata = {
+        "structure_credit_points": round(structure.credit_points, 4),
+        "structure_width_points": round(structure.width_points, 4),
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    return DecisionOutput(
+        action="TRADE",
+        strategy=structure.strategy,
+        regime=regime_label,
+        rationale=rationale + structure.rationale,
+        confidence_score=confidence_score,
+        entry={
+            "timestamp": entry_time.isoformat(),
+            "order_type": "LIMIT",
+            "reference_price": "MID",
+            "expected_credit_points": round(entry_credit_points, 4),
+            "slippage_points": slippage_points,
+        },
+        stop_loss={
+            "premium_multiple": PREMIUM_SL_MULTIPLIER,
+            "spread_value_points": round(entry_credit_points * PREMIUM_SL_MULTIPLIER, 4),
+            "short_delta_abs": delta_sl,
+        },
+        take_profit={
+            "credit_capture_pct": tp_capture,
+            "spread_value_points": round(entry_credit_points * (1.0 - tp_capture), 4),
+        },
+        time_exit=entry_time.replace(hour=15, minute=15, second=0, microsecond=0).isoformat(),
+        max_loss_rupees_per_lot=round(max_loss_rupees_per_lot, 2),
+        lots=lots,
+        legs=legs,
+        metadata=metadata,
+    )
+
+
+def build_no_trade_decision(
+    regime: RegimeLabel | str,
+    rationale: list[str],
+    *,
+    confidence_score: float = 0.0,
+    extra_metadata: dict[str, object] | None = None,
+) -> DecisionOutput:
+    try:
+        regime_label = regime if isinstance(regime, RegimeLabel) else RegimeLabel(regime)
+    except ValueError:
+        regime_label = RegimeLabel.NO_TRADE
+    metadata: dict[str, object] = {}
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    return DecisionOutput(
+        action="NO_TRADE",
+        strategy=StrategyType.NO_TRADE,
+        regime=regime_label,
+        rationale=rationale,
+        confidence_score=confidence_score,
+        entry={},
+        stop_loss={},
+        take_profit={},
+        time_exit="",
+        max_loss_rupees_per_lot=0.0,
+        lots=0,
+        legs=[],
+        metadata=metadata,
+    )
+
+
+def mark_to_market_value_points(position: OpenPosition, quotes_by_leg: list[StrategyLeg]) -> float:
+    liability = 0.0
+    for leg in quotes_by_leg:
+        mark = leg.quote.mid_price or leg.quote.ltp
+        if mark <= 0:
+            continue
+        if leg.action == "SELL":
+            liability += mark
+        else:
+            liability -= mark
+    return max(liability, 0.0)
+
+
+def evaluate_exit(
+    position: OpenPosition,
+    current_structure: TradeStructure | None = None,
+    *,
+    current_snapshot: MarketSnapshot | None = None,
+    current_regime: RegimeState | None = None,
+    now: datetime,
+) -> ExitDecision:
+    current_value_points, current_legs = _current_position_mark(position, current_snapshot, current_structure)
+    if now.time() >= TIME_EXIT:
+        liability = current_value_points if current_value_points is not None else position.stop_value_points
+        pnl_rupees = (position.entry_credit_points - liability) * position.lot_size * position.lots
+        return ExitDecision(True, "TIME_EXIT", liability, pnl_rupees)
+
+    invalidation_reason = _regime_invalidation_reason(position, current_snapshot, current_regime)
+    if invalidation_reason:
+        liability = current_value_points if current_value_points is not None else position.stop_value_points
+        pnl_rupees = (position.entry_credit_points - liability) * position.lot_size * position.lots
+        return ExitDecision(True, invalidation_reason, liability, pnl_rupees)
+
+    if current_value_points is None:
+        return ExitDecision(False, "MISSING_QUOTES", 0.0, 0.0)
+
+    pnl_rupees = (position.entry_credit_points - current_value_points) * position.lot_size * position.lots
+    profit_trail_reason = _session_profit_trail_reason(position, current_snapshot, pnl_rupees)
+    if profit_trail_reason:
+        return ExitDecision(True, profit_trail_reason, current_value_points, pnl_rupees)
+    structure_trail_reason = _structure_profit_trail_reason(position, current_snapshot, current_value_points)
+    if structure_trail_reason:
+        return ExitDecision(True, structure_trail_reason, current_value_points, pnl_rupees)
+    if current_value_points <= position.target_value_points:
+        return ExitDecision(True, "TAKE_PROFIT", current_value_points, pnl_rupees)
+    if current_value_points >= position.stop_value_points:
+        return ExitDecision(True, "PREMIUM_STOP", current_value_points, pnl_rupees)
+
+    short_delta_limit = DIRECTIONAL_DELTA_SL if position.structure.strategy != StrategyType.IRON_CONDOR else CONDOR_DELTA_SL
+    selection_mode = position.structure.metadata.get("selection_mode")
+    if position.structure.strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD and selection_mode == "STRUCTURE_DISTANCE_FALLBACK":
+        short_delta_limit = 1.01
+    if position.structure.strategy == StrategyType.BULL_PUT_CREDIT_SPREAD and position.metadata.get("playbook") in {
+        "OPEN_DRIVE_BULLISH",
+        "HIGH_CONFLUENCE_BULLISH_CONTINUATION",
+        "EARLY_BALANCE_BULLISH_RECLAIM",
+        "SIDEWAYS_TO_BULLISH_RECLAIM",
+        "GAP_UP_BULLISH_CONTINUATION",
+        "GAP_DOWN_BULLISH_RECOVERY",
+    }:
+        short_delta_limit = BULLISH_PLAYBOOK_DELTA_SL
+    short_deltas = [abs(leg.quote.delta) for leg in current_legs if leg.action == "SELL" and leg.quote.delta is not None]
+    if short_deltas and max(short_deltas) >= short_delta_limit:
+        if (
+            position.structure.strategy == StrategyType.BULL_PUT_CREDIT_SPREAD
+            and position.metadata.get("playbook") in {
+                "OPEN_DRIVE_BULLISH",
+                "HIGH_CONFLUENCE_BULLISH_CONTINUATION",
+                "EARLY_BALANCE_BULLISH_RECLAIM",
+                "SIDEWAYS_TO_BULLISH_RECLAIM",
+                "GAP_UP_BULLISH_CONTINUATION",
+                "GAP_DOWN_BULLISH_RECOVERY",
+            }
+            and pnl_rupees > 0
+        ):
+            return ExitDecision(False, "HOLD", current_value_points, pnl_rupees)
+        return ExitDecision(True, "DELTA_STOP", current_value_points, pnl_rupees)
+
+    return ExitDecision(False, "HOLD", current_value_points, pnl_rupees)
+
+
+def _current_position_mark(
+    position: OpenPosition,
+    current_snapshot: MarketSnapshot | None,
+    current_structure: TradeStructure | None,
+) -> tuple[float | None, list[StrategyLeg]]:
+    if current_snapshot is not None:
+        repriced_legs: list[StrategyLeg] = []
+        for leg in position.structure.legs:
+            quote = current_snapshot.option_chain.find_quote(leg.strike, leg.option_type)
+            if quote is None:
+                return None, []
+            repriced_legs.append(
+                StrategyLeg(
+                    action=leg.action,
+                    option_type=leg.option_type,
+                    strike=leg.strike,
+                    quote=quote,
+                )
+            )
+        return mark_to_market_value_points(position, repriced_legs), repriced_legs
+
+    if current_structure is not None:
+        return current_structure.credit_points, current_structure.legs
+    return None, []
+
+
+def _regime_invalidation_reason(
+    position: OpenPosition,
+    current_snapshot: MarketSnapshot | None,
+    current_regime: RegimeState | None,
+) -> str | None:
+    if current_snapshot is None:
+        return None
+    bars = session_bars(current_snapshot.nifty_5m)
+    if len(bars) < 2:
+        return None
+    vwap = current_snapshot.live_vwap
+    if vwap is None and current_regime is not None:
+        vwap = current_regime.vwap
+    if vwap is None:
+        vwap = compute_vwap(bars)
+    if vwap is None or vwap <= 0:
+        return None
+
+    spot = current_snapshot.option_chain.spot
+    strategy = position.structure.strategy
+    if strategy == StrategyType.BULL_PUT_CREDIT_SPREAD:
+        if spot < vwap and last_n_closes_below(vwap, bars, n=2):
+            return "VWAP_INVALIDATION"
+    elif strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD:
+        ema20_5m = ema_value(closes(bars), period=20)
+        if (
+            ema20_5m is not None
+            and last_n_closes_above(ema20_5m, bars, n=2)
+            and (vwap is None or last_n_closes_above(vwap, bars, n=2))
+        ):
+            return "EMA20_INVALIDATION"
+        if (
+            bullish_reversal_structure(bars)
+            and ema20_5m is not None
+            and bars[-1].close > ema20_5m
+            and (vwap is None or last_n_closes_above(vwap, bars, n=2))
+        ):
+            return "REVERSAL_STRUCTURE"
+        if spot > vwap and last_n_closes_above(vwap, bars, n=2):
+            return "VWAP_INVALIDATION"
+    elif strategy == StrategyType.IRON_CONDOR:
+        if current_regime is not None and current_regime.regime != RegimeLabel.RANGE:
+            return "RANGE_INVALIDATION"
+    return None
+
+
+def _session_profit_trail_reason(
+    position: OpenPosition,
+    current_snapshot: MarketSnapshot | None,
+    open_pnl_rupees: float,
+) -> str | None:
+    if current_snapshot is None:
+        return None
+    if position.metadata.get("playbook") == "GAP_DOWN_BEARISH_CONTINUATION":
+        return None
+    session_realized = current_snapshot.account_state.realised_pnl_rupees
+    combined_pnl = session_realized + open_pnl_rupees
+    prior_peak = float(position.metadata.get("session_profit_peak_rupees", 0.0))
+    peak = max(prior_peak, combined_pnl)
+    position.metadata["session_profit_peak_rupees"] = peak
+    trail_arm = DAILY_PROFIT_TRAIL_ARM_RUPEES
+    trail_giveback = DAILY_PROFIT_TRAIL_GIVEBACK_RUPEES
+    if (
+        position.structure.strategy == StrategyType.BULL_PUT_CREDIT_SPREAD
+        and position.metadata.get("playbook") in {"SIDEWAYS_TO_BULLISH_RECLAIM", "HIGH_CONFLUENCE_BULLISH_CONTINUATION"}
+    ):
+        trail_arm = BULLISH_PLAYBOOK_PROFIT_TRAIL_ARM_RUPEES
+        trail_giveback = BULLISH_PLAYBOOK_PROFIT_TRAIL_GIVEBACK_RUPEES
+    if peak < trail_arm:
+        return None
+    trailing_floor = max(trail_arm, peak - trail_giveback)
+    if combined_pnl <= trailing_floor:
+        return "DAILY_PROFIT_TRAIL"
+    return None
+
+
+def _structure_profit_trail_reason(
+    position: OpenPosition,
+    current_snapshot: MarketSnapshot | None,
+    current_value_points: float,
+) -> str | None:
+    if current_snapshot is None or position.entry_credit_points <= 0:
+        return None
+    capture_pct = max(position.entry_credit_points - current_value_points, 0.0) / position.entry_credit_points
+    if capture_pct < PROFIT_TRAIL_CAPTURE_ARM:
+        return None
+    best_value_points = float(position.metadata.get("best_value_points", position.entry_credit_points))
+    best_value_points = min(best_value_points, current_value_points)
+    position.metadata["best_value_points"] = best_value_points
+    if current_value_points <= best_value_points:
+        return None
+
+    bars = session_bars(current_snapshot.nifty_5m)
+    if len(bars) < 6:
+        return None
+    last_close = bars[-1].close
+    ema20_5m = ema_value(closes(bars), period=20)
+    giveback_triggered = current_value_points >= (best_value_points + PROFIT_TRAIL_GIVEBACK_POINTS)
+    if not giveback_triggered:
+        return None
+
+    if position.structure.strategy == StrategyType.BULL_PUT_CREDIT_SPREAD:
+        pivot_low = latest_pivot_low(bars, lookback=10)
+        structure_broken = (
+            (ema20_5m is not None and last_n_closes_below(ema20_5m, bars, n=2))
+            or (pivot_low is not None and last_close < pivot_low)
+        )
+        if structure_broken:
+            return "PROFIT_TRAIL_STRUCTURE"
+    elif position.structure.strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD:
+        pivot_high = latest_pivot_high(bars, lookback=10)
+        structure_broken = (
+            (ema20_5m is not None and last_n_closes_above(ema20_5m, bars, n=2))
+            or (pivot_high is not None and last_close > pivot_high)
+        )
+        if structure_broken:
+            return "PROFIT_TRAIL_STRUCTURE"
+    return None
+
+
+def _serialize_leg(leg: StrategyLeg, lots: int, lot_size: int) -> dict[str, object]:
+    payload = asdict(leg.quote)
+    payload["option_type"] = leg.option_type.value
+    payload["action"] = leg.action
+    payload["strike"] = leg.strike
+    payload["quantity"] = lots * lot_size
+    return payload

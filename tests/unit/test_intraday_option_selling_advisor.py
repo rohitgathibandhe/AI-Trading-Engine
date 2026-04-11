@@ -70,14 +70,53 @@ def _low_credit_bearish_chain_rows() -> list[dict]:
     return rows
 
 
-def _context(*, conflict: float = 15.0, trend_conf: float = 0.78, bias: str = "BULLISH") -> dict:
+def _context(
+    *,
+    conflict: float = 15.0,
+    trend_conf: float = 0.78,
+    bias: str = "BULLISH",
+    spot: float = 25600.0,
+) -> dict:
     ema_alignment = "BULLISH" if bias == "BULLISH" else ("BEARISH" if bias == "BEARISH" else "NEUTRAL")
+    ema_2050_alignment = ema_alignment
     orb_confirmation = "UP_CONFIRMED" if bias == "BULLISH" else ("DOWN_CONFIRMED" if bias == "BEARISH" else "NONE")
     price_action_pattern = (
         "BREAKOUT_CONTINUATION_UP"
         if bias == "BULLISH"
         else ("BREAKOUT_CONTINUATION_DOWN" if bias == "BEARISH" else "NONE")
     )
+    strong_candle_bias = bias if bias in {"BULLISH", "BEARISH"} else "NEUTRAL"
+    strong_candle_status = "STRONG_GREEN_5M" if bias == "BULLISH" else ("STRONG_RED_5M" if bias == "BEARISH" else "NONE")
+    strong_candle_desc = (
+        "Strong bullish 5m candle closed near the high after the pullback."
+        if bias == "BULLISH"
+        else (
+            "Strong bearish 5m candle closed near the low after the pullback."
+            if bias == "BEARISH"
+            else "No strong 5m confirmation candle."
+        )
+    )
+    if bias == "BULLISH":
+        intraday_support = spot - 40.0
+        intraday_resistance = spot + 640.0
+        swing_support = intraday_support - 20.0
+        swing_resistance = intraday_resistance + 10.0
+        put_wall = intraday_support - 120.0
+        call_wall = intraday_resistance + 260.0
+    elif bias == "BEARISH":
+        intraday_support = spot - 640.0
+        intraday_resistance = spot + 40.0
+        swing_support = intraday_support - 10.0
+        swing_resistance = intraday_resistance + 20.0
+        put_wall = intraday_support - 260.0
+        call_wall = intraday_resistance + 120.0
+    else:
+        intraday_support = spot - 260.0
+        intraday_resistance = spot + 260.0
+        swing_support = intraday_support - 20.0
+        swing_resistance = intraday_resistance + 20.0
+        put_wall = intraday_support - 120.0
+        call_wall = intraday_resistance + 120.0
     return {
         "trend": {
             "bias": bias,
@@ -89,14 +128,23 @@ def _context(*, conflict: float = 15.0, trend_conf: float = 0.78, bias: str = "B
                     "atr_like_points": 145.0,
                     "pattern": "UPTREND" if bias == "BULLISH" else ("DOWNTREND" if bias == "BEARISH" else "RANGE"),
                     "ema_alignment": ema_alignment,
+                    "ema_20_50_alignment": ema_2050_alignment,
                 },
                 "5": {
+                    "atr_like_points": 145.0,
                     "pattern": "UPTREND" if bias == "BULLISH" else ("DOWNTREND" if bias == "BEARISH" else "RANGE"),
                     "ema_alignment": ema_alignment,
+                    "ema_20_50_alignment": ema_2050_alignment,
+                    "strong_candle_bias": strong_candle_bias,
+                    "strong_candle_confirmed": strong_candle_bias in {"BULLISH", "BEARISH"},
+                    "strong_candle_status": strong_candle_status,
+                    "strong_candle_description": strong_candle_desc,
                 },
                 "60": {
+                    "atr_like_points": 145.0,
                     "pattern": "UPTREND" if bias == "BULLISH" else ("DOWNTREND" if bias == "BEARISH" else "RANGE"),
                     "ema_alignment": ema_alignment,
+                    "ema_20_50_alignment": ema_2050_alignment,
                 },
             },
             "orb": {"breakout_confirmation": orb_confirmation, "breakout_active": orb_confirmation != "NONE"},
@@ -105,8 +153,8 @@ def _context(*, conflict: float = 15.0, trend_conf: float = 0.78, bias: str = "B
             "pcr_bias": bias,
             "pcr_total": 1.12 if bias == "BULLISH" else 0.78,
             "pcr_near_atm": 1.21 if bias == "BULLISH" else 0.79,
-            "put_wall_below": {"strike": 25000.0, "distance_from_spot": 600.0},
-            "call_wall_above": {"strike": 26500.0, "distance_from_spot": 900.0},
+            "put_wall_below": {"strike": float(put_wall), "distance_from_spot": abs(float(spot) - float(put_wall))},
+            "call_wall_above": {"strike": float(call_wall), "distance_from_spot": abs(float(call_wall) - float(spot))},
             "oi_build": {"bias": "BULLISH_SUPPORT" if bias == "BULLISH" else "BEARISH_RESISTANCE"},
         },
         "structure": {
@@ -116,15 +164,20 @@ def _context(*, conflict: float = 15.0, trend_conf: float = 0.78, bias: str = "B
             "pcr_unbalanced": False,
             "pcr_unbalanced_side": "NEUTRAL",
             "volatility_regime": "NORMAL",
+            "swing_structure_bias": bias,
+            "swing_structure_label": "HH_HL_UPTREND" if bias == "BULLISH" else ("LH_LL_DOWNTREND" if bias == "BEARISH" else "RANGE"),
+            "swing_structure_confidence": 0.72 if bias in {"BULLISH", "BEARISH"} else 0.0,
             "price_action_bias": bias,
             "price_action_confirmation": "CANDLE_AND_RETEST_CONFIRMED" if bias in {"BULLISH", "BEARISH"} else "NONE",
             "price_action_patterns": [f"5m:{price_action_pattern}", f"15m:{price_action_pattern}"] if price_action_pattern != "NONE" else [],
             "retest_status": "SUPPORT_HOLD" if bias == "BULLISH" else ("RESISTANCE_HOLD" if bias == "BEARISH" else "NONE"),
             "retest_bias": bias,
-            "intraday_support": {"level": 25120.0, "source": "oi_put_wall_below"},
-            "intraday_resistance": {"level": 26240.0, "source": "oi_call_wall_above"},
-            "weekly_support": 24850.0,
-            "weekly_resistance": 26680.0,
+            "intraday_support": {"level": float(intraday_support), "source": "oi_put_wall_below"},
+            "intraday_resistance": {"level": float(intraday_resistance), "source": "oi_call_wall_above"},
+            "swing_support": {"level": float(swing_support), "source": "swing_15m_support"},
+            "swing_resistance": {"level": float(swing_resistance), "source": "swing_15m_resistance"},
+            "weekly_support": float(swing_support - 180.0),
+            "weekly_resistance": float(swing_resistance + 180.0),
         },
     }
 
@@ -181,6 +234,32 @@ def test_intraday_advisor_recommends_bull_put_spread_with_sl_tp(tmp_path: Path) 
     assert rec["strategy_type"] == "PUT_CREDIT_SPREAD"
 
 
+def test_intraday_advisor_can_emit_short_put_with_emergency_hedge_and_unlimited_trail(tmp_path: Path) -> None:
+    adv = _advisor_with_config(
+        tmp_path,
+        signal_persistence_bars=1,
+        directional_structure="SHORT_OPTION_WITH_HEDGE",
+        naked_operational_max_loss_rs=3000.0,
+        naked_profit_trail_arm_rs=5000.0,
+    )
+    out = adv.update(
+        now=_ist_dt(26, 11, 0),
+        expiry="2026-03-03",
+        spot=25600.0,
+        chain_rows=_chain_rows(),
+        context=_context(conflict=14.0, trend_conf=0.84, bias="BULLISH"),
+        has_open_bkm=False,
+    )
+    assert out["signal"] == "ENTER_NOW"
+    rec = out["recommendation"]
+    assert rec["strategy_type"] == "SHORT_PUT_WITH_HEDGE"
+    assert rec["sl"]["loss_rs_per_set"] == 3000.0
+    assert rec["tp"]["kind"] == "UNLIMITED_TRAIL"
+    assert rec["tp"]["profit_rs_per_set"] == 0.0
+    assert rec["trail"]["arm_profit_rs_per_set"] == 5000.0
+    assert rec["trail"]["unlimited_profit_mode"] is True
+
+
 def test_intraday_advisor_relaxes_bearish_directional_threshold_on_strong_alignment(tmp_path: Path) -> None:
     adv = _advisor_with_config(tmp_path, signal_persistence_bars=1)
     out = adv.update(
@@ -189,6 +268,22 @@ def test_intraday_advisor_relaxes_bearish_directional_threshold_on_strong_alignm
         spot=25600.0,
         chain_rows=_chain_rows(),
         context=_context(conflict=54.0, trend_conf=0.58, bias="BEARISH"),
+        has_open_bkm=False,
+    )
+    assert out["signal"] == "ENTER_NOW"
+    assert out["recommendation"]["strategy_type"] == "CALL_CREDIT_SPREAD"
+
+
+def test_intraday_advisor_accepts_planner_confirmed_bearish_setup_with_blank_option_context(tmp_path: Path) -> None:
+    adv = _advisor_with_config(tmp_path, signal_persistence_bars=1)
+    ctx = _context(conflict=18.0, trend_conf=0.45, bias="BEARISH", spot=25600.0)
+    ctx["option_chain"] = {}
+    out = adv.update(
+        now=_ist_dt(26, 11, 0),
+        expiry="2026-03-03",
+        spot=25550.0,
+        chain_rows=_chain_rows(),
+        context=ctx,
         has_open_bkm=False,
     )
     assert out["signal"] == "ENTER_NOW"
@@ -229,6 +324,53 @@ def test_intraday_advisor_waits_for_signal_persistence_before_enter(tmp_path: Pa
     second = adv.update(**kwargs)
     assert second["signal"] == "ENTER_NOW"
     assert second["recommendation"]["strategy_type"] == "PUT_CREDIT_SPREAD"
+
+
+def test_intraday_advisor_requires_pullback_zone_before_enter(tmp_path: Path) -> None:
+    adv = _advisor_with_config(tmp_path, signal_persistence_bars=1)
+    ctx = _context(conflict=18.0, trend_conf=0.84, bias="BEARISH", spot=25600.0)
+    out = adv.update(
+        now=_ist_dt(26, 11, 0),
+        expiry="2026-03-03",
+        spot=25480.0,
+        chain_rows=_chain_rows(),
+        context=ctx,
+        has_open_bkm=False,
+    )
+    assert out["signal"] == "ENTER_NOW"
+    assert out["recommendation"]["strategy_type"] == "CALL_CREDIT_SPREAD"
+    assert "TREND_CONTINUATION_READY" in (out.get("reasons") or [])
+
+
+def test_intraday_advisor_accepts_atr_tolerant_pullback_near_zone(tmp_path: Path) -> None:
+    adv = _advisor_with_config(tmp_path, signal_persistence_bars=1)
+    ctx = _context(conflict=18.0, trend_conf=0.86, bias="BEARISH", spot=25600.0)
+    out = adv.update(
+        now=_ist_dt(26, 11, 0),
+        expiry="2026-03-03",
+        spot=25550.0,
+        chain_rows=_chain_rows(),
+        context=ctx,
+        has_open_bkm=False,
+    )
+    assert out["signal"] == "ENTER_NOW"
+    assert out["recommendation"]["strategy_type"] == "CALL_CREDIT_SPREAD"
+
+
+def test_intraday_advisor_accepts_strong_bearish_trend_continuation_without_pullback_touch(tmp_path: Path) -> None:
+    adv = _advisor_with_config(tmp_path, signal_persistence_bars=1)
+    ctx = _context(conflict=18.0, trend_conf=0.88, bias="BEARISH", spot=25600.0)
+    out = adv.update(
+        now=_ist_dt(26, 11, 5),
+        expiry="2026-03-03",
+        spot=25440.0,
+        chain_rows=_chain_rows(),
+        context=ctx,
+        has_open_bkm=False,
+    )
+    assert out["signal"] == "ENTER_NOW"
+    assert "TREND_CONTINUATION_READY" in (out.get("reasons") or [])
+    assert out["recommendation"]["strategy_type"] == "CALL_CREDIT_SPREAD"
 
 
 def test_intraday_advisor_persistence_ignores_small_strike_shifts(tmp_path: Path) -> None:
@@ -308,7 +450,7 @@ def test_intraday_advisor_blocks_one_bar_countertrend_flip_and_preserves_candida
         expiry="2026-03-03",
         spot=25620.0,
         chain_rows=_chain_rows(),
-        context=_context(conflict=52.0, trend_conf=0.79, bias="BULLISH"),
+        context=_context(conflict=52.0, trend_conf=0.79, bias="BULLISH", spot=25620.0),
         has_open_bkm=False,
     )
     assert second["signal"] == "WAIT"
@@ -320,7 +462,7 @@ def test_intraday_advisor_blocks_one_bar_countertrend_flip_and_preserves_candida
         expiry="2026-03-03",
         spot=25570.0,
         chain_rows=_chain_rows(),
-        context=_context(conflict=43.0, trend_conf=0.80, bias="BEARISH"),
+        context=_context(conflict=43.0, trend_conf=0.80, bias="BEARISH", spot=25570.0),
         has_open_bkm=False,
     )
     assert third["signal"] == "ENTER_NOW"
@@ -341,6 +483,25 @@ def test_intraday_advisor_blocks_directional_entry_when_ema_not_aligned(tmp_path
     )
     assert out["signal"] == "WAIT"
     assert "EMA_ALIGNMENT_MISSING" in (out.get("reasons") or [])
+
+
+def test_intraday_advisor_requires_strong_5m_candle_after_pullback(tmp_path: Path) -> None:
+    adv = _advisor_with_config(tmp_path, signal_persistence_bars=1)
+    ctx = _context(conflict=18.0, trend_conf=0.82, bias="BULLISH")
+    ctx["trend"]["timeframes"]["5"]["strong_candle_bias"] = "NEUTRAL"
+    ctx["trend"]["timeframes"]["5"]["strong_candle_confirmed"] = False
+    ctx["trend"]["timeframes"]["5"]["strong_candle_status"] = "NONE"
+    ctx["trend"]["timeframes"]["5"]["strong_candle_description"] = "No strong 5m confirmation candle."
+    out = adv.update(
+        now=_ist_dt(26, 11, 0),
+        expiry="2026-03-03",
+        spot=25600.0,
+        chain_rows=_chain_rows(),
+        context=ctx,
+        has_open_bkm=False,
+    )
+    assert out["signal"] == "WAIT"
+    assert "STRONG_5M_CANDLE_MISSING" in (out.get("reasons") or [])
 
 
 def test_intraday_advisor_blocks_directional_entry_when_orb_not_confirmed(tmp_path: Path) -> None:
@@ -378,6 +539,64 @@ def test_intraday_advisor_blocks_directional_entry_when_price_action_not_confirm
     )
     assert out["signal"] == "WAIT"
     assert "PRICE_ACTION_CONFIRMATION_MISSING" in (out.get("reasons") or [])
+
+
+def test_intraday_advisor_allows_bearish_reversal_trade_with_fake_break_confirmation(tmp_path: Path) -> None:
+    adv = _advisor_with_config(tmp_path, signal_persistence_bars=1, preferred_bias="BEARISH")
+    ctx = _context(conflict=18.0, trend_conf=0.84, bias="BEARISH")
+    ctx["structure"]["price_action_bias"] = "BEARISH"
+    ctx["structure"]["price_action_confirmation"] = "REVERSAL_CONFIRMED"
+    ctx["structure"]["price_action_patterns"] = ["5m:FAKE_BREAKOUT_UP", "15m:EMA20_BREAKDOWN_DOWN"]
+    ctx["structure"]["retest_status"] = "FAILED_BREAKOUT_RETEST"
+    ctx["structure"]["retest_bias"] = "BEARISH"
+    out = adv.update(
+        now=_ist_dt(26, 11, 0),
+        expiry="2026-03-03",
+        spot=25600.0,
+        chain_rows=_chain_rows(),
+        context=ctx,
+        has_open_bkm=False,
+    )
+    assert out["signal"] == "ENTER_NOW"
+    assert out["recommendation"]["strategy_type"] == "CALL_CREDIT_SPREAD"
+
+
+def test_intraday_advisor_blocks_trade_on_fake_break_conflict_from_chart_plan(tmp_path: Path) -> None:
+    adv = _advisor_with_config(tmp_path, signal_persistence_bars=1)
+    ctx = _context(conflict=18.0, trend_conf=0.84, bias="BEARISH")
+    ctx["structure"]["primary_pattern"] = "FAKE_BREAKDOWN_DOWN"
+    ctx["structure"]["price_action_patterns"] = ["5m:FAKE_BREAKDOWN_DOWN"]
+    ctx["structure"]["price_action_confirmation"] = "REVERSAL_CONFIRMED"
+    out = adv.update(
+        now=_ist_dt(26, 11, 0),
+        expiry="2026-03-03",
+        spot=25600.0,
+        chain_rows=_chain_rows(),
+        context=ctx,
+        has_open_bkm=False,
+    )
+    assert out["signal"] == "WAIT"
+    assert "REVERSAL_PATTERN_AGAINST_SETUP" in (out.get("reasons") or [])
+
+
+def test_intraday_advisor_blocks_trade_when_confirmed_reversal_pattern_is_against_setup(tmp_path: Path) -> None:
+    adv = _advisor_with_config(tmp_path, signal_persistence_bars=1)
+    ctx = _context(conflict=18.0, trend_conf=0.82, bias="BULLISH")
+    ctx["structure"]["price_action_bias"] = "BEARISH"
+    ctx["structure"]["price_action_confirmation"] = "REVERSAL_CONFIRMED"
+    ctx["structure"]["price_action_patterns"] = ["5m:FAKE_BREAKOUT_UP", "15m:DOUBLE_TOP_M_CONFIRMED"]
+    ctx["structure"]["retest_status"] = "NONE"
+    ctx["structure"]["retest_bias"] = "NEUTRAL"
+    out = adv.update(
+        now=_ist_dt(26, 11, 0),
+        expiry="2026-03-03",
+        spot=25600.0,
+        chain_rows=_chain_rows(),
+        context=ctx,
+        has_open_bkm=False,
+    )
+    assert out["signal"] == "WAIT"
+    assert "REVERSAL_PATTERN_AGAINST_SETUP" in (out.get("reasons") or [])
 
 
 def test_intraday_advisor_requires_supportive_retest_in_high_volatility(tmp_path: Path) -> None:
@@ -494,3 +713,21 @@ def test_intraday_advisor_blocks_directional_entry_when_option_chain_is_strongly
     )
     assert out["signal"] == "WAIT"
     assert "OPTION_CHAIN_AGAINST_SETUP" in (out.get("reasons") or [])
+
+
+def test_intraday_advisor_blocks_directional_entry_when_swing_structure_is_against_setup(tmp_path: Path) -> None:
+    adv = _advisor_with_config(tmp_path, signal_persistence_bars=1)
+    ctx = _context(conflict=18.0, trend_conf=0.82, bias="BULLISH")
+    ctx["structure"]["swing_structure_bias"] = "BEARISH"
+    ctx["structure"]["swing_structure_label"] = "LH_LL_DOWNTREND"
+    ctx["structure"]["swing_structure_confidence"] = 0.81
+    out = adv.update(
+        now=_ist_dt(26, 11, 0),
+        expiry="2026-03-03",
+        spot=25600.0,
+        chain_rows=_chain_rows(),
+        context=ctx,
+        has_open_bkm=False,
+    )
+    assert out["signal"] == "WAIT"
+    assert "SWING_STRUCTURE_AGAINST_SETUP" in (out.get("reasons") or [])

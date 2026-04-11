@@ -142,6 +142,10 @@ def run_rolling_option(args: argparse.Namespace, out_dir: Path) -> None:
             "strike",
             "timestamp",
             "expiryDate",
+            "delta",
+            "gamma",
+            "theta",
+            "vega",
         ]
     cfg = RollingOptionConfig(**cfg_kwargs)
     parquet_paths = ingestor.fetch_range(cfg)

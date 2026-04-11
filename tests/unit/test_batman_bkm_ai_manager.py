@@ -173,3 +173,33 @@ def test_ai_manager_auto_protect_sets_entry_lock_in_plan(tmp_path: Path) -> None
     assert snap["plan"]["mode"] == "AUTO_PROTECT"
     assert snap["action"] == "FLATTEN_RECOMMEND"
     assert snap["plan"]["entry_lock_active"] is True
+
+
+def test_ai_manager_applies_learning_context_adjustment(tmp_path: Path) -> None:
+    mgr = _mgr(tmp_path)
+    now = _ist_dt(25, 12, 30)
+    basket = _bkm_basket(now)
+
+    snap = mgr.update_open(
+        basket=basket,
+        spot=26170.0,
+        pnl=-400.0,
+        tp=20000.0,
+        sl=-25000.0,
+        day_mode="NORMAL",
+        context={
+            "learning": {
+                "status": "CAUTION",
+                "risk_score_adjust": 6.0,
+                "reasons": ["LEARNING_NEGATIVE_ENTRY_PHASE_OPENING_RANGE"],
+                "supportive_reasons": ["LEARNING_POSITIVE_QUALITY_STATUS_PASS"],
+            }
+        },
+        when=now,
+    )
+
+    assert "LEARNING_NEGATIVE_ENTRY_PHASE_OPENING_RANGE" in (snap.get("reasons") or [])
+    assert "LEARNING_POSITIVE_QUALITY_STATUS_PASS" in (snap.get("reasons") or [])
+    market_context = snap.get("market_context") if isinstance(snap.get("market_context"), dict) else {}
+    learning = market_context.get("learning") if isinstance(market_context.get("learning"), dict) else {}
+    assert float(learning.get("risk_score_adjust") or 0.0) == 6.0

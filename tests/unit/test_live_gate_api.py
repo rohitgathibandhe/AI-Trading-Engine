@@ -73,11 +73,18 @@ def _configure_temp_state(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(server, "AGENT_HEARTBEAT_JSON", state_dir / "agent_heartbeat.json")
     monkeypatch.setattr(server, "AGENT_ALERTS_JSONL", state_dir / "agent_alerts.jsonl")
     monkeypatch.setattr(server, "TELEGRAM_ALERT_STATUS_JSON", state_dir / "telegram_alert_status.json")
+    monkeypatch.setattr(server, "BATMAN_BKM_LEARNING_STATUS_JSON", state_dir / "batman_bkm_learning_status.json")
+    monkeypatch.setattr(server, "BATMAN_BKM_LEARNING_OUTCOMES_JSONL", state_dir / "batman_bkm_learning_outcomes.jsonl")
     monkeypatch.setattr(server, "BATMAN_BKM_TUNING_ADVICE_JSON", state_dir / "batman_bkm_tuning_advice.json")
     monkeypatch.setattr(server, "BATMAN_BKM_TUNING_HISTORY_JSONL", state_dir / "batman_bkm_tuning_history.jsonl")
     monkeypatch.setattr(server, "DECISION_COMMITTEE_STATUS_JSON", state_dir / "decision_committee_status.json")
     monkeypatch.setattr(server, "DECISION_COMMITTEE_HISTORY_JSONL", state_dir / "decision_committee_history.jsonl")
     monkeypatch.setattr(server, "DECISION_COMMITTEE_OUTCOMES_JSONL", state_dir / "decision_committee_outcomes.jsonl")
+    monkeypatch.setattr(server, "INTRADAY_AI_LEARNING_STATUS_JSON", state_dir / "intraday_ai_learning_status.json")
+    monkeypatch.setattr(server, "INTRADAY_AI_ADVISOR_STATUS_JSON", state_dir / "intraday_ai_advisor_status.json")
+    monkeypatch.setattr(server, "INTRADAY_AI_DEPLOY_STATUS_JSON", state_dir / "intraday_ai_deploy_status.json")
+    monkeypatch.setattr(server, "INTRADAY_AI_POSITION_STATUS_JSON", state_dir / "intraday_ai_position_status.json")
+    monkeypatch.setattr(server, "LAST_STRATEGY_FILE", state_dir / "last_strategy.json")
     monkeypatch.setattr(server, "PID_FILE", state_dir / "agent.pid")
     monkeypatch.setattr(server, "STATIC_DIR", static_dir)
 
@@ -182,15 +189,114 @@ def test_control_status_includes_live_gate_summary(monkeypatch, tmp_path: Path) 
     assert payload["sessions_fail"] == 2
     assert payload["reconcile_status"] in {"OK", "LOCKED"}
     assert payload["execution_recovery_status"] in {"OK", "LOCKED"}
-    assert payload["watchdog_status"] in {"MISSING", "OK", "STALE", "INVALID"}
+    assert payload["watchdog_status"] in {"MISSING", "OK", "STALE", "INVALID", "STARTING", "STOPPED"}
     assert "alerts_recent_count" in payload
     assert "telegram_alerts_enabled" in payload
     assert "telegram_alerts_configured" in payload
+    assert payload["agent_execution_mode"] == "EXECUTION"
+    assert payload["execution_new_entries_allowed"] is True
+    assert payload["execution_manage_existing_allowed"] is True
     assert payload["intraday_committee_status"] == "ACTIVE"
     assert payload["intraday_committee_verdict"] == "READY"
     assert payload["intraday_committee_bias"] == "BEARISH"
     assert payload["intraday_committee_strategy"] == "CALL_CREDIT_SPREAD"
     assert payload["intraday_committee_reasons"] == ["TREND_ALIGNED", "PCR_SUPPORTIVE"]
+    assert payload["intraday_ai_mode"] == "ADVISOR"
+    assert payload["intraday_ai_execution_enabled"] is False
+    assert payload["intraday_manage_existing_enabled"] is True
+    assert payload["batman_entry_execution_enabled"] is True
+    assert payload["batman_manage_existing_enabled"] is True
+    assert payload["intraday_learning_status"] in {"IDLE", "ACTIVE", "DISABLED"}
+    assert "intraday_learning_last_assessment" in payload
+
+
+def test_control_status_reports_intraday_execution_enabled(monkeypatch, tmp_path: Path) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    state_dir = tmp_path / "state"
+    (state_dir / "agent_settings.json").write_text(
+        json.dumps(
+            {
+                "agent_execution_mode": "EXECUTION",
+                "intraday_ai_enabled": True,
+                "intraday_ai_mode": "EXECUTION",
+                "intraday_ai_auto_deploy_paper_enabled": True,
+                "trade_mode": "paper",
+            },
+            indent=2,
+        )
+    )
+    (state_dir / "intraday_ai_advisor_status.json").write_text(
+        json.dumps({"status": "ACTIVE", "mode": "EXECUTION", "signal": "WAIT"}, indent=2)
+    )
+    code, payload = _run_get("/api/control/status")
+    assert code == 200
+    assert payload["agent_execution_mode"] == "EXECUTION"
+    assert payload["intraday_ai_mode"] == "EXECUTION"
+    assert payload["intraday_ai_execution_enabled"] is True
+
+
+def test_intraday_deploy_endpoint_blocks_when_mode_is_advisor(monkeypatch, tmp_path: Path) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    state_dir = tmp_path / "state"
+    (state_dir / "agent.pid").write_text(json.dumps({"pid": 1234, "trade_mode": "paper"}))
+    (state_dir / "last_strategy.json").write_text(json.dumps({"strategy_file": "batman_bkm_monthly"}))
+    monkeypatch.setattr(server, "_is_process_alive", lambda pid: True)
+
+    code, payload = _run_post("/api/intraday_ai/deploy", {"source": "manual_ui", "note": "test"})
+    assert code == 409
+    assert payload["ok"] is False
+    assert payload["error"] == "INTRADAY_AI_NOT_EXECUTION_MODE"
+
+
+def test_intraday_deploy_endpoint_blocks_when_agent_execution_mode_is_manage_only(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    state_dir = tmp_path / "state"
+    (state_dir / "agent_settings.json").write_text(
+        json.dumps(
+            {
+                "agent_execution_mode": "MANAGE_ONLY",
+                "intraday_ai_enabled": True,
+                "intraday_ai_mode": "EXECUTION",
+                "intraday_ai_auto_deploy_paper_enabled": True,
+                "intraday_ai_deploy_require_agent_running": True,
+                "trade_mode": "paper",
+            },
+            indent=2,
+        )
+    )
+    (state_dir / "agent.pid").write_text(json.dumps({"pid": 1234, "trade_mode": "paper"}))
+    monkeypatch.setattr(server, "_is_process_alive", lambda pid: True)
+
+    code, payload = _run_post("/api/intraday_ai/deploy", {"source": "manual_ui", "note": "test"})
+    assert code == 409
+    assert payload["ok"] is False
+    assert payload["error"] == "AGENT_EXECUTION_MODE_BLOCKS_NEW_ENTRIES"
+    assert payload["agent_execution_mode"] == "MANAGE_ONLY"
+
+
+def test_get_intraday_index_chart_endpoint(monkeypatch, tmp_path: Path) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        server,
+        "_load_intraday_index_chart_payload",
+        lambda: {
+            "status": "OK",
+            "headline": "Bearish drift | Wait pullback",
+            "structure": {"regime": "BEARISH_DRIFT", "market_bias": "BEARISH"},
+            "plan": {"trade_idea": "Bear call spread", "posture": "WAIT_PULLBACK"},
+            "candles": [],
+            "ema20": [],
+            "levels": {},
+        },
+    )
+
+    code, payload = _run_get("/api/intraday_ai/index_chart")
+    assert code == 200
+    assert payload["ok"] is True
+    assert payload["chart"]["status"] == "OK"
+    assert payload["chart"]["plan"]["trade_idea"] == "Bear call spread"
 
 
 def test_intraday_committee_endpoint_returns_status_and_history(monkeypatch, tmp_path: Path) -> None:
@@ -375,6 +481,41 @@ def test_health_endpoint_reports_ok_and_stale(monkeypatch, tmp_path: Path) -> No
     code, payload = _run_get("/api/health")
     assert code == 200
     assert payload["status"] == "STALE"
+
+
+def test_health_endpoint_reports_stopped_for_dead_pid(monkeypatch, tmp_path: Path) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    state_dir = tmp_path / "state"
+    settings = json.loads((state_dir / "agent_settings.json").read_text())
+    settings["ops_watchdog_stale_after_sec"] = 10
+    (state_dir / "agent_settings.json").write_text(json.dumps(settings, indent=2))
+    (state_dir / "agent_heartbeat.json").write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-01-15T10:00:00+05:30",
+                "status": "RUNNING",
+                "phase": "loop_start",
+                "trade_mode": "paper",
+                "pid": 12345,
+            }
+        )
+    )
+    (state_dir / "agent.pid").write_text(json.dumps({}))
+
+    from data_engine.market_ai.modules.agents import ops_monitor as opsm  # type: ignore
+
+    monkeypatch.setattr(opsm, "_now_ist", lambda: server.datetime(2026, 1, 15, 10, 0, 25, tzinfo=server.ZoneInfo("Asia/Kolkata") if server.ZoneInfo else None))
+    monkeypatch.setattr(server, "_is_process_alive", lambda pid: False)
+
+    code, payload = _run_get("/api/health")
+    assert code == 200
+    assert payload["status"] == "STOPPED"
+    assert payload["pid_alive"] is False
+
+    code, payload = _run_get("/api/control/status")
+    assert code == 200
+    assert payload["running"] is False
+    assert payload["watchdog_status"] == "STOPPED"
 
 
 def test_alerts_endpoint_and_clear(monkeypatch, tmp_path: Path) -> None:
