@@ -34,8 +34,19 @@ class RegimeLabel(str, Enum):
 class AdaptiveParameters:
     rv_high_cutoff: float = 0.60
     rv_mid_cutoff: float = 0.35
-    directional_credit_width_ratio: float = 0.34
+    directional_credit_width_ratio: float = 0.26
+    relaxed_directional_credit_width_ratio: float = 0.22
+    strict_directional_credit_width_ratio: float = 0.30
     condor_credit_width_ratio: float = 0.30
+    candidate_widths: tuple[float, ...] = (50.0, 75.0, 100.0, 150.0)
+    liquidity_spread_ratio_cap: float = 0.15
+    minimum_anchor_distance_points: float = 0.0
+    strong_setup_quality_threshold: float = 10.5
+    weak_setup_quality_threshold: float = 7.0
+    hedge_cost_ratio_cap: float = 0.90
+    relaxed_hedge_cost_ratio_cap: float = 1.05
+    strict_hedge_cost_ratio_cap: float = 0.75
+    width_preference_penalty: float = 1.25
     shadow_sessions: int = 5
 
     def clamped(self) -> "AdaptiveParameters":
@@ -47,7 +58,18 @@ class AdaptiveParameters:
             rv_high_cutoff=high,
             rv_mid_cutoff=mid,
             directional_credit_width_ratio=min(max(self.directional_credit_width_ratio, 0.15), 0.40),
+            relaxed_directional_credit_width_ratio=min(max(self.relaxed_directional_credit_width_ratio, 0.15), 0.40),
+            strict_directional_credit_width_ratio=min(max(self.strict_directional_credit_width_ratio, 0.15), 0.45),
             condor_credit_width_ratio=min(max(self.condor_credit_width_ratio, 0.15), 0.40),
+            candidate_widths=tuple(sorted({float(width) for width in self.candidate_widths if width > 0} or {50.0, 75.0, 100.0, 150.0})),
+            liquidity_spread_ratio_cap=min(max(self.liquidity_spread_ratio_cap, 0.05), 0.30),
+            minimum_anchor_distance_points=max(0.0, self.minimum_anchor_distance_points),
+            strong_setup_quality_threshold=max(1.0, self.strong_setup_quality_threshold),
+            weak_setup_quality_threshold=max(1.0, min(self.weak_setup_quality_threshold, self.strong_setup_quality_threshold)),
+            hedge_cost_ratio_cap=min(max(self.hedge_cost_ratio_cap, 0.30), 1.50),
+            relaxed_hedge_cost_ratio_cap=min(max(self.relaxed_hedge_cost_ratio_cap, 0.30), 1.75),
+            strict_hedge_cost_ratio_cap=min(max(self.strict_hedge_cost_ratio_cap, 0.20), 1.25),
+            width_preference_penalty=min(max(self.width_preference_penalty, 0.0), 2.0),
             shadow_sessions=max(1, self.shadow_sessions),
         )
 

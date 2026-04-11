@@ -4,7 +4,7 @@ import csv
 from collections import Counter, defaultdict
 from datetime import date, datetime
 from pathlib import Path
-from statistics import median
+from statistics import mean, median
 
 from .data_models import (
     AdaptiveParameters,
@@ -39,6 +39,157 @@ def _default_entry_times() -> set[str]:
 
 DEFAULT_ENTRY_TIMES = _default_entry_times()
 
+MONETIZATION_REJECTION_REASONS = {
+    "CREDIT_TOO_LOW",
+    "WIDTH_TOO_LARGE",
+    "DELTA_TOO_HIGH",
+    "HEDGE_TOO_EXPENSIVE",
+    "LIQUIDITY_BAD",
+    "INVALIDATION_TOO_CLOSE",
+    "SPREAD_CONSTRUCTION_FAILED",
+    "NET_EDGE_TOO_LOW",
+}
+
+
+def _build_funnel_report(decisions: list[dict[str, object]], trades: list[dict[str, object]]) -> dict[str, object]:
+    setups_detected = 0
+    setups_passed_setup_quality = 0
+    setups_by_playbook: Counter[str] = Counter()
+    rejected_by_reason: Counter[str] = Counter()
+    rejected_by_playbook: Counter[str] = Counter()
+    rejected_time = 0
+    rejected_spread = 0
+    rejected_credit = 0
+    rejected_liquidity = 0
+    rejected_delta = 0
+    rejected_anchor = 0
+    rejected_hedge = 0
+    monthly: dict[str, dict[str, object]] = defaultdict(lambda: {
+        "setups_detected": 0,
+        "setups_passed_setup_quality": 0,
+        "trades_executed": 0,
+        "rejected_time_window": 0,
+        "rejected_spread_construction": 0,
+        "rejected_credit_width": 0,
+        "rejected_liquidity": 0,
+        "rejected_delta": 0,
+        "rejected_invalidation_distance": 0,
+        "rejected_hedge_cost": 0,
+        "setups_by_playbook": Counter(),
+        "missed_opportunities_by_playbook": Counter(),
+    })
+    for decision in decisions:
+        funnel = ((decision.get("metadata") or {}).get("trade_funnel") or {})
+        playbook = str(funnel.get("playbook") or (decision.get("metadata") or {}).get("playbook") or "UNKNOWN")
+        month = str(funnel.get("date") or decision.get("session_date") or "")[:7]
+        if funnel.get("setup_detected"):
+            setups_detected += 1
+            setups_by_playbook[playbook] += 1
+            monthly[month]["setups_detected"] += 1
+            monthly[month]["setups_by_playbook"][playbook] += 1
+            if funnel.get("passed_setup_quality"):
+                setups_passed_setup_quality += 1
+                monthly[month]["setups_passed_setup_quality"] += 1
+        if funnel.get("final_result") == "EXECUTED":
+            monthly[month]["trades_executed"] += 1
+            continue
+        reason = str(funnel.get("canonical_rejection_reason") or "UNKNOWN")
+        if funnel.get("setup_detected"):
+            rejected_by_reason[reason] += 1
+            rejected_by_playbook[playbook] += 1
+            if reason == "TIME_WINDOW":
+                rejected_time += 1
+                monthly[month]["rejected_time_window"] += 1
+            if reason in MONETIZATION_REJECTION_REASONS:
+                rejected_spread += 1
+                monthly[month]["rejected_spread_construction"] += 1
+                monthly[month]["missed_opportunities_by_playbook"][playbook] += 1
+            if reason in {"CREDIT_TOO_LOW", "NET_EDGE_TOO_LOW"}:
+                rejected_credit += 1
+                monthly[month]["rejected_credit_width"] += 1
+            if reason == "LIQUIDITY_BAD":
+                rejected_liquidity += 1
+                monthly[month]["rejected_liquidity"] += 1
+            if reason == "DELTA_TOO_HIGH":
+                rejected_delta += 1
+                monthly[month]["rejected_delta"] += 1
+            if reason == "INVALIDATION_TOO_CLOSE":
+                rejected_anchor += 1
+                monthly[month]["rejected_invalidation_distance"] += 1
+            if reason == "HEDGE_TOO_EXPENSIVE":
+                rejected_hedge += 1
+                monthly[month]["rejected_hedge_cost"] += 1
+
+    pnl_by_playbook: dict[str, list[float]] = defaultdict(list)
+    wins_by_playbook: Counter[str] = Counter()
+    losses_by_playbook: Counter[str] = Counter()
+    for trade in trades:
+        playbook = str(trade.get("playbook") or "UNKNOWN")
+        pnl = float(trade.get("pnl_rupees") or 0.0)
+        pnl_by_playbook[playbook].append(pnl)
+        if pnl > 0:
+            wins_by_playbook[playbook] += 1
+        elif pnl < 0:
+            losses_by_playbook[playbook] += 1
+
+    monthly_summary = {}
+    for month, payload in monthly.items():
+        monthly_summary[month] = {
+            "setups_detected": payload["setups_detected"],
+            "setups_passed_setup_quality": payload["setups_passed_setup_quality"],
+            "trades_executed": payload["trades_executed"],
+            "rejected_time_window": payload["rejected_time_window"],
+            "rejected_spread_construction": payload["rejected_spread_construction"],
+            "rejected_credit_width": payload["rejected_credit_width"],
+            "rejected_liquidity": payload["rejected_liquidity"],
+            "rejected_delta": payload["rejected_delta"],
+            "rejected_invalidation_distance": payload["rejected_invalidation_distance"],
+            "rejected_hedge_cost": payload["rejected_hedge_cost"],
+            "setups_by_playbook": dict(payload["setups_by_playbook"]),
+            "missed_opportunities_by_playbook": dict(payload["missed_opportunities_by_playbook"]),
+        }
+
+    return {
+        "setups_detected": setups_detected,
+        "setups_passed_setup_quality": setups_passed_setup_quality,
+        "setups_by_playbook": dict(setups_by_playbook),
+        "rejected_time_window": rejected_time,
+        "rejected_spread_construction": rejected_spread,
+        "rejected_credit_width": rejected_credit,
+        "rejected_liquidity": rejected_liquidity,
+        "rejected_delta": rejected_delta,
+        "rejected_invalidation_distance": rejected_anchor,
+        "rejected_hedge_cost": rejected_hedge,
+        "trades_executed": sum(1 for decision in decisions if ((decision.get("metadata") or {}).get("trade_funnel") or {}).get("final_result") == "EXECUTED"),
+        "top_rejection_reasons": rejected_by_reason.most_common(10),
+        "blocked_by_spread_construction_by_playbook": [
+            (playbook, count)
+            for playbook, count in rejected_by_playbook.most_common()
+            if count > 0
+        ][:10],
+        "win_loss_by_playbook": {
+            playbook: {"wins": wins_by_playbook.get(playbook, 0), "losses": losses_by_playbook.get(playbook, 0)}
+            for playbook in sorted(set(wins_by_playbook) | set(losses_by_playbook) | set(pnl_by_playbook))
+        },
+        "average_pnl_by_playbook": {
+            playbook: round(mean(values), 2) if values else 0.0
+            for playbook, values in pnl_by_playbook.items()
+        },
+        "missed_opportunity_leaderboard": [
+            (playbook, count)
+            for playbook, count in sorted(
+                (
+                    (playbook, sum(month_payload["missed_opportunities_by_playbook"].get(playbook, 0) for month_payload in monthly_summary.values()))
+                    for playbook in setups_by_playbook
+                ),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            if count > 0
+        ][:10],
+        "monthly_summary": monthly_summary,
+    }
+
 
 def run_backtest(
     data_path: str | Path,
@@ -50,6 +201,9 @@ def run_backtest(
     reset_learning_db: bool = True,
     entry_times: set[str] | None = None,
     round_trip_cost_rupees_per_lot: float = 0.0,
+    *,
+    allowed_playbook_tiers: tuple[str, ...] = ("A",),
+    include_opportunity_benchmark: bool = True,
 ) -> dict[str, object]:
     if reset_learning_db:
         Path(learning_db_path).unlink(missing_ok=True)
@@ -72,7 +226,12 @@ def run_backtest(
     )
     account_state = AccountState(realised_pnl_rupees=0.0, margin_used_rupees=0.0)
     total_realized_pnl_rupees = 0.0
-    agent = IntradayDefinedRiskAgent(learning_store=LearningStore(learning_db_path), parameters=parameters)
+    agent = IntradayDefinedRiskAgent(
+        learning_store=LearningStore(learning_db_path),
+        parameters=parameters,
+        allowed_playbook_tiers=allowed_playbook_tiers,
+        benchmark_mode="opportunity" if set(allowed_playbook_tiers) == {"A", "B"} else "strict",
+    )
     entry_times = entry_times or DEFAULT_ENTRY_TIMES
 
     decisions: list[dict[str, object]] = []
@@ -273,8 +432,40 @@ def run_backtest(
         "parameters": parameters.clamped().__dict__ if parameters is not None else None,
         "entry_times": sorted(entry_times),
         "round_trip_cost_rupees_per_lot": round_trip_cost_rupees_per_lot,
+        "benchmark_mode": "opportunity" if set(allowed_playbook_tiers) == {"A", "B"} else "strict",
+        "allowed_playbook_tiers": list(allowed_playbook_tiers),
     }
-    return {"summary": summary, "decisions": decisions, "trades": trades}
+    funnel_report = _build_funnel_report(decisions, trades)
+    summary["trade_funnel"] = funnel_report
+    opportunity_result = None
+    if include_opportunity_benchmark and set(allowed_playbook_tiers) == {"A"}:
+        opportunity_result = run_backtest(
+            data_path,
+            start=start,
+            end=end,
+            risk_limits=risk_limits,
+            learning_db_path=f"{learning_db_path}.opportunity",
+            parameters=parameters,
+            reset_learning_db=True,
+            entry_times=entry_times,
+            round_trip_cost_rupees_per_lot=round_trip_cost_rupees_per_lot,
+            allowed_playbook_tiers=("A", "B"),
+            include_opportunity_benchmark=False,
+        )
+        summary["opportunity_benchmark"] = opportunity_result["summary"]
+        summary["opportunity_gap"] = {
+            "trade_delta": opportunity_result["summary"]["trades"] - summary["trades"],
+            "pnl_delta_rupees": round(
+                opportunity_result["summary"]["realized_pnl_rupees"] - summary["realized_pnl_rupees"],
+                2,
+            ),
+        }
+    return {
+        "summary": summary,
+        "decisions": decisions,
+        "trades": trades,
+        "opportunity": opportunity_result,
+    }
 
 
 def load_backtest_dataset(data_path: str | Path) -> dict[str, object]:

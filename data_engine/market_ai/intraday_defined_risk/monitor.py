@@ -19,8 +19,8 @@ from .execution import build_no_trade_decision, build_open_position, build_trade
 from .learning import LearningStore
 from .regime import classify_regime
 from .risk import assess_trade_risk, kill_switch_triggered
-from .strategy import select_strategy
-from .strikes import select_structure
+from .strategy import playbook_tier, playbook_time_window, required_confidence_for_playbook, select_strategy
+from .strikes import select_best_structure, select_structure
 
 ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT = 35.0
 MIN_NET_EDGE_RUPEES = 500.0
@@ -28,6 +28,73 @@ MIN_NET_EDGE_COST_MULTIPLE = 3.0
 PLAYBOOK_MIN_SAMPLES = 8.0
 PLAYBOOK_BAD_PROFIT_FACTOR = 0.90
 PLAYBOOK_GOOD_PROFIT_FACTOR = 1.20
+
+
+def _canonical_strategy_rejection(reasons: list[str], *, setup_detected: bool) -> str:
+    joined = " | ".join(reasons)
+    if not setup_detected:
+        return "SETUP_NOT_DETECTED"
+    if "Tier" in joined:
+        return "PLAYBOOK_TIER_BLOCKED"
+    if "require time >=" in joined or "only allowed until" in joined or "allowed only after" in joined:
+        return "TIME_WINDOW"
+    if "below the required" in joined:
+        return "SETUP_QUALITY_TOO_LOW"
+    if "require the dedicated" in joined or "not yet printed a valid" in joined or "not balanced enough" in joined:
+        return "SETUP_PATTERN_MISMATCH"
+    if "No aligned regime/trigger pair available." in joined:
+        return "NO_VALID_STRATEGY"
+    return "SETUP_FILTERED"
+
+
+def _initial_trade_funnel(
+    snapshot: MarketSnapshot,
+    regime_state: RegimeLabel | object,
+    *,
+    allowed_playbook_tiers: tuple[str, ...],
+) -> dict[str, object]:
+    metadata = regime_state.metadata  # type: ignore[attr-defined]
+    playbook = str(metadata.get("playbook") or "UNKNOWN")
+    start_time, end_time = playbook_time_window(regime_state)  # type: ignore[arg-type]
+    setup_detected = bool(
+        metadata.get("bullish_entry_ready")
+        or metadata.get("bearish_entry_ready")
+        or metadata.get("range_entry_ready")
+        or playbook not in {"NO_TRADE", "RANGE_NO_TRADE", "EVENT_DAY_NO_TRADE", "UNKNOWN"}
+    )
+    confidence_required = required_confidence_for_playbook(playbook)
+    passed_setup_quality = bool(setup_detected and float(regime_state.confidence) >= confidence_required)  # type: ignore[attr-defined]
+    passed_time_gating = bool(
+        start_time is not None
+        and end_time is not None
+        and start_time <= snapshot.timestamp.time() <= end_time
+    ) if start_time is not None and end_time is not None else False
+    return {
+        "date": snapshot.timestamp.date().isoformat(),
+        "timestamp": snapshot.timestamp.isoformat(),
+        "regime": regime_state.regime.value,  # type: ignore[attr-defined]
+        "playbook": playbook,
+        "playbook_tier": playbook_tier(playbook),
+        "setup_quality_score": round(float(metadata.get("setup_quality_score") or 0.0), 4),
+        "setup_detected": setup_detected,
+        "passed_setup_quality": passed_setup_quality,
+        "passed_time_gating": passed_time_gating,
+        "passed_playbook_tier": playbook_tier(playbook) in allowed_playbook_tiers,
+        "passed_spread_construction": False,
+        "passed_liquidity": False,
+        "passed_credit_width": False,
+        "passed_delta_band": False,
+        "passed_anchor_distance": False,
+        "passed_net_edge": False,
+        "selected_strategy": StrategyType.NO_TRADE.value,
+        "monetization_score": 0.0,
+        "final_trade_score": 0.0,
+        "final_result": "REJECTED",
+        "canonical_rejection_reason": None,
+        "best_candidate": None,
+        "best_failed_candidate": None,
+        "candidate_evaluations": [],
+    }
 
 
 class MarketDataProvider(Protocol):
@@ -48,9 +115,14 @@ class IntradayDefinedRiskAgent:
         risk_limits: dict[str, float] | None = None,
         learning_store: LearningStore | None = None,
         parameters: AdaptiveParameters | None = None,
+        *,
+        allowed_playbook_tiers: tuple[str, ...] = ("A",),
+        benchmark_mode: str = "strict",
     ) -> None:
         self.learning_store = learning_store or LearningStore()
         self.parameters = (parameters or self.learning_store.active_parameters()).clamped()
+        self.allowed_playbook_tiers = tuple(sorted(set(allowed_playbook_tiers)))
+        self.benchmark_mode = benchmark_mode
         self.open_position: OpenPosition | None = None
         self._current_features: dict[str, object] = {}
         self._session_date = None
@@ -82,7 +154,16 @@ class IntradayDefinedRiskAgent:
             "call_wall_shift": regime_state.metadata.get("call_wall_shift", 0.0),
             "bullish_planner_alignment": regime_state.metadata.get("bullish_planner_alignment", False),
             "bearish_planner_alignment": regime_state.metadata.get("bearish_planner_alignment", False),
+            "setup_quality_score": regime_state.metadata.get("setup_quality_score", 0.0),
+            "setup_direction": regime_state.metadata.get("setup_direction"),
+            "playbook_tier": playbook_tier(playbook),
+            "benchmark_mode": self.benchmark_mode,
         }
+        trade_funnel = _initial_trade_funnel(
+            snapshot,
+            regime_state,
+            allowed_playbook_tiers=self.allowed_playbook_tiers,
+        )
 
         try:
             snapshot.validate()
@@ -97,18 +178,27 @@ class IntradayDefinedRiskAgent:
                 RegimeLabel.NO_TRADE.value,
                 rationale + kill_reasons,
                 confidence_score=regime_state.confidence,
-                extra_metadata=dict(regime_state.metadata),
+                extra_metadata=dict(regime_state.metadata) | {"trade_funnel": trade_funnel | {"canonical_rejection_reason": "KILL_SWITCH"}},
             )
             self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())
             return decision
 
-        strategy, strategy_reasons = select_strategy(regime_state, snapshot.timestamp.time())
+        strategy, strategy_reasons = select_strategy(
+            regime_state,
+            snapshot.timestamp.time(),
+            allowed_playbook_tiers=self.allowed_playbook_tiers,
+        )
+        trade_funnel["selected_strategy"] = strategy.value
         if strategy == StrategyType.NO_TRADE:
+            trade_funnel["canonical_rejection_reason"] = _canonical_strategy_rejection(
+                strategy_reasons,
+                setup_detected=bool(trade_funnel["setup_detected"]),
+            )
             decision = build_no_trade_decision(
                 regime_state.regime.value,
                 strategy_reasons,
                 confidence_score=regime_state.confidence,
-                extra_metadata=dict(regime_state.metadata),
+                extra_metadata=dict(regime_state.metadata) | {"trade_funnel": trade_funnel},
             )
             self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())
             return decision
@@ -120,7 +210,7 @@ class IntradayDefinedRiskAgent:
                     regime_state.regime.value,
                     strategy_reasons + [f"Playbook {playbook} is underperforming on recent history; skipping deployment until learning recovers."],
                     confidence_score=regime_state.confidence,
-                    extra_metadata=dict(regime_state.metadata),
+                    extra_metadata=dict(regime_state.metadata) | {"trade_funnel": trade_funnel | {"canonical_rejection_reason": "PLAYBOOK_UNDERPERFORMING"}},
                 )
                 self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())
                 return decision
@@ -129,7 +219,7 @@ class IntradayDefinedRiskAgent:
                 regime_state.regime.value,
                 strategy_reasons + [f"{strategy.value} already traded once this session; skipping repeat entry."],
                 confidence_score=regime_state.confidence,
-                extra_metadata=dict(regime_state.metadata),
+                extra_metadata=dict(regime_state.metadata) | {"trade_funnel": trade_funnel | {"canonical_rejection_reason": "SESSION_CAP"}},
             )
             self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())
             return decision
@@ -140,18 +230,39 @@ class IntradayDefinedRiskAgent:
                 regime_state.regime.value,
                 strategy_reasons + ([entry_reason] if entry_reason else []),
                 confidence_score=regime_state.confidence,
-                extra_metadata=dict(regime_state.metadata),
+                extra_metadata=dict(regime_state.metadata) | {"trade_funnel": trade_funnel | {"canonical_rejection_reason": "ENTRY_TIME_INVALID"}},
             )
             self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())
             return decision
 
-        structure, structure_reasons = select_structure(strategy, snapshot, regime_state, self.parameters)
+        structure, structure_reasons, structure_report = select_best_structure(
+            strategy,
+            snapshot,
+            regime_state,
+            self.parameters,
+            setup_quality_score=float(regime_state.metadata.get("setup_quality_score") or 0.0),
+            playbook_tier=playbook_tier(playbook),
+        )
+        trade_funnel.update({
+            "passed_spread_construction": bool(structure_report.get("passed_spread_construction")),
+            "passed_liquidity": bool(structure_report.get("passed_liquidity")),
+            "passed_credit_width": bool(structure_report.get("passed_credit_width")),
+            "passed_delta_band": bool(structure_report.get("passed_delta_band")),
+            "passed_anchor_distance": bool(structure_report.get("passed_anchor_distance")),
+            "monetization_score": float(structure_report.get("monetization_score") or 0.0),
+            "final_trade_score": float(structure_report.get("final_trade_score") or 0.0),
+            "best_candidate": structure_report.get("best_candidate"),
+            "best_failed_candidate": structure_report.get("best_failed_candidate"),
+            "candidate_evaluations": structure_report.get("candidate_evaluations") or [],
+        })
         if not structure:
             decision = build_no_trade_decision(
                 regime_state.regime.value,
                 strategy_reasons + structure_reasons,
                 confidence_score=regime_state.confidence,
-                extra_metadata=dict(regime_state.metadata),
+                extra_metadata=dict(regime_state.metadata) | {"trade_funnel": trade_funnel | {
+                    "canonical_rejection_reason": structure_report.get("canonical_rejection_reason") or "SPREAD_CONSTRUCTION_FAILED",
+                }},
             )
             self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())
             return decision
@@ -169,7 +280,7 @@ class IntradayDefinedRiskAgent:
                 regime_state.regime.value,
                 strategy_reasons + structure_reasons + risk.reasons,
                 confidence_score=regime_state.confidence,
-                extra_metadata=dict(regime_state.metadata),
+                extra_metadata=dict(regime_state.metadata) | {"trade_funnel": trade_funnel | {"canonical_rejection_reason": "RISK_LIMIT"}},
             )
             self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())
             return decision
@@ -189,7 +300,7 @@ class IntradayDefinedRiskAgent:
                 + structure_reasons
                 + [f"Expected net edge {expected_net_edge_rupees:.2f} rupees is below the required post-cost threshold of {min_required_edge:.2f} rupees."],
                 confidence_score=regime_state.confidence,
-                extra_metadata=dict(regime_state.metadata),
+                extra_metadata=dict(regime_state.metadata) | {"trade_funnel": trade_funnel | {"canonical_rejection_reason": "NET_EDGE_TOO_LOW"}},
             )
             self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())
             return decision
@@ -200,6 +311,9 @@ class IntradayDefinedRiskAgent:
         )
         if current_playbook_stats is not None and current_playbook_stats["samples"] >= PLAYBOOK_MIN_SAMPLES and current_playbook_stats["profit_factor"] >= PLAYBOOK_GOOD_PROFIT_FACTOR:
             confidence = min(1.0, confidence + 0.03)
+        trade_funnel["passed_net_edge"] = True
+        trade_funnel["final_result"] = "EXECUTED"
+        trade_funnel["canonical_rejection_reason"] = "NONE"
         decision = build_trade_decision(
             structure=structure,
             regime=regime_state.regime,
@@ -224,6 +338,10 @@ class IntradayDefinedRiskAgent:
                 "plan_invalidation_level": regime_state.metadata.get("plan_invalidation_level"),
                 "plan_target_level": regime_state.metadata.get("plan_target_level"),
                 "plan_thesis": regime_state.metadata.get("plan_thesis"),
+                "setup_quality_score": regime_state.metadata.get("setup_quality_score"),
+                "setup_direction": regime_state.metadata.get("setup_direction"),
+                "playbook_tier": playbook_tier(playbook),
+                "trade_funnel": trade_funnel,
             },
         )
         self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())
@@ -232,7 +350,15 @@ class IntradayDefinedRiskAgent:
     def start_position(self, snapshot: MarketSnapshot, decision: DecisionOutput) -> OpenPosition | None:
         self._reset_session(snapshot.timestamp)
         strategy = decision.strategy if isinstance(decision.strategy, StrategyType) else StrategyType(decision.strategy)
-        structure, _ = select_structure(strategy, snapshot, classify_regime(snapshot, self.parameters), self.parameters)
+        regime_state = classify_regime(snapshot, self.parameters)
+        structure, _, _ = select_best_structure(
+            strategy,
+            snapshot,
+            regime_state,
+            self.parameters,
+            setup_quality_score=float(decision.metadata.get("setup_quality_score") or regime_state.metadata.get("setup_quality_score") or 0.0),
+            playbook_tier=str(decision.metadata.get("playbook_tier") or playbook_tier(str(decision.metadata.get("playbook") or "UNKNOWN"))),
+        )
         if not structure:
             return None
         open_position = build_open_position(

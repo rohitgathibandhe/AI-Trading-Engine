@@ -14,7 +14,15 @@ from .data_models import (
 )
 
 
-DIRECTIONAL_WIDTH_CHOICES = (50.0, 100.0, 150.0)
+DIRECTIONAL_WIDTH_CHOICES = (50.0, 75.0, 100.0, 150.0)
+CANDIDATE_REJECTION_PRIORITY = (
+    "LIQUIDITY_BAD",
+    "DELTA_TOO_HIGH",
+    "INVALIDATION_TOO_CLOSE",
+    "CREDIT_TOO_LOW",
+    "HEDGE_TOO_EXPENSIVE",
+    "WIDTH_TOO_LARGE",
+)
 
 
 def select_structure(
@@ -23,44 +31,48 @@ def select_structure(
     regime_state: RegimeState,
     params: AdaptiveParameters | None = None,
 ) -> tuple[TradeStructure | None, list[str]]:
+    structure, reasons, _ = select_best_structure(
+        strategy,
+        snapshot,
+        regime_state,
+        params=params,
+    )
+    return structure, reasons
+
+
+def select_best_structure(
+    strategy: StrategyType,
+    snapshot: MarketSnapshot,
+    regime_state: RegimeState,
+    params: AdaptiveParameters | None = None,
+    *,
+    setup_quality_score: float | None = None,
+    playbook_tier: str = "A",
+) -> tuple[TradeStructure | None, list[str], dict[str, object]]:
     params = (params or AdaptiveParameters()).clamped()
+    setup_quality = float(
+        setup_quality_score
+        if setup_quality_score is not None
+        else regime_state.metadata.get("setup_quality_score") or 0.0
+    )
     if strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD:
-        return _select_vertical(
+        return _evaluate_vertical_candidates(
             strategy=strategy,
             snapshot=snapshot,
             regime_state=regime_state,
             option_type=OptionType.CALL,
             short_delta_band=(0.18, 0.35),
             long_delta_band=(0.05, 0.20),
-            min_credit_ratio=max(0.22, min(params.directional_credit_width_ratio, 0.28)),
+            params=params,
+            setup_quality_score=setup_quality,
+            playbook_tier=playbook_tier,
             allow_distance_fallback_when_deltas_present=True,
             min_short_strike=regime_state.metadata.get("min_short_call_strike"),
         )
     if strategy == StrategyType.BULL_PUT_CREDIT_SPREAD:
         playbook = regime_state.metadata.get("playbook")
-        bullish_setup = regime_state.metadata.get("bullish_setup")
-        bullish_confluence_score = float(regime_state.metadata.get("bullish_confluence_score") or 0.0)
-        bullish_support_quality = float(regime_state.metadata.get("bullish_support_quality_score") or 0.0)
-        smart_money_bias = regime_state.metadata.get("smart_money_bias")
         short_delta_band = (0.18, 0.25)
         long_delta_band = (0.05, 0.10)
-        min_credit_ratio = params.directional_credit_width_ratio
-        if (
-            playbook == "SIDEWAYS_TO_BULLISH_RECLAIM"
-            and bullish_setup == "VWAP_HOLD_HIGHER_LOW"
-            and bullish_confluence_score >= 11.0
-            and bullish_support_quality >= 4.0
-            and smart_money_bias == "BULLISH"
-        ):
-            min_credit_ratio = min(min_credit_ratio, 0.30)
-        elif (
-            playbook == "SIDEWAYS_TO_BULLISH_RECLAIM"
-            and bullish_setup == "SHALLOW_CONTINUATION"
-            and bullish_confluence_score >= 11.0
-            and bullish_support_quality >= 4.5
-            and smart_money_bias == "BULLISH"
-        ):
-            min_credit_ratio = min(min_credit_ratio, 0.32)
         if (
             playbook == "SIDEWAYS_TO_BULLISH_RECLAIM"
             and regime_state.metadata.get("bullish_setup") == "VWAP_HOLD_HIGHER_LOW"
@@ -69,19 +81,42 @@ def select_structure(
         ):
             short_delta_band = (0.10, 0.25)
             long_delta_band = (0.0, 0.10)
-        return _select_vertical(
+        return _evaluate_vertical_candidates(
             strategy=strategy,
             snapshot=snapshot,
             regime_state=regime_state,
             option_type=OptionType.PUT,
             short_delta_band=short_delta_band,
             long_delta_band=long_delta_band,
-            min_credit_ratio=min_credit_ratio,
+            params=params,
+            setup_quality_score=setup_quality,
+            playbook_tier=playbook_tier,
             max_short_strike=regime_state.metadata.get("max_short_put_strike"),
         )
     if strategy == StrategyType.IRON_CONDOR:
-        return _select_condor(snapshot=snapshot, regime_state=regime_state, params=params)
-    return None, ["No allowed structure for the requested strategy."]
+        return _select_condor_candidates(
+            snapshot=snapshot,
+            regime_state=regime_state,
+            params=params,
+            setup_quality_score=setup_quality,
+            playbook_tier=playbook_tier,
+        )
+    report = {
+        "strategy": strategy.value,
+        "setup_quality_score": round(setup_quality, 4),
+        "monetization_score": 0.0,
+        "final_trade_score": 0.0,
+        "passed_spread_construction": False,
+        "passed_liquidity": False,
+        "passed_credit_width": False,
+        "passed_delta_band": False,
+        "passed_anchor_distance": False,
+        "canonical_rejection_reason": "UNSUPPORTED_STRATEGY",
+        "best_candidate": None,
+        "best_failed_candidate": None,
+        "candidate_evaluations": [],
+    }
+    return None, ["No allowed structure for the requested strategy."], report
 
 
 def _liquid_otm_quotes(
@@ -101,6 +136,612 @@ def _liquid_otm_quotes(
             continue
         filtered.append(quote)
     return sorted(filtered, key=lambda quote: quote.strike)
+
+
+def _effective_directional_credit_ratio(
+    regime_state: RegimeState,
+    params: AdaptiveParameters,
+    *,
+    setup_quality_score: float,
+    playbook_tier: str,
+) -> float:
+    playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
+    base_ratio = params.directional_credit_width_ratio
+    if (
+        playbook in {"SIDEWAYS_TO_BULLISH_RECLAIM", "SIDEWAYS_TO_BEARISH_REJECTION", "GAP_DOWN_BEARISH_CONTINUATION", "GAP_UP_BEARISH_FAILURE"}
+        and setup_quality_score >= params.strong_setup_quality_threshold
+    ):
+        return min(base_ratio, params.relaxed_directional_credit_width_ratio)
+    if playbook_tier != "A" or setup_quality_score <= params.weak_setup_quality_threshold:
+        return max(base_ratio, params.strict_directional_credit_width_ratio)
+    return base_ratio
+
+
+def _effective_hedge_cost_ratio_cap(
+    params: AdaptiveParameters,
+    *,
+    setup_quality_score: float,
+    playbook_tier: str,
+) -> float:
+    if setup_quality_score >= params.strong_setup_quality_threshold:
+        return params.relaxed_hedge_cost_ratio_cap
+    if playbook_tier != "A" or setup_quality_score <= params.weak_setup_quality_threshold:
+        return params.strict_hedge_cost_ratio_cap
+    return params.hedge_cost_ratio_cap
+
+
+def _candidate_selection_mode(
+    *,
+    has_deltas: bool,
+    delta_pass: bool,
+    fallback_pass: bool,
+) -> str:
+    if has_deltas and delta_pass:
+        return "DELTA"
+    if fallback_pass:
+        return "STRUCTURE_DISTANCE_FALLBACK" if has_deltas else "RV_DISTANCE"
+    return "NONE"
+
+
+def _candidate_rejection_reason(flags: dict[str, bool]) -> str:
+    for reason in CANDIDATE_REJECTION_PRIORITY:
+        if not flags.get(reason, True):
+            return reason
+    return "NONE"
+
+
+def _score_candidate(
+    *,
+    credit_points: float,
+    width_points: float,
+    short_delta_abs: float | None,
+    short_delta_band: tuple[float, float],
+    liquidity_quality: float,
+    credit_ratio: float,
+    required_credit_ratio: float,
+    anchor_distance_points: float | None,
+    target_anchor_buffer_points: float | None,
+    hedge_cost_ratio: float,
+    theta_efficiency: float,
+    slippage_penalty: float,
+    stop_pain: float,
+) -> float:
+    short_target = sum(short_delta_band) / 2.0
+    short_half_band = max((short_delta_band[1] - short_delta_band[0]) / 2.0, 0.01)
+    if short_delta_abs is None:
+        delta_score = 0.55
+    else:
+        delta_score = max(0.0, 1.0 - (abs(short_delta_abs - short_target) / short_half_band))
+    credit_score = min(1.5, credit_ratio / max(required_credit_ratio, 0.01))
+    if anchor_distance_points is None:
+        anchor_score = 0.5
+    else:
+        target_anchor = max(target_anchor_buffer_points or 0.0, 1.0)
+        anchor_score = min(1.5, max(anchor_distance_points, 0.0) / target_anchor)
+    hedge_score = max(0.0, 1.0 - (hedge_cost_ratio / 0.40))
+    theta_score = min(1.5, theta_efficiency / 0.20)
+    stop_pain_penalty = min(1.0, stop_pain)
+    score = (
+        3.0 * credit_score
+        + 2.0 * delta_score
+        + 1.5 * liquidity_quality
+        + 1.5 * anchor_score
+        + 1.0 * hedge_score
+        + 1.0 * theta_score
+        - 1.5 * slippage_penalty
+        - 1.0 * stop_pain_penalty
+        + min(0.6, credit_points / max(width_points, 1.0))
+    )
+    return round(score, 4)
+
+
+def _evaluate_vertical_candidates(
+    strategy: StrategyType,
+    snapshot: MarketSnapshot,
+    regime_state: RegimeState,
+    option_type: OptionType,
+    short_delta_band: tuple[float, float],
+    long_delta_band: tuple[float, float],
+    params: AdaptiveParameters,
+    *,
+    setup_quality_score: float,
+    playbook_tier: str,
+    allow_distance_fallback_when_deltas_present: bool = True,
+    min_short_strike: float | None = None,
+    max_short_strike: float | None = None,
+    candidate_quotes: list[OptionsContractQuote] | None = None,
+) -> tuple[TradeStructure | None, list[str], dict[str, object]]:
+    quotes = candidate_quotes or _liquid_otm_quotes(snapshot.option_chain.quotes, option_type=option_type, spot=snapshot.option_chain.spot)
+    playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
+    if len(quotes) < 2:
+        report = {
+            "strategy": strategy.value,
+            "playbook": playbook,
+            "setup_quality_score": round(setup_quality_score, 4),
+            "monetization_score": 0.0,
+            "final_trade_score": 0.0,
+            "passed_spread_construction": False,
+            "passed_liquidity": False,
+            "passed_credit_width": False,
+            "passed_delta_band": False,
+            "passed_anchor_distance": False,
+            "canonical_rejection_reason": "LIQUIDITY_BAD",
+            "best_candidate": None,
+            "best_failed_candidate": None,
+            "candidate_evaluations": [],
+        }
+        return None, ["No liquid OTM quotes available for vertical selection."], report
+
+    quote_by_strike = {quote.strike: quote for quote in quotes}
+    preferred_width = regime_state.metadata.get("preferred_width_points")
+    preferred_widths = tuple(float(value) for value in (regime_state.metadata.get("allowed_width_points") or ()))
+    target_short_put_buffer = regime_state.metadata.get("target_short_put_buffer_points")
+    required_credit_ratio = _effective_directional_credit_ratio(
+        regime_state,
+        params,
+        setup_quality_score=setup_quality_score,
+        playbook_tier=playbook_tier,
+    )
+    max_hedge_cost_ratio = _effective_hedge_cost_ratio_cap(
+        params,
+        setup_quality_score=setup_quality_score,
+        playbook_tier=playbook_tier,
+    )
+    rv_points = snapshot.option_chain.spot * regime_state.rv30_pct / 100.0
+    hours_remaining = max(
+        (
+            snapshot.timestamp.replace(hour=15, minute=15, second=0, microsecond=0)
+            - snapshot.timestamp
+        ).total_seconds()
+        / 3600.0,
+        0.5,
+    )
+    has_deltas = any(quote.delta is not None for quote in quotes)
+    candidate_evaluations: list[dict[str, object]] = []
+
+    for requested_width in params.candidate_widths:
+        width_seen = False
+        for short_quote in quotes:
+            if min_short_strike is not None and short_quote.strike < min_short_strike:
+                continue
+            if max_short_strike is not None and short_quote.strike > max_short_strike:
+                continue
+            long_strike = short_quote.strike + requested_width if option_type == OptionType.CALL else short_quote.strike - requested_width
+            long_quote = quote_by_strike.get(long_strike)
+            if long_quote is None:
+                continue
+            width_seen = True
+            short_mid = short_quote.mid_price
+            long_mid = long_quote.mid_price
+            if short_mid is None or long_mid is None:
+                candidate_evaluations.append(
+                    {
+                        "requested_width_points": requested_width,
+                        "width_points": requested_width,
+                        "short_strike": short_quote.strike,
+                        "long_strike": long_quote.strike,
+                        "valid": False,
+                        "selection_mode": "NONE",
+                        "canonical_rejection_reason": "LIQUIDITY_BAD",
+                        "rejection_detail": "Missing reliable mid-price for one or both legs.",
+                    }
+                )
+                continue
+            credit = short_mid - long_mid
+            width = abs(long_quote.strike - short_quote.strike)
+            short_spread_ratio = short_quote.spread_ratio
+            long_spread_ratio = long_quote.spread_ratio
+            avg_spread_ratio = (short_spread_ratio + long_spread_ratio) / 2.0
+            passed_liquidity = bool(
+                short_spread_ratio <= params.liquidity_spread_ratio_cap
+                and long_spread_ratio <= params.liquidity_spread_ratio_cap
+            )
+            credit_ratio = credit / width if width > 0 else 0.0
+            passed_credit_width = credit > 0 and credit_ratio >= required_credit_ratio
+            short_abs = abs(short_quote.delta) if short_quote.delta is not None else None
+            long_abs = abs(long_quote.delta) if long_quote.delta is not None else None
+            passed_delta = True
+            if has_deltas:
+                passed_delta = bool(
+                    short_abs is not None
+                    and long_abs is not None
+                    and short_delta_band[0] <= short_abs <= short_delta_band[1]
+                    and long_delta_band[0] <= long_abs <= long_delta_band[1]
+                )
+            anchor_level = max_short_strike if option_type == OptionType.PUT else min_short_strike
+            if option_type == OptionType.PUT:
+                anchor_distance = (max_short_strike - short_quote.strike) if max_short_strike is not None else None
+            else:
+                anchor_distance = (short_quote.strike - min_short_strike) if min_short_strike is not None else None
+            fallback_pass = False
+            if option_type == OptionType.CALL:
+                fallback_pass = (short_quote.strike - snapshot.option_chain.spot) >= rv_points and width in DIRECTIONAL_WIDTH_CHOICES
+            else:
+                fallback_pass = (snapshot.option_chain.spot - short_quote.strike) >= rv_points and width in DIRECTIONAL_WIDTH_CHOICES
+            passed_anchor_distance = bool(
+                (anchor_distance is None or anchor_distance >= params.minimum_anchor_distance_points)
+                and (anchor_distance is None or anchor_distance >= 0)
+            )
+            hedge_cost_ratio = long_mid / max(short_mid, 0.01)
+            passed_hedge_cost = bool(hedge_cost_ratio <= max_hedge_cost_ratio)
+            selection_mode = _candidate_selection_mode(
+                has_deltas=has_deltas,
+                delta_pass=passed_delta,
+                fallback_pass=passed_anchor_distance and fallback_pass and allow_distance_fallback_when_deltas_present,
+            )
+            valid = bool(
+                passed_liquidity
+                and passed_credit_width
+                and passed_hedge_cost
+                and passed_anchor_distance
+                and selection_mode != "NONE"
+            )
+            theta_efficiency = credit_ratio * max(hours_remaining / 4.0, 0.5)
+            slippage_penalty = snapshot.slippage_points / max(credit, 0.50)
+            stop_pain = ((width - credit) / max(width, 1.0)) * (short_abs or 0.20)
+            liquidity_quality = max(0.0, 1.0 - (avg_spread_ratio / max(params.liquidity_spread_ratio_cap, 0.01)))
+            monetization_score = _score_candidate(
+                credit_points=credit,
+                width_points=width,
+                short_delta_abs=short_abs,
+                short_delta_band=short_delta_band,
+                liquidity_quality=liquidity_quality,
+                credit_ratio=credit_ratio,
+                required_credit_ratio=required_credit_ratio,
+                anchor_distance_points=anchor_distance,
+                target_anchor_buffer_points=target_short_put_buffer,
+                hedge_cost_ratio=hedge_cost_ratio,
+                theta_efficiency=theta_efficiency,
+                slippage_penalty=slippage_penalty,
+                stop_pain=stop_pain,
+            )
+            preferred_width_penalty = (
+                params.width_preference_penalty
+                if preferred_widths and requested_width not in preferred_widths
+                else 0.0
+            )
+            monetization_score = round(monetization_score - preferred_width_penalty, 4)
+            rejection_flags = {
+                "LIQUIDITY_BAD": passed_liquidity,
+                "DELTA_TOO_HIGH": passed_delta or (selection_mode == "STRUCTURE_DISTANCE_FALLBACK"),
+                "INVALIDATION_TOO_CLOSE": passed_anchor_distance,
+                "CREDIT_TOO_LOW": passed_credit_width,
+                "HEDGE_TOO_EXPENSIVE": passed_hedge_cost,
+                "WIDTH_TOO_LARGE": True,
+            }
+            candidate_evaluations.append(
+                {
+                    "requested_width_points": requested_width,
+                    "width_points": width,
+                    "preferred_width_penalty": round(preferred_width_penalty, 4),
+                    "playbook_preferred_widths": preferred_widths,
+                    "short_strike": short_quote.strike,
+                    "long_strike": long_quote.strike,
+                    "anchor_level": anchor_level,
+                    "anchor_distance_points": anchor_distance,
+                    "target_anchor_buffer_points": target_short_put_buffer,
+                    "short_delta_abs": short_abs,
+                    "long_delta_abs": long_abs,
+                    "credit_points": round(credit, 4),
+                    "credit_width_ratio": round(credit_ratio, 4),
+                    "required_credit_width_ratio": round(required_credit_ratio, 4),
+                    "max_hedge_cost_ratio": round(max_hedge_cost_ratio, 4),
+                    "hedge_cost_points": round(long_mid, 4),
+                    "hedge_cost_ratio": round(hedge_cost_ratio, 4),
+                    "liquidity_quality": round(liquidity_quality, 4),
+                    "avg_spread_ratio": round(avg_spread_ratio, 4),
+                    "theta_efficiency": round(theta_efficiency, 4),
+                    "slippage_penalty": round(slippage_penalty, 4),
+                    "expected_stop_pain": round(stop_pain, 4),
+                    "selection_mode": selection_mode,
+                    "passed_liquidity": passed_liquidity,
+                    "passed_credit_width": passed_credit_width,
+                    "passed_delta_band": passed_delta,
+                    "passed_anchor_distance": passed_anchor_distance,
+                    "passed_hedge_cost": passed_hedge_cost,
+                    "valid": valid,
+                    "monetization_score": monetization_score,
+                    "canonical_rejection_reason": "NONE" if valid else _candidate_rejection_reason(rejection_flags),
+                    "rejection_detail": "" if valid else "Candidate failed monetization filters.",
+                }
+            )
+        if not width_seen:
+            candidate_evaluations.append(
+                {
+                    "requested_width_points": requested_width,
+                    "width_points": requested_width,
+                    "valid": False,
+                    "selection_mode": "NONE",
+                    "canonical_rejection_reason": "WIDTH_TOO_LARGE",
+                    "rejection_detail": "No liquid pair exists for this requested width.",
+                }
+            )
+
+    valid_candidates = [candidate for candidate in candidate_evaluations if candidate.get("valid")]
+    best_candidate = max(valid_candidates, key=lambda candidate: (float(candidate.get("monetization_score") or 0.0), -abs(float(candidate.get("width_points") or 0.0) - float(preferred_width or candidate.get("width_points") or 0.0)))) if valid_candidates else None
+    failed_candidates = [candidate for candidate in candidate_evaluations if not candidate.get("valid")]
+    best_failed_candidate = max(failed_candidates, key=lambda candidate: float(candidate.get("monetization_score") or -inf)) if failed_candidates else None
+    passed_liquidity = any(bool(candidate.get("passed_liquidity")) for candidate in candidate_evaluations)
+    passed_credit_width = any(bool(candidate.get("passed_credit_width")) for candidate in candidate_evaluations)
+    passed_delta_band = any(bool(candidate.get("passed_delta_band")) for candidate in candidate_evaluations)
+    passed_anchor_distance = any(bool(candidate.get("passed_anchor_distance")) for candidate in candidate_evaluations)
+    report = {
+        "strategy": strategy.value,
+        "playbook": playbook,
+        "setup_quality_score": round(setup_quality_score, 4),
+        "monetization_score": round(float(best_candidate.get("monetization_score") or 0.0) if best_candidate else float(best_failed_candidate.get("monetization_score") or 0.0) if best_failed_candidate else 0.0, 4),
+        "final_trade_score": round(setup_quality_score + (float(best_candidate.get("monetization_score") or 0.0) if best_candidate else 0.0), 4),
+        "passed_spread_construction": best_candidate is not None,
+        "passed_liquidity": passed_liquidity,
+        "passed_credit_width": passed_credit_width,
+        "passed_delta_band": passed_delta_band,
+        "passed_anchor_distance": passed_anchor_distance,
+        "canonical_rejection_reason": "NONE" if best_candidate else str(best_failed_candidate.get("canonical_rejection_reason") or "WIDTH_TOO_LARGE") if best_failed_candidate else "WIDTH_TOO_LARGE",
+        "best_candidate": best_candidate,
+        "best_failed_candidate": best_failed_candidate,
+        "candidate_evaluations": candidate_evaluations,
+        "narrower_width_would_pass": bool(
+            best_failed_candidate is not None
+            and any(
+                candidate.get("valid")
+                and float(candidate.get("width_points") or 0.0) < float(best_failed_candidate.get("width_points") or 0.0)
+                for candidate in candidate_evaluations
+            )
+        ),
+    }
+    if best_candidate is None:
+        return None, ["No vertical spread satisfied liquidity, delta/distance, and credit-efficiency rules."], report
+
+    short_quote = quote_by_strike[float(best_candidate["short_strike"])]
+    long_quote = quote_by_strike[float(best_candidate["long_strike"])]
+    credit = float(best_candidate["credit_points"])
+    width = float(best_candidate["width_points"])
+    structure_reasons = [
+        f"Selected short {option_type.value} strike {short_quote.strike} and protective wing {long_quote.strike}.",
+        f"Net credit {credit:.2f} points on width {width:.2f} points.",
+        f"Monetization score {float(best_candidate['monetization_score']):.2f} with setup quality {setup_quality_score:.2f}.",
+    ]
+    derived_margin = max((width - credit) * snapshot.lot_size, 0.0)
+    structure = TradeStructure(
+        strategy=strategy,
+        legs=[
+            StrategyLeg(action="SELL", option_type=option_type, strike=short_quote.strike, quote=short_quote),
+            StrategyLeg(action="BUY", option_type=option_type, strike=long_quote.strike, quote=long_quote),
+        ],
+        credit_points=credit,
+        width_points=width,
+        call_width_points=width if option_type == OptionType.CALL else 0.0,
+        put_width_points=width if option_type == OptionType.PUT else 0.0,
+        margin_estimate_per_lot=snapshot.option_chain.margin_estimate_per_lot or derived_margin,
+        rationale=structure_reasons,
+        metadata={
+            "selection_mode": str(best_candidate["selection_mode"]),
+            "preferred_width_points": preferred_width,
+            "preferred_width_penalty": best_candidate.get("preferred_width_penalty"),
+            "margin_source": "BROKER_ESTIMATE" if snapshot.option_chain.margin_estimate_per_lot is not None else "MAX_LOSS_PROXY",
+            "monetization_score": float(best_candidate["monetization_score"]),
+            "setup_quality_score": setup_quality_score,
+            "final_trade_score": round(setup_quality_score + float(best_candidate["monetization_score"]), 4),
+            "short_delta_abs": best_candidate.get("short_delta_abs"),
+            "credit_width_ratio": best_candidate.get("credit_width_ratio"),
+            "anchor_distance_points": best_candidate.get("anchor_distance_points"),
+        },
+    )
+    return structure, structure_reasons, report
+
+
+def _select_condor_candidates(
+    snapshot: MarketSnapshot,
+    regime_state: RegimeState,
+    params: AdaptiveParameters,
+    *,
+    setup_quality_score: float,
+    playbook_tier: str,
+) -> tuple[TradeStructure | None, list[str], dict[str, object]]:
+    playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
+    short_delta_band = (0.12, 0.20)
+    long_delta_band = (0.05, 0.10)
+    call_candidates = _shortlist_condor_quotes(snapshot, regime_state, OptionType.CALL, short_delta_band)
+    put_candidates = _shortlist_condor_quotes(snapshot, regime_state, OptionType.PUT, short_delta_band)
+    if not call_candidates or not put_candidates:
+        report = {
+            "strategy": StrategyType.IRON_CONDOR.value,
+            "playbook": playbook,
+            "setup_quality_score": round(setup_quality_score, 4),
+            "monetization_score": 0.0,
+            "final_trade_score": 0.0,
+            "passed_spread_construction": False,
+            "passed_liquidity": False,
+            "passed_credit_width": False,
+            "passed_delta_band": False,
+            "passed_anchor_distance": False,
+            "canonical_rejection_reason": "LIQUIDITY_BAD",
+            "best_candidate": None,
+            "best_failed_candidate": None,
+            "candidate_evaluations": [],
+        }
+        return None, ["Iron condor candidate search could not find liquid call and put shorts."], report
+
+    call_by_strike = {quote.strike: quote for quote in _liquid_otm_quotes(snapshot.option_chain.quotes, OptionType.CALL, snapshot.option_chain.spot)}
+    put_by_strike = {quote.strike: quote for quote in _liquid_otm_quotes(snapshot.option_chain.quotes, OptionType.PUT, snapshot.option_chain.spot)}
+    candidate_evaluations: list[dict[str, object]] = []
+    condor_credit_ratio = params.condor_credit_width_ratio
+    if setup_quality_score >= params.strong_setup_quality_threshold:
+        condor_credit_ratio = max(0.16, condor_credit_ratio - 0.04)
+    elif playbook_tier != "A":
+        condor_credit_ratio = min(0.40, condor_credit_ratio + 0.04)
+    max_hedge_cost_ratio = _effective_hedge_cost_ratio_cap(
+        params,
+        setup_quality_score=setup_quality_score,
+        playbook_tier=playbook_tier,
+    )
+    hours_remaining = max(
+        (
+            snapshot.timestamp.replace(hour=15, minute=15, second=0, microsecond=0)
+            - snapshot.timestamp
+        ).total_seconds()
+        / 3600.0,
+        0.5,
+    )
+
+    for requested_width in params.candidate_widths:
+        width_seen = False
+        for short_call in call_candidates:
+            long_call = call_by_strike.get(short_call.strike + requested_width)
+            if long_call is None:
+                continue
+            for short_put in put_candidates:
+                long_put = put_by_strike.get(short_put.strike - requested_width)
+                if long_put is None:
+                    continue
+                width_seen = True
+                call_credit = (short_call.mid_price or 0.0) - (long_call.mid_price or 0.0)
+                put_credit = (short_put.mid_price or 0.0) - (long_put.mid_price or 0.0)
+                total_credit = call_credit + put_credit
+                max_width = requested_width
+                avg_spread_ratio = (
+                    short_call.spread_ratio
+                    + long_call.spread_ratio
+                    + short_put.spread_ratio
+                    + long_put.spread_ratio
+                ) / 4.0
+                passed_liquidity = bool(avg_spread_ratio <= params.liquidity_spread_ratio_cap)
+                passed_delta = all(
+                    delta is not None
+                    for delta in (short_call.delta, long_call.delta, short_put.delta, long_put.delta)
+                ) and (
+                    short_delta_band[0] <= abs(short_call.delta) <= short_delta_band[1]
+                    and short_delta_band[0] <= abs(short_put.delta) <= short_delta_band[1]
+                    and long_delta_band[0] <= abs(long_call.delta) <= long_delta_band[1]
+                    and long_delta_band[0] <= abs(long_put.delta) <= long_delta_band[1]
+                )
+                credit_ratio = total_credit / max_width if max_width > 0 else 0.0
+                passed_credit = total_credit > 0 and credit_ratio >= condor_credit_ratio
+                hedge_cost_ratio = ((long_call.mid_price or 0.0) + (long_put.mid_price or 0.0)) / max((short_call.mid_price or 0.01) + (short_put.mid_price or 0.01), 0.01)
+                passed_hedge_cost = hedge_cost_ratio <= max_hedge_cost_ratio
+                theta_efficiency = credit_ratio * max(hours_remaining / 4.0, 0.5)
+                slippage_penalty = (snapshot.slippage_points * 2.0) / max(total_credit, 0.50)
+                liquidity_quality = max(0.0, 1.0 - (avg_spread_ratio / max(params.liquidity_spread_ratio_cap, 0.01)))
+                monetization_score = _score_candidate(
+                    credit_points=total_credit,
+                    width_points=max_width,
+                    short_delta_abs=max(abs(short_call.delta or 0.0), abs(short_put.delta or 0.0)),
+                    short_delta_band=short_delta_band,
+                    liquidity_quality=liquidity_quality,
+                    credit_ratio=credit_ratio,
+                    required_credit_ratio=condor_credit_ratio,
+                    anchor_distance_points=None,
+                    target_anchor_buffer_points=None,
+                    hedge_cost_ratio=hedge_cost_ratio,
+                    theta_efficiency=theta_efficiency,
+                    slippage_penalty=slippage_penalty,
+                    stop_pain=((max_width - total_credit) / max(max_width, 1.0)) * max(abs(short_call.delta or 0.0), abs(short_put.delta or 0.0), 0.1),
+                )
+                rejection_flags = {
+                    "LIQUIDITY_BAD": passed_liquidity,
+                    "DELTA_TOO_HIGH": passed_delta,
+                    "INVALIDATION_TOO_CLOSE": True,
+                    "CREDIT_TOO_LOW": passed_credit,
+                    "HEDGE_TOO_EXPENSIVE": passed_hedge_cost,
+                    "WIDTH_TOO_LARGE": True,
+                }
+                valid = bool(passed_liquidity and passed_delta and passed_credit and passed_hedge_cost)
+                candidate_evaluations.append(
+                    {
+                        "requested_width_points": requested_width,
+                        "width_points": requested_width,
+                        "short_call_strike": short_call.strike,
+                        "long_call_strike": long_call.strike,
+                        "short_put_strike": short_put.strike,
+                        "long_put_strike": long_put.strike,
+                        "credit_points": round(total_credit, 4),
+                        "credit_width_ratio": round(credit_ratio, 4),
+                        "required_credit_width_ratio": round(condor_credit_ratio, 4),
+                        "max_hedge_cost_ratio": round(max_hedge_cost_ratio, 4),
+                        "avg_spread_ratio": round(avg_spread_ratio, 4),
+                        "selection_mode": "CONDOR",
+                        "passed_liquidity": passed_liquidity,
+                        "passed_credit_width": passed_credit,
+                        "passed_delta_band": passed_delta,
+                        "passed_anchor_distance": True,
+                        "passed_hedge_cost": passed_hedge_cost,
+                        "valid": valid,
+                        "monetization_score": monetization_score,
+                        "canonical_rejection_reason": "NONE" if valid else _candidate_rejection_reason(rejection_flags),
+                        "rejection_detail": "" if valid else "Condor candidate failed monetization filters.",
+                    }
+                )
+        if not width_seen:
+            candidate_evaluations.append(
+                {
+                    "requested_width_points": requested_width,
+                    "width_points": requested_width,
+                    "valid": False,
+                    "selection_mode": "CONDOR",
+                    "canonical_rejection_reason": "WIDTH_TOO_LARGE",
+                    "rejection_detail": "No liquid condor wings exist for this width.",
+                }
+            )
+
+    valid_candidates = [candidate for candidate in candidate_evaluations if candidate.get("valid")]
+    best_candidate = max(valid_candidates, key=lambda candidate: float(candidate.get("monetization_score") or 0.0)) if valid_candidates else None
+    failed_candidates = [candidate for candidate in candidate_evaluations if not candidate.get("valid")]
+    best_failed_candidate = max(failed_candidates, key=lambda candidate: float(candidate.get("monetization_score") or -inf)) if failed_candidates else None
+    report = {
+        "strategy": StrategyType.IRON_CONDOR.value,
+        "playbook": playbook,
+        "setup_quality_score": round(setup_quality_score, 4),
+        "monetization_score": round(float(best_candidate.get("monetization_score") or 0.0) if best_candidate else float(best_failed_candidate.get("monetization_score") or 0.0) if best_failed_candidate else 0.0, 4),
+        "final_trade_score": round(setup_quality_score + (float(best_candidate.get("monetization_score") or 0.0) if best_candidate else 0.0), 4),
+        "passed_spread_construction": best_candidate is not None,
+        "passed_liquidity": any(bool(candidate.get("passed_liquidity")) for candidate in candidate_evaluations),
+        "passed_credit_width": any(bool(candidate.get("passed_credit_width")) for candidate in candidate_evaluations),
+        "passed_delta_band": any(bool(candidate.get("passed_delta_band")) for candidate in candidate_evaluations),
+        "passed_anchor_distance": True,
+        "canonical_rejection_reason": "NONE" if best_candidate else str(best_failed_candidate.get("canonical_rejection_reason") or "WIDTH_TOO_LARGE") if best_failed_candidate else "WIDTH_TOO_LARGE",
+        "best_candidate": best_candidate,
+        "best_failed_candidate": best_failed_candidate,
+        "candidate_evaluations": candidate_evaluations,
+    }
+    if best_candidate is None:
+        return None, ["Condor total credit does not meet the required credit-efficiency threshold."], report
+
+    short_call = call_by_strike[float(best_candidate["short_call_strike"])]
+    long_call = call_by_strike[float(best_candidate["long_call_strike"])]
+    short_put = put_by_strike[float(best_candidate["short_put_strike"])]
+    long_put = put_by_strike[float(best_candidate["long_put_strike"])]
+    total_credit = float(best_candidate["credit_points"])
+    width = float(best_candidate["width_points"])
+    rationale = [
+        f"Selected balanced iron condor with call strikes {short_call.strike}/{long_call.strike} and put strikes {short_put.strike}/{long_put.strike}.",
+        f"Total credit {total_credit:.2f} points on wing width {width:.2f} points.",
+        f"Monetization score {float(best_candidate['monetization_score']):.2f} with setup quality {setup_quality_score:.2f}.",
+    ]
+    derived_margin = max((width - total_credit) * snapshot.lot_size, 0.0)
+    structure = TradeStructure(
+        strategy=StrategyType.IRON_CONDOR,
+        legs=[
+            StrategyLeg(action="SELL", option_type=OptionType.CALL, strike=short_call.strike, quote=short_call),
+            StrategyLeg(action="BUY", option_type=OptionType.CALL, strike=long_call.strike, quote=long_call),
+            StrategyLeg(action="SELL", option_type=OptionType.PUT, strike=short_put.strike, quote=short_put),
+            StrategyLeg(action="BUY", option_type=OptionType.PUT, strike=long_put.strike, quote=long_put),
+        ],
+        credit_points=total_credit,
+        width_points=width,
+        call_width_points=width,
+        put_width_points=width,
+        margin_estimate_per_lot=snapshot.option_chain.margin_estimate_per_lot or derived_margin,
+        rationale=rationale,
+        metadata={
+            "selection_mode": "CONDOR",
+            "margin_source": "BROKER_ESTIMATE" if snapshot.option_chain.margin_estimate_per_lot is not None else "MAX_LOSS_PROXY",
+            "monetization_score": float(best_candidate["monetization_score"]),
+            "setup_quality_score": setup_quality_score,
+            "final_trade_score": round(setup_quality_score + float(best_candidate["monetization_score"]), 4),
+            "credit_width_ratio": best_candidate.get("credit_width_ratio"),
+        },
+    )
+    return structure, rationale, report
 
 
 def _select_vertical(

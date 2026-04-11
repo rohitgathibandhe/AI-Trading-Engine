@@ -29,6 +29,7 @@ SIDEWAYS_BEARISH_REJECTION_START = time(11, 30)
 SIDEWAYS_BEARISH_REJECTION_END = time(12, 45)
 GAP_BEARISH_START = time(9, 45)
 GAP_BEARISH_END = time(13, 0)
+GAP_DOWN_BEARISH_CONTINUATION_END = time(12, 0)
 GAP_UP_BEARISH_FAILURE_END = time(11, 15)
 RANGE_CONDOR_START = time(11, 30)
 RANGE_CONDOR_END = time(13, 30)
@@ -57,8 +58,107 @@ ENABLE_HIGH_CONFLUENCE_BULLISH_ACTIVE = True
 ENABLE_AFTERNOON_TREND_BULLISH_ACTIVE = False
 ENABLE_RANGE_CONDOR_ACTIVE = True
 
+TIER_A_PLAYBOOKS = {
+    "SIDEWAYS_TO_BEARISH_REJECTION",
+    "GAP_DOWN_BEARISH_CONTINUATION",
+    "GAP_UP_BEARISH_FAILURE",
+    "RANGE_BALANCED_CONDOR",
+}
 
-def select_strategy(regime_state: RegimeState, now_time: time) -> tuple[StrategyType, list[str]]:
+TIER_B_PLAYBOOKS = {
+    "SIDEWAYS_TO_BULLISH_RECLAIM",
+    "OPEN_DRIVE_BULLISH",
+    "HIGH_CONFLUENCE_BULLISH_CONTINUATION",
+    "GAP_UP_BULLISH_CONTINUATION",
+    "GAP_DOWN_BULLISH_RECOVERY",
+    "EARLY_BALANCE_BULLISH_RECLAIM",
+    "AFTERNOON_TREND_HOLD_BULLISH",
+    "EARLY_BALANCE_BEARISH_FAILED_RECLAIM",
+    "HIGH_CONFLUENCE_BEARISH_CONTINUATION",
+    "BEARISH_FAILED_RECLAIM",
+    "BEARISH_CONTINUATION",
+}
+
+
+def playbook_tier(playbook: str) -> str:
+    if playbook in TIER_A_PLAYBOOKS:
+        return "A"
+    if playbook in TIER_B_PLAYBOOKS:
+        return "B"
+    return "C"
+
+
+def required_confidence_for_playbook(playbook: str) -> float:
+    if playbook == "OPEN_DRIVE_BULLISH":
+        return OPEN_DRIVE_BULLISH_MIN_CONFIDENCE
+    if playbook == "HIGH_CONFLUENCE_BULLISH_CONTINUATION":
+        return HIGH_CONFLUENCE_BULLISH_MIN_CONFIDENCE
+    if playbook == "GAP_UP_BULLISH_CONTINUATION":
+        return GAP_UP_BULLISH_MIN_CONFIDENCE
+    if playbook == "GAP_DOWN_BULLISH_RECOVERY":
+        return GAP_DOWN_BULLISH_RECOVERY_MIN_CONFIDENCE
+    if playbook == "EARLY_BALANCE_BULLISH_RECLAIM":
+        return EARLY_BALANCE_BULLISH_MIN_CONFIDENCE
+    if playbook == "AFTERNOON_TREND_HOLD_BULLISH":
+        return AFTERNOON_TREND_BULLISH_MIN_CONFIDENCE
+    if playbook == "RANGE_BALANCED_CONDOR":
+        return RANGE_CONDOR_MIN_CONFIDENCE
+    if playbook in {
+        "EARLY_BALANCE_BEARISH_FAILED_RECLAIM",
+        "SIDEWAYS_TO_BEARISH_REJECTION",
+        "GAP_UP_BEARISH_FAILURE",
+        "GAP_DOWN_BEARISH_CONTINUATION",
+        "HIGH_CONFLUENCE_BEARISH_CONTINUATION",
+        "BEARISH_FAILED_RECLAIM",
+        "BEARISH_CONTINUATION",
+    }:
+        return BEAR_CALL_MIN_CONFIDENCE
+    return SIDEWAYS_BULLISH_RECLAIM_MIN_CONFIDENCE
+
+
+def playbook_time_window(regime_state: RegimeState) -> tuple[time | None, time | None]:
+    playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
+    bullish_setup = regime_state.metadata.get("bullish_setup")
+    if playbook == "OPEN_DRIVE_BULLISH":
+        return OPEN_DRIVE_BULLISH_START, OPEN_DRIVE_BULLISH_END
+    if playbook == "HIGH_CONFLUENCE_BULLISH_CONTINUATION":
+        return HIGH_CONFLUENCE_BULLISH_START, HIGH_CONFLUENCE_BULLISH_END
+    if playbook == "GAP_UP_BULLISH_CONTINUATION":
+        return GAP_UP_BULLISH_START, GAP_UP_BULLISH_END
+    if playbook == "GAP_DOWN_BULLISH_RECOVERY":
+        return GAP_DOWN_BULLISH_RECOVERY_START, GAP_DOWN_BULLISH_RECOVERY_END
+    if playbook == "EARLY_BALANCE_BULLISH_RECLAIM":
+        return EARLY_BALANCE_BULLISH_START, EARLY_BALANCE_BULLISH_END
+    if playbook == "AFTERNOON_TREND_HOLD_BULLISH":
+        return AFTERNOON_TREND_BULLISH_START, AFTERNOON_TREND_BULLISH_END
+    if playbook == "SIDEWAYS_TO_BULLISH_RECLAIM":
+        start = (
+            time(10, 30)
+            if bullish_setup == "VWAP_HOLD_HIGHER_LOW" and bool(regime_state.metadata.get("early_sideways_bullish_ready"))
+            else SIDEWAYS_BULLISH_RECLAIM_START
+        )
+        return start, SIDEWAYS_BULLISH_RECLAIM_END
+    if playbook == "EARLY_BALANCE_BEARISH_FAILED_RECLAIM":
+        return EARLY_BALANCE_BEARISH_START, EARLY_BALANCE_BEARISH_END
+    if playbook == "SIDEWAYS_TO_BEARISH_REJECTION":
+        return SIDEWAYS_BEARISH_REJECTION_START, SIDEWAYS_BEARISH_REJECTION_END
+    if playbook == "GAP_UP_BEARISH_FAILURE":
+        return GAP_BEARISH_START, GAP_UP_BEARISH_FAILURE_END
+    if playbook == "GAP_DOWN_BEARISH_CONTINUATION":
+        return GAP_BEARISH_START, GAP_DOWN_BEARISH_CONTINUATION_END
+    if playbook == "HIGH_CONFLUENCE_BEARISH_CONTINUATION":
+        return HIGH_CONFLUENCE_BEARISH_START, HIGH_CONFLUENCE_BEARISH_END
+    if playbook == "RANGE_BALANCED_CONDOR":
+        return RANGE_CONDOR_START, RANGE_CONDOR_END
+    return None, None
+
+
+def select_strategy(
+    regime_state: RegimeState,
+    now_time: time,
+    *,
+    allowed_playbook_tiers: tuple[str, ...] = ("A", "B"),
+) -> tuple[StrategyType, list[str]]:
     reasons = list(regime_state.reasons)
     day_archetype = str(regime_state.metadata.get("day_archetype") or "UNCLASSIFIED")
     if now_time < time(9, 15):
@@ -103,22 +203,12 @@ def select_strategy(regime_state: RegimeState, now_time: time) -> tuple[Strategy
         if day_archetype == "HIGH_CONFLUENCE_BEARISH" and (bearish_setup != "HIGH_CONFLUENCE_CONTINUATION" or playbook != "HIGH_CONFLUENCE_BEARISH_CONTINUATION"):
             reasons.append("High-confluence bearish sessions require the dedicated continuation playbook before deployment.")
             return StrategyType.NO_TRADE, reasons
-        if not ENABLE_BEAR_CALL_ACTIVE:
-            if day_archetype == "EARLY_BALANCE_TO_BEARISH" and ENABLE_EARLY_BALANCE_BEARISH_ACTIVE:
-                pass
-            elif day_archetype == "SIDEWAYS_TO_BEARISH" and ENABLE_SIDEWAYS_BEARISH_REJECTION_ACTIVE:
-                pass
-            elif day_archetype == "GAP_UP_FAILURE" and ENABLE_GAP_UP_BEARISH_FAILURE_ACTIVE:
-                pass
-            elif day_archetype == "GAP_DOWN_CONTINUATION" and ENABLE_GAP_DOWN_BEARISH_CONTINUATION_ACTIVE:
-                pass
-            elif day_archetype == "HIGH_CONFLUENCE_BEARISH" and ENABLE_HIGH_CONFLUENCE_BEARISH_ACTIVE:
-                pass
-            else:
-                reasons.append(
-                    f"High-conviction bearish setup ({bearish_setup or 'TREND_FOLLOW'}) detected on {day_archetype}, but Bear Call Credit Spread remains in shadow until it proves positive expectancy on post-2025-09-02 data."
-                )
-                return StrategyType.NO_TRADE, reasons
+        tier = playbook_tier(playbook)
+        if tier not in allowed_playbook_tiers:
+            reasons.append(
+                f"Playbook {playbook} is Tier {tier}; current benchmark mode allows only tiers {', '.join(allowed_playbook_tiers)}."
+            )
+            return StrategyType.NO_TRADE, reasons
         if day_archetype == "OPEN_DRIVE_BEARISH":
             required_bear_start = EARLY_BEAR_CALL_START
             required_bear_end = time(14, 0)
@@ -134,6 +224,9 @@ def select_strategy(regime_state: RegimeState, now_time: time) -> tuple[Strategy
         elif day_archetype == "HIGH_CONFLUENCE_BEARISH":
             required_bear_start = HIGH_CONFLUENCE_BEARISH_START
             required_bear_end = HIGH_CONFLUENCE_BEARISH_END
+        elif day_archetype == "GAP_DOWN_CONTINUATION":
+            required_bear_start = GAP_BEARISH_START
+            required_bear_end = GAP_DOWN_BEARISH_CONTINUATION_END
         else:
             required_bear_start = GAP_BEARISH_START
             required_bear_end = GAP_BEARISH_END
@@ -205,26 +298,11 @@ def select_strategy(regime_state: RegimeState, now_time: time) -> tuple[Strategy
         if playbook == "SIDEWAYS_TO_BULLISH_RECLAIM" and bullish_setup not in {"PULLBACK_RECLAIM", "SHALLOW_CONTINUATION", "VWAP_HOLD_HIGHER_LOW"}:
             reasons.append("Sideways-to-bullish sessions require a pullback reclaim, VWAP hold higher-low, or shallow continuation setup before deployment.")
             return StrategyType.NO_TRADE, reasons
-        if playbook == "OPEN_DRIVE_BULLISH" and not ENABLE_OPEN_DRIVE_BULLISH_ACTIVE:
-            reasons.append("Open-drive bullish playbook remains in shadow until it proves positive expectancy.")
-            return StrategyType.NO_TRADE, reasons
-        if playbook == "HIGH_CONFLUENCE_BULLISH_CONTINUATION" and not ENABLE_HIGH_CONFLUENCE_BULLISH_ACTIVE:
-            reasons.append("High-confluence bullish continuation playbook remains in shadow until it proves positive expectancy.")
-            return StrategyType.NO_TRADE, reasons
-        if playbook == "GAP_UP_BULLISH_CONTINUATION" and not ENABLE_GAP_UP_BULLISH_ACTIVE:
-            reasons.append("Gap-up bullish continuation playbook remains in shadow until it proves positive expectancy.")
-            return StrategyType.NO_TRADE, reasons
-        if playbook == "GAP_DOWN_BULLISH_RECOVERY" and not ENABLE_GAP_DOWN_BULLISH_RECOVERY_ACTIVE:
-            reasons.append("Gap-down bullish recovery playbook remains in shadow until it proves positive expectancy.")
-            return StrategyType.NO_TRADE, reasons
-        if playbook == "EARLY_BALANCE_BULLISH_RECLAIM" and not ENABLE_EARLY_BALANCE_BULLISH_ACTIVE:
-            reasons.append("Early balance bullish reclaim playbook remains in shadow until it proves positive expectancy.")
-            return StrategyType.NO_TRADE, reasons
-        if playbook == "AFTERNOON_TREND_HOLD_BULLISH" and not ENABLE_AFTERNOON_TREND_BULLISH_ACTIVE:
-            reasons.append("Afternoon bullish trend-hold playbook remains in shadow until it proves positive expectancy.")
-            return StrategyType.NO_TRADE, reasons
-        if playbook == "SIDEWAYS_TO_BULLISH_RECLAIM" and not ENABLE_SIDEWAYS_BULLISH_RECLAIM_ACTIVE:
-            reasons.append("Sideways-to-bullish reclaim playbook remains in shadow until it proves positive expectancy.")
+        tier = playbook_tier(playbook)
+        if tier not in allowed_playbook_tiers:
+            reasons.append(
+                f"Playbook {playbook} is Tier {tier}; current benchmark mode allows only tiers {', '.join(allowed_playbook_tiers)}."
+            )
             return StrategyType.NO_TRADE, reasons
         if playbook == "OPEN_DRIVE_BULLISH":
             required_bull_start = OPEN_DRIVE_BULLISH_START
@@ -287,6 +365,11 @@ def select_strategy(regime_state: RegimeState, now_time: time) -> tuple[Strategy
             return StrategyType.NO_TRADE, reasons
         if not ENABLE_RANGE_CONDOR_ACTIVE:
             reasons.append(f"Dedicated range condor playbook remains in shadow until it proves edge on honest data. Balance score {range_balance_score:.2f}.")
+            return StrategyType.NO_TRADE, reasons
+        if playbook_tier(playbook) not in allowed_playbook_tiers:
+            reasons.append(
+                f"Playbook {playbook} is Tier {playbook_tier(playbook)}; current benchmark mode allows only tiers {', '.join(allowed_playbook_tiers)}."
+            )
             return StrategyType.NO_TRADE, reasons
         if regime_state.rv30_pct > 0.20:
             reasons.append("Iron Condor requires a cleaner low-volatility range regime.")

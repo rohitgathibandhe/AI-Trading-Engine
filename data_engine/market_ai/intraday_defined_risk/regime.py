@@ -333,6 +333,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "allowed_width_points": None,
         "target_short_put_buffer_points": None,
         "minimum_net_edge_rupees": None,
+        "setup_quality_score": 0.0,
+        "setup_direction": "NONE",
         "trend_follow_ready_bullish": False,
         "trend_follow_ready_bearish": False,
         "bullish_trend_score": 0.0,
@@ -1366,6 +1368,33 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             metadata["playbook"] = "EVENT_DAY_NO_TRADE"
         elif range_bias:
             metadata["day_archetype"] = "SIDEWAYS_RANGE"
+
+    bullish_setup_quality = (
+        float(metadata.get("bullish_confluence_score") or 0.0)
+        + float(metadata.get("bullish_entry_score") or 0.0)
+        + float(metadata.get("bullish_trend_score") or 0.0)
+        + float(metadata.get("bullish_support_quality_score") or 0.0)
+    )
+    bearish_setup_quality = (
+        float(metadata.get("bearish_confluence_score") or 0.0)
+        + float(metadata.get("bearish_entry_score") or 0.0)
+        + float(metadata.get("bearish_trend_score") or 0.0)
+    )
+    range_setup_quality = float(metadata.get("range_balance_score") or 0.0) + (
+        1.5 if bool(metadata.get("range_entry_ready")) else 0.0
+    )
+    if regime == RegimeLabel.UP_TREND and metadata.get("bullish_entry_ready"):
+        metadata["setup_quality_score"] = round(bullish_setup_quality, 4)
+        metadata["setup_direction"] = "BULLISH"
+    elif regime == RegimeLabel.DOWN_TREND and metadata.get("bearish_entry_ready"):
+        metadata["setup_quality_score"] = round(bearish_setup_quality, 4)
+        metadata["setup_direction"] = "BEARISH"
+    elif regime == RegimeLabel.RANGE and metadata.get("range_entry_ready"):
+        metadata["setup_quality_score"] = round(range_setup_quality, 4)
+        metadata["setup_direction"] = "RANGE"
+    else:
+        metadata["setup_quality_score"] = round(max(bullish_setup_quality, bearish_setup_quality, range_setup_quality), 4)
+        metadata["setup_direction"] = "NEUTRAL"
 
     trade_plan = _build_trade_plan(
         metadata=metadata,
