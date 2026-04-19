@@ -15,6 +15,15 @@ from .dataset import (
 )
 from .learning import LearningStore
 from .monitor import run_live
+from .ops_runtime import (
+    RuntimeMode,
+    build_operator_status_report,
+    build_paper_live_report,
+    build_shadow_live_report,
+    flatten_all_emergency,
+    load_runtime_config,
+    set_runtime_mode,
+)
 from .pipeline import refresh_training_data, run_training_data_pipeline
 from .research import (
     DEFAULT_BACKTEST_START,
@@ -190,6 +199,20 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_parser.add_argument("--start")
     optimize_parser.add_argument("--end")
     optimize_parser.add_argument("--db_dir", default="/tmp/intraday_defined_risk_opt")
+
+    ops_status_parser = subparsers.add_parser("ops_status")
+    ops_status_parser.add_argument("--no_write", action="store_true")
+
+    mode_parser = subparsers.add_parser("set_runtime_mode")
+    mode_parser.add_argument("--mode", choices=[mode.value for mode in RuntimeMode], required=True)
+    mode_parser.add_argument("--live_arm", action="store_true")
+    mode_parser.add_argument("--source", default="cli")
+
+    flatten_parser = subparsers.add_parser("flatten_all")
+    flatten_parser.add_argument("--source", default="cli")
+
+    reports_parser = subparsers.add_parser("write_operational_reports")
+    reports_parser.add_argument("--no_write", action="store_true")
     return parser
 
 
@@ -404,6 +427,27 @@ def main(argv: list[str] | None = None) -> int:
             db_dir=args.db_dir,
         )
         print(result.to_json())
+        return 0
+    if args.command == "ops_status":
+        report = build_operator_status_report(write=not args.no_write)
+        print(json.dumps(report, indent=2, sort_keys=True, default=str))
+        return 0
+    if args.command == "set_runtime_mode":
+        config = set_runtime_mode(args.mode, live_arm=args.live_arm, source=args.source)
+        print(json.dumps(config.to_dict(), indent=2, sort_keys=True, default=str))
+        return 0
+    if args.command == "flatten_all":
+        result = flatten_all_emergency(source=args.source)
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+        return 0
+    if args.command == "write_operational_reports":
+        paths = {
+            "shadow_live_report": build_shadow_live_report(write=not args.no_write),
+            "paper_live_report": build_paper_live_report(write=not args.no_write),
+            "operator_status_report": build_operator_status_report(write=not args.no_write),
+            "runtime_config": load_runtime_config().to_dict(),
+        }
+        print(json.dumps(paths, indent=2, sort_keys=True, default=str))
         return 0
     parser.error("Unknown command")
     return 2

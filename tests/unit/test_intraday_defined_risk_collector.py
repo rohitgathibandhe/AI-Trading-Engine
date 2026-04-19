@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 
-from market_ai.intraday_defined_risk.collector import _flatten_option_chain_payload, run_daily_chain_schedule
+import market_ai.intraday_defined_risk.collector as collector_module
+from market_ai.intraday_defined_risk.collector import (
+    _default_dhan_creds_candidates,
+    _flatten_option_chain_payload,
+    _load_dhan_creds,
+    run_daily_chain_schedule,
+)
 
 
 def test_flatten_option_chain_payload_extracts_bid_ask_and_greeks() -> None:
@@ -92,3 +99,23 @@ def test_run_daily_chain_schedule_captures_targets_and_stops(monkeypatch, tmp_pa
 
     assert [report.decision_time for report in reports] == ["09:30", "10:00", "13:00"]
     assert captured == [("09:30", "2026-04-06"), ("10:00", "2026-04-06"), ("13:00", "2026-04-06")]
+
+
+def test_default_dhan_creds_candidates_prefer_ui_saved_creds_path() -> None:
+    candidates = _default_dhan_creds_candidates()
+
+    assert candidates[0].as_posix().endswith("/data_engine/market_ai/state/creds.json")
+
+
+def test_load_dhan_creds_reads_ui_saved_creds_candidate(monkeypatch, tmp_path) -> None:
+    creds = tmp_path / "market_ai" / "state" / "creds.json"
+    creds.parent.mkdir(parents=True)
+    creds.write_text(json.dumps({"client_id": "1000678336", "access_token": "token-from-ui"}))
+    monkeypatch.delenv("DHAN_CLIENT_ID", raising=False)
+    monkeypatch.delenv("DHAN_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(collector_module, "_default_dhan_creds_candidates", lambda: [creds])
+
+    client_id, token = _load_dhan_creds()
+
+    assert client_id == "1000678336"
+    assert token == "token-from-ui"

@@ -203,6 +203,65 @@
           <div class="muted" id="agent-status" style="margin-top:8px;">Status: unknown</div>
         </div>
       </div>
+      <div class="card" style="margin-top:12px;">
+        <div class="card-header">
+          <div style="font-weight:700;">v83 Intraday Defined-Risk Operations</div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <span class="chip" id="v83-mode-chip">Mode: —</span>
+            <span class="chip" id="v83-health-chip">Health: —</span>
+            <button id="v83-flatten-all" class="action-btn intraday-deploy-off">Emergency Flatten All</button>
+          </div>
+        </div>
+        <div class="summary-bar">
+          <div class="summary-card">
+            <div class="summary-title">Execution Mode</div>
+            <div class="summary-value" id="v83-exec-mode">—</div>
+            <div class="summary-sub" id="v83-live-arm">Live arm: —</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Health Summary</div>
+            <div class="summary-value" id="v83-health-status">—</div>
+            <div class="summary-sub" id="v83-health-reasons">Reasons: —</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Broker Sync / Recovery</div>
+            <div class="summary-value" id="v83-broker-sync">—</div>
+            <div class="summary-sub" id="v83-recovery-status">Recovery: —</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Daily Lock / Block</div>
+            <div class="summary-value" id="v83-daily-lock">—</div>
+            <div class="summary-sub" id="v83-primary-block">Primary block: —</div>
+          </div>
+        </div>
+        <div class="summary-bar">
+          <div class="summary-card">
+            <div class="summary-title">Market Context</div>
+            <div class="summary-sub" id="v83-market-state">State: —</div>
+            <div class="summary-sub" id="v83-tradability">Tradability: —</div>
+            <div class="summary-sub" id="v83-candidate">Candidate: —</div>
+            <div class="summary-sub" id="v83-failure-type">Failure: —</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Freshness</div>
+            <div class="summary-sub" id="v83-feed-freshness">Feed: —</div>
+            <div class="summary-sub" id="v83-chain-freshness">Option chain: —</div>
+            <div class="summary-sub" id="v83-pipeline-freshness">Pipeline: —</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Last Activity</div>
+            <div class="summary-sub" id="v83-last-order">Last order: —</div>
+            <div class="summary-sub" id="v83-last-sim">Last simulated: —</div>
+            <div class="summary-sub" id="v83-last-exit">Last exit: —</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-title">Promotion Gates</div>
+            <div class="summary-sub" id="v83-gate-shadow">Research → Shadow: —</div>
+            <div class="summary-sub" id="v83-gate-paper">Shadow → Paper: —</div>
+            <div class="summary-sub" id="v83-gate-micro">Paper → Micro: —</div>
+          </div>
+        </div>
+      </div>
     </section>
 
     <!-- Live Trades -->
@@ -1092,6 +1151,58 @@
       if (!raw) return "—";
       return raw.split("_").map(x => x.charAt(0) + x.slice(1).toLowerCase()).join(" ");
     };
+    const setText = (id, value) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = value;
+    };
+
+    function renderV83OpsStatus(ops) {
+      const payload = ops || {};
+      const cfg = payload.runtime_config || {};
+      const state = payload.runtime_state || {};
+      const health = payload.health || {};
+      const components = health.components || {};
+      const sync = payload.broker_sync_status || {};
+      const recovery = payload.recovery_status || {};
+      const gates = payload.promotion_gates || {};
+      const candidate = state.last_candidate || {};
+      const candidateMeta = candidate.metadata || {};
+      const mode = cfg.mode || "—";
+      const healthStatus = health.status || "—";
+      setText("v83-mode-chip", `Mode: ${mode}`);
+      setText("v83-health-chip", `Health: ${healthStatus}`);
+      setText("v83-exec-mode", humanizeReason(mode));
+      setText("v83-live-arm", `Live arm: ${cfg.live_arm ? "ARMED" : "not armed"}`);
+      setText("v83-health-status", humanizeReason(healthStatus));
+      setText("v83-health-reasons", `Reasons: ${(health.block_reasons || []).slice(0, 3).join(", ") || "none"}`);
+      setText("v83-broker-sync", humanizeReason(sync.status || "UNKNOWN"));
+      setText("v83-recovery-status", `Recovery: ${recovery.active ? humanizeReason(recovery.reason || "ACTIVE") : "Clear"}`);
+      const dailyLock = state.daily_lock || {};
+      setText("v83-daily-lock", dailyLock.active ? "LOCKED" : "Clear");
+      setText("v83-primary-block", `Primary block: ${humanizeReason(state.primary_block_reason || "NONE")}`);
+      setText("v83-market-state", `State: ${humanizeReason(candidateMeta.market_state || "—")}`);
+      setText("v83-tradability", `Tradability: ${humanizeReason(candidateMeta.tradability_class || candidateMeta.regime_tradability || "—")}`);
+      setText("v83-candidate", `Candidate: ${humanizeReason(candidateMeta.playbook || "—")} / ${humanizeReason(candidateMeta.setup_subtype || candidateMeta.bearish_subtype || "—")}`);
+      setText("v83-failure-type", `Failure: ${humanizeReason(candidateMeta.failure_type || "—")}`);
+      const feed = components.market_feed_health || {};
+      const chain = components.option_chain_health || {};
+      const pipeline = components.data_pipeline_health || {};
+      setText("v83-feed-freshness", `Feed: ${humanizeReason(feed.status || "—")} (${feed.age_sec ?? "—"}s)`);
+      setText("v83-chain-freshness", `Option chain: ${humanizeReason(chain.status || "—")} (${chain.age_sec ?? "—"}s)`);
+      setText("v83-pipeline-freshness", `Pipeline: ${humanizeReason(pipeline.status || "—")}`);
+      const lastOrder = state.last_order || {};
+      const lastSim = state.last_simulated_order || {};
+      setText("v83-last-order", `Last order: ${lastOrder.event || lastOrder.status || "—"}`);
+      setText("v83-last-sim", `Last simulated: ${lastSim.event || lastSim.playbook || "—"}`);
+      setText("v83-last-exit", `Last exit: ${humanizeReason(state.last_exit_reason || "—")}`);
+      setText("v83-gate-shadow", `Research → Shadow: ${(gates.research_to_shadow_live || {}).passed ? "PASS" : "WAIT"}`);
+      setText("v83-gate-paper", `Shadow → Paper: ${(gates.shadow_live_to_paper_live || {}).passed ? "PASS" : "WAIT"}`);
+      setText("v83-gate-micro", `Paper → Micro: ${(gates.paper_live_to_micro_live || {}).passed ? "PASS" : "WAIT"}`);
+      const modeChip = document.getElementById("v83-mode-chip");
+      const healthChip = document.getElementById("v83-health-chip");
+      if (modeChip) modeChip.style.color = mode === "LIVE_DISABLED" ? "var(--neg)" : "var(--pos)";
+      if (healthChip) healthChip.style.color = healthStatus === "HEALTHY" ? "var(--pos)" : "var(--neg)";
+    }
 
     function renderIntradayPerformance(perf) {
       const data = perf || {};
@@ -1825,6 +1936,7 @@
     async function refreshAgentStatus() {
       const data = await fetchJSON("/api/control/status");
       latestControlStatus = data || {};
+      renderV83OpsStatus(data.intraday_defined_risk_ops || {});
       if (!data.running) {
         document.getElementById("agent-status").textContent = "Stopped";
         _setIntradayDeployButtonState({
@@ -1842,6 +1954,32 @@
       const aiLock = !!data.bkm_ai_entry_lock_active;
       const aiSuffix = aiAction ? ` | AI: ${aiAction}${aiScore ? ` (${aiScore})` : ""}${aiSev ? ` ${aiSev}` : ""}${aiLock ? " [ENTRY LOCK]" : ""}` : "";
       document.getElementById("agent-status").textContent = `Running (pid ${data.pid})${aiSuffix}`;
+    }
+
+    async function flattenV83All() {
+      const btn = document.getElementById("v83-flatten-all");
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Flatten requested…";
+      }
+      try {
+        const resp = await fetch("/api/intraday_defined_risk/flatten_all", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ source: "ui" }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || "flatten failed");
+        renderV83OpsStatus(data.ops || {});
+        document.getElementById("agent-status").textContent = "v83 flatten-all request logged";
+      } catch (e) {
+        document.getElementById("agent-status").textContent = `v83 flatten failed: ${e.message || "error"}`;
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = "Emergency Flatten All";
+        }
+      }
     }
 
     function _fmtNum(v, digits = 2) {
@@ -2336,6 +2474,7 @@
     document.getElementById("bkm-ai-clear-lock").addEventListener("click", toggleBkmAiProtection);
     document.getElementById("intraday-ai-deploy").addEventListener("click", deployIntradayRecommendation);
     document.getElementById("paper-close-all").addEventListener("click", closePaperTrades);
+    document.getElementById("v83-flatten-all").addEventListener("click", flattenV83All);
 
     function pageVisible() {
       return document.visibilityState === "visible";
@@ -2351,6 +2490,8 @@
         loadPnl().catch(() => {});
       } else if (activeTab === "live") {
         loadLive().catch(() => {});
+      } else if (activeTab === "control") {
+        refreshAgentStatus().catch(() => {});
       } else if (activeTab === "state") {
         loadState().catch(() => {});
       }

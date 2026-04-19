@@ -17,6 +17,21 @@ from .data_models import (
 )
 from .execution import build_no_trade_decision, build_open_position, build_trade_decision, evaluate_exit, validate_entry_time
 from .learning import LearningStore
+from .ops_runtime import (
+    RuntimeMode,
+    build_operator_status_report,
+    build_unified_health,
+    evaluate_entry_gate,
+    load_paper_position,
+    load_runtime_config,
+    load_runtime_state,
+    log_shadow_decision,
+    manage_paper_position,
+    open_position_from_decision,
+    record_paper_entry,
+    reconcile_positions,
+    save_runtime_state,
+)
 from .regime import classify_regime
 from .risk import assess_trade_risk, kill_switch_triggered
 from .strategy import (
@@ -147,6 +162,20 @@ class BrokerExecutor(Protocol):
     def enter_trade(self, decision: DecisionOutput) -> dict[str, object]: ...
 
     def exit_trade(self, position: OpenPosition, reason: str) -> dict[str, object]: ...
+
+
+def _broker_positions_from_executor(executor: object) -> list[dict[str, object]] | None:
+    for attr in ("get_positions_raw", "get_positions_live", "positions"):
+        fn = getattr(executor, attr, None)
+        if not callable(fn):
+            continue
+        try:
+            rows = fn()
+        except Exception:
+            return None
+        if isinstance(rows, list):
+            return [dict(row) for row in rows if isinstance(row, dict)]
+    return None
 
 
 class IntradayDefinedRiskAgent:
@@ -556,23 +585,83 @@ def run_live(config: dict[str, object]) -> None:
     executor = executor_cls(config)
     learning_store = LearningStore(config.get("learning_db_path", "/tmp/intraday_defined_risk_learning.sqlite3"))
     agent = IntradayDefinedRiskAgent(learning_store=learning_store)
+    runtime_config = load_runtime_config()
+    if runtime_config.mode == RuntimeMode.PAPER_LIVE:
+        agent.open_position = load_paper_position()
     poll_seconds = int(config.get("poll_seconds", 30))
 
     while True:
+        runtime_config = load_runtime_config()
         snapshot = provider.current_snapshot()
+        health = build_unified_health(config=runtime_config, snapshot=snapshot)
+        broker_positions = _broker_positions_from_executor(executor)
+        reconcile_positions(mode=runtime_config.mode, broker_positions=broker_positions)
+        if runtime_config.mode == RuntimeMode.LIVE_DISABLED:
+            decision = build_no_trade_decision(
+                RegimeLabel.NO_TRADE.value,
+                ["Runtime mode is LIVE_DISABLED; no shadow, paper, or broker execution is allowed."],
+                extra_metadata={"runtime_mode": runtime_config.mode.value, "primary_block_reason": "LIVE_DISABLED"},
+            )
+            print(decision.to_json())
+            build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
+            sleep(poll_seconds)
+            continue
+        if runtime_config.mode in {RuntimeMode.RESEARCH}:
+            decision = agent.evaluate(snapshot)
+            print(decision.to_json())
+            build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
+            sleep(poll_seconds)
+            continue
+        if runtime_config.mode == RuntimeMode.PAPER_LIVE:
+            paper_position = manage_paper_position(snapshot)
+            agent.open_position = paper_position
+            if paper_position is not None:
+                build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
+                sleep(poll_seconds)
+                continue
+
         if agent.open_position:
             current_position = agent.open_position
             exit_decision = agent.manage_position(snapshot)
             if exit_decision is not None and current_position is not None:
                 reason = exit_decision.rationale[-2] if len(exit_decision.rationale) >= 2 else "EXIT"
-                executor.exit_trade(current_position, reason)
+                if runtime_config.mode == RuntimeMode.MICRO_LIVE and runtime_config.live_arm:
+                    executor.exit_trade(current_position, reason)
                 print(exit_decision.to_json())
         else:
             decision = agent.evaluate(snapshot)
             print(decision.to_json())
             if decision.action == "TRADE":
-                executor.enter_trade(decision)
-                agent.start_position(snapshot, decision)
+                if runtime_config.mode == RuntimeMode.SHADOW_LIVE:
+                    log_shadow_decision(decision, snapshot=snapshot)
+                    runtime_state = load_runtime_state(config=runtime_config)
+                    runtime_state["mode"] = runtime_config.mode.value
+                    runtime_state["live_arm"] = runtime_config.live_arm
+                    runtime_state["primary_block_reason"] = "SHADOW_WOULD_TRADE"
+                    runtime_state["last_candidate"] = decision.to_dict()
+                    runtime_state["last_decision_at"] = snapshot.timestamp.isoformat()
+                    save_runtime_state(runtime_state)
+                else:
+                    gate = evaluate_entry_gate(decision, snapshot, config=runtime_config, health=health)
+                    if gate["allowed"] and runtime_config.mode == RuntimeMode.PAPER_LIVE:
+                        position = open_position_from_decision(decision, snapshot)
+                        agent.open_position = position
+                        record_paper_entry(position, decision=decision, snapshot=snapshot, gate=gate)
+                    elif gate["allowed"] and runtime_config.mode == RuntimeMode.MICRO_LIVE and runtime_config.live_arm:
+                        executor.enter_trade(decision)
+                        agent.start_position(snapshot, decision)
+                    else:
+                        log_shadow_decision(decision, snapshot=snapshot, block_reason=str(gate.get("primary_block_reason") or "ENTRY_GATE_BLOCKED"))
+                        runtime_state = load_runtime_state(config=runtime_config)
+                        runtime_state["mode"] = runtime_config.mode.value
+                        runtime_state["live_arm"] = runtime_config.live_arm
+                        runtime_state["primary_block_reason"] = gate.get("primary_block_reason")
+                        runtime_state["last_candidate"] = decision.to_dict()
+                        runtime_state["last_decision_at"] = snapshot.timestamp.isoformat()
+                        save_runtime_state(runtime_state)
+            elif runtime_config.mode == RuntimeMode.SHADOW_LIVE:
+                log_shadow_decision(decision, snapshot=snapshot, block_reason="NO_TRADE_DECISION")
+        build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
         sleep(poll_seconds)
 
 

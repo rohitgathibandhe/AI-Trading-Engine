@@ -200,16 +200,22 @@ def run_decision_time_schedule(
     return reports
 
 
+def _default_dhan_creds_candidates() -> list[Path]:
+    market_ai_root = Path(__file__).resolve().parents[1]
+    data_engine_root = market_ai_root.parent
+    repo_root = data_engine_root.parent
+    return [
+        market_ai_root / "state" / "creds.json",
+        data_engine_root / "state" / "creds.json",
+        repo_root / "state" / "creds.json",
+    ]
+
+
 def _load_dhan_creds(creds_path: str | Path | None = None) -> tuple[str, str]:
     if creds_path:
         candidates = [Path(creds_path)]
     else:
-        engine_root = Path(__file__).resolve().parents[2]
-        repo_root = engine_root.parent
-        candidates = [
-            engine_root / "state" / "creds.json",
-            repo_root / "state" / "creds.json",
-        ]
+        candidates = _default_dhan_creds_candidates()
 
     client_id = (os.environ.get("DHAN_CLIENT_ID") or "").strip()
     token = (os.environ.get("DHAN_ACCESS_TOKEN") or "").strip()

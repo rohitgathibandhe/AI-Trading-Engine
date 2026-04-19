@@ -116,6 +116,13 @@ from data_engine.market_ai.modules.analytics.price_action_patterns import (  # t
 from data_engine.market_ai.modules.analytics.intraday_trade_planner import (  # type: ignore
     build_trade_plan as _shared_build_trade_plan,
 )
+from data_engine.market_ai.intraday_defined_risk.ops_runtime import (  # type: ignore
+    RuntimeMode as V83RuntimeMode,
+    build_operator_status_report as _v83_operator_status_report,
+    flatten_all_emergency as _v83_flatten_all_emergency,
+    load_runtime_config as _v83_load_runtime_config,
+    set_runtime_mode as _v83_set_runtime_mode,
+)
 
 
 def _parse_float(val: Any, default: float = 0.0) -> float:
@@ -3093,6 +3100,27 @@ def _send_telegram_test_message(text: Optional[str] = None) -> Dict[str, Any]:
     return forwarder.send_test_message(creds=creds if isinstance(creds, dict) else {}, text=text)
 
 
+def _load_v83_ops_status() -> Dict[str, Any]:
+    try:
+        cfg = _v83_load_runtime_config()
+        broker_positions = None
+        if cfg.mode == V83RuntimeMode.MICRO_LIVE:
+            broker_payload = _load_broker_live_positions()
+            positions = broker_payload.get("positions") if isinstance(broker_payload, dict) else None
+            broker_positions = positions if isinstance(positions, list) else None
+        return _v83_operator_status_report(write=True, broker_positions=broker_positions)
+    except Exception as exc:
+        return {
+            "generated_at": _ist_now().isoformat(timespec="seconds"),
+            "runtime_config": {"mode": "UNKNOWN", "live_arm": False},
+            "runtime_state": {"primary_block_reason": "OPS_STATUS_ERROR"},
+            "health": {"status": "BLOCKED", "block_reasons": [str(exc)], "components": {}},
+            "broker_sync_status": {"status": "UNKNOWN", "reason": "OPS_STATUS_ERROR"},
+            "recovery_status": {"active": True, "reason": "OPS_STATUS_ERROR"},
+            "error": str(exc),
+        }
+
+
 def _is_process_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -3467,6 +3495,35 @@ class PaperHandler(SimpleHTTPRequestHandler):
                     raise
                 self._send_json(_api_error_payload(exc, code="INTRADAY_AI_DEPLOY_HANDLER_CRASH"), status=500)
             return
+        if self.path.startswith("/api/intraday_defined_risk/runtime_mode"):
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+                mode = str((data or {}).get("mode") or "").strip().upper()
+                if mode not in {item.value for item in V83RuntimeMode}:
+                    self._send_json({"ok": False, "error": "INVALID_RUNTIME_MODE", "mode": mode}, status=400)
+                    return
+                live_arm = bool((data or {}).get("live_arm", False))
+                config = _v83_set_runtime_mode(mode, live_arm=live_arm, source=str((data or {}).get("source") or "ui"))
+                self._send_json({"ok": True, "runtime_config": config.to_dict(), "ops": _load_v83_ops_status()})
+            except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                self._send_json(_api_error_payload(exc, code="V83_RUNTIME_MODE_HANDLER_CRASH"), status=500)
+            return
+        if self.path.startswith("/api/intraday_defined_risk/flatten_all"):
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+                result = _v83_flatten_all_emergency(source=str((data or {}).get("source") or "ui"))
+                self._send_json({"ok": True, "result": result, "ops": _load_v83_ops_status()})
+            except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                self._send_json(_api_error_payload(exc, code="V83_FLATTEN_ALL_HANDLER_CRASH"), status=500)
+            return
         if self.path.startswith("/api/control/restart"):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -3763,6 +3820,12 @@ class PaperHandler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return
+        if self.path.startswith("/api/intraday_defined_risk/ops_status"):
+            try:
+                self._send_json({"ok": True, "ops": _load_v83_ops_status()})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
         if self.path.startswith("/api/control/status"):
             try:
                 settings = _json_read(SETTINGS_JSON)
@@ -3834,6 +3897,7 @@ class PaperHandler(SimpleHTTPRequestHandler):
                     except Exception:
                         proposal_count = 0
                 last_alert = alerts[-1] if alerts else {}
+                v83_ops = _load_v83_ops_status()
                 self._send_json(
                     {
                         "running": bool(running),
@@ -3976,6 +4040,11 @@ class PaperHandler(SimpleHTTPRequestHandler):
                         "telegram_alerts_last_error": telegram_status.get("last_error"),
                         "batman_bkm_tuning_proposals_pending": proposal_count,
                         "batman_bkm_tuning_last_generated_at": advice.get("generated_at") if isinstance(advice, dict) else None,
+                        "intraday_defined_risk_ops": v83_ops,
+                        "v83_execution_mode": ((v83_ops.get("runtime_config") or {}).get("mode") if isinstance(v83_ops, dict) else None),
+                        "v83_live_arm": bool(((v83_ops.get("runtime_config") or {}).get("live_arm") if isinstance(v83_ops, dict) else False)),
+                        "v83_health_status": ((v83_ops.get("health") or {}).get("status") if isinstance(v83_ops, dict) else None),
+                        "v83_primary_block_reason": ((v83_ops.get("runtime_state") or {}).get("primary_block_reason") if isinstance(v83_ops, dict) else None),
                     }
                 )
             except Exception as exc:

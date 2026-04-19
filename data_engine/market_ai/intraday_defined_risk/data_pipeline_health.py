@@ -128,6 +128,8 @@ def _pid_status(path: Path) -> dict[str, Any]:
         return {"exists": True, "pid": None, "alive": False, "status": "INVALID"}
     try:
         os.kill(pid, 0)
+    except PermissionError:
+        alive = True
     except OSError:
         alive = False
     else:
