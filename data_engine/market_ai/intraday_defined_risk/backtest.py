@@ -50,6 +50,34 @@ MONETIZATION_REJECTION_REASONS = {
     "NET_EDGE_TOO_LOW",
 }
 
+BULLISH_SHADOW_SUBTYPES = {
+    "VWAP_RECLAIM_HIGHER_LOW",
+    "OR_HOLD_BULLISH_CONTINUATION",
+    "LATE_SESSION_BULLISH_RECLAIM",
+    "SHALLOW_PULLBACK_CONTINUATION",
+    "EMA20_AND_VWAP_ALIGNED_BULLISH",
+}
+
+BEARISH_CONTINUATION_SUBTYPES = {
+    "GAP_DOWN_FAILED_BOUNCE",
+    "VWAP_REJECTION_CONTINUATION",
+    "OR_LOW_RETEST_FAILURE",
+    "MIDDAY_WEAK_RECLAIM_CONTINUATION",
+    "AFTERNOON_TREND_HOLD_BEARISH",
+}
+
+BEARISH_FAILED_RECLAIM_SUBTYPES = {
+    "EMA20_FAILED_RECLAIM",
+    "VWAP_FAILED_RECLAIM",
+    "LOWER_HIGH_FAILED_RECLAIM",
+    "SUPPLY_ZONE_FAILED_RECLAIM",
+    "CHOCH_FAILED_RECLAIM",
+}
+
+BEARISH_REJECTION_SUBTYPES = {
+    "BEARISH_REJECTION_TRANSITION",
+}
+
 
 def _build_funnel_report(decisions: list[dict[str, object]], trades: list[dict[str, object]]) -> dict[str, object]:
     setups_detected = 0
@@ -191,6 +219,315 @@ def _build_funnel_report(decisions: list[dict[str, object]], trades: list[dict[s
     }
 
 
+def _build_regime_tradability_report(decisions: list[dict[str, object]], trades: list[dict[str, object]]) -> dict[str, object]:
+    detected_by_tradability: Counter[str] = Counter()
+    executed_by_tradability: Counter[str] = Counter()
+    pnl_by_tradability: defaultdict[str, float] = defaultdict(float)
+    pnl_by_playbook: defaultdict[str, float] = defaultdict(float)
+    avoided_by_playbook: Counter[str] = Counter()
+    low_edge_filtered_by_playbook: Counter[str] = Counter()
+    avoided_bullish_playbooks: Counter[str] = Counter()
+
+    for decision in decisions:
+        metadata = decision.get("metadata") or {}
+        funnel = metadata.get("trade_funnel") or {}
+        tradability = str(funnel.get("regime_tradability") or metadata.get("regime_tradability") or "UNKNOWN")
+        playbook = str(funnel.get("playbook") or metadata.get("playbook") or "UNKNOWN")
+        if bool(funnel.get("setup_detected")):
+            detected_by_tradability[tradability] += 1
+        reason = str(funnel.get("canonical_rejection_reason") or "NONE")
+        if reason == "STRUCTURALLY_NOT_MONETIZABLE":
+            avoided_by_playbook[playbook] += 1
+            if str(metadata.get("setup_direction") or "") == "BULLISH":
+                avoided_bullish_playbooks[playbook] += 1
+        if reason == "LOW_EDGE_FILTERED":
+            low_edge_filtered_by_playbook[playbook] += 1
+
+    for trade in trades:
+        tradability = str(trade.get("regime_tradability") or "UNKNOWN")
+        playbook = str(trade.get("playbook") or "UNKNOWN")
+        pnl = float(trade.get("pnl_rupees") or 0.0)
+        executed_by_tradability[tradability] += 1
+        pnl_by_tradability[tradability] += pnl
+        pnl_by_playbook[playbook] += pnl
+
+    return {
+        "detected_by_tradability": dict(detected_by_tradability),
+        "executed_trades_by_tradability": dict(executed_by_tradability),
+        "pnl_by_tradability": {key: round(value, 2) for key, value in pnl_by_tradability.items()},
+        "regime_wise_pnl": {key: round(value, 2) for key, value in pnl_by_playbook.items()},
+        "trades_avoided_due_to_not_tradable": int(sum(avoided_by_playbook.values())),
+        "avoided_due_to_not_tradable_by_playbook": dict(avoided_by_playbook),
+        "low_edge_filtered_by_playbook": dict(low_edge_filtered_by_playbook),
+        "skipped_bullish_regimes": {
+            "count": int(sum(avoided_bullish_playbooks.values())),
+            "by_playbook": dict(avoided_bullish_playbooks),
+        },
+    }
+
+
+def _build_market_state_report(decisions: list[dict[str, object]], trades: list[dict[str, object]]) -> dict[str, object]:
+    detected_by_state: Counter[str] = Counter()
+    passed_quality_by_state: Counter[str] = Counter()
+    executed_by_state: Counter[str] = Counter()
+    wins_by_state: Counter[str] = Counter()
+    losses_by_state: Counter[str] = Counter()
+    pnl_by_state: defaultdict[str, float] = defaultdict(float)
+    state_confidence_samples: defaultdict[str, list[float]] = defaultdict(list)
+
+    for decision in decisions:
+        metadata = decision.get("metadata") or {}
+        funnel = metadata.get("trade_funnel") or {}
+        state = str(funnel.get("market_state") or metadata.get("market_state") or "UNKNOWN")
+        if bool(funnel.get("setup_detected")):
+            detected_by_state[state] += 1
+        if bool(funnel.get("passed_setup_quality")):
+            passed_quality_by_state[state] += 1
+        state_confidence = float(funnel.get("state_confidence_score") or metadata.get("state_confidence_score") or 0.0)
+        state_confidence_samples[state].append(state_confidence)
+
+    for trade in trades:
+        state = str(trade.get("market_state") or "UNKNOWN")
+        pnl = float(trade.get("pnl_rupees") or 0.0)
+        executed_by_state[state] += 1
+        pnl_by_state[state] += pnl
+        if pnl > 0:
+            wins_by_state[state] += 1
+        elif pnl < 0:
+            losses_by_state[state] += 1
+
+    return {
+        "setups_detected_by_state": dict(detected_by_state),
+        "setups_passing_quality_by_state": dict(passed_quality_by_state),
+        "executed_trades_by_state": dict(executed_by_state),
+        "wins_losses_by_state": {
+            state: {
+                "wins": wins_by_state.get(state, 0),
+                "losses": losses_by_state.get(state, 0),
+            }
+            for state in sorted(set(detected_by_state) | set(executed_by_state))
+        },
+        "pnl_by_state": {state: round(value, 2) for state, value in pnl_by_state.items()},
+        "average_state_confidence_by_state": {
+            state: round(mean(values), 4) if values else 0.0
+            for state, values in state_confidence_samples.items()
+        },
+    }
+
+
+def _build_context_layer_report(decisions: list[dict[str, object]], trades: list[dict[str, object]]) -> dict[str, object]:
+    detected_by_failure: Counter[str] = Counter()
+    executed_by_failure: Counter[str] = Counter()
+    pnl_by_failure: defaultdict[str, float] = defaultdict(float)
+    action_by_state: dict[str, Counter[str]] = defaultdict(Counter)
+    action_by_failure: dict[str, Counter[str]] = defaultdict(Counter)
+    strategy_by_state: dict[str, Counter[str]] = defaultdict(Counter)
+
+    for decision in decisions:
+        metadata = decision.get("metadata") or {}
+        funnel = metadata.get("trade_funnel") or {}
+        state = str(funnel.get("market_state") or metadata.get("market_state") or "UNKNOWN")
+        failure_type = str(funnel.get("failure_type") or metadata.get("failure_type") or "NONE")
+        action = str(decision.get("action") or "UNKNOWN")
+        strategy = str(decision.get("strategy") or "UNKNOWN")
+        action_by_state[state][action] += 1
+        action_by_failure[failure_type][action] += 1
+        strategy_by_state[state][strategy] += 1
+        if bool(funnel.get("setup_detected")):
+            detected_by_failure[failure_type] += 1
+
+    for trade in trades:
+        failure_type = str(trade.get("failure_type") or "NONE")
+        pnl = float(trade.get("pnl_rupees") or 0.0)
+        executed_by_failure[failure_type] += 1
+        pnl_by_failure[failure_type] += pnl
+
+    return {
+        "setups_detected_by_failure_type": dict(detected_by_failure),
+        "executed_trades_by_failure_type": dict(executed_by_failure),
+        "pnl_by_failure_type": {key: round(value, 2) for key, value in pnl_by_failure.items()},
+        "actions_by_market_state": {key: dict(value) for key, value in action_by_state.items()},
+        "actions_by_failure_type": {key: dict(value) for key, value in action_by_failure.items()},
+        "strategies_by_market_state": {key: dict(value) for key, value in strategy_by_state.items()},
+    }
+
+
+def _candidate_snapshot(candidate: dict[str, object] | None) -> dict[str, object] | None:
+    if not candidate:
+        return None
+    keys = [
+        "requested_width_points",
+        "width_points",
+        "call_width_points",
+        "put_width_points",
+        "shape_label",
+        "delta_band_label",
+        "short_strike",
+        "long_strike",
+        "short_call_strike",
+        "long_call_strike",
+        "short_put_strike",
+        "long_put_strike",
+        "credit_points",
+        "credit_width_ratio",
+        "required_credit_width_ratio",
+        "hedge_cost_ratio",
+        "max_hedge_cost_ratio",
+        "anchor_distance_points",
+        "short_delta_abs",
+        "monetization_score",
+        "canonical_rejection_reason",
+        "condor_profile",
+    ]
+    return {key: candidate.get(key) for key in keys if key in candidate}
+
+
+def _build_subtype_report(
+    decisions: list[dict[str, object]],
+    trades: list[dict[str, object]],
+    *,
+    subtype_field: str,
+    allowed_subtypes: set[str],
+    family_field: str | None = None,
+    family_value: str | None = None,
+) -> dict[str, object]:
+    setups_detected: Counter[str] = Counter()
+    setups_passed_quality: Counter[str] = Counter()
+    executed_trades: Counter[str] = Counter()
+    wins: Counter[str] = Counter()
+    losses: Counter[str] = Counter()
+    rejection_reasons: dict[str, Counter[str]] = defaultdict(Counter)
+    pnl_by_subtype: dict[str, list[float]] = defaultdict(list)
+    best_candidate_profile: dict[str, tuple[float, dict[str, object]]] = {}
+
+    for decision in decisions:
+        metadata = decision.get("metadata") or {}
+        funnel = metadata.get("trade_funnel") or {}
+        if family_field is not None and str(funnel.get(family_field) or metadata.get(family_field) or "") != str(family_value):
+            continue
+        subtype = str(funnel.get(subtype_field) or metadata.get(subtype_field) or "")
+        if subtype not in allowed_subtypes:
+            continue
+        setups_detected[subtype] += 1
+        if funnel.get("passed_setup_quality"):
+            setups_passed_quality[subtype] += 1
+        reason = str(funnel.get("canonical_rejection_reason") or "NONE")
+        if reason != "NONE":
+            rejection_reasons[subtype][reason] += 1
+        candidate = funnel.get("best_candidate") or funnel.get("best_failed_candidate")
+        monetization_score = float((candidate or {}).get("monetization_score") or funnel.get("monetization_score") or 0.0)
+        prior = best_candidate_profile.get(subtype)
+        if candidate is not None and (prior is None or monetization_score > prior[0]):
+            best_candidate_profile[subtype] = (monetization_score, _candidate_snapshot(candidate) or {})
+
+    for trade in trades:
+        if family_field is not None and str(trade.get(family_field) or "") != str(family_value):
+            continue
+        subtype = str(trade.get(subtype_field) or trade.get("setup_subtype") or "")
+        if subtype not in allowed_subtypes:
+            continue
+        executed_trades[subtype] += 1
+        pnl = float(trade.get("pnl_rupees") or 0.0)
+        pnl_by_subtype[subtype].append(pnl)
+        if pnl > 0:
+            wins[subtype] += 1
+        elif pnl < 0:
+            losses[subtype] += 1
+
+    rows = []
+    for subtype in sorted(allowed_subtypes, key=lambda item: (-(setups_detected[item]), item)):
+        pnl_values = pnl_by_subtype.get(subtype, [])
+        rows.append(
+            {
+                "subtype": subtype,
+                "setups_detected": setups_detected.get(subtype, 0),
+                "setups_passed_setup_quality": setups_passed_quality.get(subtype, 0),
+                "executed_trades": executed_trades.get(subtype, 0),
+                "wins": wins.get(subtype, 0),
+                "losses": losses.get(subtype, 0),
+                "average_pnl_rupees": round(mean(pnl_values), 2) if pnl_values else 0.0,
+                "total_pnl_rupees": round(sum(pnl_values), 2) if pnl_values else 0.0,
+                "top_rejection_reasons": rejection_reasons.get(subtype, Counter()).most_common(5),
+                "best_monetization_candidate": (best_candidate_profile.get(subtype) or (None, None))[1],
+            }
+        )
+
+    expectancy_rows = [row for row in rows if row["executed_trades"] > 0]
+    recommended = None
+    if expectancy_rows:
+        recommended = max(expectancy_rows, key=lambda row: (row["average_pnl_rupees"], row["wins"] - row["losses"]))["subtype"]
+    elif rows:
+        recommended = max(rows, key=lambda row: row["setups_passed_setup_quality"])["subtype"]
+    return {
+        "rows": rows,
+        "recommended_subtype": recommended,
+    }
+
+
+def _build_condor_opportunity_report(decisions: list[dict[str, object]], trades: list[dict[str, object]]) -> dict[str, object]:
+    relevant_decisions = [
+        decision
+        for decision in decisions
+        if str((decision.get("metadata") or {}).get("playbook") or "") == "RANGE_BALANCED_CONDOR"
+    ]
+    candidate_reason_counts: Counter[str] = Counter()
+    delta_band_counts: Counter[str] = Counter()
+    delta_band_valid: Counter[str] = Counter()
+    shape_counts: Counter[str] = Counter()
+    shape_valid: Counter[str] = Counter()
+    best_candidate: tuple[float, dict[str, object]] | None = None
+    for decision in relevant_decisions:
+        funnel = ((decision.get("metadata") or {}).get("trade_funnel") or {})
+        for candidate in funnel.get("candidate_evaluations") or []:
+            label = str(candidate.get("delta_band_label") or "UNKNOWN")
+            shape = str(candidate.get("shape_label") or "UNKNOWN")
+            delta_band_counts[label] += 1
+            shape_counts[shape] += 1
+            if candidate.get("valid"):
+                delta_band_valid[label] += 1
+                shape_valid[shape] += 1
+                score = float(candidate.get("monetization_score") or 0.0)
+                if best_candidate is None or score > best_candidate[0]:
+                    best_candidate = (score, _candidate_snapshot(candidate) or {})
+            else:
+                candidate_reason_counts[str(candidate.get("canonical_rejection_reason") or "UNKNOWN")] += 1
+
+    delta_band_pass_rate = {
+        label: {
+            "candidates": delta_band_counts[label],
+            "valid": delta_band_valid[label],
+            "pass_rate": round(delta_band_valid[label] / delta_band_counts[label], 4) if delta_band_counts[label] else 0.0,
+        }
+        for label in sorted(delta_band_counts)
+    }
+    shape_pass_rate = {
+        label: {
+            "candidates": shape_counts[label],
+            "valid": shape_valid[label],
+            "pass_rate": round(shape_valid[label] / shape_counts[label], 4) if shape_counts[label] else 0.0,
+        }
+        for label in sorted(shape_counts)
+    }
+    symmetric_valid = sum(count for label, count in shape_valid.items() if label == "SYMMETRIC")
+    symmetric_total = sum(count for label, count in shape_counts.items() if label == "SYMMETRIC")
+    asymmetric_valid = sum(count for label, count in shape_valid.items() if label.startswith("ASYMMETRIC"))
+    asymmetric_total = sum(count for label, count in shape_counts.items() if label.startswith("ASYMMETRIC"))
+    return {
+        "decisions_seen": len(relevant_decisions),
+        "executed_trades": sum(1 for trade in trades if str(trade.get("playbook") or "") == "RANGE_BALANCED_CONDOR"),
+        "top_failure_reasons": candidate_reason_counts.most_common(10),
+        "delta_band_pass_rate": delta_band_pass_rate,
+        "best_delta_band_label": max(delta_band_pass_rate.items(), key=lambda item: item[1]["pass_rate"])[0] if delta_band_pass_rate else None,
+        "shape_pass_rate": shape_pass_rate,
+        "asymmetric_improves_conversion": (
+            (asymmetric_valid / asymmetric_total) > (symmetric_valid / symmetric_total)
+            if asymmetric_total and symmetric_total
+            else False
+        ),
+        "best_valid_candidate_profile": best_candidate[1] if best_candidate is not None else None,
+    }
+
+
 def run_backtest(
     data_path: str | Path,
     start: str | None = None,
@@ -204,6 +541,9 @@ def run_backtest(
     *,
     allowed_playbook_tiers: tuple[str, ...] = ("A",),
     include_opportunity_benchmark: bool = True,
+    experimental_policy: dict[str, object] | None = None,
+    use_regime_tradability_layer: bool = True,
+    use_market_state_engine: bool = False,
 ) -> dict[str, object]:
     if reset_learning_db:
         Path(learning_db_path).unlink(missing_ok=True)
@@ -231,6 +571,9 @@ def run_backtest(
         parameters=parameters,
         allowed_playbook_tiers=allowed_playbook_tiers,
         benchmark_mode="opportunity" if set(allowed_playbook_tiers) == {"A", "B"} else "strict",
+        experimental_policy=experimental_policy,
+        use_regime_tradability_layer=use_regime_tradability_layer,
+        use_market_state_engine=use_market_state_engine,
     )
     entry_times = entry_times or DEFAULT_ENTRY_TIMES
 
@@ -308,6 +651,22 @@ def run_backtest(
                 "strategy": current_strategy,
                 "day_archetype": position.metadata.get("day_archetype"),
                 "playbook": position.metadata.get("playbook"),
+                "setup_subtype": position.metadata.get("setup_subtype"),
+                "bullish_shadow_subtype": position.metadata.get("bullish_shadow_subtype"),
+                "bearish_family": position.metadata.get("bearish_family"),
+                "bearish_subtype": position.metadata.get("bearish_subtype"),
+                "condor_profile": position.metadata.get("condor_profile"),
+                "market_state": position.metadata.get("market_state"),
+                "market_state_bias": position.metadata.get("market_state_bias"),
+                "state_quality_score": position.metadata.get("state_quality_score"),
+                "state_confidence_score": position.metadata.get("state_confidence_score"),
+                "tradability_class": position.metadata.get("tradability_class"),
+                "failure_type": position.metadata.get("failure_type"),
+                "option_chain_pressure_state": position.metadata.get("option_chain_pressure_state"),
+                "bearish_trade_score": position.metadata.get("bearish_trade_score"),
+                "bullish_trade_score": position.metadata.get("bullish_trade_score"),
+                "no_trade_score": position.metadata.get("no_trade_score"),
+                "regime_tradability": position.metadata.get("regime_tradability"),
                 "bullish_setup": position.metadata.get("bullish_setup"),
                 "bearish_setup": position.metadata.get("bearish_setup"),
                 "smart_money_bias": position.metadata.get("smart_money_bias"),
@@ -434,9 +793,15 @@ def run_backtest(
         "round_trip_cost_rupees_per_lot": round_trip_cost_rupees_per_lot,
         "benchmark_mode": "opportunity" if set(allowed_playbook_tiers) == {"A", "B"} else "strict",
         "allowed_playbook_tiers": list(allowed_playbook_tiers),
+        "experimental_policy": experimental_policy,
+        "use_regime_tradability_layer": use_regime_tradability_layer,
+        "use_market_state_engine": use_market_state_engine,
     }
     funnel_report = _build_funnel_report(decisions, trades)
     summary["trade_funnel"] = funnel_report
+    summary["regime_tradability_report"] = _build_regime_tradability_report(decisions, trades)
+    summary["market_state_report"] = _build_market_state_report(decisions, trades)
+    summary["context_layer_report"] = _build_context_layer_report(decisions, trades)
     opportunity_result = None
     if include_opportunity_benchmark and set(allowed_playbook_tiers) == {"A"}:
         opportunity_result = run_backtest(
@@ -451,6 +816,9 @@ def run_backtest(
             round_trip_cost_rupees_per_lot=round_trip_cost_rupees_per_lot,
             allowed_playbook_tiers=("A", "B"),
             include_opportunity_benchmark=False,
+            experimental_policy=experimental_policy,
+            use_regime_tradability_layer=use_regime_tradability_layer,
+            use_market_state_engine=use_market_state_engine,
         )
         summary["opportunity_benchmark"] = opportunity_result["summary"]
         summary["opportunity_gap"] = {
@@ -460,6 +828,39 @@ def run_backtest(
                 2,
             ),
         }
+    subtype_source_decisions = opportunity_result["decisions"] if opportunity_result is not None else decisions
+    subtype_source_trades = opportunity_result["trades"] if opportunity_result is not None else trades
+    summary["bullish_shadow_subtype_report"] = _build_subtype_report(
+        subtype_source_decisions,
+        subtype_source_trades,
+        subtype_field="bullish_shadow_subtype",
+        allowed_subtypes=BULLISH_SHADOW_SUBTYPES,
+    )
+    summary["bearish_continuation_subtype_report"] = _build_subtype_report(
+        subtype_source_decisions,
+        subtype_source_trades,
+        subtype_field="bearish_subtype",
+        allowed_subtypes=BEARISH_CONTINUATION_SUBTYPES,
+        family_field="bearish_family",
+        family_value="BEARISH_CONTINUATION",
+    )
+    summary["bearish_failed_reclaim_subtype_report"] = _build_subtype_report(
+        subtype_source_decisions,
+        subtype_source_trades,
+        subtype_field="bearish_subtype",
+        allowed_subtypes=BEARISH_FAILED_RECLAIM_SUBTYPES,
+        family_field="bearish_family",
+        family_value="BEARISH_FAILED_RECLAIM",
+    )
+    summary["bearish_rejection_subtype_report"] = _build_subtype_report(
+        subtype_source_decisions,
+        subtype_source_trades,
+        subtype_field="bearish_subtype",
+        allowed_subtypes=BEARISH_REJECTION_SUBTYPES,
+        family_field="bearish_family",
+        family_value="BEARISH_REJECTION",
+    )
+    summary["condor_redesign_report"] = _build_condor_opportunity_report(decisions, trades)
     return {
         "summary": summary,
         "decisions": decisions,

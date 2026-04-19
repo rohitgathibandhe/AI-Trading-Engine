@@ -19,7 +19,16 @@ from .execution import build_no_trade_decision, build_open_position, build_trade
 from .learning import LearningStore
 from .regime import classify_regime
 from .risk import assess_trade_risk, kill_switch_triggered
-from .strategy import playbook_tier, playbook_time_window, required_confidence_for_playbook, select_strategy
+from .strategy import (
+    REGIME_TRADABILITY_LOW_EDGE,
+    REGIME_TRADABILITY_NOT_TRADABLE,
+    classify_regime_tradability,
+    low_edge_tradability_filter_reason,
+    playbook_tier,
+    playbook_time_window,
+    required_confidence_for_playbook,
+    select_strategy,
+)
 from .strikes import select_best_structure, select_structure
 
 ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT = 35.0
@@ -52,10 +61,15 @@ def _initial_trade_funnel(
     regime_state: RegimeLabel | object,
     *,
     allowed_playbook_tiers: tuple[str, ...],
+    experimental_policy: dict[str, object] | None = None,
 ) -> dict[str, object]:
     metadata = regime_state.metadata  # type: ignore[attr-defined]
     playbook = str(metadata.get("playbook") or "UNKNOWN")
-    start_time, end_time = playbook_time_window(regime_state)  # type: ignore[arg-type]
+    tradability, tradability_reason = classify_regime_tradability(regime_state)  # type: ignore[arg-type]
+    start_time, end_time = playbook_time_window(
+        regime_state,  # type: ignore[arg-type]
+        experimental_policy=experimental_policy,
+    )
     setup_detected = bool(
         metadata.get("bullish_entry_ready")
         or metadata.get("bearish_entry_ready")
@@ -75,11 +89,36 @@ def _initial_trade_funnel(
         "regime": regime_state.regime.value,  # type: ignore[attr-defined]
         "playbook": playbook,
         "playbook_tier": playbook_tier(playbook),
+        "market_state": metadata.get("market_state"),
+        "market_state_bias": metadata.get("market_state_bias"),
+        "state_quality_score": round(float(metadata.get("state_quality_score") or 0.0), 4),
+        "state_confidence_score": round(float(metadata.get("state_confidence_score") or 0.0), 4),
+        "tradability_class": metadata.get("tradability_class"),
+        "failure_type": metadata.get("failure_type"),
+        "option_chain_pressure_state": metadata.get("option_chain_pressure_state"),
+        "market_state_score": round(float(metadata.get("market_state_score") or 0.0), 4),
+        "trend_quality_score": round(float(metadata.get("trend_quality_score") or 0.0), 4),
+        "failure_score": round(float(metadata.get("failure_score") or 0.0), 4),
+        "location_score": round(float(metadata.get("location_score") or 0.0), 4),
+        "option_chain_pressure_score": round(float(metadata.get("option_chain_pressure_score") or 0.0), 4),
+        "live_monetization_score": round(float(metadata.get("monetization_score") or 0.0), 4),
+        "tradability_score": round(float(metadata.get("tradability_score") or 0.0), 4),
+        "bearish_trade_score": round(float(metadata.get("bearish_trade_score") or 0.0), 4),
+        "bullish_trade_score": round(float(metadata.get("bullish_trade_score") or 0.0), 4),
+        "no_trade_score": round(float(metadata.get("no_trade_score") or 0.0), 4),
+        "regime_tradability": tradability,
+        "tradability_reason": tradability_reason,
+        "setup_subtype": metadata.get("setup_subtype"),
+        "bullish_shadow_subtype": metadata.get("bullish_shadow_subtype"),
+        "bearish_family": metadata.get("bearish_family"),
+        "bearish_subtype": metadata.get("bearish_subtype"),
+        "condor_profile": metadata.get("condor_profile"),
         "setup_quality_score": round(float(metadata.get("setup_quality_score") or 0.0), 4),
         "setup_detected": setup_detected,
         "passed_setup_quality": passed_setup_quality,
         "passed_time_gating": passed_time_gating,
         "passed_playbook_tier": playbook_tier(playbook) in allowed_playbook_tiers,
+        "passed_tradability_gate": tradability != REGIME_TRADABILITY_NOT_TRADABLE,
         "passed_spread_construction": False,
         "passed_liquidity": False,
         "passed_credit_width": False,
@@ -94,6 +133,7 @@ def _initial_trade_funnel(
         "best_candidate": None,
         "best_failed_candidate": None,
         "candidate_evaluations": [],
+        "experimental_policy_name": experimental_policy.get("name") if experimental_policy else None,
     }
 
 
@@ -118,11 +158,17 @@ class IntradayDefinedRiskAgent:
         *,
         allowed_playbook_tiers: tuple[str, ...] = ("A",),
         benchmark_mode: str = "strict",
+        experimental_policy: dict[str, object] | None = None,
+        use_regime_tradability_layer: bool = True,
+        use_market_state_engine: bool = False,
     ) -> None:
         self.learning_store = learning_store or LearningStore()
         self.parameters = (parameters or self.learning_store.active_parameters()).clamped()
         self.allowed_playbook_tiers = tuple(sorted(set(allowed_playbook_tiers)))
         self.benchmark_mode = benchmark_mode
+        self.experimental_policy = dict(experimental_policy or {})
+        self.use_regime_tradability_layer = use_regime_tradability_layer
+        self.use_market_state_engine = use_market_state_engine
         self.open_position: OpenPosition | None = None
         self._current_features: dict[str, object] = {}
         self._session_date = None
@@ -131,8 +177,10 @@ class IntradayDefinedRiskAgent:
     def evaluate(self, snapshot: MarketSnapshot) -> DecisionOutput:
         self._reset_session(snapshot.timestamp)
         regime_state = classify_regime(snapshot, self.parameters)
+        regime_state.metadata["enable_market_state_gating"] = self.use_market_state_engine
         rationale = list(regime_state.reasons)
         playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
+        regime_tradability, tradability_reason = classify_regime_tradability(regime_state)
         self._current_features = {
             "rv30_pct": regime_state.rv30_pct,
             "trend_15m": regime_state.trend_15m,
@@ -156,13 +204,40 @@ class IntradayDefinedRiskAgent:
             "bearish_planner_alignment": regime_state.metadata.get("bearish_planner_alignment", False),
             "setup_quality_score": regime_state.metadata.get("setup_quality_score", 0.0),
             "setup_direction": regime_state.metadata.get("setup_direction"),
+            "setup_subtype": regime_state.metadata.get("setup_subtype"),
+            "bullish_shadow_subtype": regime_state.metadata.get("bullish_shadow_subtype"),
+            "bearish_family": regime_state.metadata.get("bearish_family"),
+            "bearish_subtype": regime_state.metadata.get("bearish_subtype"),
+            "condor_profile": regime_state.metadata.get("condor_profile"),
+            "market_state": regime_state.metadata.get("market_state"),
+            "market_state_bias": regime_state.metadata.get("market_state_bias"),
+            "state_quality_score": regime_state.metadata.get("state_quality_score", 0.0),
+            "state_confidence_score": regime_state.metadata.get("state_confidence_score", 0.0),
+            "tradability_class": regime_state.metadata.get("tradability_class"),
+            "failure_type": regime_state.metadata.get("failure_type"),
+            "option_chain_pressure_state": regime_state.metadata.get("option_chain_pressure_state"),
+            "market_state_score": regime_state.metadata.get("market_state_score", 0.0),
+            "trend_quality_score": regime_state.metadata.get("trend_quality_score", 0.0),
+            "failure_score": regime_state.metadata.get("failure_score", 0.0),
+            "location_score": regime_state.metadata.get("location_score", 0.0),
+            "option_chain_pressure_score": regime_state.metadata.get("option_chain_pressure_score", 0.0),
+            "live_monetization_score": regime_state.metadata.get("monetization_score", 0.0),
+            "tradability_score": regime_state.metadata.get("tradability_score", 0.0),
+            "bearish_trade_score": regime_state.metadata.get("bearish_trade_score", 0.0),
+            "bullish_trade_score": regime_state.metadata.get("bullish_trade_score", 0.0),
+            "no_trade_score": regime_state.metadata.get("no_trade_score", 0.0),
             "playbook_tier": playbook_tier(playbook),
+            "regime_tradability": regime_tradability,
             "benchmark_mode": self.benchmark_mode,
+            "experimental_policy_name": self.experimental_policy.get("name"),
+            "use_regime_tradability_layer": self.use_regime_tradability_layer,
+            "use_market_state_engine": self.use_market_state_engine,
         }
         trade_funnel = _initial_trade_funnel(
             snapshot,
             regime_state,
             allowed_playbook_tiers=self.allowed_playbook_tiers,
+            experimental_policy=self.experimental_policy,
         )
 
         try:
@@ -187,6 +262,7 @@ class IntradayDefinedRiskAgent:
             regime_state,
             snapshot.timestamp.time(),
             allowed_playbook_tiers=self.allowed_playbook_tiers,
+            experimental_policy=self.experimental_policy,
         )
         trade_funnel["selected_strategy"] = strategy.value
         if strategy == StrategyType.NO_TRADE:
@@ -202,6 +278,35 @@ class IntradayDefinedRiskAgent:
             )
             self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())
             return decision
+        if self.use_regime_tradability_layer:
+            if regime_tradability == REGIME_TRADABILITY_NOT_TRADABLE:
+                decision = build_no_trade_decision(
+                    regime_state.regime.value,
+                    strategy_reasons + [tradability_reason],
+                    confidence_score=regime_state.confidence,
+                    extra_metadata=dict(regime_state.metadata) | {"trade_funnel": trade_funnel | {
+                        "passed_tradability_gate": False,
+                        "canonical_rejection_reason": "STRUCTURALLY_NOT_MONETIZABLE",
+                    }},
+                )
+                self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())
+                return decision
+            if regime_tradability == REGIME_TRADABILITY_LOW_EDGE:
+                low_edge_reason = low_edge_tradability_filter_reason(regime_state, self.parameters)
+                if low_edge_reason:
+                    decision = build_no_trade_decision(
+                        regime_state.regime.value,
+                        strategy_reasons + [tradability_reason, low_edge_reason],
+                        confidence_score=regime_state.confidence,
+                        extra_metadata=dict(regime_state.metadata) | {"trade_funnel": trade_funnel | {
+                            "passed_tradability_gate": False,
+                            "canonical_rejection_reason": "LOW_EDGE_FILTERED",
+                        }},
+                    )
+                    self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())
+                    return decision
+        else:
+            trade_funnel["passed_tradability_gate"] = True
         playbook_stats = self.learning_store.playbook_summary(window=120)
         current_playbook_stats = playbook_stats.get(playbook)
         if current_playbook_stats is not None and current_playbook_stats["samples"] >= PLAYBOOK_MIN_SAMPLES:
@@ -327,9 +432,31 @@ class IntradayDefinedRiskAgent:
             extra_metadata={
                 "day_archetype": regime_state.metadata.get("day_archetype"),
                 "playbook": playbook,
+                "setup_subtype": regime_state.metadata.get("setup_subtype"),
+                "bullish_shadow_subtype": regime_state.metadata.get("bullish_shadow_subtype"),
+                "bearish_family": regime_state.metadata.get("bearish_family"),
+                "bearish_subtype": regime_state.metadata.get("bearish_subtype"),
                 "bullish_setup": regime_state.metadata.get("bullish_setup"),
                 "bearish_setup": regime_state.metadata.get("bearish_setup"),
                 "smart_money_bias": regime_state.metadata.get("smart_money_bias"),
+                "condor_profile": regime_state.metadata.get("condor_profile"),
+                "market_state": regime_state.metadata.get("market_state"),
+                "market_state_bias": regime_state.metadata.get("market_state_bias"),
+                "state_quality_score": regime_state.metadata.get("state_quality_score"),
+                "state_confidence_score": regime_state.metadata.get("state_confidence_score"),
+                "tradability_class": regime_state.metadata.get("tradability_class"),
+                "failure_type": regime_state.metadata.get("failure_type"),
+                "option_chain_pressure_state": regime_state.metadata.get("option_chain_pressure_state"),
+                "market_state_score": regime_state.metadata.get("market_state_score"),
+                "trend_quality_score": regime_state.metadata.get("trend_quality_score"),
+                "failure_score": regime_state.metadata.get("failure_score"),
+                "location_score": regime_state.metadata.get("location_score"),
+                "option_chain_pressure_score": regime_state.metadata.get("option_chain_pressure_score"),
+                "live_monetization_score": regime_state.metadata.get("monetization_score"),
+                "tradability_score": regime_state.metadata.get("tradability_score"),
+                "bearish_trade_score": regime_state.metadata.get("bearish_trade_score"),
+                "bullish_trade_score": regime_state.metadata.get("bullish_trade_score"),
+                "no_trade_score": regime_state.metadata.get("no_trade_score"),
                 "trade_plan": regime_state.metadata.get("trade_plan"),
                 "structure_signal": regime_state.metadata.get("structure_signal"),
                 "fvg_context": regime_state.metadata.get("fvg_context"),
@@ -341,6 +468,8 @@ class IntradayDefinedRiskAgent:
                 "setup_quality_score": regime_state.metadata.get("setup_quality_score"),
                 "setup_direction": regime_state.metadata.get("setup_direction"),
                 "playbook_tier": playbook_tier(playbook),
+                "regime_tradability": regime_tradability,
+                "experimental_policy_name": self.experimental_policy.get("name"),
                 "trade_funnel": trade_funnel,
             },
         )

@@ -539,11 +539,18 @@ def _select_condor_candidates(
     playbook_tier: str,
 ) -> tuple[TradeStructure | None, list[str], dict[str, object]]:
     playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
-    short_delta_band = (0.12, 0.20)
-    long_delta_band = (0.05, 0.10)
-    call_candidates = _shortlist_condor_quotes(snapshot, regime_state, OptionType.CALL, short_delta_band)
-    put_candidates = _shortlist_condor_quotes(snapshot, regime_state, OptionType.PUT, short_delta_band)
-    if not call_candidates or not put_candidates:
+    delta_profiles = (
+        ("08_14", (0.08, 0.14), (0.03, 0.08)),
+        ("10_16", (0.10, 0.16), (0.04, 0.09)),
+        ("12_20", (0.12, 0.20), (0.05, 0.10)),
+    )
+    preferred_delta_label = str(regime_state.metadata.get("condor_short_delta_band_bias") or "12_20")
+    shape_bias = str(regime_state.metadata.get("condor_shape_bias") or "SYMMETRIC")
+    compression_score = float(regime_state.metadata.get("range_compression_score") or 0.0)
+    avg_chain_iv = regime_state.metadata.get("avg_chain_iv")
+    call_by_strike = {quote.strike: quote for quote in _liquid_otm_quotes(snapshot.option_chain.quotes, OptionType.CALL, snapshot.option_chain.spot)}
+    put_by_strike = {quote.strike: quote for quote in _liquid_otm_quotes(snapshot.option_chain.quotes, OptionType.PUT, snapshot.option_chain.spot)}
+    if not call_by_strike or not put_by_strike:
         report = {
             "strategy": StrategyType.IRON_CONDOR.value,
             "playbook": playbook,
@@ -560,16 +567,20 @@ def _select_condor_candidates(
             "best_failed_candidate": None,
             "candidate_evaluations": [],
         }
-        return None, ["Iron condor candidate search could not find liquid call and put shorts."], report
+        return None, ["Iron condor candidate search could not find liquid call and put wings."], report
 
-    call_by_strike = {quote.strike: quote for quote in _liquid_otm_quotes(snapshot.option_chain.quotes, OptionType.CALL, snapshot.option_chain.spot)}
-    put_by_strike = {quote.strike: quote for quote in _liquid_otm_quotes(snapshot.option_chain.quotes, OptionType.PUT, snapshot.option_chain.spot)}
     candidate_evaluations: list[dict[str, object]] = []
     condor_credit_ratio = params.condor_credit_width_ratio
     if setup_quality_score >= params.strong_setup_quality_threshold:
-        condor_credit_ratio = max(0.16, condor_credit_ratio - 0.04)
+        condor_credit_ratio = max(0.14, condor_credit_ratio - 0.05)
     elif playbook_tier != "A":
-        condor_credit_ratio = min(0.40, condor_credit_ratio + 0.04)
+        condor_credit_ratio = min(0.40, condor_credit_ratio + 0.03)
+    if compression_score >= 0.75:
+        condor_credit_ratio = max(0.12, condor_credit_ratio - 0.03)
+    if avg_chain_iv is not None and float(avg_chain_iv) >= 22.0:
+        condor_credit_ratio = max(0.12, condor_credit_ratio - 0.02)
+    if avg_chain_iv is not None and float(avg_chain_iv) <= 15.0:
+        condor_credit_ratio = min(0.40, condor_credit_ratio + 0.03)
     max_hedge_cost_ratio = _effective_hedge_cost_ratio_cap(
         params,
         setup_quality_score=setup_quality_score,
@@ -584,104 +595,135 @@ def _select_condor_candidates(
         0.5,
     )
 
-    for requested_width in params.candidate_widths:
-        width_seen = False
-        for short_call in call_candidates:
-            long_call = call_by_strike.get(short_call.strike + requested_width)
-            if long_call is None:
-                continue
-            for short_put in put_candidates:
-                long_put = put_by_strike.get(short_put.strike - requested_width)
-                if long_put is None:
+    for delta_band_label, short_delta_band, long_delta_band in delta_profiles:
+        call_candidates = _shortlist_condor_quotes(snapshot, regime_state, OptionType.CALL, short_delta_band)
+        put_candidates = _shortlist_condor_quotes(snapshot, regime_state, OptionType.PUT, short_delta_band)
+        for call_width in params.candidate_widths:
+            for put_width in params.candidate_widths:
+                if compression_score < 0.25 and min(call_width, put_width) < 75.0:
                     continue
-                width_seen = True
-                call_credit = (short_call.mid_price or 0.0) - (long_call.mid_price or 0.0)
-                put_credit = (short_put.mid_price or 0.0) - (long_put.mid_price or 0.0)
-                total_credit = call_credit + put_credit
-                max_width = requested_width
-                avg_spread_ratio = (
-                    short_call.spread_ratio
-                    + long_call.spread_ratio
-                    + short_put.spread_ratio
-                    + long_put.spread_ratio
-                ) / 4.0
-                passed_liquidity = bool(avg_spread_ratio <= params.liquidity_spread_ratio_cap)
-                passed_delta = all(
-                    delta is not None
-                    for delta in (short_call.delta, long_call.delta, short_put.delta, long_put.delta)
-                ) and (
-                    short_delta_band[0] <= abs(short_call.delta) <= short_delta_band[1]
-                    and short_delta_band[0] <= abs(short_put.delta) <= short_delta_band[1]
-                    and long_delta_band[0] <= abs(long_call.delta) <= long_delta_band[1]
-                    and long_delta_band[0] <= abs(long_put.delta) <= long_delta_band[1]
+                if compression_score >= 0.75 and avg_chain_iv is not None and float(avg_chain_iv) >= 22.0 and max(call_width, put_width) > 100.0:
+                    continue
+                shape_label = (
+                    "SYMMETRIC"
+                    if call_width == put_width
+                    else ("ASYMMETRIC_CALL_WIDER" if call_width > put_width else "ASYMMETRIC_PUT_WIDER")
                 )
-                credit_ratio = total_credit / max_width if max_width > 0 else 0.0
-                passed_credit = total_credit > 0 and credit_ratio >= condor_credit_ratio
-                hedge_cost_ratio = ((long_call.mid_price or 0.0) + (long_put.mid_price or 0.0)) / max((short_call.mid_price or 0.01) + (short_put.mid_price or 0.01), 0.01)
-                passed_hedge_cost = hedge_cost_ratio <= max_hedge_cost_ratio
-                theta_efficiency = credit_ratio * max(hours_remaining / 4.0, 0.5)
-                slippage_penalty = (snapshot.slippage_points * 2.0) / max(total_credit, 0.50)
-                liquidity_quality = max(0.0, 1.0 - (avg_spread_ratio / max(params.liquidity_spread_ratio_cap, 0.01)))
-                monetization_score = _score_candidate(
-                    credit_points=total_credit,
-                    width_points=max_width,
-                    short_delta_abs=max(abs(short_call.delta or 0.0), abs(short_put.delta or 0.0)),
-                    short_delta_band=short_delta_band,
-                    liquidity_quality=liquidity_quality,
-                    credit_ratio=credit_ratio,
-                    required_credit_ratio=condor_credit_ratio,
-                    anchor_distance_points=None,
-                    target_anchor_buffer_points=None,
-                    hedge_cost_ratio=hedge_cost_ratio,
-                    theta_efficiency=theta_efficiency,
-                    slippage_penalty=slippage_penalty,
-                    stop_pain=((max_width - total_credit) / max(max_width, 1.0)) * max(abs(short_call.delta or 0.0), abs(short_put.delta or 0.0), 0.1),
-                )
-                rejection_flags = {
-                    "LIQUIDITY_BAD": passed_liquidity,
-                    "DELTA_TOO_HIGH": passed_delta,
-                    "INVALIDATION_TOO_CLOSE": True,
-                    "CREDIT_TOO_LOW": passed_credit,
-                    "HEDGE_TOO_EXPENSIVE": passed_hedge_cost,
-                    "WIDTH_TOO_LARGE": True,
-                }
-                valid = bool(passed_liquidity and passed_delta and passed_credit and passed_hedge_cost)
-                candidate_evaluations.append(
-                    {
-                        "requested_width_points": requested_width,
-                        "width_points": requested_width,
-                        "short_call_strike": short_call.strike,
-                        "long_call_strike": long_call.strike,
-                        "short_put_strike": short_put.strike,
-                        "long_put_strike": long_put.strike,
-                        "credit_points": round(total_credit, 4),
-                        "credit_width_ratio": round(credit_ratio, 4),
-                        "required_credit_width_ratio": round(condor_credit_ratio, 4),
-                        "max_hedge_cost_ratio": round(max_hedge_cost_ratio, 4),
-                        "avg_spread_ratio": round(avg_spread_ratio, 4),
-                        "selection_mode": "CONDOR",
-                        "passed_liquidity": passed_liquidity,
-                        "passed_credit_width": passed_credit,
-                        "passed_delta_band": passed_delta,
-                        "passed_anchor_distance": True,
-                        "passed_hedge_cost": passed_hedge_cost,
-                        "valid": valid,
-                        "monetization_score": monetization_score,
-                        "canonical_rejection_reason": "NONE" if valid else _candidate_rejection_reason(rejection_flags),
-                        "rejection_detail": "" if valid else "Condor candidate failed monetization filters.",
-                    }
-                )
-        if not width_seen:
-            candidate_evaluations.append(
-                {
-                    "requested_width_points": requested_width,
-                    "width_points": requested_width,
-                    "valid": False,
-                    "selection_mode": "CONDOR",
-                    "canonical_rejection_reason": "WIDTH_TOO_LARGE",
-                    "rejection_detail": "No liquid condor wings exist for this width.",
-                }
-            )
+                width_seen = False
+                for short_call in call_candidates:
+                    long_call = call_by_strike.get(short_call.strike + call_width)
+                    if long_call is None:
+                        continue
+                    for short_put in put_candidates:
+                        long_put = put_by_strike.get(short_put.strike - put_width)
+                        if long_put is None:
+                            continue
+                        width_seen = True
+                        call_credit = (short_call.mid_price or 0.0) - (long_call.mid_price or 0.0)
+                        put_credit = (short_put.mid_price or 0.0) - (long_put.mid_price or 0.0)
+                        total_credit = call_credit + put_credit
+                        max_width = max(call_width, put_width)
+                        avg_spread_ratio = (
+                            short_call.spread_ratio
+                            + long_call.spread_ratio
+                            + short_put.spread_ratio
+                            + long_put.spread_ratio
+                        ) / 4.0
+                        passed_liquidity = bool(avg_spread_ratio <= params.liquidity_spread_ratio_cap)
+                        passed_delta = all(
+                            delta is not None
+                            for delta in (short_call.delta, long_call.delta, short_put.delta, long_put.delta)
+                        ) and (
+                            short_delta_band[0] <= abs(short_call.delta) <= short_delta_band[1]
+                            and short_delta_band[0] <= abs(short_put.delta) <= short_delta_band[1]
+                            and long_delta_band[0] <= abs(long_call.delta) <= long_delta_band[1]
+                            and long_delta_band[0] <= abs(long_put.delta) <= long_delta_band[1]
+                        )
+                        credit_ratio = total_credit / max_width if max_width > 0 else 0.0
+                        passed_credit = total_credit > 0 and credit_ratio >= condor_credit_ratio
+                        hedge_cost_ratio = ((long_call.mid_price or 0.0) + (long_put.mid_price or 0.0)) / max((short_call.mid_price or 0.01) + (short_put.mid_price or 0.01), 0.01)
+                        passed_hedge_cost = hedge_cost_ratio <= max_hedge_cost_ratio
+                        theta_efficiency = credit_ratio * max(hours_remaining / 4.0, 0.5)
+                        slippage_penalty = (snapshot.slippage_points * 2.0) / max(total_credit, 0.50)
+                        liquidity_quality = max(0.0, 1.0 - (avg_spread_ratio / max(params.liquidity_spread_ratio_cap, 0.01)))
+                        monetization_score = _score_candidate(
+                            credit_points=total_credit,
+                            width_points=max_width,
+                            short_delta_abs=max(abs(short_call.delta or 0.0), abs(short_put.delta or 0.0)),
+                            short_delta_band=short_delta_band,
+                            liquidity_quality=liquidity_quality,
+                            credit_ratio=credit_ratio,
+                            required_credit_ratio=condor_credit_ratio,
+                            anchor_distance_points=None,
+                            target_anchor_buffer_points=None,
+                            hedge_cost_ratio=hedge_cost_ratio,
+                            theta_efficiency=theta_efficiency,
+                            slippage_penalty=slippage_penalty,
+                            stop_pain=((max_width - total_credit) / max(max_width, 1.0)) * max(abs(short_call.delta or 0.0), abs(short_put.delta or 0.0), 0.1),
+                        )
+                        if delta_band_label != preferred_delta_label:
+                            monetization_score = round(monetization_score - 0.25, 4)
+                        if (
+                            (shape_bias == "SYMMETRIC" and shape_label != "SYMMETRIC")
+                            or (shape_bias == "CALL_WIDER" and shape_label != "ASYMMETRIC_CALL_WIDER")
+                            or (shape_bias == "PUT_WIDER" and shape_label != "ASYMMETRIC_PUT_WIDER")
+                        ):
+                            monetization_score = round(monetization_score - 0.20, 4)
+                        rejection_flags = {
+                            "LIQUIDITY_BAD": passed_liquidity,
+                            "DELTA_TOO_HIGH": passed_delta,
+                            "INVALIDATION_TOO_CLOSE": True,
+                            "CREDIT_TOO_LOW": passed_credit,
+                            "HEDGE_TOO_EXPENSIVE": passed_hedge_cost,
+                            "WIDTH_TOO_LARGE": True,
+                        }
+                        valid = bool(passed_liquidity and passed_delta and passed_credit and passed_hedge_cost)
+                        candidate_evaluations.append(
+                            {
+                                "requested_width_points": max_width,
+                                "width_points": max_width,
+                                "call_width_points": call_width,
+                                "put_width_points": put_width,
+                                "shape_label": shape_label,
+                                "delta_band_label": delta_band_label,
+                                "short_call_strike": short_call.strike,
+                                "long_call_strike": long_call.strike,
+                                "short_put_strike": short_put.strike,
+                                "long_put_strike": long_put.strike,
+                                "credit_points": round(total_credit, 4),
+                                "credit_width_ratio": round(credit_ratio, 4),
+                                "required_credit_width_ratio": round(condor_credit_ratio, 4),
+                                "max_hedge_cost_ratio": round(max_hedge_cost_ratio, 4),
+                                "avg_spread_ratio": round(avg_spread_ratio, 4),
+                                "selection_mode": "CONDOR",
+                                "condor_profile": regime_state.metadata.get("condor_profile"),
+                                "passed_liquidity": passed_liquidity,
+                                "passed_credit_width": passed_credit,
+                                "passed_delta_band": passed_delta,
+                                "passed_anchor_distance": True,
+                                "passed_hedge_cost": passed_hedge_cost,
+                                "valid": valid,
+                                "monetization_score": monetization_score,
+                                "canonical_rejection_reason": "NONE" if valid else _candidate_rejection_reason(rejection_flags),
+                                "rejection_detail": "" if valid else "Condor candidate failed monetization filters.",
+                            }
+                        )
+                if not width_seen:
+                    candidate_evaluations.append(
+                        {
+                            "requested_width_points": max(call_width, put_width),
+                            "width_points": max(call_width, put_width),
+                            "call_width_points": call_width,
+                            "put_width_points": put_width,
+                            "shape_label": shape_label,
+                            "delta_band_label": delta_band_label,
+                            "valid": False,
+                            "selection_mode": "CONDOR",
+                            "condor_profile": regime_state.metadata.get("condor_profile"),
+                            "canonical_rejection_reason": "WIDTH_TOO_LARGE",
+                            "rejection_detail": "No liquid condor wings exist for this width pair.",
+                        }
+                    )
 
     valid_candidates = [candidate for candidate in candidate_evaluations if candidate.get("valid")]
     best_candidate = max(valid_candidates, key=lambda candidate: float(candidate.get("monetization_score") or 0.0)) if valid_candidates else None
@@ -704,20 +746,22 @@ def _select_condor_candidates(
         "candidate_evaluations": candidate_evaluations,
     }
     if best_candidate is None:
-        return None, ["Condor total credit does not meet the required credit-efficiency threshold."], report
+        return None, ["Condor optimizer could not find a valid symmetric or asymmetric defined-risk structure."], report
 
     short_call = call_by_strike[float(best_candidate["short_call_strike"])]
     long_call = call_by_strike[float(best_candidate["long_call_strike"])]
     short_put = put_by_strike[float(best_candidate["short_put_strike"])]
     long_put = put_by_strike[float(best_candidate["long_put_strike"])]
     total_credit = float(best_candidate["credit_points"])
-    width = float(best_candidate["width_points"])
+    max_width = float(best_candidate["width_points"])
+    call_width = float(best_candidate["call_width_points"])
+    put_width = float(best_candidate["put_width_points"])
     rationale = [
-        f"Selected balanced iron condor with call strikes {short_call.strike}/{long_call.strike} and put strikes {short_put.strike}/{long_put.strike}.",
-        f"Total credit {total_credit:.2f} points on wing width {width:.2f} points.",
-        f"Monetization score {float(best_candidate['monetization_score']):.2f} with setup quality {setup_quality_score:.2f}.",
+        f"Selected {best_candidate['shape_label'].lower()} iron condor with call strikes {short_call.strike}/{long_call.strike} and put strikes {short_put.strike}/{long_put.strike}.",
+        f"Total credit {total_credit:.2f} points on call width {call_width:.2f} and put width {put_width:.2f}.",
+        f"Delta band {best_candidate['delta_band_label']} produced monetization score {float(best_candidate['monetization_score']):.2f}.",
     ]
-    derived_margin = max((width - total_credit) * snapshot.lot_size, 0.0)
+    derived_margin = max((max_width - total_credit) * snapshot.lot_size, 0.0)
     structure = TradeStructure(
         strategy=StrategyType.IRON_CONDOR,
         legs=[
@@ -727,13 +771,16 @@ def _select_condor_candidates(
             StrategyLeg(action="BUY", option_type=OptionType.PUT, strike=long_put.strike, quote=long_put),
         ],
         credit_points=total_credit,
-        width_points=width,
-        call_width_points=width,
-        put_width_points=width,
+        width_points=max_width,
+        call_width_points=call_width,
+        put_width_points=put_width,
         margin_estimate_per_lot=snapshot.option_chain.margin_estimate_per_lot or derived_margin,
         rationale=rationale,
         metadata={
             "selection_mode": "CONDOR",
+            "condor_profile": regime_state.metadata.get("condor_profile"),
+            "condor_shape": best_candidate.get("shape_label"),
+            "condor_delta_band_label": best_candidate.get("delta_band_label"),
             "margin_source": "BROKER_ESTIMATE" if snapshot.option_chain.margin_estimate_per_lot is not None else "MAX_LOSS_PROXY",
             "monetization_score": float(best_candidate["monetization_score"]),
             "setup_quality_score": setup_quality_score,

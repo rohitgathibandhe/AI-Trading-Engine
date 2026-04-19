@@ -49,7 +49,10 @@ def _snapshot() -> MarketSnapshot:
 
 def test_agent_blocks_repeat_strategy_entry_in_same_session(monkeypatch) -> None:
     snapshot = _snapshot()
-    agent = IntradayDefinedRiskAgent(learning_store=LearningStore("/tmp/test_intraday_defined_risk_monitor.sqlite3"))
+    agent = IntradayDefinedRiskAgent(
+        learning_store=LearningStore("/tmp/test_intraday_defined_risk_monitor.sqlite3"),
+        use_regime_tradability_layer=False,
+    )
     regime = RegimeState(
         regime=RegimeLabel.UP_TREND,
         trend_15m="TREND_UP",
@@ -84,7 +87,26 @@ def test_agent_blocks_repeat_strategy_entry_in_same_session(monkeypatch) -> None
         lambda *_args, **_kwargs: (StrategyType.BULL_PUT_CREDIT_SPREAD, ["Bullish pullback reclaim confirmed."]),
     )
     monkeypatch.setattr(monitor_module, "validate_entry_time", lambda *_args, **_kwargs: (True, None))
-    monkeypatch.setattr(monitor_module, "select_structure", lambda *_args, **_kwargs: (structure, ["Structure selected."]))
+    monkeypatch.setattr(
+        monitor_module,
+        "select_best_structure",
+        lambda *_args, **_kwargs: (
+            structure,
+            ["Structure selected."],
+            {
+                "passed_spread_construction": True,
+                "passed_liquidity": True,
+                "passed_credit_width": True,
+                "passed_delta_band": True,
+                "passed_anchor_distance": True,
+                "monetization_score": 1.0,
+                "final_trade_score": 1.0,
+                "best_candidate": None,
+                "best_failed_candidate": None,
+                "candidate_evaluations": [],
+            },
+        ),
+    )
     monkeypatch.setattr(
         monitor_module,
         "assess_trade_risk",
@@ -114,7 +136,10 @@ def test_agent_blocks_repeat_strategy_entry_in_same_session(monkeypatch) -> None
 
 def test_agent_blocks_trade_when_expected_net_edge_is_too_small(monkeypatch) -> None:
     snapshot = _snapshot()
-    agent = IntradayDefinedRiskAgent(learning_store=LearningStore("/tmp/test_intraday_defined_risk_monitor_netedge.sqlite3"))
+    agent = IntradayDefinedRiskAgent(
+        learning_store=LearningStore("/tmp/test_intraday_defined_risk_monitor_netedge.sqlite3"),
+        use_regime_tradability_layer=False,
+    )
     regime = RegimeState(
         regime=RegimeLabel.UP_TREND,
         trend_15m="TREND_UP",
@@ -149,7 +174,26 @@ def test_agent_blocks_trade_when_expected_net_edge_is_too_small(monkeypatch) -> 
         lambda *_args, **_kwargs: (StrategyType.BULL_PUT_CREDIT_SPREAD, ["Bullish pullback reclaim confirmed."]),
     )
     monkeypatch.setattr(monitor_module, "validate_entry_time", lambda *_args, **_kwargs: (True, None))
-    monkeypatch.setattr(monitor_module, "select_structure", lambda *_args, **_kwargs: (structure, ["Structure selected."]))
+    monkeypatch.setattr(
+        monitor_module,
+        "select_best_structure",
+        lambda *_args, **_kwargs: (
+            structure,
+            ["Structure selected."],
+            {
+                "passed_spread_construction": True,
+                "passed_liquidity": True,
+                "passed_credit_width": True,
+                "passed_delta_band": True,
+                "passed_anchor_distance": True,
+                "monetization_score": 1.0,
+                "final_trade_score": 1.0,
+                "best_candidate": None,
+                "best_failed_candidate": None,
+                "candidate_evaluations": [],
+            },
+        ),
+    )
     monkeypatch.setattr(
         monitor_module,
         "assess_trade_risk",

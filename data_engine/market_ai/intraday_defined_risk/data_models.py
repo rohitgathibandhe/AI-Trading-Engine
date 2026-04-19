@@ -19,6 +19,7 @@ class OptionType(str, Enum):
 class StrategyType(str, Enum):
     BEAR_CALL_CREDIT_SPREAD = "BEAR_CALL_CREDIT_SPREAD"
     BULL_PUT_CREDIT_SPREAD = "BULL_PUT_CREDIT_SPREAD"
+    CALL_DEBIT_SPREAD = "CALL_DEBIT_SPREAD"
     IRON_CONDOR = "IRON_CONDOR"
     NO_TRADE = "NO_TRADE"
 
@@ -48,6 +49,10 @@ class AdaptiveParameters:
     strict_hedge_cost_ratio_cap: float = 0.75
     width_preference_penalty: float = 1.25
     shadow_sessions: int = 5
+    bearish_trade_score_threshold: float = 6.5
+    bullish_trade_score_threshold: float = 7.5
+    bearish_trade_margin: float = 1.5
+    bullish_trade_margin: float = 2.0
 
     def clamped(self) -> "AdaptiveParameters":
         mid = min(max(self.rv_mid_cutoff, 0.25), 0.75)
@@ -71,6 +76,10 @@ class AdaptiveParameters:
             strict_hedge_cost_ratio_cap=min(max(self.strict_hedge_cost_ratio_cap, 0.20), 1.25),
             width_preference_penalty=min(max(self.width_preference_penalty, 0.0), 2.0),
             shadow_sessions=max(1, self.shadow_sessions),
+            bearish_trade_score_threshold=min(max(self.bearish_trade_score_threshold, 2.0), 12.0),
+            bullish_trade_score_threshold=min(max(self.bullish_trade_score_threshold, 2.0), 12.0),
+            bearish_trade_margin=min(max(self.bearish_trade_margin, 0.5), 5.0),
+            bullish_trade_margin=min(max(self.bullish_trade_margin, 0.5), 5.0),
         )
 
 

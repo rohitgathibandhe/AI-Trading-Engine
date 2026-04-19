@@ -43,6 +43,18 @@ AFTERNOON_TREND_BULLISH_MIN_CONFIDENCE = 0.72
 RANGE_CONDOR_MIN_CONFIDENCE = 0.55
 CONFIDENCE_EPSILON = 1e-6
 BEAR_CALL_MIN_CONFIDENCE = 0.85
+REGIME_TRADABILITY_TRADABLE = "TRADABLE"
+REGIME_TRADABILITY_SPREAD = REGIME_TRADABILITY_TRADABLE
+REGIME_TRADABILITY_LOW_EDGE = "LOW_EDGE"
+REGIME_TRADABILITY_NOT_TRADABLE = "NOT_TRADABLE"
+
+BEARISH_CONTEXT_FAILURE_TYPES = {
+    "FAILED_BREAKOUT",
+    "FAILED_RECLAIM",
+    "FAILED_BOUNCE",
+    "BEARISH_REJECTION_TRANSITION",
+    "ACCEPTED_BREAKDOWN",
+}
 ENABLE_BEAR_CALL_ACTIVE = False
 ENABLE_EARLY_BALANCE_BEARISH_ACTIVE = True
 ENABLE_SIDEWAYS_BEARISH_REJECTION_ACTIVE = True
@@ -79,6 +91,18 @@ TIER_B_PLAYBOOKS = {
     "BEARISH_CONTINUATION",
 }
 
+STABLE_SPREAD_PLAYBOOKS = {
+    "GAP_DOWN_BEARISH_CONTINUATION",
+    "SIDEWAYS_TO_BEARISH_REJECTION",
+    "GAP_UP_BEARISH_FAILURE",
+}
+
+NOT_TRADABLE_EXPANSION_PLAYBOOKS = {
+    "OPEN_DRIVE_BULLISH",
+    "GAP_UP_BULLISH_CONTINUATION",
+    "HIGH_CONFLUENCE_BULLISH_CONTINUATION",
+}
+
 
 def playbook_tier(playbook: str) -> str:
     if playbook in TIER_A_PLAYBOOKS:
@@ -86,6 +110,110 @@ def playbook_tier(playbook: str) -> str:
     if playbook in TIER_B_PLAYBOOKS:
         return "B"
     return "C"
+
+
+def classify_regime_tradability(regime_state: RegimeState) -> tuple[str, str]:
+    metadata = regime_state.metadata
+    explicit_class = str(metadata.get("tradability_class") or "")
+    explicit_reason = str(metadata.get("tradability_reason") or "")
+    if explicit_class in {REGIME_TRADABILITY_TRADABLE, REGIME_TRADABILITY_LOW_EDGE, REGIME_TRADABILITY_NOT_TRADABLE}:
+        return explicit_class, explicit_reason or f"Context layer classified the setup as {explicit_class}."
+
+    playbook = str(metadata.get("playbook") or "UNKNOWN")
+    bullish_shadow_subtype = str(metadata.get("bullish_shadow_subtype") or "")
+    bearish_subtype = str(metadata.get("bearish_subtype") or "")
+    tier = playbook_tier(playbook)
+
+    if bullish_shadow_subtype == "LATE_SESSION_BULLISH_RECLAIM":
+        return (
+            REGIME_TRADABILITY_LOW_EDGE,
+            "Late-session bullish reclaim shows only a small edge under current spread monetization and must remain low-edge.",
+        )
+    if bearish_subtype == "GAP_DOWN_FAILED_BOUNCE":
+        return (
+            REGIME_TRADABILITY_TRADABLE,
+            "Gap-down failed bounce is a validated early-session bearish spread subtype.",
+        )
+    if bearish_subtype == "BEARISH_REJECTION_TRANSITION":
+        return (
+            REGIME_TRADABILITY_TRADABLE,
+            "Transition-state bearish rejection is a validated live bearish subtype when rejection holds below the trigger zone.",
+        )
+    if playbook in STABLE_SPREAD_PLAYBOOKS:
+        return (
+            REGIME_TRADABILITY_TRADABLE,
+            f"{playbook} is a validated spread-monetizable playbook.",
+        )
+    if playbook in NOT_TRADABLE_EXPANSION_PLAYBOOKS:
+        return (
+            REGIME_TRADABILITY_NOT_TRADABLE,
+            f"{playbook} is structurally not monetizable with the current spread framework.",
+        )
+    if tier == "A":
+        return (
+            REGIME_TRADABILITY_TRADABLE,
+            f"{playbook} remains live-eligible under the validated Tier A stack.",
+        )
+    if regime_state.regime == RegimeLabel.UP_TREND:
+        return (
+            REGIME_TRADABILITY_NOT_TRADABLE,
+            "Bullish regimes remain structurally unproven for current spread monetization.",
+        )
+    if tier == "B":
+        return (
+            REGIME_TRADABILITY_NOT_TRADABLE,
+            f"{playbook} is still a research-only playbook without proven live spread edge.",
+        )
+    return (
+        REGIME_TRADABILITY_LOW_EDGE,
+        f"{playbook} does not yet have robust spread expectancy and should stay behind stricter deployment filters.",
+    )
+
+
+def low_edge_tradability_filter_reason(
+    regime_state: RegimeState,
+    params: AdaptiveParameters,
+) -> str | None:
+    tradability, _ = classify_regime_tradability(regime_state)
+    if tradability != REGIME_TRADABILITY_LOW_EDGE:
+        return None
+    setup_quality_score = float(regime_state.metadata.get("setup_quality_score") or 0.0)
+    bullish_trade_score = float(regime_state.metadata.get("bullish_trade_score") or 0.0)
+    no_trade_score = float(regime_state.metadata.get("no_trade_score") or 0.0)
+    required_confidence = required_confidence_for_playbook(str(regime_state.metadata.get("playbook") or "UNKNOWN")) + 0.03
+    if setup_quality_score < params.strong_setup_quality_threshold:
+        return (
+            f"Low-edge regime requires setup quality >= {params.strong_setup_quality_threshold:.2f}; "
+            f"current quality is {setup_quality_score:.2f}."
+        )
+    if bullish_trade_score <= no_trade_score + params.bullish_trade_margin:
+        return (
+            f"Low-edge regime requires bullish trade score > no-trade score by {params.bullish_trade_margin:.2f}; "
+            f"current spread is {bullish_trade_score - no_trade_score:.2f}."
+        )
+    if regime_state.confidence + CONFIDENCE_EPSILON < required_confidence:
+        return (
+            f"Low-edge regime requires conviction >= {required_confidence:.2f}; "
+            f"current conviction is {regime_state.confidence:.2f}."
+        )
+    return None
+
+
+def _gap_down_failed_bounce_end_time(
+    regime_state: RegimeState,
+    experimental_policy: dict[str, object] | None,
+) -> time:
+    if not experimental_policy:
+        return GAP_DOWN_BEARISH_CONTINUATION_END
+    subtype = str(regime_state.metadata.get("bearish_subtype") or "")
+    if subtype != "GAP_DOWN_FAILED_BOUNCE":
+        return GAP_DOWN_BEARISH_CONTINUATION_END
+    override = experimental_policy.get("gap_down_failed_bounce_end_time")
+    if isinstance(override, time):
+        return override
+    if isinstance(override, str):
+        return time.fromisoformat(override)
+    return GAP_DOWN_BEARISH_CONTINUATION_END
 
 
 def required_confidence_for_playbook(playbook: str) -> float:
@@ -116,7 +244,11 @@ def required_confidence_for_playbook(playbook: str) -> float:
     return SIDEWAYS_BULLISH_RECLAIM_MIN_CONFIDENCE
 
 
-def playbook_time_window(regime_state: RegimeState) -> tuple[time | None, time | None]:
+def playbook_time_window(
+    regime_state: RegimeState,
+    *,
+    experimental_policy: dict[str, object] | None = None,
+) -> tuple[time | None, time | None]:
     playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
     bullish_setup = regime_state.metadata.get("bullish_setup")
     if playbook == "OPEN_DRIVE_BULLISH":
@@ -145,7 +277,7 @@ def playbook_time_window(regime_state: RegimeState) -> tuple[time | None, time |
     if playbook == "GAP_UP_BEARISH_FAILURE":
         return GAP_BEARISH_START, GAP_UP_BEARISH_FAILURE_END
     if playbook == "GAP_DOWN_BEARISH_CONTINUATION":
-        return GAP_BEARISH_START, GAP_DOWN_BEARISH_CONTINUATION_END
+        return GAP_BEARISH_START, _gap_down_failed_bounce_end_time(regime_state, experimental_policy)
     if playbook == "HIGH_CONFLUENCE_BEARISH_CONTINUATION":
         return HIGH_CONFLUENCE_BEARISH_START, HIGH_CONFLUENCE_BEARISH_END
     if playbook == "RANGE_BALANCED_CONDOR":
@@ -158,15 +290,54 @@ def select_strategy(
     now_time: time,
     *,
     allowed_playbook_tiers: tuple[str, ...] = ("A", "B"),
+    experimental_policy: dict[str, object] | None = None,
 ) -> tuple[StrategyType, list[str]]:
     reasons = list(regime_state.reasons)
+    metadata = regime_state.metadata
+    context_layer_active = any(
+        key in metadata
+        for key in (
+            "tradability_class",
+            "bearish_trade_score",
+            "bullish_trade_score",
+            "no_trade_score",
+            "failure_type",
+        )
+    )
     day_archetype = str(regime_state.metadata.get("day_archetype") or "UNCLASSIFIED")
+    market_state = str(metadata.get("market_state") or "TRUE_RANGE")
+    tradability, tradability_reason = classify_regime_tradability(regime_state)
+    failure_type = str(metadata.get("failure_type") or "NONE")
+    bearish_trade_score = float(metadata.get("bearish_trade_score") or 0.0)
+    bullish_trade_score = float(metadata.get("bullish_trade_score") or 0.0)
+    no_trade_score = float(metadata.get("no_trade_score") or 0.0)
+    bearish_failure_score = float(metadata.get("bearish_failure_score") or 0.0)
+    bullish_failure_score = float(metadata.get("bullish_failure_score") or 0.0)
+    bearish_location_live_score = float(metadata.get("bearish_location_live_score") or 0.0)
+    open_space_up = float(metadata.get("open_space_up") or 0.0)
+    overhead_call_pressure_score = float(metadata.get("overhead_call_pressure_score") or 0.0)
+    bearish_margin = float(metadata.get("trade_score_margin_bearish") or 1.5)
+    bullish_margin = float(metadata.get("trade_score_margin_bullish") or 2.0)
+    bearish_threshold = float(metadata.get("bearish_trade_score_threshold") or 6.5)
+    bullish_threshold = float(metadata.get("bullish_trade_score_threshold") or 7.5)
     if now_time < time(9, 15):
         reasons.append("Pre-market entry is not allowed.")
         return StrategyType.NO_TRADE, reasons
+    if context_layer_active and now_time >= time(14, 0):
+        reasons.append("No new entries are allowed after 14:00 IST under the context-aware late-session penalty.")
+        return StrategyType.NO_TRADE, reasons
+    if (
+        bool(metadata.get("enable_market_state_gating"))
+        and market_state == "TRUE_RANGE"
+        and str(metadata.get("playbook") or "UNKNOWN") != "RANGE_BALANCED_CONDOR"
+    ):
+        reasons.append("Market state engine classifies the session as TRUE_RANGE; directional deployment is blocked outside strict condor criteria.")
+        return StrategyType.NO_TRADE, reasons
+    if context_layer_active and tradability == REGIME_TRADABILITY_NOT_TRADABLE and str(metadata.get("playbook") or "UNKNOWN") != "RANGE_BALANCED_CONDOR":
+        reasons.append(tradability_reason)
+        return StrategyType.NO_TRADE, reasons
 
     if regime_state.regime == RegimeLabel.DOWN_TREND:
-        metadata = regime_state.metadata
         bearish_setup = metadata.get("bearish_setup")
         bearish_ready = bool(metadata.get("bearish_entry_ready"))
         playbook = str(metadata.get("playbook") or "UNKNOWN")
@@ -175,9 +346,35 @@ def select_strategy(
                 "Bearish downtrend detected, but price has not yet printed a valid bearish pullback rejection, failed reclaim, or shallow continuation setup."
             )
             return StrategyType.NO_TRADE, reasons
-        if regime_state.confidence + CONFIDENCE_EPSILON < BEAR_CALL_MIN_CONFIDENCE:
+        if context_layer_active and failure_type not in BEARISH_CONTEXT_FAILURE_TYPES:
             reasons.append(
-                f"Bearish setup detected, but conviction {regime_state.confidence:.2f} is below the required {BEAR_CALL_MIN_CONFIDENCE:.2f}."
+                f"Bearish routing requires a recognized failure/acceptance context; current failure type is {failure_type}."
+            )
+            return StrategyType.NO_TRADE, reasons
+        if context_layer_active and bearish_failure_score < 2.5:
+            reasons.append(
+                f"Bearish failure score {bearish_failure_score:.2f} is below the required 2.50."
+            )
+            return StrategyType.NO_TRADE, reasons
+        if context_layer_active and bearish_location_live_score < 1.5:
+            reasons.append(
+                f"Bearish location score {bearish_location_live_score:.2f} is below the required 1.50."
+            )
+            return StrategyType.NO_TRADE, reasons
+        if context_layer_active and bearish_trade_score < bearish_threshold:
+            reasons.append(
+                f"Bearish trade score {bearish_trade_score:.2f} is below the required {bearish_threshold:.2f}."
+            )
+            return StrategyType.NO_TRADE, reasons
+        if context_layer_active and bearish_trade_score <= no_trade_score + bearish_margin:
+            reasons.append(
+                f"Bearish trade score {bearish_trade_score:.2f} does not exceed no-trade score {no_trade_score:.2f} by the required {bearish_margin:.2f}."
+            )
+            return StrategyType.NO_TRADE, reasons
+        required_bear_confidence = BEAR_CALL_MIN_CONFIDENCE + (0.05 if now_time >= time(14, 0) else 0.0)
+        if regime_state.confidence + CONFIDENCE_EPSILON < required_bear_confidence:
+            reasons.append(
+                f"Bearish setup detected, but conviction {regime_state.confidence:.2f} is below the required {required_bear_confidence:.2f}."
             )
             return StrategyType.NO_TRADE, reasons
         if day_archetype not in {"OPEN_DRIVE_BEARISH", "EARLY_BALANCE_TO_BEARISH", "SIDEWAYS_TO_BEARISH", "GAP_UP_FAILURE", "GAP_DOWN_CONTINUATION", "HIGH_CONFLUENCE_BEARISH"}:
@@ -226,7 +423,7 @@ def select_strategy(
             required_bear_end = HIGH_CONFLUENCE_BEARISH_END
         elif day_archetype == "GAP_DOWN_CONTINUATION":
             required_bear_start = GAP_BEARISH_START
-            required_bear_end = GAP_DOWN_BEARISH_CONTINUATION_END
+            required_bear_end = _gap_down_failed_bounce_end_time(regime_state, experimental_policy)
         else:
             required_bear_start = GAP_BEARISH_START
             required_bear_end = GAP_BEARISH_END
@@ -253,6 +450,34 @@ def select_strategy(
                 "Bullish uptrend detected, but price has not yet printed a valid pullback reclaim or shallow continuation setup."
             )
             return StrategyType.NO_TRADE, reasons
+        if context_layer_active and tradability == REGIME_TRADABILITY_NOT_TRADABLE:
+            reasons.append(tradability_reason)
+            return StrategyType.NO_TRADE, reasons
+        if context_layer_active and bullish_failure_score < 1.0 and failure_type not in {"ACCEPTED_BREAKOUT", "NONE"}:
+            reasons.append(
+                f"Bullish context is too conflicted; failure score is {bullish_failure_score:.2f} with failure type {failure_type}."
+            )
+            return StrategyType.NO_TRADE, reasons
+        if context_layer_active and open_space_up < 120.0:
+            reasons.append(
+                f"Bullish open space is too small at {open_space_up:.2f} points."
+            )
+            return StrategyType.NO_TRADE, reasons
+        if context_layer_active and overhead_call_pressure_score >= 1.5:
+            reasons.append(
+                f"Overhead call-wall pressure {overhead_call_pressure_score:.2f} is too high for bullish deployment."
+            )
+            return StrategyType.NO_TRADE, reasons
+        if context_layer_active and bullish_trade_score < bullish_threshold:
+            reasons.append(
+                f"Bullish trade score {bullish_trade_score:.2f} is below the required {bullish_threshold:.2f}."
+            )
+            return StrategyType.NO_TRADE, reasons
+        if context_layer_active and bullish_trade_score <= no_trade_score + bullish_margin:
+            reasons.append(
+                f"Bullish trade score {bullish_trade_score:.2f} does not exceed no-trade score {no_trade_score:.2f} by the required {bullish_margin:.2f}."
+            )
+            return StrategyType.NO_TRADE, reasons
         if playbook == "OPEN_DRIVE_BULLISH":
             required_confidence = OPEN_DRIVE_BULLISH_MIN_CONFIDENCE
         elif playbook == "HIGH_CONFLUENCE_BULLISH_CONTINUATION":
@@ -267,9 +492,10 @@ def select_strategy(
             required_confidence = AFTERNOON_TREND_BULLISH_MIN_CONFIDENCE
         else:
             required_confidence = SIDEWAYS_BULLISH_RECLAIM_MIN_CONFIDENCE
-        if regime_state.confidence + CONFIDENCE_EPSILON < required_confidence:
+        required_bull_confidence = required_confidence + (0.05 if now_time >= time(14, 0) else 0.0)
+        if regime_state.confidence + CONFIDENCE_EPSILON < required_bull_confidence:
             reasons.append(
-                f"Bullish setup detected, but conviction {regime_state.confidence:.2f} is below the required {required_confidence:.2f}."
+                f"Bullish setup detected, but conviction {regime_state.confidence:.2f} is below the required {required_bull_confidence:.2f}."
             )
             return StrategyType.NO_TRADE, reasons
         if playbook not in {"OPEN_DRIVE_BULLISH", "HIGH_CONFLUENCE_BULLISH_CONTINUATION", "SIDEWAYS_TO_BULLISH_RECLAIM", "EARLY_BALANCE_BULLISH_RECLAIM", "GAP_UP_BULLISH_CONTINUATION", "GAP_DOWN_BULLISH_RECOVERY", "AFTERNOON_TREND_HOLD_BULLISH"}:
@@ -355,12 +581,16 @@ def select_strategy(
         playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
         range_ready = bool(regime_state.metadata.get("range_entry_ready"))
         range_balance_score = float(regime_state.metadata.get("range_balance_score") or 0.0)
+        if context_layer_active and tradability == REGIME_TRADABILITY_NOT_TRADABLE:
+            reasons.append(tradability_reason)
+            return StrategyType.NO_TRADE, reasons
         if playbook != "RANGE_BALANCED_CONDOR" or not range_ready:
             reasons.append("Range regime detected, but the session is not balanced enough for the dedicated condor playbook.")
             return StrategyType.NO_TRADE, reasons
-        if regime_state.confidence + CONFIDENCE_EPSILON < RANGE_CONDOR_MIN_CONFIDENCE:
+        required_range_confidence = RANGE_CONDOR_MIN_CONFIDENCE + (0.05 if now_time >= time(14, 0) else 0.0)
+        if regime_state.confidence + CONFIDENCE_EPSILON < required_range_confidence:
             reasons.append(
-                f"Range playbook detected, but conviction {regime_state.confidence:.2f} is below the required {RANGE_CONDOR_MIN_CONFIDENCE:.2f}."
+                f"Range playbook detected, but conviction {regime_state.confidence:.2f} is below the required {required_range_confidence:.2f}."
             )
             return StrategyType.NO_TRADE, reasons
         if not ENABLE_RANGE_CONDOR_ACTIVE:

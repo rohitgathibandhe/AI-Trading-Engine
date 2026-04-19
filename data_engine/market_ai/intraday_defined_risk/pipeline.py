@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from market_ai.modules.data_fetch.dhan_rolling_option import RollingOptionConfig, RollingOptionIngestor
 
 from .collector import IST, _is_trading_day, _load_dhan_creds, capture_decision_time_snapshot
+from .data_pipeline_health import enrich_status_payload
 from .dataset import (
     DatasetCoverageReport,
     DeltaEnrichmentReport,
@@ -74,54 +75,68 @@ def refresh_training_data(
     rolling_days_written = 0
     fetch_error: str | None = None
     try:
-        rolling_start, rolling_end, rolling_days_written = _fetch_missing_rolling_history(
-            rolling_root=rolling_root,
-            start_date=start_date,
+        try:
+            rolling_start, rolling_end, rolling_days_written = _fetch_missing_rolling_history(
+                rolling_root=rolling_root,
+                start_date=start_date,
+                to_date=resolved_to_date,
+                underlying=underlying,
+                security_id=security_id,
+                segment=segment,
+                interval=interval,
+                creds_path=creds_path,
+            )
+        except Exception as exc:
+            if not tolerate_fetch_errors:
+                raise
+            fetch_error = str(exc)
+            logger.warning("Rolling history refresh skipped due to fetch error: %s", exc)
+        structured_report = refresh_structured_training_dataset_from_rolling(
+            rolling_root,
+            structured_root,
+            trade_blotter_path=trade_blotter_path,
+            scrip_master_path=scrip_master_path,
+            from_date=start_date,
             to_date=resolved_to_date,
-            underlying=underlying,
-            security_id=security_id,
-            segment=segment,
-            interval=interval,
-            creds_path=creds_path,
         )
+        delta_report = enrich_structured_chain_deltas(structured_root)
+        research_report = append_research_backtest_dataset_from_rolling(
+            rolling_root,
+            research_root,
+            from_date=start_date,
+            to_date=resolved_to_date,
+            monitor_times=tuple(monitor_times) if monitor_times else None,
+        )
+        coverage = assess_structured_dataset(structured_root)
+        report = TrainingDataRefreshReport(
+            as_of=datetime.now(IST).isoformat(),
+            rolling_fetch_start=rolling_start,
+            rolling_fetch_end=rolling_end,
+            rolling_days_written=rolling_days_written,
+            structured_refresh=structured_report.to_dict(),
+            delta_enrichment=delta_report.to_dict(),
+            research_append=research_report.to_dict(),
+            coverage=coverage.to_dict(),
+        )
+        if status_path:
+            payload = {"status": "REFRESHED", **report.to_dict()}
+            if fetch_error:
+                payload["fetch_error"] = fetch_error
+            _write_status(Path(status_path), payload)
+        return report
     except Exception as exc:
-        if not tolerate_fetch_errors:
-            raise
-        fetch_error = str(exc)
-        logger.warning("Rolling history refresh skipped due to fetch error: %s", exc)
-    structured_report = refresh_structured_training_dataset_from_rolling(
-        rolling_root,
-        structured_root,
-        trade_blotter_path=trade_blotter_path,
-        scrip_master_path=scrip_master_path,
-        from_date=start_date,
-        to_date=resolved_to_date,
-    )
-    delta_report = enrich_structured_chain_deltas(structured_root)
-    research_report = append_research_backtest_dataset_from_rolling(
-        rolling_root,
-        research_root,
-        from_date=start_date,
-        to_date=resolved_to_date,
-        monitor_times=tuple(monitor_times) if monitor_times else None,
-    )
-    coverage = assess_structured_dataset(structured_root)
-    report = TrainingDataRefreshReport(
-        as_of=datetime.now(IST).isoformat(),
-        rolling_fetch_start=rolling_start,
-        rolling_fetch_end=rolling_end,
-        rolling_days_written=rolling_days_written,
-        structured_refresh=structured_report.to_dict(),
-        delta_enrichment=delta_report.to_dict(),
-        research_append=research_report.to_dict(),
-        coverage=coverage.to_dict(),
-    )
-    if status_path:
-        payload = {"status": "REFRESHED", **report.to_dict()}
-        if fetch_error:
-            payload["fetch_error"] = fetch_error
-        _write_status(Path(status_path), payload)
-    return report
+        if status_path:
+            _write_status(
+                Path(status_path),
+                {
+                    "status": "REFRESH_ERROR",
+                    "as_of": datetime.now(IST).isoformat(),
+                    "to_date": resolved_to_date,
+                    "error": str(exc),
+                    "error_type": exc.__class__.__name__,
+                },
+            )
+        raise
 
 
 def run_training_data_pipeline(
@@ -312,7 +327,14 @@ def _load_recorded_times(data_root: str | Path, session_date: str) -> set[str]:
 
 def _write_status(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    state_root = path.parent
+    enriched = enrich_status_payload(
+        payload,
+        state_root=state_root,
+        structured_root=state_root / "intraday_structured_dataset",
+        research_root=state_root / "intraday_research_dataset_2025_01_01_2026_03_30_5m",
+    )
+    path.write_text(json.dumps(enriched, indent=2, sort_keys=True))
 
 
 def pd_date(value: str) -> date:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import time
 
-from .data_models import AdaptiveParameters, MarketSnapshot, RegimeLabel, RegimeState, ValidationError
+from .data_models import AdaptiveParameters, MarketSnapshot, OhlcvBar, RegimeLabel, RegimeState, ValidationError
 from .features import (
     RANGE_GATE_TIME,
     adaptive_or_length_minutes,
@@ -74,6 +74,524 @@ def _structure_signal(metadata: dict[str, float | str | bool | None]) -> str:
     if bool(metadata.get("bearish_bos")):
         return "BEARISH_BOS"
     return "BALANCED"
+
+
+def _market_state_classification(
+    *,
+    spot: float,
+    now_time: time,
+    vwap: float | None,
+    ema_fast: float | None,
+    ema_mid: float | None,
+    ema_slow: float | None,
+    current_structure_signal: str,
+    execution_5m: str,
+    bullish_pullback: bool,
+    bullish_shallow: bool,
+    bullish_vwap_hold: bool,
+    bearish_pullback: bool,
+    bearish_shallow: bool,
+    range_entry_ready: bool,
+    gap_up_bearish_failure_ready: bool,
+    gap_down_bearish_continuation_ready: bool,
+    gap_up_bullish_ready: bool,
+    gap_down_bullish_recovery_ready: bool,
+    open_drive_bullish_ready: bool,
+    open_drive_bearish: bool,
+    bullish_candle_pattern: str,
+    bearish_candle_pattern: str,
+    around_vwap: bool,
+    opening_range_break_state: str = "NONE",
+    candle_overlap_ratio: float = 1.0,
+    trend_efficiency_ratio: float = 0.0,
+    momentum_persistence_score: float = 0.0,
+    higher_low_confirmed: bool = False,
+    lower_high_confirmed: bool = False,
+    failed_reclaim_candidate: bool = False,
+    failed_bounce_candidate: bool = False,
+) -> tuple[str, str, float, float, list[str]]:
+    reasons: list[str] = []
+    market_state = "TRUE_RANGE"
+    market_state_bias = "NEUTRAL"
+    state_confidence_score = 0.45
+    state_quality_score = -1.25
+
+    ema_alignment_bullish = bool(
+        ema_fast is not None
+        and ema_mid is not None
+        and ema_slow is not None
+        and ema_fast > ema_mid > ema_slow
+    )
+    ema_alignment_bearish = bool(
+        ema_fast is not None
+        and ema_mid is not None
+        and ema_slow is not None
+        and ema_fast < ema_mid < ema_slow
+    )
+    ema_compression = bool(
+        ema_fast is not None
+        and ema_mid is not None
+        and ema_slow is not None
+        and ((max(ema_fast, ema_mid, ema_slow) - min(ema_fast, ema_mid, ema_slow)) / max(spot, 1.0) <= 0.002)
+    )
+    sustained_above_vwap = bool(vwap is not None and spot > vwap and execution_5m == "UP_CONFIRMED")
+    sustained_below_vwap = bool(vwap is not None and spot < vwap and execution_5m == "DOWN_CONFIRMED")
+
+    bullish_failure_signal = bool(
+        current_structure_signal == "BULLISH_CHOCH"
+        or bullish_candle_pattern in {"BULLISH_BREAKDOWN_FAILURE", "BULLISH_MORNING_STAR", "BULLISH_HAMMER"}
+        or gap_down_bullish_recovery_ready
+    )
+    bearish_failure_signal = bool(
+        current_structure_signal == "BEARISH_CHOCH"
+        or bearish_candle_pattern in {"BEARISH_BREAKOUT_FAILURE", "BEARISH_EVENING_STAR", "BEARISH_SHOOTING_STAR"}
+        or gap_up_bearish_failure_ready
+    )
+    bearish_transition_signal = bool(bearish_failure_signal or failed_reclaim_candidate or failed_bounce_candidate)
+    bullish_transition_signal = bool(bullish_failure_signal)
+    directional_balance_bearish = bool(
+        not ema_alignment_bullish
+        and (
+            lower_high_confirmed
+            or bearish_pullback
+            or bearish_shallow
+            or execution_5m == "DOWN_CONFIRMED"
+            or opening_range_break_state in {"DOWN", "FAILED_UP"}
+            or failed_reclaim_candidate
+            or failed_bounce_candidate
+        )
+        and (
+            trend_efficiency_ratio >= 0.28
+            or momentum_persistence_score >= 0.40
+            or current_structure_signal in {"BEARISH_BOS", "BEARISH_CHOCH"}
+        )
+    )
+    directional_balance_bullish = bool(
+        not ema_alignment_bearish
+        and (
+            higher_low_confirmed
+            or bullish_pullback
+            or bullish_shallow
+            or bullish_vwap_hold
+            or execution_5m == "UP_CONFIRMED"
+            or opening_range_break_state in {"UP", "FAILED_DOWN"}
+            or gap_up_bullish_ready
+            or open_drive_bullish_ready
+        )
+        and (
+            trend_efficiency_ratio >= 0.28
+            or momentum_persistence_score >= 0.40
+            or current_structure_signal in {"BULLISH_BOS", "BULLISH_CHOCH"}
+        )
+    )
+    true_range_like = bool(
+        ema_compression
+        or around_vwap
+        or range_entry_ready
+        or (candle_overlap_ratio >= 0.68 and trend_efficiency_ratio <= 0.45)
+    )
+
+    if bullish_transition_signal or bearish_transition_signal:
+        market_state = "TRANSITION"
+        if bearish_transition_signal and not bullish_transition_signal:
+            market_state_bias = "BEARISH"
+        elif bullish_transition_signal and not bearish_transition_signal:
+            market_state_bias = "BULLISH"
+        elif current_structure_signal.startswith("BEARISH"):
+            market_state_bias = "BEARISH"
+        elif current_structure_signal.startswith("BULLISH"):
+            market_state_bias = "BULLISH"
+        state_confidence_score = 0.75
+        if current_structure_signal.endswith("CHOCH"):
+            state_confidence_score += 0.10
+        if bullish_transition_signal and bearish_transition_signal:
+            state_confidence_score -= 0.05
+        state_quality_score = 3.5 + (1.0 if current_structure_signal.endswith("CHOCH") else 0.5)
+        if failed_bounce_candidate:
+            state_quality_score += 0.4
+        if failed_reclaim_candidate:
+            state_quality_score += 0.25
+        reasons.append("Market state is TRANSITION: structure shift or bearish/bullish failure signal has priority over pure trend continuation.")
+    elif ema_alignment_bullish and sustained_above_vwap and current_structure_signal == "BULLISH_BOS":
+        market_state = "TREND_UP"
+        market_state_bias = "BULLISH"
+        state_confidence_score = 0.72
+        state_quality_score = 2.4
+        if bullish_pullback or bullish_shallow or bullish_vwap_hold or open_drive_bullish_ready or gap_up_bullish_ready:
+            state_quality_score += 0.85
+        reasons.append("Market state is TREND_UP: fast/mid/slow EMA proxy is aligned and bullish structure is continuing above VWAP.")
+    elif ema_alignment_bearish and sustained_below_vwap and current_structure_signal == "BEARISH_BOS":
+        market_state = "TREND_DOWN"
+        market_state_bias = "BEARISH"
+        state_confidence_score = 0.72
+        state_quality_score = 2.4
+        if bearish_pullback or bearish_shallow or gap_down_bearish_continuation_ready or open_drive_bearish:
+            state_quality_score += 0.85
+        reasons.append("Market state is TREND_DOWN: fast/mid/slow EMA proxy is aligned and bearish structure is continuing below VWAP.")
+    elif directional_balance_bearish or directional_balance_bullish:
+        market_state = "DIRECTIONAL_BALANCE"
+        if directional_balance_bearish and not directional_balance_bullish:
+            market_state_bias = "BEARISH"
+        elif directional_balance_bullish and not directional_balance_bearish:
+            market_state_bias = "BULLISH"
+        elif current_structure_signal.startswith("BEARISH") or opening_range_break_state in {"DOWN", "FAILED_UP"}:
+            market_state_bias = "BEARISH"
+        elif current_structure_signal.startswith("BULLISH") or opening_range_break_state in {"UP", "FAILED_DOWN"}:
+            market_state_bias = "BULLISH"
+        state_confidence_score = 0.64 + (0.08 if market_state_bias != "NEUTRAL" else 0.0)
+        state_quality_score = 0.85
+        if market_state_bias == "BEARISH":
+            state_quality_score += 0.55
+        if market_state_bias == "BULLISH":
+            state_quality_score += 0.35
+        if failed_bounce_candidate or failed_reclaim_candidate:
+            state_quality_score += 0.65
+        if opening_range_break_state in {"DOWN", "FAILED_UP", "UP", "FAILED_DOWN"}:
+            state_quality_score += 0.25
+        reasons.append("Market state is DIRECTIONAL_BALANCE: balance/compression persists, but directional bias and failure/acceptance context remain tradable.")
+    else:
+        market_state = "TRUE_RANGE"
+        market_state_bias = "NEUTRAL"
+        state_confidence_score = 0.70 if (true_range_like or ema_compression or around_vwap) else 0.52
+        state_quality_score = -2.1 if not range_entry_ready else -1.1
+        if candle_overlap_ratio >= 0.72:
+            state_quality_score -= 0.35
+        reasons.append("Market state is TRUE_RANGE: EMA compression, repeated VWAP rotation, and overlap dominate without directional acceptance.")
+
+    if now_time >= time(14, 0):
+        state_quality_score -= 0.75
+        state_confidence_score = max(0.0, state_confidence_score - 0.08)
+        reasons.append("Late-session state penalty applied after 14:00 IST.")
+
+    return (
+        market_state,
+        market_state_bias,
+        round(state_quality_score, 4),
+        round(min(max(state_confidence_score, 0.0), 1.0), 4),
+        reasons,
+    )
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _recent_path_quality(bars: list[OhlcvBar], *, count: int = 8) -> dict[str, float]:
+    recent = bars[-count:]
+    if len(recent) < 3:
+        return {
+            "candle_overlap_ratio": 1.0,
+            "trend_efficiency_ratio": 0.0,
+            "expansion_score": 0.0,
+            "compression_score": 1.0,
+            "wick_rejection_score": 0.0,
+            "momentum_persistence_score": 0.0,
+            "impulse_strength": 0.0,
+            "pullback_depth_pct": 0.0,
+            "pullback_duration_bars": 0.0,
+        }
+
+    overlap_samples: list[float] = []
+    directional_matches = 0
+    path_length = 0.0
+    upper_rejection = 0.0
+    lower_rejection = 0.0
+    bullish_bodies = 0.0
+    bearish_bodies = 0.0
+    for previous, current in zip(recent, recent[1:]):
+        overlap = max(0.0, min(previous.high, current.high) - max(previous.low, current.low))
+        envelope = max(max(previous.high, current.high) - min(previous.low, current.low), 0.01)
+        overlap_samples.append(overlap / envelope)
+        delta = current.close - previous.close
+        if delta != 0:
+            directional_matches += 1 if delta > 0 else 0
+        path_length += abs(delta)
+        body = abs(current.close - current.open)
+        range_points = max(current.high - current.low, 0.01)
+        upper_wick = current.high - max(current.open, current.close)
+        lower_wick = min(current.open, current.close) - current.low
+        upper_rejection += upper_wick / range_points
+        lower_rejection += lower_wick / range_points
+        if current.close >= current.open:
+            bullish_bodies += body / range_points
+        else:
+            bearish_bodies += body / range_points
+
+    net_move = abs(recent[-1].close - recent[0].open)
+    total_range = max(max(bar.high for bar in recent) - min(bar.low for bar in recent), 0.01)
+    trend_efficiency_ratio = net_move / max(path_length, 0.01)
+    candle_overlap_ratio = sum(overlap_samples) / len(overlap_samples)
+    body_bias = abs(bullish_bodies - bearish_bodies) / max(len(recent) - 1, 1)
+    expansion_score = _clamp((total_range / max(abs(recent[0].open), 1.0)) * 100.0 * 4.0 + (body_bias * 2.0), 0.0, 5.0)
+    compression_score = _clamp(5.0 - (expansion_score * 0.8) - (trend_efficiency_ratio * 1.5), 0.0, 5.0)
+    wick_rejection_score = _clamp(max(upper_rejection, lower_rejection) / max(len(recent) - 1, 1) * 5.0, 0.0, 5.0)
+    momentum_persistence_score = _clamp((directional_matches / max(len(recent) - 1, 1)) * 5.0, 0.0, 5.0)
+
+    pullback_depth_pct = 0.0
+    pullback_duration_bars = 0.0
+    closes_only = [bar.close for bar in recent]
+    highest_close = max(closes_only)
+    lowest_close = min(closes_only)
+    if recent[-1].close >= recent[0].open:
+        local_pullback_low = min(bar.low for bar in recent[-4:])
+        pullback_depth_pct = max((highest_close - local_pullback_low) / max(highest_close, 1.0) * 100.0, 0.0)
+        pullback_duration_bars = float(sum(1 for bar in recent[-4:] if bar.close <= bar.open))
+    else:
+        local_pullback_high = max(bar.high for bar in recent[-4:])
+        pullback_depth_pct = max((local_pullback_high - lowest_close) / max(abs(lowest_close), 1.0) * 100.0, 0.0)
+        pullback_duration_bars = float(sum(1 for bar in recent[-4:] if bar.close >= bar.open))
+
+    return {
+        "candle_overlap_ratio": round(candle_overlap_ratio, 4),
+        "trend_efficiency_ratio": round(_clamp(trend_efficiency_ratio, 0.0, 1.0), 4),
+        "expansion_score": round(expansion_score, 4),
+        "compression_score": round(compression_score, 4),
+        "wick_rejection_score": round(wick_rejection_score, 4),
+        "momentum_persistence_score": round(momentum_persistence_score, 4),
+        "impulse_strength": round(_clamp((net_move / total_range) * 5.0, 0.0, 5.0), 4),
+        "pullback_depth_pct": round(pullback_depth_pct, 4),
+        "pullback_duration_bars": round(pullback_duration_bars, 4),
+    }
+
+
+def _opening_range_break_state(
+    bars: list[OhlcvBar],
+    opening_range_high: float | None,
+    opening_range_low: float | None,
+    vwap: float | None,
+) -> str:
+    if not bars or opening_range_high is None or opening_range_low is None:
+        return "NONE"
+    recent = bars[-6:]
+    last = recent[-1]
+    above_count = sum(1 for bar in recent if bar.close > opening_range_high)
+    below_count = sum(1 for bar in recent if bar.close < opening_range_low)
+    broke_up = any(bar.high > opening_range_high for bar in recent)
+    broke_down = any(bar.low < opening_range_low for bar in recent)
+    if above_count >= 2 and (vwap is None or last.close > vwap):
+        return "UP"
+    if below_count >= 2 and (vwap is None or last.close < vwap):
+        return "DOWN"
+    if broke_up and last.close < opening_range_high and (vwap is None or last.close < vwap):
+        return "FAILED_UP"
+    if broke_down and last.close > opening_range_low and (vwap is None or last.close > vwap):
+        return "FAILED_DOWN"
+    return "NONE"
+
+
+def _option_chain_context(
+    *,
+    spot: float,
+    support_ref: float | None,
+    resistance_ref: float | None,
+    metadata: dict[str, float | str | bool | None],
+    option_pressure: dict[str, float],
+    oi_flow: dict[str, float | str | None],
+    wall_migration: dict[str, float | str | None],
+) -> dict[str, float | str | bool | None]:
+    nearest_call_wall = metadata.get("current_call_wall")
+    nearest_put_wall = metadata.get("current_put_wall")
+    distance_to_call_wall = None if nearest_call_wall is None else float(nearest_call_wall) - spot
+    distance_to_put_wall = None if nearest_put_wall is None else spot - float(nearest_put_wall)
+    oi_pressure_imbalance = float(option_pressure.get("bearish_pressure", 0.0) - option_pressure.get("bullish_pressure", 0.0))
+    overhead_call_pressure_score = 0.0
+    downside_put_support_score = 0.0
+    if distance_to_call_wall is not None:
+        if distance_to_call_wall <= 50.0:
+            overhead_call_pressure_score = 2.5
+        elif distance_to_call_wall <= 100.0:
+            overhead_call_pressure_score = 1.5
+        elif distance_to_call_wall <= 150.0:
+            overhead_call_pressure_score = 0.75
+    if distance_to_put_wall is not None:
+        if distance_to_put_wall <= 50.0:
+            downside_put_support_score = 2.5
+        elif distance_to_put_wall <= 100.0:
+            downside_put_support_score = 1.5
+        elif distance_to_put_wall <= 150.0:
+            downside_put_support_score = 0.75
+
+    if overhead_call_pressure_score >= 1.5 and downside_put_support_score >= 1.5:
+        pressure_state = "BALANCED_WALLS"
+    elif overhead_call_pressure_score >= 1.5:
+        pressure_state = "OVERHEAD_CALL_PRESSURE"
+    elif downside_put_support_score >= 1.5:
+        pressure_state = "DOWNSIDE_PUT_SUPPORT"
+    elif (wall_migration.get("wall_migration_bias") or "NEUTRAL") == "BEARISH":
+        pressure_state = "BEARISH_WALL_SHIFT"
+    elif (wall_migration.get("wall_migration_bias") or "NEUTRAL") == "BULLISH":
+        pressure_state = "BULLISH_WALL_SHIFT"
+    else:
+        pressure_state = "NEUTRAL"
+
+    return {
+        "nearest_call_wall": nearest_call_wall,
+        "nearest_put_wall": nearest_put_wall,
+        "distance_to_call_wall": None if distance_to_call_wall is None else round(distance_to_call_wall, 2),
+        "distance_to_put_wall": None if distance_to_put_wall is None else round(distance_to_put_wall, 2),
+        "call_wall_migration": "UP" if float(wall_migration.get("call_wall_shift") or 0.0) > 0 else ("DOWN" if float(wall_migration.get("call_wall_shift") or 0.0) < 0 else "STABLE"),
+        "put_wall_migration": "UP" if float(wall_migration.get("put_wall_shift") or 0.0) > 0 else ("DOWN" if float(wall_migration.get("put_wall_shift") or 0.0) < 0 else "STABLE"),
+        "oi_pressure_imbalance": round(oi_pressure_imbalance, 4),
+        "oi_pressure_bias": str(oi_flow.get("smart_money_bias") or "NEUTRAL"),
+        "smart_money_bias": str(oi_flow.get("smart_money_bias") or "NEUTRAL"),
+        "overhead_call_pressure_score": round(overhead_call_pressure_score, 4),
+        "downside_put_support_score": round(downside_put_support_score, 4),
+        "option_chain_pressure_state": pressure_state,
+        "price_into_overhead_call_wall": bool(distance_to_call_wall is not None and distance_to_call_wall <= 75.0),
+        "price_into_downside_put_wall": bool(distance_to_put_wall is not None and distance_to_put_wall <= 75.0),
+        "nearest_resistance": _round_level(resistance_ref),
+        "nearest_support": _round_level(support_ref),
+    }
+
+def _average_chain_iv(snapshot: MarketSnapshot) -> float | None:
+    ivs = [
+        float(quote.iv)
+        for quote in snapshot.option_chain.quotes
+        if quote.iv is not None and quote.ltp > 0
+    ]
+    if not ivs:
+        return None
+    return sum(ivs) / len(ivs)
+
+
+def _bullish_shadow_subtype(
+    *,
+    playbook: str,
+    bullish_setup: str | None,
+    now_time: time,
+    spot: float,
+    ema20_5m_value: float | None,
+    vwap: float | None,
+    opening_range_high: float | None,
+) -> str | None:
+    if playbook not in {
+        "SIDEWAYS_TO_BULLISH_RECLAIM",
+        "EARLY_BALANCE_BULLISH_RECLAIM",
+        "OPEN_DRIVE_BULLISH",
+        "GAP_UP_BULLISH_CONTINUATION",
+        "GAP_DOWN_BULLISH_RECOVERY",
+        "AFTERNOON_TREND_HOLD_BULLISH",
+        "HIGH_CONFLUENCE_BULLISH_CONTINUATION",
+    }:
+        return None
+    if bullish_setup == "VWAP_HOLD_HIGHER_LOW" and vwap is not None and spot > vwap:
+        return "VWAP_RECLAIM_HIGHER_LOW"
+    if opening_range_high is not None and spot > opening_range_high and bullish_setup in {"SHALLOW_CONTINUATION", "HIGH_CONFLUENCE_CONTINUATION"}:
+        return "OR_HOLD_BULLISH_CONTINUATION"
+    if now_time >= time(13, 0) and bullish_setup in {"PULLBACK_RECLAIM", "VWAP_HOLD_HIGHER_LOW", "AFTERNOON_TREND_HOLD"}:
+        return "LATE_SESSION_BULLISH_RECLAIM"
+    if bullish_setup == "SHALLOW_CONTINUATION":
+        return "SHALLOW_PULLBACK_CONTINUATION"
+    if bullish_setup in {"PULLBACK_RECLAIM", "EARLY_BALANCE_RECLAIM", "OPEN_DRIVE_RECLAIM"} and ema20_5m_value is not None and vwap is not None and spot > ema20_5m_value and spot > vwap:
+        return "EMA20_AND_VWAP_ALIGNED_BULLISH"
+    return None
+
+
+def _bearish_continuation_subtype(
+    *,
+    playbook: str,
+    bearish_setup: str | None,
+    now_time: time,
+    big_gap_down: bool,
+    spot: float,
+    opening_range_low: float | None,
+    vwap: float | None,
+) -> str | None:
+    if playbook not in {
+        "BEARISH_CONTINUATION",
+        "HIGH_CONFLUENCE_BEARISH_CONTINUATION",
+        "GAP_DOWN_BEARISH_CONTINUATION",
+    }:
+        return None
+    if big_gap_down and bearish_setup == "GAP_CONTINUATION":
+        return "GAP_DOWN_FAILED_BOUNCE"
+    if opening_range_low is not None and bearish_setup in {"PULLBACK_REJECTION", "TIGHT_BREAKDOWN"} and spot < opening_range_low:
+        return "OR_LOW_RETEST_FAILURE"
+    if vwap is not None and bearish_setup in {"PULLBACK_REJECTION", "HIGH_CONFLUENCE_CONTINUATION"} and spot < vwap:
+        return "VWAP_REJECTION_CONTINUATION"
+    if now_time >= time(13, 0):
+        return "AFTERNOON_TREND_HOLD_BEARISH"
+    if bearish_setup in {"SHALLOW_CONTINUATION", "PULLBACK_REJECTION"}:
+        return "MIDDAY_WEAK_RECLAIM_CONTINUATION"
+    return None
+
+
+def _bearish_failed_reclaim_subtype(
+    *,
+    playbook: str,
+    current_structure_signal: str,
+    spot: float,
+    ema20_5m_value: float | None,
+    vwap: float | None,
+    resistance_5m: float | None,
+) -> str | None:
+    if playbook not in {"BEARISH_FAILED_RECLAIM", "EARLY_BALANCE_BEARISH_FAILED_RECLAIM"}:
+        return None
+    if current_structure_signal == "BEARISH_CHOCH":
+        return "CHOCH_FAILED_RECLAIM"
+    if resistance_5m is not None and resistance_5m >= spot and (resistance_5m - spot) <= 35.0:
+        return "SUPPLY_ZONE_FAILED_RECLAIM"
+    if ema20_5m_value is not None and abs(spot - ema20_5m_value) <= 20.0 and spot < ema20_5m_value:
+        return "EMA20_FAILED_RECLAIM"
+    if vwap is not None and abs(spot - vwap) <= 20.0 and spot < vwap:
+        return "VWAP_FAILED_RECLAIM"
+    return "LOWER_HIGH_FAILED_RECLAIM"
+
+
+def _bearish_rejection_transition_subtype(
+    *,
+    playbook: str,
+    bearish_setup: str | None,
+    market_state: str,
+    opening_range_break_state: str,
+    opening_range_low: float | None,
+    spot: float,
+    vwap: float | None,
+    ema20_5m_value: float | None,
+    ema50_5m_value: float | None,
+    recent_rejection_high: float,
+    recent_local_low: float,
+    lower_high_confirmed: bool,
+    bearish_pullback: bool,
+    bearish_candle_quality_score: float,
+    current_structure_signal: str,
+    trend_efficiency_ratio: float,
+    momentum_persistence_score: float,
+) -> str | None:
+    if playbook != "SIDEWAYS_TO_BEARISH_REJECTION":
+        return None
+    if bearish_setup != "PULLBACK_REJECTION":
+        return None
+    if market_state != "TRANSITION":
+        return None
+    if opening_range_break_state not in {"DOWN", "FAILED_UP"}:
+        return None
+    if not bearish_pullback or not lower_high_confirmed:
+        return None
+    if bearish_candle_quality_score < 3.25:
+        return None
+    if current_structure_signal not in {"BALANCED", "BEARISH_BOS", "BEARISH_CHOCH"}:
+        return None
+    if trend_efficiency_ratio < 0.22:
+        return None
+    bounce_distance = recent_rejection_high - recent_local_low
+    if bounce_distance < 18.0:
+        return None
+    trigger_levels = [
+        level
+        for level in [opening_range_low, vwap, ema20_5m_value, ema50_5m_value]
+        if level is not None
+    ]
+    if not trigger_levels:
+        return None
+    trigger_zone = min(float(level) for level in trigger_levels)
+    rejection_under_trigger = recent_rejection_high <= trigger_zone - 8.0
+    acceptance_lost = spot <= recent_rejection_high - 8.0 and spot < trigger_zone
+    if not rejection_under_trigger or not acceptance_lost:
+        return None
+    if momentum_persistence_score < 1.2:
+        return None
+    return "BEARISH_REJECTION_TRANSITION"
 
 
 def _build_trade_plan(
@@ -264,6 +782,10 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     ema20_slope_value = ema_slope(close_15m, period=20, lookback=3)
     ema20_5m_value = ema_value(close_5m, period=20)
     ema50_5m_value = ema_value(close_5m, period=50)
+    ema100_5m_value = ema_value(close_5m, period=100) or ema20_value
+    ema20_5m_slope_value = ema_slope(close_5m, period=20, lookback=3)
+    ema50_5m_slope_value = ema_slope(close_5m, period=50, lookback=3)
+    ema100_proxy_slope_value = ema_slope(close_15m, period=20, lookback=5)
     trend_15m = "NEUTRAL"
     reasons: list[str] = []
     confidence = 0.0
@@ -297,6 +819,11 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "big_gap_down": False,
         "ema20_5m": ema20_5m_value,
         "ema50_5m": ema50_5m_value,
+        "ema100_5m": ema100_5m_value,
+        "ema20_15m": ema20_value,
+        "ema20_slope_5m": ema20_5m_slope_value,
+        "ema50_slope_5m": ema50_5m_slope_value,
+        "ema100_slope_proxy": ema100_proxy_slope_value,
         "ema_distance_pct_5m": ema_distance_pct(ema20_5m_value, ema50_5m_value, spot),
         "last_hour_change_pct": hour_change_pct,
         "support_5m": support_5m[0] if support_5m else None,
@@ -327,6 +854,15 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "bearish_entry_ready": False,
         "bearish_setup": None,
         "playbook": "NO_TRADE",
+        "setup_subtype": None,
+        "bullish_shadow_subtype": None,
+        "bearish_family": None,
+        "bearish_subtype": None,
+        "condor_profile": None,
+        "condor_shape_bias": None,
+        "condor_short_delta_band_bias": None,
+        "avg_chain_iv": None,
+        "range_compression_score": 0.0,
         "min_short_call_strike": None,
         "max_short_put_strike": None,
         "preferred_width_points": None,
@@ -356,6 +892,11 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "early_sideways_bullish_ready": False,
         "gap_bullish_ready": False,
         "gap_bearish_ready": False,
+        "market_state": "RANGE",
+        "market_state_bias": "NEUTRAL",
+        "state_quality_score": 0.0,
+        "state_confidence_score": 0.0,
+        "state_confidence": 0.0,
     }
 
     if ema20_value is not None:
@@ -402,6 +943,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         opening_range = compute_opening_range(bars_5m, or_length)
 
     vwap = snapshot.live_vwap if snapshot.live_vwap is not None else compute_vwap(bars_5m)
+    metadata["bars_above_vwap"] = sum(1 for bar in bars_5m[-10:] if vwap is not None and bar.close > vwap)
+    metadata["bars_below_vwap"] = sum(1 for bar in bars_5m[-10:] if vwap is not None and bar.close < vwap)
     execution_5m = "UNCONFIRMED"
 
     if opening_range and vwap:
@@ -1070,6 +1613,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         metadata["preferred_width_points"] = 100.0
         metadata["allowed_width_points"] = (100.0,)
         metadata["minimum_net_edge_rupees"] = 500.0
+    failed_reclaim = False
     if (
         (trend_15m == "TREND_DOWN" and execution_5m == "DOWN_CONFIRMED")
         or (
@@ -1369,6 +1913,203 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         elif range_bias:
             metadata["day_archetype"] = "SIDEWAYS_RANGE"
 
+    avg_chain_iv = _average_chain_iv(snapshot)
+    range_compression_score = max(0.0, min(2.0, (params.rv_mid_cutoff - rv30_pct) / max(params.rv_mid_cutoff, 0.05))) if rv30_pct <= params.rv_mid_cutoff else 0.0
+    metadata["avg_chain_iv"] = round(avg_chain_iv, 4) if avg_chain_iv is not None else None
+    metadata["range_compression_score"] = round(range_compression_score, 4)
+
+    bullish_shadow_subtype = _bullish_shadow_subtype(
+        playbook=str(metadata.get("playbook") or "NO_TRADE"),
+        bullish_setup=metadata.get("bullish_setup"),
+        now_time=snapshot.timestamp.time(),
+        spot=spot,
+        ema20_5m_value=ema20_5m_value,
+        vwap=vwap,
+        opening_range_high=opening_range.high if opening_range else None,
+    )
+    if bullish_shadow_subtype is not None:
+        metadata["bullish_shadow_subtype"] = bullish_shadow_subtype
+        metadata["setup_subtype"] = bullish_shadow_subtype
+        if bullish_shadow_subtype == "VWAP_RECLAIM_HIGHER_LOW":
+            metadata["preferred_width_points"] = 75.0
+            metadata["allowed_width_points"] = (75.0, 100.0)
+            metadata["minimum_net_edge_rupees"] = 800.0
+        elif bullish_shadow_subtype == "OR_HOLD_BULLISH_CONTINUATION":
+            metadata["preferred_width_points"] = 100.0
+            metadata["allowed_width_points"] = (100.0, 150.0)
+            metadata["minimum_net_edge_rupees"] = 1100.0
+        elif bullish_shadow_subtype == "LATE_SESSION_BULLISH_RECLAIM":
+            metadata["preferred_width_points"] = 75.0
+            metadata["allowed_width_points"] = (75.0, 100.0)
+            metadata["minimum_net_edge_rupees"] = 700.0
+        elif bullish_shadow_subtype == "SHALLOW_PULLBACK_CONTINUATION":
+            metadata["preferred_width_points"] = 100.0
+            metadata["allowed_width_points"] = (75.0, 100.0)
+            metadata["minimum_net_edge_rupees"] = 850.0
+        elif bullish_shadow_subtype == "EMA20_AND_VWAP_ALIGNED_BULLISH":
+            metadata["preferred_width_points"] = 100.0
+            metadata["allowed_width_points"] = (100.0, 150.0)
+            metadata["minimum_net_edge_rupees"] = 900.0
+
+    bearish_continuation_subtype = _bearish_continuation_subtype(
+        playbook=str(metadata.get("playbook") or "NO_TRADE"),
+        bearish_setup=metadata.get("bearish_setup"),
+        now_time=snapshot.timestamp.time(),
+        big_gap_down=big_gap_down,
+        spot=spot,
+        opening_range_low=opening_range.low if opening_range else None,
+        vwap=vwap,
+    )
+    if bearish_continuation_subtype is not None:
+        metadata["bearish_family"] = "BEARISH_CONTINUATION"
+        metadata["bearish_subtype"] = bearish_continuation_subtype
+        metadata["setup_subtype"] = bearish_continuation_subtype
+        if bearish_continuation_subtype == "GAP_DOWN_FAILED_BOUNCE":
+            metadata["preferred_width_points"] = 100.0
+            metadata["allowed_width_points"] = (100.0, 150.0)
+            metadata["minimum_net_edge_rupees"] = 1100.0
+        elif bearish_continuation_subtype == "VWAP_REJECTION_CONTINUATION":
+            metadata["preferred_width_points"] = 100.0
+            metadata["allowed_width_points"] = (75.0, 100.0)
+            metadata["minimum_net_edge_rupees"] = 950.0
+        elif bearish_continuation_subtype == "OR_LOW_RETEST_FAILURE":
+            metadata["preferred_width_points"] = 100.0
+            metadata["allowed_width_points"] = (100.0,)
+            metadata["minimum_net_edge_rupees"] = 1000.0
+        elif bearish_continuation_subtype == "MIDDAY_WEAK_RECLAIM_CONTINUATION":
+            metadata["preferred_width_points"] = 75.0
+            metadata["allowed_width_points"] = (75.0, 100.0)
+            metadata["minimum_net_edge_rupees"] = 850.0
+        elif bearish_continuation_subtype == "AFTERNOON_TREND_HOLD_BEARISH":
+            metadata["preferred_width_points"] = 75.0
+            metadata["allowed_width_points"] = (75.0, 100.0)
+            metadata["minimum_net_edge_rupees"] = 800.0
+
+    bearish_failed_reclaim_subtype = _bearish_failed_reclaim_subtype(
+        playbook=str(metadata.get("playbook") or "NO_TRADE"),
+        current_structure_signal=current_structure_signal,
+        spot=spot,
+        ema20_5m_value=ema20_5m_value,
+        vwap=vwap,
+        resistance_5m=metadata.get("resistance_5m"),
+    )
+    if bearish_failed_reclaim_subtype is not None:
+        metadata["bearish_family"] = "BEARISH_FAILED_RECLAIM"
+        metadata["bearish_subtype"] = bearish_failed_reclaim_subtype
+        metadata["setup_subtype"] = bearish_failed_reclaim_subtype
+        if bearish_failed_reclaim_subtype in {"EMA20_FAILED_RECLAIM", "VWAP_FAILED_RECLAIM"}:
+            metadata["preferred_width_points"] = 75.0
+            metadata["allowed_width_points"] = (75.0, 100.0)
+            metadata["minimum_net_edge_rupees"] = 850.0
+        elif bearish_failed_reclaim_subtype == "LOWER_HIGH_FAILED_RECLAIM":
+            metadata["preferred_width_points"] = 100.0
+            metadata["allowed_width_points"] = (75.0, 100.0)
+            metadata["minimum_net_edge_rupees"] = 900.0
+        elif bearish_failed_reclaim_subtype == "SUPPLY_ZONE_FAILED_RECLAIM":
+            metadata["preferred_width_points"] = 100.0
+            metadata["allowed_width_points"] = (100.0,)
+            metadata["minimum_net_edge_rupees"] = 1000.0
+        elif bearish_failed_reclaim_subtype == "CHOCH_FAILED_RECLAIM":
+            metadata["preferred_width_points"] = 100.0
+            metadata["allowed_width_points"] = (100.0,)
+            metadata["minimum_net_edge_rupees"] = 1050.0
+
+    path_quality = _recent_path_quality(bars_5m)
+    metadata.update(path_quality)
+    opening_range_break_state = _opening_range_break_state(
+        bars_5m,
+        opening_range.high if opening_range else None,
+        opening_range.low if opening_range else None,
+        vwap,
+    )
+    higher_low_confirmed = bool(recent_higher_lows(hour_bars, needed=2))
+    lower_high_confirmed = bool(recent_lower_highs(hour_bars, needed=2))
+    failed_reclaim_candidate = bool(
+        metadata.get("bearish_setup") == "FAILED_RECLAIM"
+        or bearish_failed_reclaim_subtype is not None
+        or failed_reclaim
+    )
+    pre_failed_bounce_candidate = bool(
+        bearish_continuation_subtype == "GAP_DOWN_FAILED_BOUNCE"
+        or (
+            opening_range is not None
+            and bearish_pullback
+            and spot < opening_range.low
+            and opening_range_break_state in {"DOWN", "FAILED_UP"}
+        )
+        or (
+            vwap is not None
+            and bearish_pullback
+            and spot < vwap
+            and opening_range_break_state in {"FAILED_UP", "DOWN"}
+        )
+        or (
+            lower_high_confirmed
+            and current_structure_signal in {"BEARISH_BOS", "BEARISH_CHOCH"}
+            and bearish_pullback
+        )
+    )
+
+    market_state, market_state_bias, state_quality_score, state_confidence_score, market_state_reasons = _market_state_classification(
+        spot=spot,
+        now_time=snapshot.timestamp.time(),
+        vwap=vwap,
+        ema_fast=ema20_5m_value,
+        ema_mid=ema50_5m_value,
+        ema_slow=ema20_value,
+        current_structure_signal=current_structure_signal,
+        execution_5m=execution_5m,
+        bullish_pullback=bullish_pullback,
+        bullish_shallow=bullish_shallow,
+        bullish_vwap_hold=bullish_vwap_hold,
+        bearish_pullback=bearish_pullback,
+        bearish_shallow=bearish_shallow,
+        range_entry_ready=bool(metadata.get("range_entry_ready")),
+        gap_up_bearish_failure_ready=gap_up_bearish_failure_ready,
+        gap_down_bearish_continuation_ready=gap_down_bearish_continuation_ready,
+        gap_up_bullish_ready=gap_up_bullish_ready,
+        gap_down_bullish_recovery_ready=gap_down_bullish_recovery_ready,
+        open_drive_bullish_ready=open_drive_bullish_ready,
+        open_drive_bearish=open_drive_bearish,
+        bullish_candle_pattern=str(metadata.get("bullish_candle_pattern") or "NONE"),
+        bearish_candle_pattern=str(metadata.get("bearish_candle_pattern") or "NONE"),
+        around_vwap=bool(vwap is not None and oscillates_around_vwap(bars_5m, vwap, required_bars=6)),
+        opening_range_break_state=opening_range_break_state,
+        candle_overlap_ratio=float(path_quality["candle_overlap_ratio"]),
+        trend_efficiency_ratio=float(path_quality["trend_efficiency_ratio"]),
+        momentum_persistence_score=float(path_quality["momentum_persistence_score"]),
+        higher_low_confirmed=higher_low_confirmed,
+        lower_high_confirmed=lower_high_confirmed,
+        failed_reclaim_candidate=failed_reclaim_candidate,
+        failed_bounce_candidate=pre_failed_bounce_candidate,
+    )
+    metadata["market_state"] = market_state
+    metadata["market_state_bias"] = market_state_bias
+    metadata["state_quality_score"] = state_quality_score
+    metadata["state_confidence_score"] = state_confidence_score
+    reasons.extend(market_state_reasons)
+    if snapshot.timestamp.time() >= time(14, 0):
+        confidence = max(0.0, confidence - 0.05)
+
+    if metadata.get("playbook") == "RANGE_BALANCED_CONDOR":
+        if avg_chain_iv is not None and avg_chain_iv >= 22.0 and range_compression_score >= 0.75:
+            metadata["condor_profile"] = "COMPRESSED_HIGH_IV"
+            metadata["condor_short_delta_band_bias"] = "10_16"
+            metadata["condor_shape_bias"] = "SYMMETRIC"
+        elif metadata.get("smart_money_bias") == "BULLISH":
+            metadata["condor_profile"] = "SLIGHT_BULLISH_RANGE"
+            metadata["condor_short_delta_band_bias"] = "08_14"
+            metadata["condor_shape_bias"] = "CALL_WIDER"
+        elif metadata.get("smart_money_bias") == "BEARISH":
+            metadata["condor_profile"] = "SLIGHT_BEARISH_RANGE"
+            metadata["condor_short_delta_band_bias"] = "08_14"
+            metadata["condor_shape_bias"] = "PUT_WIDER"
+        else:
+            metadata["condor_profile"] = "NEUTRAL_BALANCED_RANGE"
+            metadata["condor_short_delta_band_bias"] = "12_20"
+            metadata["condor_shape_bias"] = "SYMMETRIC"
+        metadata["setup_subtype"] = metadata["condor_profile"]
+
     bullish_setup_quality = (
         float(metadata.get("bullish_confluence_score") or 0.0)
         + float(metadata.get("bullish_entry_score") or 0.0)
@@ -1383,6 +2124,37 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     range_setup_quality = float(metadata.get("range_balance_score") or 0.0) + (
         1.5 if bool(metadata.get("range_entry_ready")) else 0.0
     )
+    if market_state == "TREND_UP":
+        bullish_setup_quality += state_quality_score
+        bearish_setup_quality += min(state_quality_score, 0.0)
+    elif market_state == "TREND_DOWN":
+        bearish_setup_quality += state_quality_score
+        bullish_setup_quality += min(state_quality_score, 0.0)
+    elif market_state == "TRANSITION":
+        if market_state_bias == "BULLISH":
+            bullish_setup_quality += state_quality_score
+            bearish_setup_quality -= 0.5
+        elif market_state_bias == "BEARISH":
+            bearish_setup_quality += state_quality_score
+            bullish_setup_quality -= 0.5
+        else:
+            bullish_setup_quality += state_quality_score * 0.5
+            bearish_setup_quality += state_quality_score * 0.5
+    elif market_state == "DIRECTIONAL_BALANCE":
+        if market_state_bias == "BEARISH":
+            bearish_setup_quality += state_quality_score
+            bullish_setup_quality += min(state_quality_score - 0.75, 0.0)
+        elif market_state_bias == "BULLISH":
+            bullish_setup_quality += state_quality_score * 0.75
+            bearish_setup_quality += min(state_quality_score - 0.5, 0.0)
+        else:
+            bullish_setup_quality += state_quality_score * 0.35
+            bearish_setup_quality += state_quality_score * 0.35
+        range_setup_quality += max(state_quality_score * 0.25, 0.0)
+    elif market_state == "TRUE_RANGE":
+        bullish_setup_quality += state_quality_score
+        bearish_setup_quality += state_quality_score
+        range_setup_quality += max(state_quality_score, -0.25)
     if regime == RegimeLabel.UP_TREND and metadata.get("bullish_entry_ready"):
         metadata["setup_quality_score"] = round(bullish_setup_quality, 4)
         metadata["setup_direction"] = "BULLISH"
@@ -1395,6 +2167,460 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     else:
         metadata["setup_quality_score"] = round(max(bullish_setup_quality, bearish_setup_quality, range_setup_quality), 4)
         metadata["setup_direction"] = "NEUTRAL"
+
+    option_context = _option_chain_context(
+        spot=spot,
+        support_ref=support_ref,
+        resistance_ref=resistance_ref,
+        metadata=metadata,
+        option_pressure=option_pressure,
+        oi_flow=oi_flow,
+        wall_migration=wall_migration,
+    )
+    metadata.update(option_context)
+
+    time_remaining_minutes = max(0, ((15 * 60) + 15) - (snapshot.timestamp.hour * 60 + snapshot.timestamp.minute))
+    ema_alignment = "MIXED"
+    if ema20_5m_value is not None and ema50_5m_value is not None and ema100_5m_value is not None:
+        if ema20_5m_value > ema50_5m_value > ema100_5m_value:
+            ema_alignment = "BULLISH"
+        elif ema20_5m_value < ema50_5m_value < ema100_5m_value:
+            ema_alignment = "BEARISH"
+    ema_spread_points = 0.0
+    ema_compression_score = 0.0
+    if ema20_5m_value is not None and ema50_5m_value is not None and ema100_5m_value is not None:
+        ema_spread_points = ((max(ema20_5m_value, ema50_5m_value, ema100_5m_value) - min(ema20_5m_value, ema50_5m_value, ema100_5m_value)) / max(spot, 1.0)) * 1000.0
+        ema_compression_score = _clamp(5.0 - (ema_spread_points * 2.0), 0.0, 5.0)
+    metadata["ema_alignment"] = ema_alignment
+    metadata["ema_spread_score"] = round(_clamp(ema_spread_points * 1.5, 0.0, 5.0), 4)
+    metadata["ema_compression_score"] = round(ema_compression_score, 4)
+    metadata["price_vs_ema20"] = None if ema20_5m_value is None else round(spot - ema20_5m_value, 2)
+    metadata["price_vs_ema50"] = None if ema50_5m_value is None else round(spot - ema50_5m_value, 2)
+    metadata["price_vs_ema100"] = None if ema100_5m_value is None else round(spot - ema100_5m_value, 2)
+    metadata["ema20_slope"] = round(float(ema20_5m_slope_value or 0.0), 4)
+    metadata["ema50_slope"] = round(float(ema50_5m_slope_value or 0.0), 4)
+    metadata["ema100_slope"] = round(float(ema100_proxy_slope_value or 0.0), 4)
+    metadata["price_vs_vwap"] = None if vwap is None else round(spot - vwap, 2)
+    metadata["or_high"] = opening_range.high if opening_range else None
+    metadata["or_low"] = opening_range.low if opening_range else None
+    metadata["price_vs_or_high"] = None if opening_range is None else round(spot - opening_range.high, 2)
+    metadata["price_vs_or_low"] = None if opening_range is None else round(spot - opening_range.low, 2)
+    metadata["inside_opening_range"] = bool(opening_range is not None and opening_range.low <= spot <= opening_range.high)
+    metadata["opening_range_break_state"] = opening_range_break_state
+    metadata["higher_low_confirmed"] = higher_low_confirmed
+    metadata["lower_high_confirmed"] = lower_high_confirmed
+    if bool(metadata.get("higher_lows_5m")) and bool(metadata.get("higher_highs_5m")):
+        metadata["swing_state"] = "HH_HL"
+    elif bool(metadata.get("lower_highs_5m")) and bool(metadata.get("lower_lows_5m")):
+        metadata["swing_state"] = "LH_LL"
+    else:
+        metadata["swing_state"] = "MIXED"
+
+    resistance_candidates = [
+        level
+        for level in [
+            resistance_ref,
+            option_context.get("nearest_call_wall"),
+        ]
+        if isinstance(level, (int, float))
+    ]
+    support_candidates = [
+        level
+        for level in [
+            support_ref,
+            option_context.get("nearest_put_wall"),
+        ]
+        if isinstance(level, (int, float))
+    ]
+    nearest_resistance_level = min((float(level) for level in resistance_candidates if float(level) > spot), default=None)
+    nearest_support_level = max((float(level) for level in support_candidates if float(level) < spot), default=None)
+    distance_to_resistance = max((nearest_resistance_level - spot), 0.0) if nearest_resistance_level is not None else 999.0
+    distance_to_support = max((spot - nearest_support_level), 0.0) if nearest_support_level is not None else 999.0
+    metadata["distance_to_resistance"] = round(distance_to_resistance, 2)
+    metadata["distance_to_support"] = round(distance_to_support, 2)
+    metadata["open_space_up"] = round(min(distance_to_resistance, float(option_context.get("distance_to_call_wall") or distance_to_resistance)), 2)
+    metadata["open_space_down"] = round(min(distance_to_support, float(option_context.get("distance_to_put_wall") or distance_to_support)), 2)
+    metadata["inside_balance_zone"] = bool(metadata["inside_opening_range"] and abs(float(metadata.get("price_vs_vwap") or 0.0)) <= 20.0)
+
+    failed_breakout = bool(
+        opening_range_break_state == "FAILED_UP"
+        or metadata.get("bearish_candle_pattern") == "BEARISH_BREAKOUT_FAILURE"
+        or gap_up_bearish_failure_ready
+    )
+    failed_reclaim_flag = failed_reclaim_candidate
+    recent_rejection_high = max((bar.high for bar in bars_5m[-4:]), default=spot)
+    recent_local_low = min((bar.low for bar in bars_5m[-6:-1]), default=spot)
+    ema_cluster_upper = max(
+        value
+        for value in [ema20_5m_value, ema50_5m_value]
+        if value is not None
+    ) if any(value is not None for value in [ema20_5m_value, ema50_5m_value]) else None
+    ema_cluster_rejection = bool(
+        ema_cluster_upper is not None
+        and ema20_5m_value is not None
+        and ema50_5m_value is not None
+        and abs(ema20_5m_value - ema50_5m_value) <= 35.0
+        and bearish_pullback
+        and recent_rejection_high >= ema_cluster_upper - 10.0
+        and spot < ema20_5m_value
+        and lower_high_confirmed
+    )
+    vwap_failed_bounce = bool(
+        vwap is not None
+        and bearish_pullback
+        and recent_rejection_high >= vwap - 10.0
+        and spot < vwap
+        and opening_range_break_state in {"DOWN", "FAILED_UP"}
+    )
+    lower_high_breakdown_retest = bool(
+        lower_high_confirmed
+        and current_structure_signal in {"BEARISH_BOS", "BEARISH_CHOCH"}
+        and bearish_pullback
+        and float(path_quality["trend_efficiency_ratio"]) >= 0.28
+    )
+    or_low_revisit_rejection = bool(
+        opening_range is not None
+        and opening_range.low is not None
+        and recent_rejection_high >= opening_range.low - 8.0
+        and spot < opening_range.low
+        and bearish_pullback
+    )
+    weak_failed_bounce = bool(
+        (bearish_pullback or bearish_shallow)
+        and lower_high_confirmed
+        and float(path_quality["momentum_persistence_score"]) <= 0.42
+        and (vwap is None or spot < vwap)
+    )
+    bearish_rejection_transition_subtype = _bearish_rejection_transition_subtype(
+        playbook=str(metadata.get("playbook") or "NO_TRADE"),
+        bearish_setup=metadata.get("bearish_setup"),
+        market_state=market_state,
+        opening_range_break_state=opening_range_break_state,
+        opening_range_low=opening_range.low if opening_range else None,
+        spot=spot,
+        vwap=vwap,
+        ema20_5m_value=ema20_5m_value,
+        ema50_5m_value=ema50_5m_value,
+        recent_rejection_high=recent_rejection_high,
+        recent_local_low=recent_local_low,
+        lower_high_confirmed=lower_high_confirmed,
+        bearish_pullback=bearish_pullback,
+        bearish_candle_quality_score=float(metadata.get("bearish_candle_quality_score") or 0.0),
+        current_structure_signal=current_structure_signal,
+        trend_efficiency_ratio=float(path_quality["trend_efficiency_ratio"]),
+        momentum_persistence_score=float(path_quality["momentum_persistence_score"]),
+    )
+    if bearish_rejection_transition_subtype is not None and metadata.get("bearish_subtype") is None:
+        metadata["bearish_family"] = "BEARISH_REJECTION"
+        metadata["bearish_subtype"] = bearish_rejection_transition_subtype
+        metadata["setup_subtype"] = bearish_rejection_transition_subtype
+    metadata["bearish_rejection_transition"] = bool(bearish_rejection_transition_subtype)
+    failed_bounce = bool(
+        bearish_continuation_subtype == "GAP_DOWN_FAILED_BOUNCE"
+        or ema_cluster_rejection
+        or vwap_failed_bounce
+        or lower_high_breakdown_retest
+        or or_low_revisit_rejection
+        or weak_failed_bounce
+        or (
+            gap_down_bearish_continuation_ready
+            and bearish_pullback
+            and lower_high_confirmed
+            and market_state in {"TREND_DOWN", "TRANSITION", "DIRECTIONAL_BALANCE"}
+        )
+    )
+    accepted_breakout = bool(
+        opening_range_break_state == "UP"
+        and current_structure_signal == "BULLISH_BOS"
+        and market_state == "TREND_UP"
+    )
+    accepted_breakdown = bool(
+        opening_range_break_state == "DOWN"
+        and current_structure_signal == "BEARISH_BOS"
+        and market_state in {"TREND_DOWN", "TRANSITION"}
+    )
+    metadata["failed_breakout"] = failed_breakout
+    metadata["failed_breakdown"] = bool(opening_range_break_state == "FAILED_DOWN")
+    metadata["failed_reclaim"] = failed_reclaim_flag
+    metadata["failed_bounce"] = failed_bounce
+    metadata["accepted_breakout"] = accepted_breakout
+    metadata["accepted_breakdown"] = accepted_breakdown
+    if failed_breakout:
+        failure_type = "FAILED_BREAKOUT"
+    elif failed_reclaim_flag:
+        failure_type = "FAILED_RECLAIM"
+    elif failed_bounce:
+        failure_type = "FAILED_BOUNCE"
+    elif bearish_rejection_transition_subtype is not None:
+        failure_type = "BEARISH_REJECTION_TRANSITION"
+    elif accepted_breakout:
+        failure_type = "ACCEPTED_BREAKOUT"
+    elif accepted_breakdown:
+        failure_type = "ACCEPTED_BREAKDOWN"
+    else:
+        failure_type = "NONE"
+    metadata["failure_type"] = failure_type
+
+    retest_success_score = 0.0
+    retest_failure_score = 0.0
+    if accepted_breakout or accepted_breakdown:
+        retest_success_score += 2.0
+    if failed_breakout or failed_reclaim_flag or failed_bounce:
+        retest_failure_score += 2.5
+    metadata["break_acceptance_score"] = round(2.0 if accepted_breakout or accepted_breakdown else 0.0, 4)
+    metadata["retest_success_score"] = round(retest_success_score, 4)
+    metadata["retest_failure_score"] = round(retest_failure_score, 4)
+
+    first_test_buffer = 20.0
+    first_test_hits = 0
+    if nearest_resistance_level is not None:
+        first_test_hits += sum(1 for bar in bars_5m[-8:-1] if abs(bar.high - nearest_resistance_level) <= first_test_buffer)
+    if nearest_support_level is not None:
+        first_test_hits += sum(1 for bar in bars_5m[-8:-1] if abs(bar.low - nearest_support_level) <= first_test_buffer)
+    metadata["at_first_test_of_level"] = first_test_hits <= 1
+    level_rejection_score = 0.0
+    if failed_breakout or failed_reclaim_flag or failed_bounce:
+        level_rejection_score += max(float(metadata.get("bearish_candle_quality_score") or 0.0), float(path_quality["wick_rejection_score"]) * 0.5)
+    elif accepted_breakout:
+        level_rejection_score += max(float(metadata.get("bullish_candle_quality_score") or 0.0), 1.0)
+    metadata["level_rejection_score"] = round(_clamp(level_rejection_score, 0.0, 5.0), 4)
+
+    bullish_trend_quality_score = _clamp(
+        (bullish_trend_score * 1.55)
+        + (1.0 if market_state == "TREND_UP" else 0.0)
+        + (0.5 if current_structure_signal == "BULLISH_BOS" else 0.0)
+        + (float(path_quality["momentum_persistence_score"]) * 0.4),
+        0.0,
+        10.0,
+    )
+    bearish_trend_quality_score = _clamp(
+        (bearish_trend_score * 1.55)
+        + (1.0 if market_state == "TREND_DOWN" else 0.0)
+        + (0.75 if market_state == "TRANSITION" and market_state_bias == "BEARISH" else 0.0)
+        + (0.5 if current_structure_signal in {"BEARISH_BOS", "BEARISH_CHOCH"} else 0.0)
+        + (float(path_quality["momentum_persistence_score"]) * 0.4),
+        0.0,
+        10.0,
+    )
+    bearish_failure_score = 0.0
+    bullish_failure_score = 0.0
+    if failed_reclaim_flag:
+        bearish_failure_score += 3.0
+    if failed_bounce:
+        bearish_failure_score += 3.0
+    if bearish_rejection_transition_subtype is not None:
+        bearish_failure_score += 2.5
+    if failed_breakout:
+        bearish_failure_score += 2.5
+    if accepted_breakdown:
+        bearish_failure_score += 1.5
+    if current_structure_signal == "BEARISH_CHOCH":
+        bearish_failure_score += 1.0
+    bearish_failure_score += min(float(metadata.get("bearish_candle_quality_score") or 0.0), 2.0)
+    if accepted_breakout:
+        bullish_failure_score += 1.5
+    if current_structure_signal == "BULLISH_CHOCH":
+        bullish_failure_score += 1.0
+    if opening_range_break_state == "FAILED_DOWN":
+        bullish_failure_score += 2.5
+    bullish_failure_score += min(float(metadata.get("bullish_candle_quality_score") or 0.0), 2.0)
+
+    bearish_location_live_score = _clamp(
+        (float(metadata.get("bearish_location_score") or 0.0) * 2.0)
+        + (min(float(metadata.get("open_space_down") or 0.0), 250.0) / 80.0)
+        + (0.75 if metadata.get("at_first_test_of_level") else 0.0)
+        + float(metadata.get("level_rejection_score") or 0.0),
+        0.0,
+        10.0,
+    )
+    bullish_location_live_score = _clamp(
+        (float(metadata.get("bullish_location_score") or 0.0) * 2.0)
+        + (min(float(metadata.get("open_space_up") or 0.0), 250.0) / 80.0)
+        + (0.75 if metadata.get("at_first_test_of_level") else 0.0)
+        - float(metadata.get("overhead_call_pressure_score") or 0.0),
+        0.0,
+        10.0,
+    )
+    bearish_option_chain_pressure_score = _clamp(
+        (max(float(metadata.get("oi_pressure_imbalance") or 0.0), 0.0) * 6.0)
+        + (2.0 if metadata.get("smart_money_bias") == "BEARISH" else 0.0)
+        + (1.5 if metadata.get("option_chain_pressure_state") in {"OVERHEAD_CALL_PRESSURE", "BEARISH_WALL_SHIFT"} else 0.0)
+        + (0.75 if metadata.get("price_into_overhead_call_wall") else 0.0),
+        0.0,
+        10.0,
+    )
+    bullish_option_chain_pressure_score = _clamp(
+        (max(-float(metadata.get("oi_pressure_imbalance") or 0.0), 0.0) * 6.0)
+        + (2.0 if metadata.get("smart_money_bias") == "BULLISH" else 0.0)
+        + (1.5 if metadata.get("option_chain_pressure_state") in {"DOWNSIDE_PUT_SUPPORT", "BULLISH_WALL_SHIFT"} else 0.0)
+        - (float(metadata.get("overhead_call_pressure_score") or 0.0) * 0.75),
+        0.0,
+        10.0,
+    )
+
+    candidate_quotes = sorted(
+        [quote for quote in snapshot.option_chain.quotes if quote.ltp > 0.0 and quote.bid >= 0.0 and quote.ask > 0.0],
+        key=lambda quote: abs(quote.strike - spot),
+    )[:8]
+    avg_spread_ratio = (
+        sum((quote.ask - quote.bid) / max(quote.ltp, 0.01) for quote in candidate_quotes) / len(candidate_quotes)
+        if candidate_quotes
+        else 0.25
+    )
+    liquidity_score = _clamp((0.20 - avg_spread_ratio) / 0.20 * 5.0, 0.0, 5.0)
+    slippage_penalty = _clamp(snapshot.slippage_points / 1.5, 0.0, 2.5)
+    bearish_expected_stop_pain = _clamp((120.0 - min(float(metadata.get("open_space_down") or 0.0), 120.0)) / 30.0, 0.0, 4.0)
+    bullish_expected_stop_pain = _clamp((120.0 - min(float(metadata.get("open_space_up") or 0.0), 120.0)) / 30.0, 0.0, 4.0)
+    time_score = _clamp(time_remaining_minutes / 45.0, 0.0, 4.0)
+    bearish_monetization_score = _clamp(
+        liquidity_score
+        + time_score
+        + min(float(metadata.get("open_space_down") or 0.0), 250.0) / 100.0
+        - slippage_penalty
+        - bearish_expected_stop_pain,
+        0.0,
+        10.0,
+    )
+    bullish_monetization_score = _clamp(
+        liquidity_score
+        + time_score
+        + min(float(metadata.get("open_space_up") or 0.0), 250.0) / 100.0
+        - slippage_penalty
+        - bullish_expected_stop_pain
+        - float(metadata.get("overhead_call_pressure_score") or 0.0),
+        0.0,
+        10.0,
+    )
+
+    if market_state == "TRUE_RANGE":
+        range_penalty_score = 4.25
+    elif market_state == "DIRECTIONAL_BALANCE":
+        range_penalty_score = 1.1
+    else:
+        range_penalty_score = 0.0
+    if market_state == "TRUE_RANGE" and float(path_quality["candle_overlap_ratio"]) > 0.65:
+        range_penalty_score += 2.0
+    elif market_state == "DIRECTIONAL_BALANCE" and float(path_quality["candle_overlap_ratio"]) > 0.74:
+        range_penalty_score += 0.6
+    low_liquidity_penalty = _clamp((0.12 - liquidity_score) * 0.0 + max(0.0, (avg_spread_ratio - 0.08) * 25.0), 0.0, 5.0)
+    late_session_penalty = 1.5 if time_remaining_minutes < 75 else 0.0
+    monetization_failure_penalty = 2.5 if max(bearish_monetization_score, bullish_monetization_score) < 2.5 else 0.0
+    conflicting_signal_penalty = 0.0
+    if market_state == "TRANSITION" and market_state_bias == "BULLISH" and failure_type in {"FAILED_BREAKOUT", "FAILED_RECLAIM", "FAILED_BOUNCE", "BEARISH_REJECTION_TRANSITION"}:
+        conflicting_signal_penalty += 1.5
+    if market_state == "TRANSITION" and market_state_bias == "BEARISH" and failure_type == "ACCEPTED_BREAKOUT":
+        conflicting_signal_penalty += 1.5
+    no_trade_score = (
+        0.35 * range_penalty_score
+        + 0.20 * low_liquidity_penalty
+        + 0.15 * late_session_penalty
+        + 0.15 * monetization_failure_penalty
+        + 0.15 * conflicting_signal_penalty
+    )
+    market_state_score = state_quality_score
+    bearish_trade_score = (
+        0.22 * bearish_trend_quality_score
+        + 0.24 * bearish_failure_score
+        + 0.16 * bearish_location_live_score
+        + 0.16 * bearish_option_chain_pressure_score
+        + 0.12 * bearish_monetization_score
+        + 0.10 * market_state_score
+    )
+    bullish_trade_score = (
+        0.20 * bullish_trend_quality_score
+        + 0.12 * bullish_failure_score
+        + 0.20 * bullish_location_live_score
+        + 0.14 * bullish_option_chain_pressure_score
+        + 0.14 * bullish_monetization_score
+        + 0.20 * market_state_score
+    )
+
+    stable_range = bool(
+        market_state == "TRUE_RANGE"
+        and float(path_quality["candle_overlap_ratio"]) <= 0.72
+        and float(metadata.get("ema_compression_score") or 0.0) >= 1.0
+        and abs(float(metadata.get("oi_pressure_imbalance") or 0.0)) <= 0.10
+    )
+    effective_bearish_threshold = params.bearish_trade_score_threshold
+    effective_bearish_margin = params.bearish_trade_margin
+    if market_state == "TREND_DOWN":
+        effective_bearish_threshold = max(5.9, params.bearish_trade_score_threshold - 0.3)
+        effective_bearish_margin = max(1.1, params.bearish_trade_margin - 0.3)
+    elif market_state == "TRANSITION":
+        effective_bearish_threshold = max(5.8, params.bearish_trade_score_threshold - 0.4)
+        effective_bearish_margin = max(1.0, params.bearish_trade_margin - 0.4)
+    elif market_state == "DIRECTIONAL_BALANCE":
+        effective_bearish_threshold = max(5.45, params.bearish_trade_score_threshold - 0.9)
+        effective_bearish_margin = max(0.8, params.bearish_trade_margin - 0.7)
+
+    bearish_failure_context = failure_type in {"FAILED_BREAKOUT", "FAILED_RECLAIM", "FAILED_BOUNCE", "BEARISH_REJECTION_TRANSITION", "ACCEPTED_BREAKDOWN"}
+    directional_balance_tradable = bool(
+        market_state == "DIRECTIONAL_BALANCE"
+        and market_state_bias == "BEARISH"
+        and bearish_failure_context
+        and bearish_failure_score >= 2.5
+        and bearish_location_live_score >= 1.5
+        and bearish_trade_score > no_trade_score + 0.35
+    )
+    if market_state in {"TREND_DOWN", "TRANSITION"} and bearish_failure_context and bearish_trade_score > no_trade_score + 0.05:
+        tradability_class = "TRADABLE"
+        tradability_reason = f"{market_state} with {failure_type} and aligned bearish structure/chain pressure is spread-tradable."
+    elif directional_balance_tradable:
+        tradability_class = "TRADABLE"
+        tradability_reason = "Directional balance with bearish failure context is tradable even though the session is not a fully aligned trend yet."
+    elif market_state == "TRUE_RANGE" and stable_range and bool(metadata.get("range_entry_ready")):
+        tradability_class = "TRADABLE"
+        tradability_reason = "Stable range with compressed EMAs and balanced option walls is tradable only through a strict condor."
+    elif str(metadata.get("playbook") or "") == "LATE_SESSION_BULLISH_RECLAIM" or (
+        market_state == "TREND_UP"
+        and (
+            float(metadata.get("open_space_up") or 0.0) < 100.0
+            or bool(metadata.get("price_into_overhead_call_wall"))
+            or time_remaining_minutes < 90
+        )
+    ):
+        tradability_class = "LOW_EDGE"
+        tradability_reason = "Bullish context is structurally valid but monetization edge is weak due to time, overhead pressure, or limited open space."
+    else:
+        tradability_class = "NOT_TRADABLE"
+        tradability_reason = "Context does not offer a clean spread edge once state, location, path quality, and option-chain pressure are combined."
+
+    metadata["market_state_score"] = round(market_state_score, 4)
+    metadata["trend_quality_score"] = round(max(bearish_trend_quality_score, bullish_trend_quality_score), 4)
+    metadata["bearish_trend_quality_score"] = round(bearish_trend_quality_score, 4)
+    metadata["bullish_trend_quality_score"] = round(bullish_trend_quality_score, 4)
+    metadata["failure_score"] = round(max(bearish_failure_score, bullish_failure_score), 4)
+    metadata["bearish_failure_score"] = round(bearish_failure_score, 4)
+    metadata["bullish_failure_score"] = round(bullish_failure_score, 4)
+    metadata["location_score"] = round(max(bearish_location_live_score, bullish_location_live_score), 4)
+    metadata["bearish_location_live_score"] = round(bearish_location_live_score, 4)
+    metadata["bullish_location_live_score"] = round(bullish_location_live_score, 4)
+    metadata["option_chain_pressure_score"] = round(max(bearish_option_chain_pressure_score, bullish_option_chain_pressure_score), 4)
+    metadata["bearish_option_chain_pressure_score"] = round(bearish_option_chain_pressure_score, 4)
+    metadata["bullish_option_chain_pressure_score"] = round(bullish_option_chain_pressure_score, 4)
+    metadata["monetization_score"] = round(max(bearish_monetization_score, bullish_monetization_score), 4)
+    metadata["bearish_monetization_score"] = round(bearish_monetization_score, 4)
+    metadata["bullish_monetization_score"] = round(bullish_monetization_score, 4)
+    metadata["tradability_score"] = {"TRADABLE": 3.0, "LOW_EDGE": 1.0, "NOT_TRADABLE": -2.0}[tradability_class]
+    metadata["tradability_class"] = tradability_class
+    metadata["tradability_reason"] = tradability_reason
+    metadata["bearish_trade_score"] = round(bearish_trade_score, 4)
+    metadata["bullish_trade_score"] = round(bullish_trade_score, 4)
+    metadata["no_trade_score"] = round(no_trade_score, 4)
+    metadata["time_remaining_minutes"] = time_remaining_minutes
+    metadata["liquidity_score"] = round(liquidity_score, 4)
+    metadata["slippage_penalty"] = round(slippage_penalty, 4)
+    metadata["range_penalty_score"] = round(range_penalty_score, 4)
+    metadata["structure_is_monetizable"] = bool(max(bearish_monetization_score, bullish_monetization_score) >= 2.5)
+    metadata["trade_score_margin_bearish"] = round(effective_bearish_margin, 4)
+    metadata["trade_score_margin_bullish"] = params.bullish_trade_margin
+    metadata["bearish_trade_score_threshold"] = round(effective_bearish_threshold, 4)
+    metadata["bullish_trade_score_threshold"] = params.bullish_trade_score_threshold
+    metadata["state_confidence"] = state_confidence_score
+    if tradability_class == "TRADABLE":
+        reasons.append(tradability_reason)
+    else:
+        reasons.append(f"Tradability classified as {tradability_class}: {tradability_reason}")
 
     trade_plan = _build_trade_plan(
         metadata=metadata,

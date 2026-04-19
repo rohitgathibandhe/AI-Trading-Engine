@@ -20,6 +20,9 @@ def kill_switch_triggered(account_state: AccountState, risk_limits: AccountRiskL
 def compute_max_loss_rupees_per_lot(structure: TradeStructure, lot_size: int) -> float:
     if structure.strategy in {StrategyType.BEAR_CALL_CREDIT_SPREAD, StrategyType.BULL_PUT_CREDIT_SPREAD}:
         return max((structure.width_points - structure.credit_points) * lot_size, 0.0)
+    if structure.strategy == StrategyType.CALL_DEBIT_SPREAD:
+        debit_points = float(structure.metadata.get("debit_points") or 0.0)
+        return max(debit_points * lot_size, 0.0)
     if structure.strategy == StrategyType.IRON_CONDOR:
         call_side = max(structure.call_width_points - structure.credit_points, 0.0)
         put_side = max(structure.put_width_points - structure.credit_points, 0.0)
