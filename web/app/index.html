@@ -186,6 +186,7 @@
           <div class="card-header"><div style="font-weight:700;">Strategy & Mode</div></div>
           <div class="muted">Strategy</div>
           <select id="strategy-select" style="width:100%; padding:8px; border-radius:8px; border:1px solid var(--border); background:#0b1224; color:var(--text);">
+            <option value="intraday_defined_risk_v83">v83 Intraday Defined-Risk</option>
             <option value="batman_bkm_monthly">Batman BKM (Monthly)</option>
             <option value="monthly_strangle_with_weekly_hedge.py">Monthly Strangle w/ Hedge</option>
             <option value="batman">Batman Monthly (with hedges)</option>
@@ -1783,11 +1784,14 @@
           const stop = data.stop || {};
           const cleanup = stop.cleanup || {};
           const cleanupMsg = cleanup.performed ? " + cleaned" : (cleanup.reason ? ` + ${cleanup.reason}` : "");
+          const startedStrategy = data.strategy_file || data.start?.strategy_file || document.getElementById("strategy-select").value;
+          const v83Mode = data.v83_runtime_mode || data.start?.v83_runtime_mode;
           const autoImport = data.auto_import || (data.start && data.start.auto_import) || {};
           const importMsg = autoImport.imported
             ? ` + imported BKM ${autoImport.expiry || ""}`.trim()
             : (autoImport.reason === "NO_BROKER_OPEN_POSITIONS" ? "" : (autoImport.reason ? ` + ${autoImport.reason}` : ""));
-          statusEl.textContent = `Running (pid ${data.pid})${cleanupMsg}${importMsg}`;
+          const runtimeMsg = startedStrategy === "intraday_defined_risk_v83" && v83Mode ? ` | ${humanizeReason(v83Mode)}` : "";
+          statusEl.textContent = `Running ${humanizeReason(startedStrategy)} (pid ${data.pid})${runtimeMsg}${cleanupMsg}${importMsg}`;
         } else {
           statusEl.textContent = `Error: ${data.error || "failed"}`;
         }

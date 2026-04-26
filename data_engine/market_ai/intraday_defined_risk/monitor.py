@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from collections import Counter
 from datetime import datetime
 from importlib import import_module
@@ -25,6 +27,7 @@ from .ops_runtime import (
     load_paper_position,
     load_runtime_config,
     load_runtime_state,
+    log_validation_decision,
     log_shadow_decision,
     manage_paper_position,
     open_position_from_decision,
@@ -52,6 +55,29 @@ MIN_NET_EDGE_COST_MULTIPLE = 3.0
 PLAYBOOK_MIN_SAMPLES = 8.0
 PLAYBOOK_BAD_PROFIT_FACTOR = 0.90
 PLAYBOOK_GOOD_PROFIT_FACTOR = 1.20
+STATE_ROOT = Path(__file__).resolve().parents[1] / "state"
+AGENT_HEARTBEAT_PATH = STATE_ROOT / "agent_heartbeat.json"
+
+
+def _write_v83_agent_heartbeat(*, runtime_config: object, phase: str) -> None:
+    """Keep the shared UI watchdog heartbeat fresh for the v83 runner."""
+    mode = getattr(runtime_config, "mode", None)
+    mode_value = getattr(mode, "value", str(mode or "UNKNOWN"))
+    payload = {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "status": "RUNNING",
+        "phase": phase,
+        "pid": os.getpid(),
+        "trade_mode": "paper" if mode_value == RuntimeMode.PAPER_LIVE.value else mode_value.lower(),
+        "strategy_file": "intraday_defined_risk_v83",
+        "v83_runtime_mode": mode_value,
+    }
+    try:
+        AGENT_HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        AGENT_HEARTBEAT_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    except Exception:
+        # Heartbeat write failures are reported via state-store health; do not stop trade management.
+        return
 
 
 def _canonical_strategy_rejection(reasons: list[str], *, setup_detected: bool) -> str:
@@ -69,6 +95,38 @@ def _canonical_strategy_rejection(reasons: list[str], *, setup_detected: bool) -
     if "No aligned regime/trigger pair available." in joined:
         return "NO_VALID_STRATEGY"
     return "SETUP_FILTERED"
+
+
+def _decision_block_reason(decision: DecisionOutput, explicit: str | None = None) -> str:
+    if explicit:
+        return explicit
+    metadata = decision.metadata if isinstance(decision.metadata, dict) else {}
+    funnel = metadata.get("trade_funnel") if isinstance(metadata.get("trade_funnel"), dict) else {}
+    for key in ("primary_block_reason", "canonical_rejection_reason", "rejection_reason"):
+        value = metadata.get(key)
+        if value:
+            return str(value)
+    value = funnel.get("canonical_rejection_reason") if isinstance(funnel, dict) else None
+    if value:
+        return str(value)
+    return "NONE" if decision.action == "TRADE" else "NO_TRADE_DECISION"
+
+
+def _update_runtime_decision_state(
+    decision: DecisionOutput,
+    *,
+    runtime_config: object,
+    snapshot: MarketSnapshot,
+    block_reason: str | None = None,
+) -> None:
+    resolved = _decision_block_reason(decision, block_reason)
+    runtime_state = load_runtime_state(config=runtime_config)
+    runtime_state["mode"] = runtime_config.mode.value
+    runtime_state["live_arm"] = runtime_config.live_arm
+    runtime_state["primary_block_reason"] = resolved
+    runtime_state["last_candidate"] = decision.to_dict()
+    runtime_state["last_decision_at"] = snapshot.timestamp.isoformat()
+    save_runtime_state(runtime_state)
 
 
 def _initial_trade_funnel(
@@ -125,6 +183,7 @@ def _initial_trade_funnel(
         "tradability_reason": tradability_reason,
         "setup_subtype": metadata.get("setup_subtype"),
         "bullish_shadow_subtype": metadata.get("bullish_shadow_subtype"),
+        "bearish_shadow_subtype": metadata.get("bearish_shadow_subtype"),
         "bearish_family": metadata.get("bearish_family"),
         "bearish_subtype": metadata.get("bearish_subtype"),
         "condor_profile": metadata.get("condor_profile"),
@@ -150,6 +209,94 @@ def _initial_trade_funnel(
         "candidate_evaluations": [],
         "experimental_policy_name": experimental_policy.get("name") if experimental_policy else None,
     }
+
+
+def _shadow_only_failed_breakout_candidate(
+    *,
+    snapshot: MarketSnapshot,
+    agent: "IntradayDefinedRiskAgent",
+    decision: DecisionOutput,
+) -> DecisionOutput | None:
+    metadata = decision.metadata if isinstance(decision.metadata, dict) else {}
+    if str(metadata.get("bearish_shadow_subtype") or "") != "BEARISH_FAILED_BREAKOUT_TRANSITION":
+        return None
+    regime_state = classify_regime(snapshot, agent.parameters)
+    if str(regime_state.metadata.get("bearish_shadow_subtype") or "") != "BEARISH_FAILED_BREAKOUT_TRANSITION":
+        return None
+    structure, structure_reasons, structure_report = select_best_structure(
+        StrategyType.BEAR_CALL_CREDIT_SPREAD,
+        snapshot,
+        regime_state,
+        agent.parameters,
+        setup_quality_score=float(regime_state.metadata.get("setup_quality_score") or 0.0),
+        playbook_tier="B",
+    )
+    if structure is None:
+        return None
+    risk = assess_trade_risk(
+        structure=structure,
+        lot_size=snapshot.lot_size,
+        risk_limits=snapshot.risk_limits,
+        account_state=snapshot.account_state,
+        margin_estimate_per_lot=structure.margin_estimate_per_lot,
+    )
+    if not risk.allowed:
+        return None
+    expected_credit_rupees = max(structure.credit_points - snapshot.slippage_points, 0.0) * snapshot.lot_size * risk.lots
+    expected_round_trip_cost_rupees = ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT * risk.lots
+    expected_net_edge_rupees = expected_credit_rupees - expected_round_trip_cost_rupees
+    playbook_min_edge = float(regime_state.metadata.get("minimum_net_edge_rupees") or 0.0)
+    min_required_edge = max(MIN_NET_EDGE_RUPEES, playbook_min_edge, expected_round_trip_cost_rupees * MIN_NET_EDGE_COST_MULTIPLE)
+    if expected_net_edge_rupees < min_required_edge:
+        return None
+    return build_trade_decision(
+        structure=structure,
+        regime=regime_state.regime,
+        rationale=list(decision.rationale)
+        + [
+            "Shadow-only subtype BEARISH_FAILED_BREAKOUT_TRANSITION would relax the missing 5m trigger inside research mode only.",
+        ]
+        + structure_reasons,
+        confidence_score=max(decision.confidence_score, regime_state.confidence),
+        entry_time=snapshot.timestamp,
+        lots=risk.lots,
+        lot_size=snapshot.lot_size,
+        max_loss_rupees_per_lot=risk.max_loss_rupees_per_lot,
+        slippage_points=snapshot.slippage_points,
+        extra_metadata={
+            "day_archetype": regime_state.metadata.get("day_archetype"),
+            "playbook": regime_state.metadata.get("playbook"),
+            "setup_subtype": regime_state.metadata.get("setup_subtype"),
+            "bullish_shadow_subtype": regime_state.metadata.get("bullish_shadow_subtype"),
+            "bearish_shadow_subtype": regime_state.metadata.get("bearish_shadow_subtype"),
+            "bearish_family": regime_state.metadata.get("bearish_family"),
+            "bearish_subtype": regime_state.metadata.get("bearish_subtype"),
+            "market_state": regime_state.metadata.get("market_state"),
+            "market_state_bias": regime_state.metadata.get("market_state_bias"),
+            "state_quality_score": regime_state.metadata.get("state_quality_score"),
+            "state_confidence_score": regime_state.metadata.get("state_confidence_score"),
+            "tradability_class": regime_state.metadata.get("tradability_class"),
+            "failure_type": regime_state.metadata.get("failure_type"),
+            "option_chain_pressure_state": regime_state.metadata.get("option_chain_pressure_state"),
+            "market_state_score": regime_state.metadata.get("market_state_score"),
+            "trend_quality_score": regime_state.metadata.get("trend_quality_score"),
+            "failure_score": regime_state.metadata.get("failure_score"),
+            "location_score": regime_state.metadata.get("location_score"),
+            "option_chain_pressure_score": regime_state.metadata.get("option_chain_pressure_score"),
+            "live_monetization_score": regime_state.metadata.get("monetization_score"),
+            "tradability_score": regime_state.metadata.get("tradability_score"),
+            "bearish_trade_score": regime_state.metadata.get("bearish_trade_score"),
+            "bullish_trade_score": regime_state.metadata.get("bullish_trade_score"),
+            "no_trade_score": regime_state.metadata.get("no_trade_score"),
+            "setup_quality_score": regime_state.metadata.get("setup_quality_score"),
+            "setup_direction": regime_state.metadata.get("setup_direction"),
+            "playbook_tier": "B",
+            "regime_tradability": "TRADABLE",
+            "shadow_only_subtype": "BEARISH_FAILED_BREAKOUT_TRANSITION",
+            "shadow_only_reason": "RELAXED_5M_TRIGGER",
+            "structure_report": structure_report,
+        },
+    )
 
 
 class MarketDataProvider(Protocol):
@@ -235,6 +382,7 @@ class IntradayDefinedRiskAgent:
             "setup_direction": regime_state.metadata.get("setup_direction"),
             "setup_subtype": regime_state.metadata.get("setup_subtype"),
             "bullish_shadow_subtype": regime_state.metadata.get("bullish_shadow_subtype"),
+            "bearish_shadow_subtype": regime_state.metadata.get("bearish_shadow_subtype"),
             "bearish_family": regime_state.metadata.get("bearish_family"),
             "bearish_subtype": regime_state.metadata.get("bearish_subtype"),
             "condor_profile": regime_state.metadata.get("condor_profile"),
@@ -463,6 +611,7 @@ class IntradayDefinedRiskAgent:
                 "playbook": playbook,
                 "setup_subtype": regime_state.metadata.get("setup_subtype"),
                 "bullish_shadow_subtype": regime_state.metadata.get("bullish_shadow_subtype"),
+                "bearish_shadow_subtype": regime_state.metadata.get("bearish_shadow_subtype"),
                 "bearish_family": regime_state.metadata.get("bearish_family"),
                 "bearish_subtype": regime_state.metadata.get("bearish_subtype"),
                 "bullish_setup": regime_state.metadata.get("bullish_setup"),
@@ -592,7 +741,42 @@ def run_live(config: dict[str, object]) -> None:
 
     while True:
         runtime_config = load_runtime_config()
-        snapshot = provider.current_snapshot()
+        _write_v83_agent_heartbeat(runtime_config=runtime_config, phase="v83_run_live_loop")
+        try:
+            snapshot = provider.current_snapshot()
+        except Exception as exc:  # noqa: BLE001
+            _write_v83_agent_heartbeat(runtime_config=runtime_config, phase="v83_snapshot_unavailable")
+            reason_code = str(getattr(exc, "reason_code", "") or "SNAPSHOT_UNAVAILABLE")
+            diagnostics = getattr(exc, "diagnostics", None)
+            data_status = dict(diagnostics) if isinstance(diagnostics, dict) else {
+                "snapshot_status": "UNAVAILABLE",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+            runtime_state = load_runtime_state(config=runtime_config)
+            runtime_state["mode"] = runtime_config.mode.value
+            runtime_state["live_arm"] = runtime_config.live_arm
+            runtime_state["primary_block_reason"] = reason_code
+            runtime_state["last_decision_at"] = datetime.now().isoformat()
+            runtime_state["last_candidate"] = {"error": f"{type(exc).__name__}: {exc}", "data_readiness": data_status}
+            save_runtime_state(runtime_state)
+            decision = build_no_trade_decision(
+                RegimeLabel.NO_TRADE.value,
+                [f"Live snapshot unavailable: {type(exc).__name__}: {exc}"],
+                extra_metadata={
+                    "runtime_mode": runtime_config.mode.value,
+                    "primary_block_reason": reason_code,
+                    "data_readiness": data_status,
+                },
+            )
+            log_validation_decision(
+                decision,
+                block_reason=reason_code,
+                data_status=data_status,
+            )
+            print(decision.to_json())
+            build_operator_status_report()
+            sleep(poll_seconds)
+            continue
         health = build_unified_health(config=runtime_config, snapshot=snapshot)
         broker_positions = _broker_positions_from_executor(executor)
         reconcile_positions(mode=runtime_config.mode, broker_positions=broker_positions)
@@ -602,12 +786,16 @@ def run_live(config: dict[str, object]) -> None:
                 ["Runtime mode is LIVE_DISABLED; no shadow, paper, or broker execution is allowed."],
                 extra_metadata={"runtime_mode": runtime_config.mode.value, "primary_block_reason": "LIVE_DISABLED"},
             )
+            log_validation_decision(decision, snapshot=snapshot, block_reason="LIVE_DISABLED")
+            _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="LIVE_DISABLED")
             print(decision.to_json())
             build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
             sleep(poll_seconds)
             continue
         if runtime_config.mode in {RuntimeMode.RESEARCH}:
             decision = agent.evaluate(snapshot)
+            log_validation_decision(decision, snapshot=snapshot, block_reason="RESEARCH_MODE")
+            _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="RESEARCH_MODE")
             print(decision.to_json())
             build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
             sleep(poll_seconds)
@@ -616,6 +804,23 @@ def run_live(config: dict[str, object]) -> None:
             paper_position = manage_paper_position(snapshot)
             agent.open_position = paper_position
             if paper_position is not None:
+                decision = build_no_trade_decision(
+                    RegimeLabel.NO_TRADE.value,
+                    ["Active paper structure is being managed; new entries are blocked until it exits."],
+                    extra_metadata={
+                        "runtime_mode": runtime_config.mode.value,
+                        "primary_block_reason": "ACTIVE_STRUCTURE_EXISTS",
+                        "playbook": paper_position.metadata.get("playbook"),
+                        "setup_subtype": paper_position.metadata.get("setup_subtype") or paper_position.metadata.get("bearish_subtype"),
+                    },
+                )
+                log_validation_decision(
+                    decision,
+                    snapshot=snapshot,
+                    block_reason="ACTIVE_STRUCTURE_EXISTS",
+                    event_type="POSITION_MANAGEMENT",
+                )
+                _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="ACTIVE_STRUCTURE_EXISTS")
                 build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
                 sleep(poll_seconds)
                 continue
@@ -627,6 +832,8 @@ def run_live(config: dict[str, object]) -> None:
                 reason = exit_decision.rationale[-2] if len(exit_decision.rationale) >= 2 else "EXIT"
                 if runtime_config.mode == RuntimeMode.MICRO_LIVE and runtime_config.live_arm:
                     executor.exit_trade(current_position, reason)
+                log_validation_decision(exit_decision, snapshot=snapshot, block_reason="EXIT_DECISION", event_type="EXIT")
+                _update_runtime_decision_state(exit_decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="EXIT_DECISION")
                 print(exit_decision.to_json())
         else:
             decision = agent.evaluate(snapshot)
@@ -634,6 +841,8 @@ def run_live(config: dict[str, object]) -> None:
             if decision.action == "TRADE":
                 if runtime_config.mode == RuntimeMode.SHADOW_LIVE:
                     log_shadow_decision(decision, snapshot=snapshot)
+                    log_validation_decision(decision, snapshot=snapshot, block_reason="SHADOW_WOULD_TRADE")
+                    _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="SHADOW_WOULD_TRADE")
                     runtime_state = load_runtime_state(config=runtime_config)
                     runtime_state["mode"] = runtime_config.mode.value
                     runtime_state["live_arm"] = runtime_config.live_arm
@@ -647,11 +856,26 @@ def run_live(config: dict[str, object]) -> None:
                         position = open_position_from_decision(decision, snapshot)
                         agent.open_position = position
                         record_paper_entry(position, decision=decision, snapshot=snapshot, gate=gate)
+                        log_validation_decision(decision, snapshot=snapshot, block_reason="NONE")
+                        _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="NONE")
                     elif gate["allowed"] and runtime_config.mode == RuntimeMode.MICRO_LIVE and runtime_config.live_arm:
                         executor.enter_trade(decision)
                         agent.start_position(snapshot, decision)
+                        log_validation_decision(decision, snapshot=snapshot, block_reason="NONE")
+                        _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="NONE")
                     else:
                         log_shadow_decision(decision, snapshot=snapshot, block_reason=str(gate.get("primary_block_reason") or "ENTRY_GATE_BLOCKED"))
+                        log_validation_decision(
+                            decision,
+                            snapshot=snapshot,
+                            block_reason=str(gate.get("primary_block_reason") or "ENTRY_GATE_BLOCKED"),
+                        )
+                        _update_runtime_decision_state(
+                            decision,
+                            runtime_config=runtime_config,
+                            snapshot=snapshot,
+                            block_reason=str(gate.get("primary_block_reason") or "ENTRY_GATE_BLOCKED"),
+                        )
                         runtime_state = load_runtime_state(config=runtime_config)
                         runtime_state["mode"] = runtime_config.mode.value
                         runtime_state["live_arm"] = runtime_config.live_arm
@@ -661,6 +885,23 @@ def run_live(config: dict[str, object]) -> None:
                         save_runtime_state(runtime_state)
             elif runtime_config.mode == RuntimeMode.SHADOW_LIVE:
                 log_shadow_decision(decision, snapshot=snapshot, block_reason="NO_TRADE_DECISION")
+                log_validation_decision(decision, snapshot=snapshot)
+                _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot)
+            else:
+                shadow_candidate = _shadow_only_failed_breakout_candidate(
+                    snapshot=snapshot,
+                    agent=agent,
+                    decision=decision,
+                )
+                if shadow_candidate is not None:
+                    log_shadow_decision(
+                        shadow_candidate,
+                        snapshot=snapshot,
+                        block_reason="SHADOW_ONLY_RESEARCH_SUBTYPE",
+                        force_would_trade=True,
+                    )
+                log_validation_decision(decision, snapshot=snapshot)
+                _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot)
         build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
         sleep(poll_seconds)
 

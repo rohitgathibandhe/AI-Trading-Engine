@@ -454,9 +454,30 @@ class DhanWrapper:
     def _parse_timestamp(value: Any) -> Optional[datetime]:
         if value in (None, "", [], {}):
             return None
+        if isinstance(value, (int, float)):
+            try:
+                epoch = float(value)
+                if epoch > 1_000_000_000_000:
+                    epoch /= 1000.0
+                if epoch > 10_000_000:
+                    tz = ZoneInfo("Asia/Kolkata") if ZoneInfo else None
+                    parsed = datetime.fromtimestamp(epoch, tz=tz) if tz else datetime.fromtimestamp(epoch)
+                    return parsed.replace(tzinfo=None)
+            except Exception:
+                return None
         text = str(value).strip()
         if not text:
             return None
+        try:
+            epoch = float(text)
+            if epoch > 1_000_000_000_000:
+                epoch /= 1000.0
+            if epoch > 10_000_000:
+                tz = ZoneInfo("Asia/Kolkata") if ZoneInfo else None
+                parsed = datetime.fromtimestamp(epoch, tz=tz) if tz else datetime.fromtimestamp(epoch)
+                return parsed.replace(tzinfo=None)
+        except Exception:
+            pass
         text = text.replace("T", " ").replace("/", "-")
         try:
             return datetime.fromisoformat(text)
@@ -691,7 +712,11 @@ class DhanWrapper:
             if not seg or seg in seen:
                 continue
             seen.add(seg)
-            for attempt in range(3):
+            try:
+                max_attempts = max(1, int(getattr(self, "option_chain_attempts", 3) or 3))
+            except Exception:
+                max_attempts = 3
+            for attempt in range(max_attempts):
                 resp = _try_fetch(seg)
                 if resp is not None:
                     break

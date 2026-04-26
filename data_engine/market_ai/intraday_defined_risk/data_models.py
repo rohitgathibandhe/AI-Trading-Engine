@@ -53,6 +53,7 @@ class AdaptiveParameters:
     bullish_trade_score_threshold: float = 7.5
     bearish_trade_margin: float = 1.5
     bullish_trade_margin: float = 2.0
+    failed_breakout_transition_shadow_buffer: float = 0.25
 
     def clamped(self) -> "AdaptiveParameters":
         mid = min(max(self.rv_mid_cutoff, 0.25), 0.75)
@@ -80,6 +81,7 @@ class AdaptiveParameters:
             bullish_trade_score_threshold=min(max(self.bullish_trade_score_threshold, 2.0), 12.0),
             bearish_trade_margin=min(max(self.bearish_trade_margin, 0.5), 5.0),
             bullish_trade_margin=min(max(self.bullish_trade_margin, 0.5), 5.0),
+            failed_breakout_transition_shadow_buffer=min(max(self.failed_breakout_transition_shadow_buffer, 0.0), 1.0),
         )
 
 

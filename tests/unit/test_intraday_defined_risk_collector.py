@@ -59,6 +59,35 @@ def test_flatten_option_chain_payload_extracts_bid_ask_and_greeks() -> None:
     assert pe["delta_source"] == "PROVIDED"
 
 
+def test_flatten_option_chain_payload_accepts_dhan_nested_data_shape() -> None:
+    payload = {
+        "status": "success",
+        "data": {
+            "status": "success",
+            "data": {
+                "last_price": 24356.15,
+                "oc": {
+                    "24400.000000": {
+                        "ce": {"last_price": 35.0, "top_bid_price": 34.5, "top_ask_price": 35.5, "greeks": {"delta": 0.31}},
+                        "pe": {"last_price": 71.0, "top_bid_price": 70.5, "top_ask_price": 71.5, "greeks": {"delta": -0.24}},
+                    }
+                },
+            },
+        },
+    }
+
+    rows = _flatten_option_chain_payload(
+        payload,
+        timestamp=datetime(2026, 4, 22, 10, 30, 0),
+        decision_time="10:30",
+        expiry="2026-04-28",
+    )
+
+    assert len(rows) == 2
+    assert {row["option_type"] for row in rows} == {"CALL", "PUT"}
+    assert {row["spot"] for row in rows} == {24356.15}
+
+
 def test_run_daily_chain_schedule_captures_targets_and_stops(monkeypatch, tmp_path) -> None:
     captured: list[tuple[str, str]] = []
 

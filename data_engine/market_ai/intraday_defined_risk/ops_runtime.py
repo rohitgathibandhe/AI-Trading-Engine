@@ -143,8 +143,10 @@ class OpsPaths:
     reconciliation_events: Path = STATE_ROOT / "intraday_v83_reconciliation_events.jsonl"
     recovery_state: Path = STATE_ROOT / "intraday_v83_recovery_state.json"
     emergency_flatten_events: Path = STATE_ROOT / "intraday_v83_emergency_flatten_events.jsonl"
+    validation_decisions: Path = STATE_ROOT / "intraday_v83_paper_live_validation_decisions.jsonl"
     shadow_report: Path = STATE_ROOT / "intraday_v83_shadow_live_report.json"
     paper_report: Path = STATE_ROOT / "intraday_v83_paper_live_report.json"
+    validation_report: Path = STATE_ROOT / "intraday_v83_paper_live_validation_report.json"
     operator_status_report: Path = STATE_ROOT / "intraday_v83_operator_status_report.json"
     creds_path: Path = STATE_ROOT / "creds.json"
 
@@ -480,7 +482,28 @@ def build_unified_health(
 
     pipeline = build_data_freshness_report(state_root=paths.state_root)
     pipeline_reasons = list(pipeline.get("stale_reasons") or [])
-    hard_pipeline_reasons = [reason for reason in pipeline_reasons if reason != "COLLECTOR_LOG_STALE"]
+    degraded_only_pipeline_reasons = {
+        "COLLECTOR_LOG_STALE",
+        "RESEARCH_5M_DATASET_STALE",
+        "RESEARCH_OPTION_CHAIN_STALE",
+    }
+    hard_pipeline_reasons = [reason for reason in pipeline_reasons if reason not in degraded_only_pipeline_reasons]
+    pipeline_checks = pipeline.get("checks") if isinstance(pipeline.get("checks"), dict) else {}
+    structured_5m_ok = bool((pipeline_checks.get("structured_5m_dataset") or {}).get("fresh"))
+    structured_chain_ok = bool((pipeline_checks.get("structured_option_chain_dataset") or {}).get("fresh"))
+    collector_pid = pipeline.get("collector_pid_status") if isinstance(pipeline.get("collector_pid_status"), dict) else {}
+    before_first_collector_capture = now.time() < time(9, 30)
+    if (
+        "COLLECTOR_HEARTBEAT_STALE" in hard_pipeline_reasons
+        and bool(collector_pid.get("alive"))
+        and before_first_collector_capture
+        and structured_5m_ok
+        and structured_chain_ok
+    ):
+        # The monitor intentionally does not write a same-day capture heartbeat before
+        # the first 09:30 decision snapshot. Treat this as degraded pre-market
+        # readiness, not a paper-live hard block.
+        hard_pipeline_reasons = [reason for reason in hard_pipeline_reasons if reason != "COLLECTOR_HEARTBEAT_STALE"]
     if pipeline.get("fresh"):
         pipeline_status = HealthStatus.HEALTHY
     elif hard_pipeline_reasons:
@@ -815,7 +838,7 @@ def _decision_log_payload(decision: DecisionOutput, *, snapshot: MarketSnapshot,
         "market_state": metadata.get("market_state") or funnel.get("market_state"),
         "tradability_class": metadata.get("tradability_class") or funnel.get("tradability_class"),
         "playbook": metadata.get("playbook") or funnel.get("playbook"),
-        "subtype": metadata.get("setup_subtype") or metadata.get("bearish_subtype") or metadata.get("bullish_shadow_subtype"),
+        "subtype": metadata.get("setup_subtype") or metadata.get("bearish_shadow_subtype") or metadata.get("bearish_subtype") or metadata.get("bullish_shadow_subtype"),
         "failure_type": metadata.get("failure_type"),
         "setup_quality_score": metadata.get("setup_quality_score") or funnel.get("setup_quality_score"),
         "market_state_score": metadata.get("market_state_score") or funnel.get("market_state_score"),
@@ -838,15 +861,218 @@ def _decision_log_payload(decision: DecisionOutput, *, snapshot: MarketSnapshot,
     }
 
 
+def _snapshot_data_summary(
+    *,
+    snapshot: MarketSnapshot | None = None,
+    data_status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    data_status = dict(data_status or {})
+    if snapshot is None:
+        return {
+            "snapshot_status": str(data_status.get("snapshot_status") or "UNAVAILABLE"),
+            "reason": data_status.get("reason"),
+            "candle_count": int(data_status.get("candle_count") or 0),
+            "first_timestamp": data_status.get("first_timestamp"),
+            "last_timestamp": data_status.get("last_timestamp"),
+            "timestamps_valid": bool(data_status.get("timestamps_valid", False)),
+            "minimum_required_5m": data_status.get("minimum_required_5m"),
+            "option_quote_count": int(data_status.get("option_quote_count") or 0),
+            "option_chain_available": bool(data_status.get("option_chain_available", False)),
+            "spot_price": data_status.get("spot_price"),
+            "spot_available": bool(data_status.get("spot_available", False)),
+        } | {
+            key: value
+            for key, value in data_status.items()
+            if key not in {
+                "snapshot_status",
+                "reason",
+                "candle_count",
+                "first_timestamp",
+                "last_timestamp",
+                "timestamps_valid",
+                "minimum_required_5m",
+                "option_quote_count",
+                "option_chain_available",
+                "spot_price",
+                "spot_available",
+            }
+        }
+
+    bars = list(snapshot.nifty_5m.bars or [])
+    return {
+        "snapshot_status": str(data_status.get("snapshot_status") or "READY"),
+        "reason": data_status.get("reason"),
+        "candle_count": len(bars),
+        "first_timestamp": bars[0].timestamp.isoformat() if bars else None,
+        "last_timestamp": bars[-1].timestamp.isoformat() if bars else None,
+        "timestamps_valid": all(bar.timestamp is not None for bar in bars),
+        "minimum_required_5m": data_status.get("minimum_required_5m") or 5,
+        "option_quote_count": len(snapshot.option_chain.quotes),
+        "option_chain_available": bool(snapshot.option_chain.quotes),
+        "spot_price": snapshot.option_chain.spot,
+        "spot_available": snapshot.option_chain.spot > 0.0,
+        "option_chain_timestamp": snapshot.option_chain.timestamp.isoformat(),
+    }
+
+
+def _fallback_block_reason(decision: DecisionOutput, explicit: str | None = None) -> str:
+    if explicit:
+        return explicit
+    metadata = _decision_metadata(decision)
+    funnel = _trade_funnel(decision)
+    for key in ("primary_block_reason", "canonical_rejection_reason", "rejection_reason"):
+        value = metadata.get(key)
+        if value:
+            return str(value)
+    value = funnel.get("canonical_rejection_reason")
+    if value:
+        return str(value)
+    if decision.action == "TRADE":
+        return "NONE"
+    return "NO_TRADE_DECISION"
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _validation_anomalies(payload: dict[str, Any], *, paths: OpsPaths) -> list[dict[str, Any]]:
+    rows = _read_jsonl(paths.validation_decisions)
+    session_date = str(payload.get("session_date") or "")
+    recent = [row for row in rows[-120:] if str(row.get("session_date") or "") == session_date]
+    anomalies: list[dict[str, Any]] = []
+    block_reason = str(payload.get("block_reason") or "NONE")
+    decision = str(payload.get("decision") or "")
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    snapshot_status = str(data.get("snapshot_status") or "")
+
+    if decision == "NO_TRADE" and block_reason != "NONE":
+        streak = 1
+        for row in reversed(recent):
+            if str(row.get("decision") or "") != "NO_TRADE":
+                break
+            if str(row.get("block_reason") or "NONE") != block_reason:
+                break
+            streak += 1
+        if streak > 50:
+            anomalies.append(
+                {
+                    "type": "REPEATED_IDENTICAL_NO_TRADE_REASON",
+                    "severity": "WARNING",
+                    "block_reason": block_reason,
+                    "consecutive_count": streak,
+                }
+            )
+
+    current_count = int(data.get("candle_count") or 0)
+    previous_with_count = next(
+        (
+            row for row in reversed(recent)
+            if isinstance(row.get("data"), dict) and int(row.get("data", {}).get("candle_count") or 0) > 0
+        ),
+        None,
+    )
+    if previous_with_count is not None:
+        previous_count = int(previous_with_count.get("data", {}).get("candle_count") or 0)
+        if current_count > 0 and previous_count > 0 and current_count < previous_count:
+            anomalies.append(
+                {
+                    "type": "SUDDEN_CANDLE_COUNT_DROP",
+                    "severity": "WARNING",
+                    "previous_candle_count": previous_count,
+                    "current_candle_count": current_count,
+                }
+            )
+
+    if snapshot_status == "READY" and block_reason in {"SNAPSHOT_UNAVAILABLE", "INSUFFICIENT_DATA"}:
+        anomalies.append(
+            {
+                "type": "SNAPSHOT_PRESENT_BUT_IGNORED",
+                "severity": "WARNING",
+                "block_reason": block_reason,
+            }
+        )
+    if snapshot_status == "READY" and not payload.get("market_state"):
+        anomalies.append(
+            {
+                "type": "STATE_CLASSIFICATION_MISSING",
+                "severity": "WARNING",
+            }
+        )
+    if snapshot_status == "READY" and (
+        payload.get("bearish_trade_score") is None or payload.get("no_trade_score") is None
+    ):
+        anomalies.append(
+            {
+                "type": "SCORE_CALCULATION_SKIPPED",
+                "severity": "WARNING",
+            }
+        )
+    return anomalies
+
+
+def log_validation_decision(
+    decision: DecisionOutput,
+    *,
+    snapshot: MarketSnapshot | None = None,
+    paths: OpsPaths | None = None,
+    block_reason: str | None = None,
+    data_status: dict[str, Any] | None = None,
+    event_type: str = "DECISION",
+) -> dict[str, Any]:
+    paths = paths or OpsPaths()
+    metadata = _decision_metadata(decision)
+    funnel = _trade_funnel(decision)
+    timestamp = snapshot.timestamp if snapshot is not None else _now()
+    chosen_strategy = decision.strategy.value if isinstance(decision.strategy, StrategyType) else str(decision.strategy)
+    resolved_block = _fallback_block_reason(decision, block_reason)
+    data = _snapshot_data_summary(snapshot=snapshot, data_status=data_status)
+    payload = {
+        "event_type": event_type,
+        "timestamp": timestamp.isoformat(),
+        "session_date": timestamp.date().isoformat(),
+        "market_state": metadata.get("market_state") or funnel.get("market_state"),
+        "tradability_class": metadata.get("tradability_class") or funnel.get("tradability_class"),
+        "playbook": metadata.get("playbook") or funnel.get("playbook"),
+        "subtype": metadata.get("setup_subtype") or metadata.get("bearish_shadow_subtype") or metadata.get("bearish_subtype") or metadata.get("bullish_shadow_subtype"),
+        "failure_type": metadata.get("failure_type"),
+        "bearish_trade_score": _first_present(metadata.get("bearish_trade_score"), funnel.get("bearish_trade_score")),
+        "no_trade_score": _first_present(metadata.get("no_trade_score"), funnel.get("no_trade_score")),
+        "decision": "TRADE" if decision.action == "TRADE" and resolved_block == "NONE" else "NO_TRADE",
+        "raw_action": decision.action,
+        "chosen_strategy": chosen_strategy,
+        "block_reason": resolved_block,
+        "data": data,
+    }
+    anomalies = _validation_anomalies(payload, paths=paths)
+    payload["anomalies"] = anomalies
+    if anomalies:
+        _append_jsonl(
+            paths.operator_events,
+            {
+                "timestamp": _now().isoformat(timespec="seconds"),
+                "event": "PAPER_LIVE_VALIDATION_WARNING",
+                "session_date": payload["session_date"],
+                "anomalies": anomalies,
+            },
+        )
+    _append_jsonl(paths.validation_decisions, payload)
+    return payload
+
+
 def log_shadow_decision(
     decision: DecisionOutput,
     *,
     snapshot: MarketSnapshot,
     paths: OpsPaths | None = None,
     block_reason: str | None = None,
+    force_would_trade: bool = False,
 ) -> None:
     paths = paths or OpsPaths()
-    action = "WOULD_TRADE" if decision.action == "TRADE" and not block_reason else "NO_TRADE"
+    action = "WOULD_TRADE" if decision.action == "TRADE" and (force_would_trade or not block_reason) else "NO_TRADE"
     _append_jsonl(paths.shadow_decisions, _decision_log_payload(decision, snapshot=snapshot, action=action, block_reason=block_reason))
 
 
@@ -1136,6 +1362,70 @@ def build_paper_live_report(paths: OpsPaths | None = None, *, write: bool = True
     return payload
 
 
+def build_paper_live_validation_report(
+    paths: OpsPaths | None = None,
+    *,
+    session_date: str | None = None,
+    write: bool = True,
+) -> dict[str, Any]:
+    paths = paths or OpsPaths()
+    rows = _read_jsonl(paths.validation_decisions)
+    available_sessions = sorted({str(row.get("session_date") or "") for row in rows if row.get("session_date")})
+    target_session = session_date or (available_sessions[-1] if available_sessions else _now().date().isoformat())
+    session_rows = [row for row in rows if str(row.get("session_date") or "") == target_session]
+    top_no_trade_reasons = Counter(
+        str(row.get("block_reason") or "UNKNOWN")
+        for row in session_rows
+        if str(row.get("decision") or "") != "TRADE"
+    )
+    states = Counter(str(row.get("market_state") or "UNKNOWN") for row in session_rows)
+    playbooks = Counter(str(row.get("playbook") or "UNKNOWN") for row in session_rows)
+    data_rows = [row.get("data") for row in session_rows if isinstance(row.get("data"), dict)]
+    candle_counts = [int(data.get("candle_count") or 0) for data in data_rows]
+    data_first = [str(data.get("first_timestamp")) for data in data_rows if data.get("first_timestamp")]
+    data_last = [str(data.get("last_timestamp")) for data in data_rows if data.get("last_timestamp")]
+    snapshot_statuses = Counter(str(data.get("snapshot_status") or "UNKNOWN") for data in data_rows)
+    anomalies = [
+        {
+            "timestamp": row.get("timestamp"),
+            "block_reason": row.get("block_reason"),
+            "anomaly": anomaly,
+        }
+        for row in session_rows
+        for anomaly in (row.get("anomalies") if isinstance(row.get("anomalies"), list) else [])
+    ]
+    payload = {
+        "generated_at": _now().isoformat(timespec="seconds"),
+        "session_date": target_session,
+        "available_sessions": available_sessions,
+        "total_decisions": len(session_rows),
+        "trade_count": sum(1 for row in session_rows if row.get("decision") == "TRADE"),
+        "no_trade_count": sum(1 for row in session_rows if row.get("decision") != "TRADE"),
+        "top_no_trade_reasons": dict(top_no_trade_reasons.most_common(20)),
+        "market_state_distribution": dict(states),
+        "playbook_candidate_distribution": dict(playbooks),
+        "data_availability_summary": {
+            "snapshot_status_distribution": dict(snapshot_statuses),
+            "ready_count": snapshot_statuses.get("READY", 0),
+            "insufficient_data_count": snapshot_statuses.get("INSUFFICIENT_DATA", 0),
+            "unavailable_count": snapshot_statuses.get("UNAVAILABLE", 0),
+            "min_candle_count": min(candle_counts) if candle_counts else 0,
+            "max_candle_count": max(candle_counts) if candle_counts else 0,
+            "latest_candle_count": candle_counts[-1] if candle_counts else 0,
+            "first_data_timestamp_seen": min(data_first) if data_first else None,
+            "last_data_timestamp_seen": max(data_last) if data_last else None,
+            "latest_snapshot_status": str(data_rows[-1].get("snapshot_status") or "UNKNOWN") if data_rows else "UNKNOWN",
+        },
+        "anomaly_count": len(anomalies),
+        "anomalies_by_type": dict(Counter(str(item.get("anomaly", {}).get("type") or "UNKNOWN") for item in anomalies)),
+        "anomalies": anomalies[-50:],
+        "sample_decision_logs": session_rows[-10:],
+    }
+    if write:
+        _write_json(paths.validation_report, payload)
+    return payload
+
+
 def build_promotion_gates(
     *,
     paths: OpsPaths | None = None,
@@ -1212,6 +1502,7 @@ def build_operator_status_report(
     recovery = _read_json(paths.recovery_state) or {"active": False, "reason": None}
     shadow = build_shadow_live_report(paths, write=True)
     paper = build_paper_live_report(paths, write=True)
+    validation = build_paper_live_validation_report(paths, write=True)
     events = _read_jsonl(paths.operator_events)
     flatten_events = _read_jsonl(paths.emergency_flatten_events)
     payload = {
@@ -1223,6 +1514,7 @@ def build_operator_status_report(
         "recovery_status": recovery,
         "shadow_live_report_path": str(paths.shadow_report),
         "paper_live_report_path": str(paths.paper_report),
+        "paper_live_validation_report_path": str(paths.validation_report),
         "operator_status_report_path": str(paths.operator_status_report),
         "operator_status": {
             "health_incidents": [
@@ -1236,10 +1528,12 @@ def build_operator_status_report(
                 row for row in events[-50:]
                 if "BLOCK" in str(row.get("event") or "") or "LOCK" in str(row.get("event") or "")
             ],
+            "validation_anomalies": validation.get("anomalies", []),
         },
         "promotion_gates": build_promotion_gates(paths=paths, config=config, health=health),
         "shadow_summary": shadow,
         "paper_summary": paper,
+        "paper_live_validation_summary": validation,
     }
     if write:
         _write_json(paths.operator_status_report, payload)

@@ -235,6 +235,46 @@ def test_control_status_reports_intraday_execution_enabled(monkeypatch, tmp_path
     assert payload["intraday_ai_execution_enabled"] is True
 
 
+def test_start_agent_process_launches_v83_paper_runner(monkeypatch, tmp_path: Path) -> None:
+    _configure_temp_state(monkeypatch, tmp_path)
+    state_dir = tmp_path / "state"
+    (state_dir / "last_strategy.json").write_text(json.dumps({"strategy_file": "intraday_defined_risk_v83"}))
+    monkeypatch.setattr(server, "V83_RUN_CONFIG_JSON", state_dir / "intraday_v83_run_live_config.json")
+    monkeypatch.setattr(server, "V83_RUNNER_LOG", state_dir / "intraday_v83_runner.log")
+    monkeypatch.setattr(server, "_is_process_alive", lambda _pid: False)
+
+    class DummyRuntimeConfig:
+        mode = server.V83RuntimeMode.PAPER_LIVE
+
+        def to_dict(self) -> dict:
+            return {"mode": self.mode.value, "live_arm": False}
+
+    monkeypatch.setattr(server, "_v83_set_runtime_mode", lambda *_args, **_kwargs: DummyRuntimeConfig())
+    captured: dict = {}
+
+    class DummyProc:
+        pid = 4321
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return DummyProc()
+
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+
+    out = server._start_agent_process("paper")
+
+    assert out["ok"] is True
+    assert out["strategy_file"] == "intraday_defined_risk_v83"
+    assert out["v83_runtime_mode"] == "PAPER_LIVE"
+    assert "market_ai.intraday_defined_risk.cli" in captured["cmd"]
+    assert "run_live" in captured["cmd"]
+    assert str(state_dir / "intraday_v83_run_live_config.json") in captured["cmd"]
+    pid_payload = json.loads((state_dir / "agent.pid").read_text())
+    assert pid_payload["pid"] == 4321
+    assert pid_payload["strategy_file"] == "intraday_defined_risk_v83"
+
+
 def test_intraday_deploy_endpoint_blocks_when_mode_is_advisor(monkeypatch, tmp_path: Path) -> None:
     _configure_temp_state(monkeypatch, tmp_path)
     state_dir = tmp_path / "state"

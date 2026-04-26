@@ -58,6 +58,10 @@ BULLISH_SHADOW_SUBTYPES = {
     "EMA20_AND_VWAP_ALIGNED_BULLISH",
 }
 
+BEARISH_SHADOW_SUBTYPES = {
+    "BEARISH_FAILED_BREAKOUT_TRANSITION",
+}
+
 BEARISH_CONTINUATION_SUBTYPES = {
     "GAP_DOWN_FAILED_BOUNCE",
     "VWAP_REJECTION_CONTINUATION",
@@ -653,6 +657,7 @@ def run_backtest(
                 "playbook": position.metadata.get("playbook"),
                 "setup_subtype": position.metadata.get("setup_subtype"),
                 "bullish_shadow_subtype": position.metadata.get("bullish_shadow_subtype"),
+                "bearish_shadow_subtype": position.metadata.get("bearish_shadow_subtype"),
                 "bearish_family": position.metadata.get("bearish_family"),
                 "bearish_subtype": position.metadata.get("bearish_subtype"),
                 "condor_profile": position.metadata.get("condor_profile"),
@@ -835,6 +840,12 @@ def run_backtest(
         subtype_source_trades,
         subtype_field="bullish_shadow_subtype",
         allowed_subtypes=BULLISH_SHADOW_SUBTYPES,
+    )
+    summary["bearish_shadow_subtype_report"] = _build_subtype_report(
+        subtype_source_decisions,
+        subtype_source_trades,
+        subtype_field="bearish_shadow_subtype",
+        allowed_subtypes=BEARISH_SHADOW_SUBTYPES,
     )
     summary["bearish_continuation_subtype_report"] = _build_subtype_report(
         subtype_source_decisions,

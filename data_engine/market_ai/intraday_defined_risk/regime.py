@@ -594,6 +594,58 @@ def _bearish_rejection_transition_subtype(
     return "BEARISH_REJECTION_TRANSITION"
 
 
+def _bearish_failed_breakout_transition_shadow_subtype(
+    *,
+    market_state: str,
+    failure_type: str,
+    tradability_class: str,
+    opening_range_break_state: str,
+    execution_5m: str,
+    bearish_trade_score: float,
+    bearish_trade_score_threshold: float,
+    threshold_buffer: float,
+    setup_quality_score: float,
+    strong_setup_quality_threshold: float,
+    bearish_candle_quality_score: float,
+    lower_high_confirmed: bool,
+    current_structure_signal: str,
+    price_vs_vwap: float | None,
+    price_vs_ema20: float | None,
+    price_vs_or_high: float | None,
+    trend_efficiency_ratio: float,
+    momentum_persistence_score: float,
+) -> str | None:
+    if market_state != "TRANSITION":
+        return None
+    if failure_type != "FAILED_BREAKOUT":
+        return None
+    if tradability_class != "TRADABLE":
+        return None
+    if opening_range_break_state != "FAILED_UP":
+        return None
+    if execution_5m in {"UP_CONFIRMED", "RANGE_CONFIRMED"}:
+        return None
+    if bearish_trade_score < bearish_trade_score_threshold - threshold_buffer:
+        return None
+    if setup_quality_score < strong_setup_quality_threshold:
+        return None
+    if current_structure_signal not in {"BALANCED", "BEARISH_BOS", "BEARISH_CHOCH"}:
+        return None
+    if not lower_high_confirmed and bearish_candle_quality_score < 3.0:
+        return None
+    if trend_efficiency_ratio < 0.28:
+        return None
+    if momentum_persistence_score < 0.5 or momentum_persistence_score > 3.8:
+        return None
+    rejection_points = 0
+    for distance in (price_vs_vwap, price_vs_ema20, price_vs_or_high):
+        if distance is not None and float(distance) <= -5.0:
+            rejection_points += 1
+    if rejection_points == 0:
+        return None
+    return "BEARISH_FAILED_BREAKOUT_TRANSITION"
+
+
 def _build_trade_plan(
     *,
     metadata: dict[str, float | str | bool | None],
@@ -856,6 +908,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "playbook": "NO_TRADE",
         "setup_subtype": None,
         "bullish_shadow_subtype": None,
+        "bearish_shadow_subtype": None,
         "bearish_family": None,
         "bearish_subtype": None,
         "condor_profile": None,
@@ -2584,6 +2637,28 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     else:
         tradability_class = "NOT_TRADABLE"
         tradability_reason = "Context does not offer a clean spread edge once state, location, path quality, and option-chain pressure are combined."
+
+    bearish_shadow_subtype = _bearish_failed_breakout_transition_shadow_subtype(
+        market_state=market_state,
+        failure_type=failure_type,
+        tradability_class=tradability_class,
+        opening_range_break_state=opening_range_break_state,
+        execution_5m=execution_5m,
+        bearish_trade_score=bearish_trade_score,
+        bearish_trade_score_threshold=effective_bearish_threshold,
+        threshold_buffer=params.failed_breakout_transition_shadow_buffer,
+        setup_quality_score=float(metadata.get("setup_quality_score") or 0.0),
+        strong_setup_quality_threshold=params.strong_setup_quality_threshold,
+        bearish_candle_quality_score=float(metadata.get("bearish_candle_quality_score") or 0.0),
+        lower_high_confirmed=lower_high_confirmed,
+        current_structure_signal=current_structure_signal,
+        price_vs_vwap=metadata.get("price_vs_vwap"),  # type: ignore[arg-type]
+        price_vs_ema20=metadata.get("price_vs_ema20"),  # type: ignore[arg-type]
+        price_vs_or_high=metadata.get("price_vs_or_high"),  # type: ignore[arg-type]
+        trend_efficiency_ratio=float(path_quality["trend_efficiency_ratio"]),
+        momentum_persistence_score=float(path_quality["momentum_persistence_score"]),
+    )
+    metadata["bearish_shadow_subtype"] = bearish_shadow_subtype
 
     metadata["market_state_score"] = round(market_state_score, 4)
     metadata["trend_quality_score"] = round(max(bearish_trend_quality_score, bullish_trend_quality_score), 4)

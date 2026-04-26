@@ -35,6 +35,11 @@ try:
 except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
+
+class ReusableHTTPServer(HTTPServer):
+    allow_reuse_address = True
+
+
 ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = ROOT / "data_engine" / "market_ai" / "state"
 AGENT_LOG = STATE_DIR / "agent.log"
@@ -71,6 +76,8 @@ CREDS_FILE = STATE_DIR / "creds.json"
 LAST_STRATEGY_FILE = STATE_DIR / "last_strategy.json"
 PID_FILE = STATE_DIR / "agent.pid"
 AGENT_ENTRY = ROOT / "data_engine" / "market_ai" / "start_agent.py"
+V83_RUN_CONFIG_JSON = STATE_DIR / "intraday_v83_run_live_config.json"
+V83_RUNNER_LOG = STATE_DIR / "intraday_v83_runner.log"
 # New unified frontend location
 STATIC_DIR = ROOT / "web" / "app"
 INDEX_SECURITY_ID = int(os.getenv("MARKET_AI_INDEX_SECURITY_ID", "13"))
@@ -3139,6 +3146,84 @@ def _api_error_payload(exc: BaseException, *, code: str) -> Dict[str, Any]:
     }
 
 
+def _write_v83_run_config(*, trade_mode: str) -> Path:
+    payload = {
+        "provider_class": "market_ai.intraday_defined_risk.live_runtime:DhanLiveMarketDataProvider",
+        "executor_class": "market_ai.intraday_defined_risk.live_runtime:PaperOnlyExecutor",
+        "learning_db_path": str(STATE_DIR / "intraday_v83_paper_live_learning.sqlite3"),
+        "poll_seconds": 30,
+        "underlying_id": INDEX_SECURITY_ID,
+        "underlying_seg": INDEX_EXCHANGE_SEG,
+        "lot_size": 65,
+        "slippage_points": 0.5,
+        "margin_estimate_per_lot": 10_000.0,
+        "max_risk_rupees_per_trade": 10_000.0,
+        "max_margin_rupees": 200_000.0,
+        "max_daily_loss_rupees": 10_000.0,
+        "dhan_http_timeout_sec": 8,
+        "dhan_http_retries": 1,
+        "dhan_option_chain_attempts": 1,
+        "trade_mode": trade_mode,
+    }
+    V83_RUN_CONFIG_JSON.parent.mkdir(parents=True, exist_ok=True)
+    _json_write(V83_RUN_CONFIG_JSON, payload)
+    return V83_RUN_CONFIG_JSON
+
+
+def _start_v83_process(*, trade_mode: str) -> Dict[str, Any]:
+    trade_mode = str(trade_mode or "paper").strip().lower() or "paper"
+    if trade_mode != "paper":
+        return {
+            "ok": False,
+            "error": "V83_LIVE_START_BLOCKED",
+            "message": "v83 can be started from this UI only in PAPER_LIVE. MICRO_LIVE requires explicit runtime arming.",
+        }
+    run_config = _write_v83_run_config(trade_mode=trade_mode)
+    runtime_config = _v83_set_runtime_mode(V83RuntimeMode.PAPER_LIVE, live_arm=False, source="ui_start_agent")
+    env = os.environ.copy()
+    env["TRADE_MODE"] = trade_mode
+    data_engine_path = str(ROOT / "data_engine")
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = data_engine_path if not existing_pythonpath else f"{data_engine_path}:{existing_pythonpath}"
+    pybin = sys.executable or "python3"
+    cmd = [
+        pybin,
+        "-u",
+        "-m",
+        "market_ai.intraday_defined_risk.cli",
+        "run_live",
+        "--config",
+        str(run_config),
+    ]
+    V83_RUNNER_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with V83_RUNNER_LOG.open("ab") as log_handle:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            stdout=log_handle,
+            stderr=log_handle,
+            env=env,
+        )
+    pid_payload = {
+        "pid": proc.pid,
+        "trade_mode": trade_mode,
+        "strategy_file": "intraday_defined_risk_v83",
+        "v83_runtime_mode": runtime_config.mode.value,
+        "started_at": datetime.now().isoformat(),
+    }
+    _json_write(PID_FILE, pid_payload)
+    _write_agent_heartbeat_stub(status="STARTING", phase="v83_launch_requested", pid=proc.pid, trade_mode=trade_mode)
+    return {
+        "ok": True,
+        "pid": proc.pid,
+        "trade_mode": trade_mode,
+        "strategy_file": "intraday_defined_risk_v83",
+        "v83_runtime_mode": runtime_config.mode.value,
+        "run_config": str(run_config),
+        "log_path": str(V83_RUNNER_LOG),
+    }
+
+
 def _start_agent_process(trade_mode: str) -> Dict[str, Any]:
     trade_mode = str(trade_mode or "paper").strip().lower() or "paper"
     if PID_FILE.exists():
@@ -3149,11 +3234,16 @@ def _start_agent_process(trade_mode: str) -> Dict[str, Any]:
                 return {"ok": False, "error": "agent already running", "pid": pid}
         except Exception:
             pass
+    try:
+        selected_strategy = str((_json_read(LAST_STRATEGY_FILE) or {}).get("strategy_file") or "batman_bkm_monthly").strip()
+    except Exception:
+        selected_strategy = "batman_bkm_monthly"
+    if selected_strategy == "intraday_defined_risk_v83":
+        return _start_v83_process(trade_mode=trade_mode)
     auto_import_result: Optional[Dict[str, Any]] = None
     if trade_mode == "live":
         try:
-            last_strategy = _json_read(LAST_STRATEGY_FILE)
-            strategy_file = str((last_strategy or {}).get("strategy_file") or "batman_bkm_monthly").strip()
+            strategy_file = selected_strategy
         except Exception:
             strategy_file = "batman_bkm_monthly"
         if strategy_file == "batman_bkm_monthly":
@@ -3543,6 +3633,8 @@ class PaperHandler(SimpleHTTPRequestHandler):
                     "ok": True,
                     "pid": start_res.get("pid"),
                     "trade_mode": trade_mode,
+                    "strategy_file": start_res.get("strategy_file"),
+                    "v83_runtime_mode": start_res.get("v83_runtime_mode"),
                     "stop": stop_res,
                     "start": start_res,
                     "auto_import": start_res.get("auto_import"),
@@ -3898,11 +3990,34 @@ class PaperHandler(SimpleHTTPRequestHandler):
                         proposal_count = 0
                 last_alert = alerts[-1] if alerts else {}
                 v83_ops = _load_v83_ops_status()
+                active_strategy = (
+                    str(pid_data.get("strategy_file") or "").strip()
+                    if isinstance(pid_data, dict)
+                    else ""
+                ) or str((_json_read(LAST_STRATEGY_FILE) or {}).get("strategy_file") or "batman_bkm_monthly").strip()
+                v83_runtime_config = v83_ops.get("runtime_config") if isinstance(v83_ops, dict) else {}
+                v83_runtime_state = v83_ops.get("runtime_state") if isinstance(v83_ops, dict) else {}
+                v83_candidate = (
+                    v83_runtime_state.get("last_candidate")
+                    if isinstance(v83_runtime_state, dict) and isinstance(v83_runtime_state.get("last_candidate"), dict)
+                    else {}
+                )
+                v83_candidate_meta = (
+                    v83_candidate.get("metadata")
+                    if isinstance(v83_candidate, dict) and isinstance(v83_candidate.get("metadata"), dict)
+                    else {}
+                )
+                v83_trade_funnel = (
+                    v83_candidate_meta.get("trade_funnel")
+                    if isinstance(v83_candidate_meta.get("trade_funnel"), dict)
+                    else {}
+                )
                 self._send_json(
                     {
                         "running": bool(running),
                         "pid": pid,
                         "trade_mode": (str(pid_data.get("trade_mode") or "").lower() if isinstance(pid_data, dict) else None),
+                        "strategy_file": active_strategy,
                         "agent_execution_mode": execution_policy.get("mode"),
                         "execution_new_entries_allowed": bool(execution_policy.get("new_entries_allowed", False)),
                         "execution_manage_existing_allowed": bool(execution_policy.get("manage_existing_allowed", False)),
@@ -4041,10 +4156,17 @@ class PaperHandler(SimpleHTTPRequestHandler):
                         "batman_bkm_tuning_proposals_pending": proposal_count,
                         "batman_bkm_tuning_last_generated_at": advice.get("generated_at") if isinstance(advice, dict) else None,
                         "intraday_defined_risk_ops": v83_ops,
-                        "v83_execution_mode": ((v83_ops.get("runtime_config") or {}).get("mode") if isinstance(v83_ops, dict) else None),
-                        "v83_live_arm": bool(((v83_ops.get("runtime_config") or {}).get("live_arm") if isinstance(v83_ops, dict) else False)),
+                        "v83_execution_mode": (v83_runtime_config.get("mode") if isinstance(v83_runtime_config, dict) else None),
+                        "v83_runtime_mode": (v83_runtime_config.get("mode") if isinstance(v83_runtime_config, dict) else None),
+                        "v83_live_arm": bool((v83_runtime_config.get("live_arm") if isinstance(v83_runtime_config, dict) else False)),
                         "v83_health_status": ((v83_ops.get("health") or {}).get("status") if isinstance(v83_ops, dict) else None),
-                        "v83_primary_block_reason": ((v83_ops.get("runtime_state") or {}).get("primary_block_reason") if isinstance(v83_ops, dict) else None),
+                        "v83_primary_block_reason": (
+                            v83_runtime_state.get("primary_block_reason") if isinstance(v83_runtime_state, dict) else None
+                        ),
+                        "v83_market_state": v83_candidate_meta.get("market_state") or v83_trade_funnel.get("market_state"),
+                        "v83_tradability_class": v83_candidate_meta.get("tradability_class") or v83_trade_funnel.get("tradability_class"),
+                        "v83_candidate_playbook": v83_candidate_meta.get("playbook") or v83_trade_funnel.get("playbook"),
+                        "v83_failure_type": v83_candidate_meta.get("failure_type") or v83_trade_funnel.get("failure_type"),
                     }
                 )
             except Exception as exc:
@@ -4155,7 +4277,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=int(os.getenv("PAPER_PNL_PORT", "8000")))
     args = parser.parse_args()
     os.chdir(STATIC_DIR)
-    httpd = HTTPServer(("", args.port), PaperHandler)
+    httpd = ReusableHTTPServer(("", args.port), PaperHandler)
     print(f"Serving Paper P&L frontend on http://localhost:{args.port}")
     httpd.serve_forever()
 

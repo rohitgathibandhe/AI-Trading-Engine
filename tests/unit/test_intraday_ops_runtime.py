@@ -16,12 +16,16 @@ from market_ai.intraday_defined_risk.data_models import (
     RegimeLabel,
     StrategyType,
 )
+from market_ai.intraday_defined_risk.execution import build_no_trade_decision
+from market_ai.intraday_defined_risk import ops_runtime
 from market_ai.intraday_defined_risk.ops_runtime import (
     HealthStatus,
     OpsPaths,
     ReconciliationStatus,
     RuntimeConfig,
     RuntimeMode,
+    build_paper_live_validation_report,
+    build_unified_health,
     evaluate_entry_gate,
     load_paper_position,
     load_runtime_config,
@@ -29,6 +33,7 @@ from market_ai.intraday_defined_risk.ops_runtime import (
     reconcile_positions,
     save_paper_position,
     set_runtime_mode,
+    log_validation_decision,
 )
 
 
@@ -45,8 +50,10 @@ def _paths(root: Path) -> OpsPaths:
         reconciliation_events=root / "reconciliation_events.jsonl",
         recovery_state=root / "recovery_state.json",
         emergency_flatten_events=root / "emergency_flatten_events.jsonl",
+        validation_decisions=root / "validation_decisions.jsonl",
         shadow_report=root / "shadow_report.json",
         paper_report=root / "paper_report.json",
+        validation_report=root / "validation_report.json",
         operator_status_report=root / "operator_status_report.json",
         creds_path=root / "creds.json",
     )
@@ -162,6 +169,34 @@ def test_paper_gate_passes_for_v83_bearish_candidate(tmp_path: Path) -> None:
     assert gate["primary_block_reason"] == "NONE"
 
 
+def test_research_dataset_staleness_is_degraded_not_paper_blocking(monkeypatch, tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    paths.creds_path.write_text('{"client_id":"client","access_token":"token"}')
+    paths.reconciliation_status.write_text('{"status":"NO_POSITIONS"}')
+
+    monkeypatch.setattr(
+        ops_runtime,
+        "build_data_freshness_report",
+        lambda **_kwargs: {
+            "fresh": False,
+            "as_of": "2026-04-22T09:35:00+05:30",
+            "stale_reasons": ["RESEARCH_5M_DATASET_STALE", "RESEARCH_OPTION_CHAIN_STALE"],
+            "checks": {},
+            "collector_pid_status": {"alive": True},
+        },
+    )
+
+    snapshot = _snapshot(datetime.now().replace(second=0, microsecond=0))
+
+    health = build_unified_health(config=RuntimeConfig(mode=RuntimeMode.PAPER_LIVE), paths=paths, snapshot=snapshot)
+
+    assert health["status"] == HealthStatus.DEGRADED.value
+    assert health["components"]["data_pipeline_health"]["status"] == HealthStatus.DEGRADED.value
+    gate = evaluate_entry_gate(_decision(), snapshot, config=RuntimeConfig(mode=RuntimeMode.PAPER_LIVE), health=health, paths=paths)
+    assert "HEALTH_BLOCKED" not in gate["block_reasons"]
+    assert "DATA_PIPELINE_HEALTH_BLOCKED" not in gate["block_reasons"]
+
+
 def test_paper_position_persists_without_broker_orphan_in_paper_mode(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     position = open_position_from_decision(_decision(), _snapshot())
@@ -186,3 +221,55 @@ def test_micro_live_detects_broker_orphan_position(tmp_path: Path) -> None:
 
     assert reconcile["status"] == ReconciliationStatus.ORPHAN_POSITION.value
     assert reconcile["hard_lock"] is True
+
+
+def test_validation_report_counts_decisions_and_data_readiness(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    snapshot = _snapshot()
+    no_trade = build_no_trade_decision(
+        RegimeLabel.NO_TRADE.value,
+        ["score too low"],
+        extra_metadata={
+            "playbook": "SIDEWAYS_TO_BEARISH_REJECTION",
+            "market_state": "TRANSITION",
+            "tradability_class": "TRADABLE",
+            "failure_type": "FAILED_RECLAIM",
+            "bearish_trade_score": 5.9,
+            "no_trade_score": 4.7,
+            "primary_block_reason": "SCORE_TOO_LOW",
+        },
+    )
+
+    log_validation_decision(no_trade, snapshot=snapshot, paths=paths)
+    log_validation_decision(_decision(), snapshot=snapshot, paths=paths, block_reason="NONE")
+
+    report = build_paper_live_validation_report(paths, session_date=snapshot.timestamp.date().isoformat())
+
+    assert report["total_decisions"] == 2
+    assert report["trade_count"] == 1
+    assert report["no_trade_count"] == 1
+    assert report["top_no_trade_reasons"]["SCORE_TOO_LOW"] == 1
+    assert report["data_availability_summary"]["ready_count"] == 2
+    assert report["market_state_distribution"]["TRANSITION"] == 2
+
+
+def test_validation_detects_repeated_no_trade_reason(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    snapshot = _snapshot()
+    no_trade = build_no_trade_decision(
+        RegimeLabel.NO_TRADE.value,
+        ["not tradable"],
+        extra_metadata={
+            "market_state": "TRANSITION",
+            "bearish_trade_score": 4.0,
+            "no_trade_score": 6.0,
+            "primary_block_reason": "NOT_TRADABLE",
+        },
+    )
+
+    for _ in range(51):
+        log_validation_decision(no_trade, snapshot=snapshot, paths=paths, block_reason="NOT_TRADABLE")
+
+    report = build_paper_live_validation_report(paths, session_date=snapshot.timestamp.date().isoformat())
+
+    assert report["anomalies_by_type"]["REPEATED_IDENTICAL_NO_TRADE_REASON"] >= 1

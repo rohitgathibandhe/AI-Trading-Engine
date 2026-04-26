@@ -292,6 +292,8 @@ def _flatten_option_chain_payload(
     if not isinstance(payload, dict):
         return []
     data = payload.get("data") or payload
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        data = data.get("data") or data
     oc = data.get("oc") if isinstance(data, dict) else None
     if not isinstance(oc, dict):
         return []
