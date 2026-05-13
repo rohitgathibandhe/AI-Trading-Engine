@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 from collections import Counter, defaultdict
@@ -32,7 +33,7 @@ V83_LIVE_PLAYBOOKS = {
     "GAP_UP_BEARISH_FAILURE",
 }
 V83_LIVE_STRATEGIES = {StrategyType.BEAR_CALL_CREDIT_SPREAD.value}
-V83_APPROVED_BEARISH_STATES = {"TREND_DOWN", "TRANSITION"}
+V83_APPROVED_BEARISH_STATES = {"TREND_DOWN", "TRANSITION", "DIRECTIONAL_BALANCE"}
 
 
 class RuntimeMode(str, Enum):
@@ -62,13 +63,15 @@ class ReconciliationStatus(str, Enum):
 class RuntimeRiskGovernance:
     max_lots_per_trade: int = 1
     max_open_structures: int = 1
-    max_trades_per_day: int = 1
+    max_trades_per_day: int = 2
     max_daily_realized_loss_rupees: float = 10_000.0
     max_daily_total_loss_rupees: float = 10_000.0
-    no_new_entries_after_hhmm: str = "14:00"
+    no_new_entries_after_hhmm: str = "14:30"
     stop_after_first_full_loss: bool = True
     require_manual_live_arm: bool = True
     live_only_bearish: bool = True
+    second_trade_requires_first_trade_profit: bool = True
+    second_trade_min_gap_minutes: int = 90
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "RuntimeRiskGovernance":
@@ -76,13 +79,15 @@ class RuntimeRiskGovernance:
         return cls(
             max_lots_per_trade=max(1, int(float(payload.get("max_lots_per_trade", 1) or 1))),
             max_open_structures=max(1, int(float(payload.get("max_open_structures", 1) or 1))),
-            max_trades_per_day=max(1, int(float(payload.get("max_trades_per_day", 1) or 1))),
+            max_trades_per_day=max(1, int(float(payload.get("max_trades_per_day", 2) or 2))),
             max_daily_realized_loss_rupees=max(0.0, float(payload.get("max_daily_realized_loss_rupees", 10_000.0) or 0.0)),
             max_daily_total_loss_rupees=max(0.0, float(payload.get("max_daily_total_loss_rupees", 10_000.0) or 0.0)),
-            no_new_entries_after_hhmm=str(payload.get("no_new_entries_after_hhmm") or "14:00"),
+            no_new_entries_after_hhmm=str(payload.get("no_new_entries_after_hhmm") or "14:30"),
             stop_after_first_full_loss=bool(payload.get("stop_after_first_full_loss", True)),
             require_manual_live_arm=bool(payload.get("require_manual_live_arm", True)),
             live_only_bearish=bool(payload.get("live_only_bearish", True)),
+            second_trade_requires_first_trade_profit=bool(payload.get("second_trade_requires_first_trade_profit", True)),
+            second_trade_min_gap_minutes=max(0, int(float(payload.get("second_trade_min_gap_minutes", 90) or 0))),
         )
 
 
@@ -95,8 +100,12 @@ class RuntimeConfig:
     live_enabled_strategies: tuple[str, ...] = tuple(sorted(V83_LIVE_STRATEGIES))
     approved_bearish_live_states: tuple[str, ...] = tuple(sorted(V83_APPROVED_BEARISH_STATES))
     bearish_score_margin: float = 1.5
+    directional_balance_score_margin_override: float = 0.08
     allowed_entry_start_hhmm: str = "09:30"
-    allowed_entry_end_hhmm: str = "14:00"
+    allowed_entry_end_hhmm: str = "14:30"
+    paper_override_bearish_score_threshold: float = 6.0
+    paper_override_margin: float = 1.0
+    paper_experiment_entry_end_hhmm: str = "14:30"
     health_required_for_paper: bool = True
     health_required_for_micro: bool = True
     risk: RuntimeRiskGovernance = field(default_factory=RuntimeRiskGovernance)
@@ -109,16 +118,33 @@ class RuntimeConfig:
             mode = RuntimeMode(raw_mode)
         except ValueError:
             mode = RuntimeMode.LIVE_DISABLED
+        approved_states = payload.get("approved_bearish_live_states")
+        if approved_states is None:
+            approved_states = payload.get("live_approved_market_states")
         return cls(
             mode=mode,
             live_arm=bool(payload.get("live_arm", False)),
             v83_frozen=bool(payload.get("v83_frozen", True)),
             live_enabled_playbooks=tuple(sorted(str(item) for item in payload.get("live_enabled_playbooks", sorted(V83_LIVE_PLAYBOOKS)))),
             live_enabled_strategies=tuple(sorted(str(item) for item in payload.get("live_enabled_strategies", sorted(V83_LIVE_STRATEGIES)))),
-            approved_bearish_live_states=tuple(sorted(str(item) for item in payload.get("approved_bearish_live_states", sorted(V83_APPROVED_BEARISH_STATES)))),
+            approved_bearish_live_states=tuple(sorted(str(item) for item in approved_states or sorted(V83_APPROVED_BEARISH_STATES))),
             bearish_score_margin=float(payload.get("bearish_score_margin", 1.5) or 1.5),
+            directional_balance_score_margin_override=float(
+                payload.get(
+                    "directional_balance_score_margin_override",
+                    (
+                        payload.get("risk", {}).get("directional_balance_score_margin_override")
+                        if isinstance(payload.get("risk"), dict)
+                        else 0.08
+                    ),
+                )
+                or 0.08
+            ),
             allowed_entry_start_hhmm=str(payload.get("allowed_entry_start_hhmm") or "09:30"),
-            allowed_entry_end_hhmm=str(payload.get("allowed_entry_end_hhmm") or "14:00"),
+            allowed_entry_end_hhmm=str(payload.get("allowed_entry_end_hhmm") or "14:30"),
+            paper_override_bearish_score_threshold=float(payload.get("paper_override_bearish_score_threshold", 6.0) or 6.0),
+            paper_override_margin=float(payload.get("paper_override_margin", 1.0) or 1.0),
+            paper_experiment_entry_end_hhmm=str(payload.get("paper_experiment_entry_end_hhmm") or "14:30"),
             health_required_for_paper=bool(payload.get("health_required_for_paper", True)),
             health_required_for_micro=bool(payload.get("health_required_for_micro", True)),
             risk=RuntimeRiskGovernance.from_payload(payload.get("risk") if isinstance(payload.get("risk"), dict) else payload),
@@ -127,6 +153,7 @@ class RuntimeConfig:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["mode"] = self.mode.value
+        payload["live_approved_market_states"] = list(self.approved_bearish_live_states)
         return payload
 
 
@@ -147,6 +174,9 @@ class OpsPaths:
     shadow_report: Path = STATE_ROOT / "intraday_v83_shadow_live_report.json"
     paper_report: Path = STATE_ROOT / "intraday_v83_paper_live_report.json"
     validation_report: Path = STATE_ROOT / "intraday_v83_paper_live_validation_report.json"
+    paper_context_override_report: Path = STATE_ROOT / "paper_context_override_report.json"
+    near_trade_candidates_csv: Path = STATE_ROOT / "near_trade_candidates.csv"
+    paper_time_window_audit: Path = STATE_ROOT / "paper_time_window_audit.json"
     operator_status_report: Path = STATE_ROOT / "intraday_v83_operator_status_report.json"
     creds_path: Path = STATE_ROOT / "creds.json"
 
@@ -273,8 +303,12 @@ def set_runtime_mode(
         live_enabled_strategies=current.live_enabled_strategies,
         approved_bearish_live_states=current.approved_bearish_live_states,
         bearish_score_margin=current.bearish_score_margin,
+        directional_balance_score_margin_override=current.directional_balance_score_margin_override,
         allowed_entry_start_hhmm=current.allowed_entry_start_hhmm,
         allowed_entry_end_hhmm=current.allowed_entry_end_hhmm,
+        paper_override_bearish_score_threshold=current.paper_override_bearish_score_threshold,
+        paper_override_margin=current.paper_override_margin,
+        paper_experiment_entry_end_hhmm=current.paper_experiment_entry_end_hhmm,
         health_required_for_paper=current.health_required_for_paper,
         health_required_for_micro=current.health_required_for_micro,
         risk=current.risk,
@@ -301,6 +335,7 @@ def _default_runtime_state(config: RuntimeConfig) -> dict[str, Any]:
         "session_date": now.date().isoformat(),
         "daily_lock": {"active": False, "reason": None, "locked_at": None},
         "session_trade_count": 0,
+        "trade_sequence": [],
         "realized_pnl_rupees": 0.0,
         "total_pnl_rupees": 0.0,
         "primary_block_reason": "MODE_NOT_EVALUATED",
@@ -550,6 +585,29 @@ def _primary_block(reasons: list[str]) -> str:
     return reasons[0] if reasons else "NONE"
 
 
+def _decision_origin(decision: DecisionOutput) -> str | None:
+    metadata = _decision_metadata(decision)
+    value = metadata.get("paper_trade_attribution") or metadata.get("decision_origin")
+    if value:
+        return str(value)
+    return None
+
+
+def _is_bullish_context(metadata: dict[str, Any], funnel: dict[str, Any]) -> bool:
+    direction = str(metadata.get("setup_direction") or funnel.get("setup_direction") or "").upper()
+    state_bias = str(metadata.get("market_state_bias") or funnel.get("market_state_bias") or "").upper()
+    playbook = str(metadata.get("playbook") or funnel.get("playbook") or "").upper()
+    return (
+        direction == "BULLISH"
+        or state_bias == "BULLISH"
+        or playbook.startswith("OPEN_DRIVE_BULLISH")
+        or playbook.startswith("GAP_UP_BULLISH")
+        or playbook.startswith("HIGH_CONFLUENCE_BULLISH")
+        or playbook.startswith("LATE_SESSION_BULLISH")
+        or playbook.startswith("SIDEWAYS_TO_BULLISH")
+    )
+
+
 def _active_paper_position_count(paths: OpsPaths) -> int:
     state = _read_json(paths.paper_state)
     active = state.get("active_position") if isinstance(state, dict) else None
@@ -569,6 +627,152 @@ def _has_recovery_block(paths: OpsPaths) -> tuple[bool, str | None]:
     }:
         return True, status
     return False, None
+
+
+def _trade_sequence(state: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = state.get("trade_sequence")
+    if not isinstance(rows, list):
+        return []
+    return [dict(row) for row in rows if isinstance(row, dict)]
+
+
+def _append_trade_sequence_entry(
+    state: dict[str, Any],
+    *,
+    entry_timestamp: str,
+    playbook: str,
+    strategy: str,
+    decision_origin: str,
+) -> None:
+    rows = _trade_sequence(state)
+    rows.append(
+        {
+            "entry_timestamp": entry_timestamp,
+            "exit_timestamp": None,
+            "pnl_rupees": None,
+            "exit_reason": None,
+            "playbook": playbook,
+            "strategy": strategy,
+            "decision_origin": decision_origin,
+        }
+    )
+    state["trade_sequence"] = rows
+
+
+def _close_trade_sequence_entry(
+    state: dict[str, Any],
+    *,
+    entry_timestamp: str,
+    exit_timestamp: str,
+    pnl_rupees: float,
+    exit_reason: str,
+) -> None:
+    rows = _trade_sequence(state)
+    for row in rows:
+        if str(row.get("entry_timestamp") or "") == entry_timestamp and row.get("exit_timestamp") in {None, ""}:
+            row["exit_timestamp"] = exit_timestamp
+            row["pnl_rupees"] = round(float(pnl_rupees), 2)
+            row["exit_reason"] = exit_reason
+            break
+    state["trade_sequence"] = rows
+
+
+def record_runtime_trade_entry(
+    decision: DecisionOutput,
+    snapshot: MarketSnapshot,
+    *,
+    decision_origin: str,
+    paths: OpsPaths | None = None,
+) -> None:
+    paths = paths or OpsPaths()
+    config = load_runtime_config(paths)
+    state = load_runtime_state(paths, config)
+    state["session_trade_count"] = int(state.get("session_trade_count") or 0) + 1
+    _append_trade_sequence_entry(
+        state,
+        entry_timestamp=snapshot.timestamp.isoformat(),
+        playbook=str(decision.metadata.get("playbook") or "UNKNOWN"),
+        strategy=decision.strategy.value if isinstance(decision.strategy, StrategyType) else str(decision.strategy),
+        decision_origin=decision_origin,
+    )
+    save_runtime_state(state, paths=paths)
+
+
+def record_runtime_trade_exit(
+    position: OpenPosition,
+    snapshot: MarketSnapshot,
+    *,
+    pnl_rupees: float,
+    exit_reason: str,
+    paths: OpsPaths | None = None,
+) -> None:
+    paths = paths or OpsPaths()
+    config = load_runtime_config(paths)
+    state = load_runtime_state(paths, config)
+    _close_trade_sequence_entry(
+        state,
+        entry_timestamp=position.entry_time.isoformat(),
+        exit_timestamp=snapshot.timestamp.isoformat(),
+        pnl_rupees=pnl_rupees,
+        exit_reason=exit_reason,
+    )
+    state["last_exit_reason"] = exit_reason
+    save_runtime_state(state, paths=paths)
+
+
+def _score_margin_required(
+    metadata: dict[str, Any],
+    funnel: dict[str, Any],
+    *,
+    config: RuntimeConfig,
+    market_state: str,
+    no_trade_score: float,
+) -> float:
+    configured = float(config.bearish_score_margin)
+    dynamic = float(
+        metadata.get("trade_score_margin_bearish")
+        or funnel.get("trade_score_margin_bearish")
+        or configured
+    )
+    required = dynamic if dynamic > 0 else configured
+    if market_state == "DIRECTIONAL_BALANCE":
+        required = max(
+            required,
+            max(abs(no_trade_score), 1.0) * max(config.directional_balance_score_margin_override, 0.0),
+        )
+    return round(required, 4)
+
+
+def _second_trade_block_reason(
+    state: dict[str, Any],
+    *,
+    now: datetime,
+    config: RuntimeConfig,
+) -> str | None:
+    if not config.risk.second_trade_requires_first_trade_profit:
+        return None
+    if int(state.get("session_trade_count") or 0) < 1:
+        return None
+    rows = _trade_sequence(state)
+    if not rows:
+        return "SECOND_TRADE_FIRST_RESULT_MISSING"
+    first = rows[0]
+    first_entry = _parse_dt(first.get("entry_timestamp"))
+    first_exit = _parse_dt(first.get("exit_timestamp"))
+    if first_entry is None:
+        return "SECOND_TRADE_FIRST_RESULT_MISSING"
+    if first_exit is None:
+        return "SECOND_TRADE_FIRST_NOT_COMPLETED"
+    if float(first.get("pnl_rupees") or 0.0) <= 0.0:
+        return "SECOND_TRADE_REQUIRES_FIRST_PROFIT"
+    if first_entry.tzinfo is None and now.tzinfo is not None:
+        first_entry = first_entry.replace(tzinfo=now.tzinfo)
+    elif first_entry.tzinfo is not None and now.tzinfo is None:
+        first_entry = first_entry.replace(tzinfo=None)
+    elapsed_minutes = max((now - first_entry).total_seconds() / 60.0, 0.0)
+    if elapsed_minutes < max(config.risk.second_trade_min_gap_minutes, 0):
+        return "SECOND_TRADE_MIN_GAP_NOT_MET"
+    return None
 
 
 def evaluate_entry_gate(
@@ -608,12 +812,19 @@ def evaluate_entry_gate(
         reasons.append("BULLISH_LIVE_BLOCKED")
     bearish_score = float(metadata.get("bearish_trade_score") or funnel.get("bearish_trade_score") or 0.0)
     no_trade_score = float(metadata.get("no_trade_score") or funnel.get("no_trade_score") or 0.0)
-    if bearish_score <= no_trade_score + config.bearish_score_margin:
+    score_margin_required = _score_margin_required(
+        metadata,
+        funnel,
+        config=config,
+        market_state=market_state,
+        no_trade_score=no_trade_score,
+    )
+    if bearish_score <= no_trade_score + score_margin_required:
         reasons.append("BEARISH_SCORE_MARGIN_FAIL")
     start_t = _parse_time(config.allowed_entry_start_hhmm, time(9, 30))
     end_t = min(
-        _parse_time(config.allowed_entry_end_hhmm, time(14, 0)),
-        _parse_time(config.risk.no_new_entries_after_hhmm, time(14, 0)),
+        _parse_time(config.allowed_entry_end_hhmm, time(14, 30)),
+        _parse_time(config.risk.no_new_entries_after_hhmm, time(14, 30)),
     )
     if not (start_t <= snapshot.timestamp.time() <= end_t):
         reasons.append("ENTRY_WINDOW_CLOSED")
@@ -622,8 +833,13 @@ def evaluate_entry_gate(
         reasons.append(str(daily_lock.get("reason") or "DAILY_LOCK_ACTIVE"))
     if _active_paper_position_count(paths) >= config.risk.max_open_structures:
         reasons.append("ACTIVE_STRUCTURE_EXISTS")
-    if int(state.get("session_trade_count") or 0) >= config.risk.max_trades_per_day:
+    session_trade_count = int(state.get("session_trade_count") or 0)
+    if session_trade_count >= config.risk.max_trades_per_day:
         reasons.append("MAX_TRADES_PER_DAY_REACHED")
+    elif session_trade_count >= 1:
+        second_trade_reason = _second_trade_block_reason(state, now=snapshot.timestamp, config=config)
+        if second_trade_reason:
+            reasons.append(second_trade_reason)
     if int(decision.lots or 0) > config.risk.max_lots_per_trade:
         reasons.append("LOTS_EXCEED_RUNTIME_LIMIT")
     if float(state.get("realized_pnl_rupees") or 0.0) <= -abs(config.risk.max_daily_realized_loss_rupees):
@@ -661,7 +877,124 @@ def evaluate_entry_gate(
         "tradability_class": tradability,
         "bearish_trade_score": round(bearish_score, 4),
         "no_trade_score": round(no_trade_score, 4),
-        "score_margin_required": config.bearish_score_margin,
+        "score_margin_required": score_margin_required,
+    }
+
+
+def evaluate_paper_context_override_gate(
+    decision: DecisionOutput,
+    snapshot: MarketSnapshot,
+    *,
+    config: RuntimeConfig,
+    health: dict[str, Any],
+    paths: OpsPaths | None = None,
+) -> dict[str, Any]:
+    paths = paths or OpsPaths()
+    state = load_runtime_state(paths, config)
+    metadata = _decision_metadata(decision)
+    funnel = _trade_funnel(decision)
+    reasons: list[str] = []
+
+    if config.mode != RuntimeMode.PAPER_LIVE:
+        reasons.append("MODE_NOT_PAPER_LIVE")
+    if _decision_origin(decision) != "PAPER_CONTEXT_OVERRIDE":
+        reasons.append("NOT_PAPER_CONTEXT_OVERRIDE")
+    if decision.action != "TRADE":
+        reasons.append("NO_TRADE_DECISION")
+
+    strategy = decision.strategy.value if isinstance(decision.strategy, StrategyType) else str(decision.strategy)
+    if strategy != StrategyType.BEAR_CALL_CREDIT_SPREAD.value:
+        reasons.append("STRATEGY_NOT_SUPPORTED_FOR_OVERRIDE")
+
+    playbook = str(metadata.get("playbook") or funnel.get("playbook") or "")
+    tradability = str(metadata.get("tradability_class") or funnel.get("tradability_class") or metadata.get("regime_tradability") or "")
+    if tradability != "TRADABLE":
+        reasons.append("TRADABILITY_NOT_TRADABLE")
+
+    market_state = str(metadata.get("market_state") or funnel.get("market_state") or "")
+    if market_state not in {"TRANSITION", "TREND_DOWN", "DIRECTIONAL_BALANCE"}:
+        reasons.append("MARKET_STATE_NOT_PAPER_OVERRIDE_APPROVED")
+    if market_state == "TRUE_RANGE":
+        reasons.append("TRUE_RANGE_BLOCK")
+
+    failure_type = str(metadata.get("failure_type") or funnel.get("failure_type") or "")
+    if failure_type not in {"FAILED_RECLAIM", "FAILED_BOUNCE", "FAILED_BREAKOUT", "ACCEPTED_BREAKDOWN"}:
+        reasons.append("FAILURE_TYPE_NOT_SUPPORTED")
+
+    if _is_bullish_context(metadata, funnel):
+        reasons.append("BULLISH_CONTEXT_BLOCKED")
+
+    bearish_score = float(metadata.get("bearish_trade_score") or funnel.get("bearish_trade_score") or 0.0)
+    no_trade_score = float(metadata.get("no_trade_score") or funnel.get("no_trade_score") or 0.0)
+    if bearish_score < config.paper_override_bearish_score_threshold:
+        reasons.append("PAPER_OVERRIDE_SCORE_TOO_LOW")
+    if bearish_score <= no_trade_score + config.paper_override_margin:
+        reasons.append("PAPER_OVERRIDE_MARGIN_FAIL")
+
+    start_t = _parse_time(config.allowed_entry_start_hhmm, time(9, 30))
+    end_t = _parse_time(config.paper_experiment_entry_end_hhmm, time(14, 30))
+    inside_window = start_t <= snapshot.timestamp.time() <= end_t
+    if not inside_window:
+        reasons.append("PAPER_EXPERIMENT_WINDOW_CLOSED")
+
+    daily_lock = state.get("daily_lock") if isinstance(state.get("daily_lock"), dict) else {}
+    if bool(daily_lock.get("active")):
+        reasons.append(str(daily_lock.get("reason") or "DAILY_LOCK_ACTIVE"))
+    if _active_paper_position_count(paths) >= config.risk.max_open_structures:
+        reasons.append("ACTIVE_STRUCTURE_EXISTS")
+    session_trade_count = int(state.get("session_trade_count") or 0)
+    if session_trade_count >= config.risk.max_trades_per_day:
+        reasons.append("MAX_TRADES_PER_DAY_REACHED")
+    elif session_trade_count >= 1:
+        second_trade_reason = _second_trade_block_reason(state, now=snapshot.timestamp, config=config)
+        if second_trade_reason:
+            reasons.append(second_trade_reason)
+    if int(decision.lots or 0) > config.risk.max_lots_per_trade:
+        reasons.append("LOTS_EXCEED_RUNTIME_LIMIT")
+    if float(state.get("realized_pnl_rupees") or 0.0) <= -abs(config.risk.max_daily_realized_loss_rupees):
+        reasons.append("DAILY_REALIZED_LOSS_LOCK")
+    if float(state.get("total_pnl_rupees") or 0.0) <= -abs(config.risk.max_daily_total_loss_rupees):
+        reasons.append("DAILY_TOTAL_LOSS_LOCK")
+
+    if str(health.get("status") or "") == HealthStatus.BLOCKED.value:
+        reasons.append("HEALTH_BLOCKED")
+    components = health.get("components") if isinstance(health.get("components"), dict) else {}
+    required = [
+        "broker_auth_health",
+        "market_feed_health",
+        "option_chain_health",
+        "broker_position_sync_health",
+        "state_store_health",
+        "strategy_engine_health",
+        "data_pipeline_health",
+    ]
+    for name in required:
+        component = components.get(name) if isinstance(components, dict) else None
+        if not isinstance(component, dict) or str(component.get("status") or "") == HealthStatus.BLOCKED.value:
+            reasons.append(f"{name.upper()}_BLOCKED")
+
+    recovery_blocked, recovery_reason = _has_recovery_block(paths)
+    if recovery_blocked:
+        reasons.append(f"RECOVERY_BLOCK:{recovery_reason}")
+
+    allowed = not reasons
+    return {
+        "allowed": allowed,
+        "primary_block_reason": _primary_block(reasons),
+        "block_reasons": reasons,
+        "mode": config.mode.value,
+        "playbook": playbook,
+        "strategy": strategy,
+        "market_state": market_state,
+        "tradability_class": tradability,
+        "failure_type": failure_type,
+        "bearish_trade_score": round(bearish_score, 4),
+        "no_trade_score": round(no_trade_score, 4),
+        "score_threshold_required": config.paper_override_bearish_score_threshold,
+        "score_margin_required": config.paper_override_margin,
+        "paper_experiment_entry_end_hhmm": config.paper_experiment_entry_end_hhmm,
+        "inside_paper_experiment_window": inside_window,
+        "decision_origin": "PAPER_CONTEXT_OVERRIDE",
     }
 
 
@@ -1022,6 +1355,9 @@ def log_validation_decision(
     block_reason: str | None = None,
     data_status: dict[str, Any] | None = None,
     event_type: str = "DECISION",
+    paper_candidate: dict[str, Any] | None = None,
+    actual_trade_created: bool | None = None,
+    decision_origin: str | None = None,
 ) -> dict[str, Any]:
     paths = paths or OpsPaths()
     metadata = _decision_metadata(decision)
@@ -1030,6 +1366,34 @@ def log_validation_decision(
     chosen_strategy = decision.strategy.value if isinstance(decision.strategy, StrategyType) else str(decision.strategy)
     resolved_block = _fallback_block_reason(decision, block_reason)
     data = _snapshot_data_summary(snapshot=snapshot, data_status=data_status)
+    v83_decision = "TRADE" if decision.action == "TRADE" and resolved_block == "NONE" else "NO_TRADE"
+    resolved_origin = decision_origin or _decision_origin(decision)
+    paper_candidate = dict(paper_candidate or {})
+    effective_paper_candidate_decision = paper_candidate.get("paper_candidate_decision")
+    if effective_paper_candidate_decision is None and resolved_origin == "V83_APPROVED":
+        effective_paper_candidate_decision = "TRADE"
+    if effective_paper_candidate_decision is None:
+        effective_paper_candidate_decision = "NO_TRADE"
+    effective_paper_candidate_reason = paper_candidate.get("paper_candidate_reason")
+    if effective_paper_candidate_reason is None and resolved_origin == "V83_APPROVED":
+        effective_paper_candidate_reason = "V83_APPROVED"
+    if effective_paper_candidate_reason is None:
+        effective_paper_candidate_reason = "NOT_EVALUATED"
+    effective_mapped_strategy = paper_candidate.get("mapped_strategy")
+    if effective_mapped_strategy is None and resolved_origin == "V83_APPROVED":
+        effective_mapped_strategy = chosen_strategy
+    effective_spread_status = paper_candidate.get("spread_construction_status")
+    if effective_spread_status is None and resolved_origin == "V83_APPROVED":
+        effective_spread_status = "PASSED"
+    if effective_spread_status is None:
+        effective_spread_status = "NOT_EVALUATED"
+    effective_would_create_trade = bool(
+        actual_trade_created
+        if actual_trade_created is not None
+        else paper_candidate.get("would_create_paper_trade", v83_decision == "TRADE")
+    )
+    effective_decision = "TRADE" if effective_would_create_trade else "NO_TRADE"
+    effective_chosen_strategy = effective_mapped_strategy if effective_would_create_trade and resolved_origin == "PAPER_CONTEXT_OVERRIDE" else chosen_strategy
     payload = {
         "event_type": event_type,
         "timestamp": timestamp.isoformat(),
@@ -1041,9 +1405,18 @@ def log_validation_decision(
         "failure_type": metadata.get("failure_type"),
         "bearish_trade_score": _first_present(metadata.get("bearish_trade_score"), funnel.get("bearish_trade_score")),
         "no_trade_score": _first_present(metadata.get("no_trade_score"), funnel.get("no_trade_score")),
-        "decision": "TRADE" if decision.action == "TRADE" and resolved_block == "NONE" else "NO_TRADE",
+        "decision": effective_decision,
         "raw_action": decision.action,
-        "chosen_strategy": chosen_strategy,
+        "v83_decision": v83_decision,
+        "v83_rejection_reason": "NONE" if v83_decision == "TRADE" else resolved_block,
+        "paper_candidate_decision": effective_paper_candidate_decision,
+        "paper_candidate_reason": effective_paper_candidate_reason,
+        "paper_trade_attribution": resolved_origin,
+        "mapped_strategy": effective_mapped_strategy,
+        "spread_construction_status": effective_spread_status,
+        "would_create_paper_trade": effective_would_create_trade,
+        "paper_experiment_window_allows": paper_candidate.get("paper_experiment_window_allows"),
+        "chosen_strategy": effective_chosen_strategy,
         "block_reason": resolved_block,
         "data": data,
     }
@@ -1086,6 +1459,7 @@ def record_paper_entry(
 ) -> None:
     paths = paths or OpsPaths()
     save_paper_position(position, paths=paths, extra={"last_entry_gate": gate})
+    attribution = str(decision.metadata.get("paper_trade_attribution") or "V83_APPROVED")
     event = {
         "event": "PAPER_ENTRY",
         "timestamp": snapshot.timestamp.isoformat(),
@@ -1093,6 +1467,8 @@ def record_paper_entry(
         "entry_timestamp": snapshot.timestamp.isoformat(),
         "playbook": decision.metadata.get("playbook"),
         "subtype": decision.metadata.get("setup_subtype") or decision.metadata.get("bearish_subtype"),
+        "paper_trade_attribution": attribution,
+        "paper_candidate_reason": decision.metadata.get("paper_candidate_reason"),
         "strategy": decision.strategy.value if isinstance(decision.strategy, StrategyType) else str(decision.strategy),
         "legs": decision.legs,
         "entry_price_assumptions": decision.entry,
@@ -1102,8 +1478,8 @@ def record_paper_entry(
         "mae_rupees": 0.0,
     }
     _append_jsonl(paths.paper_trades, event)
+    record_runtime_trade_entry(decision, snapshot, decision_origin=attribution, paths=paths)
     state = load_runtime_state(paths, load_runtime_config(paths))
-    state["session_trade_count"] = int(state.get("session_trade_count") or 0) + 1
     state["last_simulated_order"] = event
     state["primary_block_reason"] = "NONE"
     save_runtime_state(state, paths=paths)
@@ -1118,7 +1494,14 @@ def manage_paper_position(
     position = load_paper_position(paths)
     if position is None:
         return None
-    exit_decision = evaluate_exit(position, current_snapshot=snapshot, now=snapshot.timestamp)
+    from .regime import classify_regime
+
+    exit_decision = evaluate_exit(
+        position,
+        current_snapshot=snapshot,
+        current_regime=classify_regime(snapshot),
+        now=snapshot.timestamp,
+    )
     open_pnl = exit_decision.pnl_rupees
     state = _read_json(paths.paper_state)
     mfe = max(float(state.get("mfe_rupees") or 0.0), open_pnl)
@@ -1135,7 +1518,10 @@ def manage_paper_position(
         "exit_reason": exit_decision.reason,
         "playbook": position.metadata.get("playbook"),
         "subtype": position.metadata.get("setup_subtype") or position.metadata.get("bearish_subtype"),
+        "paper_trade_attribution": position.metadata.get("paper_trade_attribution") or "V83_APPROVED",
+        "paper_candidate_reason": position.metadata.get("paper_candidate_reason"),
         "strategy": position.structure.strategy.value,
+        "exit_mode": position.metadata.get("exit_mode") or "STANDARD_TRAIL",
         "realized_paper_pnl": round(exit_decision.pnl_rupees, 2),
         "mfe_rupees": round(mfe, 2),
         "mae_rupees": round(mae, 2),
@@ -1145,6 +1531,13 @@ def manage_paper_position(
     save_paper_position(None, paths=paths, extra={"last_exit": event, "mfe_rupees": 0.0, "mae_rupees": 0.0})
     config = load_runtime_config(paths)
     runtime_state = load_runtime_state(paths, config)
+    _close_trade_sequence_entry(
+        runtime_state,
+        entry_timestamp=position.entry_time.isoformat(),
+        exit_timestamp=snapshot.timestamp.isoformat(),
+        pnl_rupees=exit_decision.pnl_rupees,
+        exit_reason=exit_decision.reason,
+    )
     runtime_state["realized_pnl_rupees"] = round(float(runtime_state.get("realized_pnl_rupees") or 0.0) + exit_decision.pnl_rupees, 2)
     runtime_state["total_pnl_rupees"] = runtime_state["realized_pnl_rupees"]
     runtime_state["last_exit_reason"] = exit_decision.reason
@@ -1329,6 +1722,19 @@ def build_paper_live_report(paths: OpsPaths | None = None, *, write: bool = True
     entries = [row for row in rows if row.get("event") == "PAPER_ENTRY"]
     exits = [row for row in rows if row.get("event") == "PAPER_EXIT"]
     pnl_values = [float(row.get("realized_paper_pnl") or 0.0) for row in exits]
+    attribution_summary: dict[str, dict[str, Any]] = defaultdict(lambda: {"entries": 0, "exits": 0, "pnl_rupees": 0.0, "wins": 0, "losses": 0})
+    for row in entries:
+        attribution = str(row.get("paper_trade_attribution") or "UNKNOWN")
+        attribution_summary[attribution]["entries"] += 1
+    for row in exits:
+        attribution = str(row.get("paper_trade_attribution") or "UNKNOWN")
+        pnl = float(row.get("realized_paper_pnl") or 0.0)
+        attribution_summary[attribution]["exits"] += 1
+        attribution_summary[attribution]["pnl_rupees"] += pnl
+        if pnl > 0.0:
+            attribution_summary[attribution]["wins"] += 1
+        elif pnl < 0.0:
+            attribution_summary[attribution]["losses"] += 1
     by_day: dict[str, dict[str, Any]] = defaultdict(lambda: {"trades": 0, "pnl_rupees": 0.0, "exits": Counter()})
     for row in exits:
         day = str(row.get("session_date") or "")
@@ -1342,6 +1748,16 @@ def build_paper_live_report(paths: OpsPaths | None = None, *, write: bool = True
         "realized_paper_pnl": round(sum(pnl_values), 2),
         "wins": sum(1 for value in pnl_values if value > 0.0),
         "losses": sum(1 for value in pnl_values if value < 0.0),
+        "attribution_summary": {
+            key: {
+                "entries": value["entries"],
+                "exits": value["exits"],
+                "pnl_rupees": round(float(value["pnl_rupees"]), 2),
+                "wins": value["wins"],
+                "losses": value["losses"],
+            }
+            for key, value in sorted(attribution_summary.items())
+        },
         "exit_reason_distribution": dict(Counter(str(row.get("exit_reason") or "UNKNOWN") for row in exits)),
         "lock_triggers": [
             row for row in _read_jsonl(paths.operator_events)
@@ -1426,6 +1842,249 @@ def build_paper_live_validation_report(
     return payload
 
 
+def _normalized_validation_row(
+    row: dict[str, Any],
+    *,
+    config: RuntimeConfig,
+) -> dict[str, Any]:
+    timestamp = _parse_dt(row.get("timestamp"))
+    paper_candidate_decision = row.get("paper_candidate_decision")
+    paper_candidate_reason = row.get("paper_candidate_reason")
+    mapped_strategy = row.get("mapped_strategy")
+    spread_status = row.get("spread_construction_status")
+    paper_experiment_window_allows = row.get("paper_experiment_window_allows")
+    if timestamp is not None and paper_experiment_window_allows is None:
+        start_t = _parse_time(config.allowed_entry_start_hhmm, time(9, 30))
+        end_t = _parse_time(config.paper_experiment_entry_end_hhmm, time(14, 30))
+        paper_experiment_window_allows = bool(start_t <= timestamp.time() <= end_t)
+    if paper_candidate_decision is None:
+        market_state = str(row.get("market_state") or "")
+        tradability = str(row.get("tradability_class") or "")
+        failure_type = str(row.get("failure_type") or "")
+        bearish_score = float(row.get("bearish_trade_score") or 0.0)
+        no_trade_score = float(row.get("no_trade_score") or 0.0)
+        eligible = bool(
+            market_state in {"TRANSITION", "TREND_DOWN", "DIRECTIONAL_BALANCE"}
+            and tradability == "TRADABLE"
+            and failure_type in {"FAILED_RECLAIM", "FAILED_BOUNCE", "FAILED_BREAKOUT", "ACCEPTED_BREAKDOWN"}
+            and bearish_score >= config.paper_override_bearish_score_threshold
+            and bearish_score > no_trade_score + config.paper_override_margin
+            and paper_experiment_window_allows is not False
+        )
+        paper_candidate_decision = "NO_TRADE"
+        if eligible:
+            paper_candidate_reason = "LEGACY_DECISION_ROW_REQUIRES_REPLAY"
+            mapped_strategy = StrategyType.BEAR_CALL_CREDIT_SPREAD.value
+            spread_status = "NOT_EVALUATED"
+        else:
+            paper_candidate_reason = "NOT_EVALUATED"
+            spread_status = "NOT_EVALUATED"
+    return dict(row) | {
+        "paper_candidate_decision": paper_candidate_decision,
+        "paper_candidate_reason": paper_candidate_reason,
+        "mapped_strategy": mapped_strategy,
+        "spread_construction_status": spread_status,
+        "paper_experiment_window_allows": paper_experiment_window_allows,
+    }
+
+
+def build_near_trade_candidates_csv(
+    paths: OpsPaths | None = None,
+    *,
+    config: RuntimeConfig | None = None,
+    write: bool = True,
+) -> list[dict[str, Any]]:
+    paths = paths or OpsPaths()
+    config = config or load_runtime_config(paths)
+    rows = [
+        _normalized_validation_row(row, config=config)
+        for row in _read_jsonl(paths.validation_decisions)
+        if str(row.get("event_type") or "DECISION") == "DECISION"
+    ]
+    opportunities: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    current_key: tuple[Any, ...] | None = None
+    current_ts: datetime | None = None
+    merge_gap_sec = 300.0
+
+    for row in rows:
+        timestamp = _parse_dt(row.get("timestamp"))
+        if timestamp is None:
+            continue
+        key = (
+            str(row.get("session_date") or timestamp.date().isoformat()),
+            str(row.get("market_state") or ""),
+            str(row.get("tradability_class") or ""),
+            str(row.get("failure_type") or ""),
+            str(row.get("subtype") or ""),
+            str(row.get("v83_decision") or row.get("decision") or "NO_TRADE"),
+            str(row.get("v83_rejection_reason") or row.get("block_reason") or "NONE"),
+            str(row.get("paper_candidate_decision") or "NO_TRADE"),
+            str(row.get("paper_candidate_reason") or "NOT_EVALUATED"),
+            str(row.get("mapped_strategy") or ""),
+            str(row.get("spread_construction_status") or "NOT_EVALUATED"),
+            bool(row.get("would_create_paper_trade", False)),
+        )
+        if (
+            current is None
+            or current_key != key
+            or current_ts is None
+            or (timestamp - current_ts).total_seconds() > merge_gap_sec
+        ):
+            if current is not None:
+                opportunities.append(current)
+            current = {
+                "date": str(row.get("session_date") or timestamp.date().isoformat()),
+                "first_seen_time": timestamp.isoformat(),
+                "last_seen_time": timestamp.isoformat(),
+                "market_state": row.get("market_state"),
+                "tradability_class": row.get("tradability_class"),
+                "failure_type": row.get("failure_type"),
+                "subtype": row.get("subtype"),
+                "bearish_trade_score": float(row.get("bearish_trade_score") or 0.0),
+                "no_trade_score": float(row.get("no_trade_score") or 0.0),
+                "v83_decision": row.get("v83_decision") or row.get("decision") or "NO_TRADE",
+                "v83_rejection_reason": row.get("v83_rejection_reason") or row.get("block_reason") or "NONE",
+                "paper_candidate_decision": row.get("paper_candidate_decision") or "NO_TRADE",
+                "paper_candidate_reason": row.get("paper_candidate_reason") or "NOT_EVALUATED",
+                "mapped_strategy": row.get("mapped_strategy"),
+                "spread_construction_status": row.get("spread_construction_status") or "NOT_EVALUATED",
+                "would_create_paper_trade": bool(row.get("would_create_paper_trade", False)),
+            }
+            current_key = key
+        else:
+            current["last_seen_time"] = timestamp.isoformat()
+            current["bearish_trade_score"] = round(max(float(current.get("bearish_trade_score") or 0.0), float(row.get("bearish_trade_score") or 0.0)), 4)
+            current["no_trade_score"] = round(min(float(current.get("no_trade_score") or 0.0), float(row.get("no_trade_score") or 0.0)), 4)
+            current["would_create_paper_trade"] = bool(current.get("would_create_paper_trade") or row.get("would_create_paper_trade", False))
+        current_ts = timestamp
+    if current is not None:
+        opportunities.append(current)
+
+    if write:
+        paths.near_trade_candidates_csv.parent.mkdir(parents=True, exist_ok=True)
+        with paths.near_trade_candidates_csv.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "date",
+                    "first_seen_time",
+                    "last_seen_time",
+                    "market_state",
+                    "tradability_class",
+                    "failure_type",
+                    "subtype",
+                    "bearish_trade_score",
+                    "no_trade_score",
+                    "v83_decision",
+                    "v83_rejection_reason",
+                    "paper_candidate_decision",
+                    "paper_candidate_reason",
+                    "mapped_strategy",
+                    "spread_construction_status",
+                    "would_create_paper_trade",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(opportunities)
+    return opportunities
+
+
+def build_paper_time_window_audit(
+    paths: OpsPaths | None = None,
+    *,
+    config: RuntimeConfig | None = None,
+    write: bool = True,
+) -> dict[str, Any]:
+    paths = paths or OpsPaths()
+    config = config or load_runtime_config(paths)
+    rows = [
+        _normalized_validation_row(row, config=config)
+        for row in _read_jsonl(paths.validation_decisions)
+        if str(row.get("event_type") or "DECISION") == "DECISION"
+    ]
+    time_window_rows = [
+        row for row in rows
+        if str(row.get("v83_rejection_reason") or row.get("block_reason") or "") in {"TIME_WINDOW", "ENTRY_TIME_INVALID"}
+    ]
+    allowed_count = sum(1 for row in time_window_rows if row.get("paper_experiment_window_allows") is True)
+    blocked_count = sum(1 for row in time_window_rows if row.get("paper_experiment_window_allows") is False)
+    payload = {
+        "generated_at": _now().isoformat(timespec="seconds"),
+        "paper_experiment_entry_end_hhmm": config.paper_experiment_entry_end_hhmm,
+        "total_time_window_rejects": len(time_window_rows),
+        "paper_window_would_allow_count": allowed_count,
+        "paper_window_would_still_block_count": blocked_count,
+        "by_subtype": dict(Counter(str(row.get("subtype") or "UNKNOWN") for row in time_window_rows)),
+        "sample_rows": time_window_rows[-25:],
+    }
+    if write:
+        _write_json(paths.paper_time_window_audit, payload)
+    return payload
+
+
+def build_paper_context_override_report(
+    paths: OpsPaths | None = None,
+    *,
+    config: RuntimeConfig | None = None,
+    write: bool = True,
+) -> dict[str, Any]:
+    paths = paths or OpsPaths()
+    config = config or load_runtime_config(paths)
+    validation_rows = [
+        _normalized_validation_row(row, config=config)
+        for row in _read_jsonl(paths.validation_decisions)
+        if str(row.get("event_type") or "DECISION") == "DECISION"
+    ]
+    opportunities = build_near_trade_candidates_csv(paths=paths, config=config, write=write)
+    time_window_audit = build_paper_time_window_audit(paths=paths, config=config, write=write)
+    paper_report = build_paper_live_report(paths=paths, write=False)
+
+    override_candidates = [
+        row for row in validation_rows
+        if str(row.get("paper_candidate_reason") or "NOT_EVALUATED") not in {"NOT_EVALUATED", "V83_APPROVED"}
+        or str(row.get("paper_trade_attribution") or "") == "PAPER_CONTEXT_OVERRIDE"
+    ]
+    override_trades = [row for row in validation_rows if str(row.get("paper_trade_attribution") or "") == "PAPER_CONTEXT_OVERRIDE" and bool(row.get("would_create_paper_trade"))]
+    v83_approved_trades = [row for row in validation_rows if str(row.get("paper_trade_attribution") or "") == "V83_APPROVED" and bool(row.get("would_create_paper_trade"))]
+    override_rejections = Counter(
+        str(row.get("paper_candidate_reason") or "UNKNOWN")
+        for row in override_candidates
+        if not bool(row.get("would_create_paper_trade"))
+    )
+    override_opportunities = [
+        row for row in opportunities
+        if str(row.get("paper_candidate_reason") or "NOT_EVALUATED") not in {"NOT_EVALUATED", "V83_APPROVED"}
+    ]
+    trade_creation_rate = (
+        len([row for row in override_opportunities if bool(row.get("would_create_paper_trade"))]) / len(override_opportunities)
+        if override_opportunities else 0.0
+    )
+    low_quality_flow_appears = bool(override_opportunities and trade_creation_rate < 0.25)
+    payload = {
+        "generated_at": _now().isoformat(timespec="seconds"),
+        "paper_override_config": {
+            "paper_override_bearish_score_threshold": config.paper_override_bearish_score_threshold,
+            "paper_override_margin": config.paper_override_margin,
+            "paper_experiment_entry_end_hhmm": config.paper_experiment_entry_end_hhmm,
+        },
+        "v83_approved_paper_trades": len(v83_approved_trades),
+        "paper_context_override_candidates": len(override_candidates),
+        "paper_context_override_paper_trades": len(override_trades),
+        "rejection_reasons_after_override": dict(override_rejections),
+        "pnl_split": paper_report.get("attribution_summary", {}),
+        "low_quality_flow_appears": low_quality_flow_appears,
+        "override_opportunity_windows": len(override_opportunities),
+        "override_trade_creation_rate": round(trade_creation_rate, 4),
+        "near_trade_candidates_path": str(paths.near_trade_candidates_csv),
+        "paper_time_window_audit_path": str(paths.paper_time_window_audit),
+        "paper_time_window_audit": time_window_audit,
+    }
+    if write:
+        _write_json(paths.paper_context_override_report, payload)
+    return payload
+
+
 def build_promotion_gates(
     *,
     paths: OpsPaths | None = None,
@@ -1503,6 +2162,7 @@ def build_operator_status_report(
     shadow = build_shadow_live_report(paths, write=True)
     paper = build_paper_live_report(paths, write=True)
     validation = build_paper_live_validation_report(paths, write=True)
+    paper_override = build_paper_context_override_report(paths, config=config, write=True)
     events = _read_jsonl(paths.operator_events)
     flatten_events = _read_jsonl(paths.emergency_flatten_events)
     payload = {
@@ -1515,6 +2175,9 @@ def build_operator_status_report(
         "shadow_live_report_path": str(paths.shadow_report),
         "paper_live_report_path": str(paths.paper_report),
         "paper_live_validation_report_path": str(paths.validation_report),
+        "paper_context_override_report_path": str(paths.paper_context_override_report),
+        "near_trade_candidates_csv_path": str(paths.near_trade_candidates_csv),
+        "paper_time_window_audit_path": str(paths.paper_time_window_audit),
         "operator_status_report_path": str(paths.operator_status_report),
         "operator_status": {
             "health_incidents": [
@@ -1534,6 +2197,7 @@ def build_operator_status_report(
         "shadow_summary": shadow,
         "paper_summary": paper,
         "paper_live_validation_summary": validation,
+        "paper_context_override_summary": paper_override,
     }
     if write:
         _write_json(paths.operator_status_report, payload)

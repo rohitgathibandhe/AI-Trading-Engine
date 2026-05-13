@@ -24,12 +24,18 @@ from market_ai.intraday_defined_risk.ops_runtime import (
     ReconciliationStatus,
     RuntimeConfig,
     RuntimeMode,
+    build_near_trade_candidates_csv,
+    build_paper_context_override_report,
+    build_paper_live_report,
+    build_paper_time_window_audit,
     build_paper_live_validation_report,
     build_unified_health,
     evaluate_entry_gate,
+    evaluate_paper_context_override_gate,
     load_paper_position,
     load_runtime_config,
     open_position_from_decision,
+    record_paper_entry,
     reconcile_positions,
     save_paper_position,
     set_runtime_mode,
@@ -114,6 +120,24 @@ def _decision() -> DecisionOutput:
     )
 
 
+def _override_decision() -> DecisionOutput:
+    decision = _decision()
+    decision.metadata.update(
+        {
+            "playbook": "NO_TRADE",
+            "paper_trade_attribution": "PAPER_CONTEXT_OVERRIDE",
+            "paper_candidate_reason": "PAPER_CONTEXT_OVERRIDE",
+            "market_state": "TRANSITION",
+            "tradability_class": "TRADABLE",
+            "failure_type": "FAILED_BREAKOUT",
+            "setup_direction": "BEARISH",
+            "bearish_trade_score": 6.8,
+            "no_trade_score": 4.9,
+        }
+    )
+    return decision
+
+
 def _healthy() -> dict[str, object]:
     components = {
         name: {"status": HealthStatus.HEALTHY.value, "block_reasons": []}
@@ -167,6 +191,22 @@ def test_paper_gate_passes_for_v83_bearish_candidate(tmp_path: Path) -> None:
 
     assert gate["allowed"] is True
     assert gate["primary_block_reason"] == "NONE"
+
+
+def test_paper_context_override_gate_passes_for_override_candidate(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    config = RuntimeConfig(
+        mode=RuntimeMode.PAPER_LIVE,
+        paper_override_bearish_score_threshold=6.0,
+        paper_override_margin=1.0,
+        paper_experiment_entry_end_hhmm="14:30",
+    )
+
+    gate = evaluate_paper_context_override_gate(_override_decision(), _snapshot(), config=config, health=_healthy(), paths=paths)
+
+    assert gate["allowed"] is True
+    assert gate["primary_block_reason"] == "NONE"
+    assert gate["decision_origin"] == "PAPER_CONTEXT_OVERRIDE"
 
 
 def test_research_dataset_staleness_is_degraded_not_paper_blocking(monkeypatch, tmp_path: Path) -> None:
@@ -273,3 +313,104 @@ def test_validation_detects_repeated_no_trade_reason(tmp_path: Path) -> None:
     report = build_paper_live_validation_report(paths, session_date=snapshot.timestamp.date().isoformat())
 
     assert report["anomalies_by_type"]["REPEATED_IDENTICAL_NO_TRADE_REASON"] >= 1
+
+
+def test_override_reports_and_near_trade_candidates_are_built(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    snapshot = _snapshot()
+
+    strict_no_trade = build_no_trade_decision(
+        RegimeLabel.NO_TRADE.value,
+        ["pattern mismatch"],
+        extra_metadata={
+            "playbook": "SIDEWAYS_TO_BEARISH_REJECTION",
+            "market_state": "TRANSITION",
+            "tradability_class": "TRADABLE",
+            "failure_type": "FAILED_RECLAIM",
+            "setup_subtype": "SUPPLY_ZONE_FAILED_RECLAIM",
+            "bearish_trade_score": 7.1786,
+            "no_trade_score": 0.0,
+            "primary_block_reason": "SETUP_PATTERN_MISMATCH",
+        },
+    )
+    override_trade = _override_decision()
+    gate = {
+        "allowed": True,
+        "primary_block_reason": "NONE",
+    }
+    position = open_position_from_decision(override_trade, snapshot)
+    record_paper_entry(position, decision=override_trade, snapshot=snapshot, gate=gate, paths=paths)
+    ops_runtime._append_jsonl(
+        paths.paper_trades,
+        {
+            "event": "PAPER_EXIT",
+            "timestamp": snapshot.timestamp.isoformat(),
+            "session_date": snapshot.timestamp.date().isoformat(),
+            "entry_timestamp": snapshot.timestamp.isoformat(),
+            "exit_timestamp": snapshot.timestamp.isoformat(),
+            "exit_reason": "TIME_EXIT",
+            "playbook": "NO_TRADE",
+            "subtype": None,
+            "paper_trade_attribution": "PAPER_CONTEXT_OVERRIDE",
+            "paper_candidate_reason": "PAPER_CONTEXT_OVERRIDE",
+            "strategy": StrategyType.BEAR_CALL_CREDIT_SPREAD.value,
+            "realized_paper_pnl": 1250.0,
+            "mfe_rupees": 1400.0,
+            "mae_rupees": -250.0,
+            "legs": override_trade.legs,
+        },
+    )
+
+    log_validation_decision(
+        strict_no_trade,
+        snapshot=snapshot,
+        paths=paths,
+        paper_candidate={
+            "paper_candidate_decision": "NO_TRADE",
+            "paper_candidate_reason": "CREDIT_TOO_LOW",
+            "mapped_strategy": StrategyType.BEAR_CALL_CREDIT_SPREAD.value,
+            "spread_construction_status": "CREDIT_TOO_LOW",
+            "would_create_paper_trade": False,
+            "paper_experiment_window_allows": True,
+        },
+    )
+    log_validation_decision(
+        strict_no_trade,
+        snapshot=snapshot,
+        paths=paths,
+        paper_candidate={
+            "paper_candidate_decision": "NO_TRADE",
+            "paper_candidate_reason": "CREDIT_TOO_LOW",
+            "mapped_strategy": StrategyType.BEAR_CALL_CREDIT_SPREAD.value,
+            "spread_construction_status": "CREDIT_TOO_LOW",
+            "would_create_paper_trade": False,
+            "paper_experiment_window_allows": True,
+        },
+    )
+    log_validation_decision(
+        strict_no_trade,
+        snapshot=snapshot,
+        paths=paths,
+        paper_candidate={
+            "paper_candidate_decision": "TRADE",
+            "paper_candidate_reason": "PAPER_CONTEXT_OVERRIDE",
+            "mapped_strategy": StrategyType.BEAR_CALL_CREDIT_SPREAD.value,
+            "spread_construction_status": "PASSED",
+            "would_create_paper_trade": True,
+            "paper_experiment_window_allows": True,
+        },
+        actual_trade_created=True,
+        decision_origin="PAPER_CONTEXT_OVERRIDE",
+    )
+
+    paper_report = build_paper_live_report(paths=paths)
+    opportunities = build_near_trade_candidates_csv(paths=paths, config=RuntimeConfig(mode=RuntimeMode.PAPER_LIVE))
+    time_window = build_paper_time_window_audit(paths=paths, config=RuntimeConfig(mode=RuntimeMode.PAPER_LIVE))
+    override_report = build_paper_context_override_report(paths=paths, config=RuntimeConfig(mode=RuntimeMode.PAPER_LIVE))
+
+    assert paper_report["attribution_summary"]["PAPER_CONTEXT_OVERRIDE"]["pnl_rupees"] == 1250.0
+    assert len(opportunities) == 2
+    assert paths.near_trade_candidates_csv.exists()
+    assert time_window["paper_experiment_entry_end_hhmm"] == "14:30"
+    assert override_report["paper_context_override_paper_trades"] == 1
+    assert override_report["rejection_reasons_after_override"]["CREDIT_TOO_LOW"] == 2

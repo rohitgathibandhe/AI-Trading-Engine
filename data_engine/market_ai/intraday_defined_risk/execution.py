@@ -15,13 +15,14 @@ from .data_models import (
     TradeStructure,
 )
 from .features import compute_vwap, last_n_closes_above, last_n_closes_below, latest_pivot_high, latest_pivot_low, session_bars
-from .features import bullish_reversal_structure, bearish_reversal_structure, closes, ema_value
+from .features import bullish_reversal_structure, bearish_reversal_structure, closes, ema, ema_value
 
 
 TIME_EXIT = time(15, 15)
-LATEST_DIRECTIONAL_ENTRY = time(14, 0)
+LATEST_DIRECTIONAL_ENTRY = time(14, 30)
 DIRECTIONAL_TP_CAPTURE = 0.65
 CONDOR_TP_CAPTURE = 0.50
+CONVICTION_TP_CAPTURE = 0.80
 DIRECTIONAL_DELTA_SL = 0.40
 BULLISH_PLAYBOOK_DELTA_SL = 0.50
 CONDOR_DELTA_SL = 0.25
@@ -40,11 +41,43 @@ def validate_entry_time(strategy: StrategyType, now: datetime) -> tuple[bool, st
     if strategy in {StrategyType.BEAR_CALL_CREDIT_SPREAD, StrategyType.BULL_PUT_CREDIT_SPREAD} and now.time() < time(9, 30):
         return False, "Directional entries prefer time >= 09:30 IST."
     if strategy in {StrategyType.BEAR_CALL_CREDIT_SPREAD, StrategyType.BULL_PUT_CREDIT_SPREAD} and now.time() > LATEST_DIRECTIONAL_ENTRY:
-        return False, "Directional entries are blocked after 14:00 IST to avoid low-quality late-session deployment."
+        return False, "Directional entries are blocked after 14:30 IST to avoid low-quality late-session deployment."
     if strategy == StrategyType.IRON_CONDOR and now.time() < time(10, 0):
         return False, "Iron Condor entries are allowed only after 10:00 IST."
     if now.time() >= TIME_EXIT:
         return False, "No new entries are allowed after the 15:15 IST flattening cut-off."
+    return True, None
+
+
+def validate_entry_context(
+    strategy: StrategyType,
+    snapshot: MarketSnapshot,
+    regime_state: RegimeState,
+) -> tuple[bool, str | None]:
+    if strategy != StrategyType.BEAR_CALL_CREDIT_SPREAD:
+        return True, None
+    metadata = regime_state.metadata if isinstance(regime_state.metadata, dict) else {}
+    playbook = str(metadata.get("playbook") or "UNKNOWN")
+    pcr_trend = str(metadata.get("pcr_trend") or "UNKNOWN")
+    if playbook != "GAP_DOWN_BEARISH_CONTINUATION" and pcr_trend == "FALLING":
+        return False, "PCR_TREND_FALLING_BEARISH_NEGATION"
+
+    bars = session_bars(snapshot.nifty_5m)
+    if not bars:
+        return True, None
+    entry_candle = bars[-1]
+    vwap = snapshot.live_vwap
+    if vwap is None:
+        vwap = regime_state.vwap
+    if vwap is None:
+        vwap = compute_vwap(bars)
+    if (
+        playbook != "GAP_DOWN_BEARISH_CONTINUATION"
+        and vwap is not None
+        and vwap > 0
+        and entry_candle.close > (vwap * 1.002)
+    ):
+        return False, "PRICE_ABOVE_VWAP_AT_ENTRY"
     return True, None
 
 
@@ -67,6 +100,7 @@ def build_open_position(
     metadata = {
         "time_exit": entry_time.replace(hour=15, minute=15, second=0, microsecond=0).isoformat(),
         "session_profit_peak_rupees": 0.0,
+        "exit_mode": "STANDARD_TRAIL",
     }
     if extra_metadata:
         metadata.update(extra_metadata)
@@ -205,6 +239,12 @@ def evaluate_exit(
         pnl_rupees = (position.entry_credit_points - liability) * position.lot_size * position.lots
         return ExitDecision(True, "TIME_EXIT", liability, pnl_rupees)
 
+    quick_invalidation_reason = _intrabar_regime_invalidation_reason(position, current_snapshot, now=now)
+    if quick_invalidation_reason:
+        liability = current_value_points if current_value_points is not None else position.stop_value_points
+        pnl_rupees = (position.entry_credit_points - liability) * position.lot_size * position.lots
+        return ExitDecision(True, quick_invalidation_reason, liability, pnl_rupees)
+
     invalidation_reason = _regime_invalidation_reason(position, current_snapshot, current_regime)
     if invalidation_reason:
         liability = current_value_points if current_value_points is not None else position.stop_value_points
@@ -221,7 +261,36 @@ def evaluate_exit(
     structure_trail_reason = _structure_profit_trail_reason(position, current_snapshot, current_value_points)
     if structure_trail_reason:
         return ExitDecision(True, structure_trail_reason, current_value_points, pnl_rupees)
-    if current_value_points <= position.target_value_points:
+    effective_target_capture = position.take_profit_capture_pct
+    if current_snapshot is not None:
+        entry_time = position.entry_time
+        if entry_time.tzinfo is None and now.tzinfo is not None:
+            entry_time = entry_time.replace(tzinfo=now.tzinfo)
+        elif entry_time.tzinfo is not None and now.tzinfo is None:
+            entry_time = entry_time.replace(tzinfo=None)
+        elapsed_minutes = max(int((now - entry_time).total_seconds() // 60), 0)
+        current_capture_pct = max(position.entry_credit_points - current_value_points, 0.0) / max(position.entry_credit_points, 0.01)
+        if should_use_conviction_exit(
+            position,
+            current_snapshot,
+            minutes_since_entry=elapsed_minutes,
+            current_legs=current_legs,
+            current_regime=current_regime,
+        ):
+            effective_target_capture = max(effective_target_capture, CONVICTION_TP_CAPTURE)
+            position.metadata["exit_mode"] = "CONVICTION_TRAIL"
+        elif position.metadata.get("playbook") == "GAP_DOWN_BEARISH_CONTINUATION":
+            if current_capture_pct >= 0.70 and now.time() < time(12, 0):
+                effective_target_capture = max(effective_target_capture, CONVICTION_TP_CAPTURE)
+                position.metadata["exit_mode"] = "GAP_DOWN_FAST_DECAY_TRAIL"
+            else:
+                position.metadata["exit_mode"] = "STANDARD_TRAIL"
+            if current_capture_pct < 0.40 and now.time() >= time(13, 0):
+                return ExitDecision(True, "GAP_DOWN_SLOW_DECAY_TIME_EXIT", current_value_points, pnl_rupees)
+        else:
+            position.metadata["exit_mode"] = "STANDARD_TRAIL"
+    effective_target_value_points = position.entry_credit_points * (1.0 - effective_target_capture)
+    if current_value_points <= effective_target_value_points:
         return ExitDecision(True, "TAKE_PROFIT", current_value_points, pnl_rupees)
     if current_value_points >= position.stop_value_points:
         return ExitDecision(True, "PREMIUM_STOP", current_value_points, pnl_rupees)
@@ -328,6 +397,94 @@ def _regime_invalidation_reason(
     elif strategy == StrategyType.IRON_CONDOR:
         if current_regime is not None and current_regime.regime != RegimeLabel.RANGE:
             return "RANGE_INVALIDATION"
+    return None
+
+
+def should_use_conviction_exit(
+    position: OpenPosition,
+    snapshot: MarketSnapshot,
+    *,
+    minutes_since_entry: int,
+    current_legs: list[StrategyLeg] | None = None,
+    current_regime: RegimeState | None = None,
+) -> bool:
+    if position.structure.strategy != StrategyType.BEAR_CALL_CREDIT_SPREAD or minutes_since_entry < 30:
+        return False
+    bars = session_bars(snapshot.nifty_5m)
+    closes_5m = closes(bars)
+    spot = snapshot.option_chain.spot
+    if spot <= 0:
+        return False
+    ema20_slope = 0.0
+    ema50_slope = 0.0
+    ema_spacing = 0.0
+    if current_regime is not None and isinstance(current_regime.metadata, dict):
+        ema20_slope = float(current_regime.metadata.get("ema20_slope_5m") or 0.0) / spot
+        ema50_slope = float(current_regime.metadata.get("ema50_slope_5m") or 0.0) / spot
+        ema_spacing = abs(float(current_regime.metadata.get("ema_distance_pct_5m") or 0.0)) / 100.0
+    elif len(closes_5m) >= 100:
+        ema20_values = ema(closes_5m, period=20)
+        ema50_values = ema(closes_5m, period=50)
+        ema100_values = ema(closes_5m, period=100)
+        if min(len(ema20_values), len(ema50_values), len(ema100_values)) < 4:
+            return False
+        ema20_slope = (ema20_values[-1] - ema20_values[-4]) / spot
+        ema50_slope = (ema50_values[-1] - ema50_values[-4]) / spot
+        ema_spacing = ((abs(ema20_values[-1] - ema50_values[-1]) + abs(ema50_values[-1] - ema100_values[-1])) / spot)
+    else:
+        return False
+    vwap = snapshot.live_vwap if snapshot.live_vwap is not None else compute_vwap(bars)
+    if vwap is None or vwap <= 0:
+        return False
+    live_legs = current_legs or []
+    short_deltas = [abs(leg.quote.delta) for leg in live_legs if leg.action == "SELL" and leg.quote.delta is not None]
+    max_short_delta = max(short_deltas, default=0.0)
+    return bool(
+        ema20_slope < -0.0003
+        and ema50_slope < -0.0002
+        and ema_spacing > 0.005
+        and spot < vwap
+        and max_short_delta < 0.15
+    )
+
+
+def _intrabar_regime_invalidation_reason(
+    position: OpenPosition,
+    current_snapshot: MarketSnapshot | None,
+    *,
+    now: datetime,
+) -> str | None:
+    if current_snapshot is None or position.structure.strategy != StrategyType.BEAR_CALL_CREDIT_SPREAD:
+        return None
+    last_check_raw = position.metadata.get("last_intrabar_regime_check_at")
+    if last_check_raw:
+        try:
+            last_check = datetime.fromisoformat(str(last_check_raw))
+        except ValueError:
+            last_check = None
+        if last_check is not None:
+            if last_check.tzinfo is None and now.tzinfo is not None:
+                last_check = last_check.replace(tzinfo=now.tzinfo)
+            elif last_check.tzinfo is not None and now.tzinfo is None:
+                last_check = last_check.replace(tzinfo=None)
+        if last_check is not None and (now - last_check).total_seconds() < 120:
+            return None
+    position.metadata["last_intrabar_regime_check_at"] = now.isoformat()
+    bars = session_bars(current_snapshot.nifty_5m)
+    if len(bars) < 4:
+        return None
+    vwap = current_snapshot.live_vwap if current_snapshot.live_vwap is not None else compute_vwap(bars)
+    ema20_5m = ema_value(closes(bars), period=20)
+    last = bars[-1]
+    if (
+        vwap is not None
+        and ema20_5m is not None
+        and current_snapshot.option_chain.spot > vwap
+        and last.close > ema20_5m
+        and last.close > last.open
+        and bullish_reversal_structure(bars[-6:])
+    ):
+        return "INTRABAR_REGIME_INVALIDATION"
     return None
 
 

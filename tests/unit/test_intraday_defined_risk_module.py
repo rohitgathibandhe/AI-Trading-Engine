@@ -665,6 +665,9 @@ def test_bear_calls_require_late_session_timing() -> None:
                 "bearish_entry_ready": True,
                 "bearish_setup": "PULLBACK_REJECTION",
                 "playbook": "SIDEWAYS_TO_BEARISH_REJECTION",
+                "bearish_upper_wick_fraction": 0.60,
+                "bearish_close_location": 0.40,
+                "bearish_candle_quality_score": 0.60,
             },
         )
         strategy, reasons = strategy_module.select_strategy(regime, datetime(2026, 4, 3, 10, 0).time())

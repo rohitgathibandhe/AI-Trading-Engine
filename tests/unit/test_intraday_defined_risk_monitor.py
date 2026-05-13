@@ -47,7 +47,7 @@ def _snapshot() -> MarketSnapshot:
     )
 
 
-def test_agent_blocks_repeat_strategy_entry_in_same_session(monkeypatch) -> None:
+def test_agent_blocks_third_repeat_strategy_entry_in_same_session(monkeypatch) -> None:
     snapshot = _snapshot()
     agent = IntradayDefinedRiskAgent(
         learning_store=LearningStore("/tmp/test_intraday_defined_risk_monitor.sqlite3"),
@@ -130,8 +130,13 @@ def test_agent_blocks_repeat_strategy_entry_in_same_session(monkeypatch) -> None
     agent.open_position = None
 
     second = agent.evaluate(snapshot)
-    assert second.action == "NO_TRADE"
-    assert any("already traded once this session" in reason for reason in second.rationale)
+    assert second.action == "TRADE"
+    agent.start_position(snapshot, second)
+    agent.open_position = None
+
+    third = agent.evaluate(snapshot)
+    assert third.action == "NO_TRADE"
+    assert any("already traded twice this session" in reason for reason in third.rationale)
 
 
 def test_agent_blocks_trade_when_expected_net_edge_is_too_small(monkeypatch) -> None:

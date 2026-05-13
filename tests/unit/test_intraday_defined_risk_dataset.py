@@ -273,7 +273,19 @@ def test_enrich_structured_chain_deltas_infers_weekly_expiry_when_missing(tmp_pa
 
 def test_resolve_expiry_text_overrides_far_dated_dummy_expiry_for_weekly_intraday() -> None:
     expiry, inferred = _resolve_expiry_text("2026-04-28", session_date="2026-01-06")
-    assert expiry == "2026-01-08"
+    assert expiry == "2026-01-06"
+    assert inferred is True
+
+
+def test_resolve_expiry_text_uses_legacy_thursday_before_regime_switch() -> None:
+    expiry, inferred = _resolve_expiry_text("", session_date="2025-08-25")
+    assert expiry == "2025-08-28"
+    assert inferred is True
+
+
+def test_resolve_expiry_text_uses_tuesday_after_regime_switch() -> None:
+    expiry, inferred = _resolve_expiry_text("", session_date="2025-09-01")
+    assert expiry == "2025-09-02"
     assert inferred is True
 
 

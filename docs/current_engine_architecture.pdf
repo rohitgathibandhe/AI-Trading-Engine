@@ -1,0 +1,4220 @@
+%PDF-1.4
+%����
+1 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+2 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>
+endobj
+4 0 obj
+<< /Type /Pages /Kids [6 0 R 8 0 R 10 0 R 12 0 R 14 0 R 16 0 R 18 0 R 20 0 R 22 0 R 24 0 R 26 0 R 28 0 R 30 0 R 32 0 R 34 0 R 36 0 R 38 0 R 40 0 R 42 0 R] /Count 19 >>
+endobj
+5 0 obj
+<< /Length 3695 >>
+stream
+BT
+/F2 18.00 Tf
+1 0 0 1 48.00 788.00 Tm
+(NIFTY AI Trading Engine: Current Architecture and) Tj
+ET
+BT
+/F2 18.00 Tf
+1 0 0 1 48.00 764.00 Tm
+(Business Logic) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 722.00 Tm
+(Last updated: 2026-05-10) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 700.00 Tm
+(1. Scope and current source of truth) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 668.00 Tm
+(This document is the current architecture and business-logic reference for the active) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 654.00 Tm
+(engine in this repository.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 632.00 Tm
+(It covers:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 618.00 Tm
+(• the current intraday defined-risk engine under) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 604.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 590.00 Tm
+(• the current weekly research-only engine under) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 576.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/weekly_defined_risk`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 562.00 Tm
+(• the operational runtime, health, reconciliation, paper-mode learning layer, datasets,) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 548.00 Tm
+(and artifacts) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 526.00 Tm
+(Important:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 512.00 Tm
+(• The old top-level `README.md` still describes an older weekly theta workflow and is not) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 498.00 Tm
+(the full source of truth for the current intraday v83 stack.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 484.00 Tm
+(• The current approved live candidate is the frozen `v83` intraday bearish engine.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 470.00 Tm
+(• Weekly defined-risk logic is research-only.) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 448.00 Tm
+(2. Current approved system posture) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 416.00 Tm
+(Intraday v83) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 386.00 Tm
+(Validated benchmark artifact:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 372.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 358.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_post_tuesday_expiry_) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 344.00 Tm
+(benchmark_2026-04-12_v83.json`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 322.00 Tm
+(Current approved benchmark metrics:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 308.00 Tm
+(• trades: 10) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 294.00 Tm
+(• wins: 10) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 280.00 Tm
+(• losses: 0) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 266.00 Tm
+(• realized P&L: Rs 25,303.12) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 252.00 Tm
+(• strategy used: `BEAR_CALL_CREDIT_SPREAD`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 238.00 Tm
+(• playbook distribution:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 224.00 Tm
+(• `SIDEWAYS_TO_BEARISH_REJECTION`: 7) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 210.00 Tm
+(• `GAP_DOWN_BEARISH_CONTINUATION`: 2) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 196.00 Tm
+(• `GAP_UP_BEARISH_FAILURE`: 1) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 174.00 Tm
+(Current runtime configuration artifact:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 160.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 146.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_runtime_config.j) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 132.00 Tm
+(son`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 110.00 Tm
+(Current approved live/paper rules:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 96.00 Tm
+(• mode currently configured as `PAPER_LIVE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 82.00 Tm
+(• live playbooks enabled:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 68.00 Tm
+(• `SIDEWAYS_TO_BEARISH_REJECTION`) Tj
+ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 5 0 R >>
+endobj
+7 0 obj
+<< /Length 4355 >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 788.00 Tm
+(• `GAP_DOWN_BEARISH_CONTINUATION`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 774.00 Tm
+(• `GAP_UP_BEARISH_FAILURE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 760.00 Tm
+(• live strategy enabled:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 746.00 Tm
+(• `BEAR_CALL_CREDIT_SPREAD`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 732.00 Tm
+(• live approved market states:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 718.00 Tm
+(• `TRANSITION`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 704.00 Tm
+(• `TREND_DOWN`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 690.00 Tm
+(• bullish live trading: disabled) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 676.00 Tm
+(• condor live trading: disabled) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 662.00 Tm
+(• defined-risk only: yes) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 640.00 Tm
+(Weekly defined-risk module) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 610.00 Tm
+(Current weekly research is not promoted.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 588.00 Tm
+(Key research artifacts:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 574.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 560.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/weekly_defined_risk/weekly_ni) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 546.00 Tm
+(fty_defined_risk_backtest_summary_2026-04-28_v5_rebuilt_calendar.json`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 532.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 518.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/weekly_defined_risk/weekly_ni) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 504.00 Tm
+(fty_defined_risk_backtest_summary_2026-04-28_bearish_credit_only_rebuilt_calendar.json`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 490.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 476.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/weekly_defined_risk/weekly_ni) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 462.00 Tm
+(fty_vs_intraday_v83_2026-04-28_v5_rebuilt_calendar.json`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 440.00 Tm
+(Current weekly conclusion:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 426.00 Tm
+(• research only) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 412.00 Tm
+(• not promoted to shadow/live) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 398.00 Tm
+(• insufficient robustness and sample size versus intraday v83) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 376.00 Tm
+(3. Repository map) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 344.00 Tm
+(Current core engine paths) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 314.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 300.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/weekly_defined_risk`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 286.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/utils/nifty_expiry_calendar.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 272.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 258.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/scripts`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 244.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/ui`) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 222.00 Tm
+(Intraday module roles) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 192.00 Tm
+(• `data_models.py`: canonical dataclasses and enums) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 178.00 Tm
+(• `features.py`: price, structure, EMA, VWAP, candle, and option-chain features) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 164.00 Tm
+(• `regime.py`: market-state engine, regime classification, subtype tagging, metadata) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 150.00 Tm
+(generation) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 136.00 Tm
+(• `strategy.py`: playbook routing, tradability, time windows, tiering) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 122.00 Tm
+(• `strikes.py`: multi-candidate spread construction and monetization scoring) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 108.00 Tm
+(• `risk.py`: lot sizing, max-loss calculations, margin controls) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 94.00 Tm
+(• `execution.py`: entry validation, open-position construction, exit logic) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 80.00 Tm
+(• `decision.py`: trade/no-trade decision agent helpers) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 66.00 Tm
+(• `learning.py`: SQLite learning store, playbook summaries, guarded calibration state) Tj
+ET
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 7 0 R >>
+endobj
+9 0 obj
+<< /Length 4387 >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 788.00 Tm
+(• `backtest.py`: full benchmark engine, funnel reports, subtype reports, opportunity) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 774.00 Tm
+(reports) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 760.00 Tm
+(• `dataset.py`: structured dataset creation and validation) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 746.00 Tm
+(• `research.py`: research dataset creation and backtest optimization support) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 732.00 Tm
+(• `pipeline.py`: rolling -> structured -> research data refresh pipeline) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 718.00 Tm
+(• `collector.py`: live decision-time option-chain snapshot collector) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 704.00 Tm
+(• `data_pipeline_health.py`: freshness and health checks for datasets and collectors) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 690.00 Tm
+(• `live_runtime.py`: Dhan-backed live market snapshot provider and execution adapter) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 676.00 Tm
+(support) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 662.00 Tm
+(• `ops_runtime.py`: runtime config, health model, entry gates, reconciliation, reporting) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 648.00 Tm
+(• `monitor.py`: live loop, paper mode, shadow mode, operational orchestration) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 634.00 Tm
+(• `cli.py`: CLI entry point for all core intraday operations) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 612.00 Tm
+(Weekly module roles) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 582.00 Tm
+(• `weekly_defined_risk/research.py`: weekly dataset builder, regime classifier, structure) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 568.00 Tm
+(generation, exit-grid backtest, weekly vs intraday comparison) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 554.00 Tm
+(• `scripts/run_weekly_defined_risk_research.py`: weekly research CLI wrapper) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 540.00 Tm
+(• `utils/nifty_expiry_calendar.py`: official weekly-expiry inference and holiday) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 526.00 Tm
+(alignment) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 504.00 Tm
+(4. High-level architecture) Tj
+ET
+BT
+/F3 9.50 Tf
+1 0 0 1 48.00 464.00 Tm
+(flowchart TD) Tj
+ET
+BT
+/F3 9.50 Tf
+1 0 0 1 48.00 452.00 Tm
+(A["Rolling / structured market data"] --> B["Research dataset builders"]) Tj
+ET
+BT
+/F3 9.50 Tf
+1 0 0 1 48.00 440.00 Tm
+(A --> C["Live market snapshot provider"]) Tj
+ET
+BT
+/F3 9.50 Tf
+1 0 0 1 48.00 428.00 Tm
+(B --> D["Intraday backtest + benchmark engine"]) Tj
+ET
+BT
+/F3 9.50 Tf
+1 0 0 1 48.00 416.00 Tm
+(C --> E["Intraday v83 live monitor"]) Tj
+ET
+BT
+/F3 9.50 Tf
+1 0 0 1 48.00 404.00 Tm
+(E --> F["Regime + state engine"]) Tj
+ET
+BT
+/F3 9.50 Tf
+1 0 0 1 48.00 392.00 Tm
+(F --> G["Playbook routing + tradability layer"]) Tj
+ET
+BT
+/F3 9.50 Tf
+1 0 0 1 48.00 380.00 Tm
+(G --> H["Defined-risk spread construction"]) Tj
+ET
+BT
+/F3 9.50 Tf
+1 0 0 1 48.00 368.00 Tm
+(H --> I["Risk and health gates"]) Tj
+ET
+BT
+/F3 9.50 Tf
+1 0 0 1 48.00 356.00 Tm
+(I --> J["Mode-specific execution path"]) Tj
+ET
+BT
+/F3 9.50 Tf
+1 0 0 1 48.00 344.00 Tm
+(J --> K["Shadow logs / paper trades / broker execution"]) Tj
+ET
+BT
+/F3 9.50 Tf
+1 0 0 1 48.00 332.00 Tm
+(D --> L["Benchmark artifacts + subtype research reports"]) Tj
+ET
+BT
+/F3 9.50 Tf
+1 0 0 1 48.00 320.00 Tm
+(B --> M["Weekly defined-risk research engine"]) Tj
+ET
+BT
+/F3 9.50 Tf
+1 0 0 1 48.00 308.00 Tm
+(M --> N["Weekly dataset + weekly backtest artifacts"]) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 280.00 Tm
+(5. Canonical data contracts) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 248.00 Tm
+(The core dataclasses are defined in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 234.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 220.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/data_models.p) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 206.00 Tm
+(y`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 184.00 Tm
+(Important contracts:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 170.00 Tm
+(• `MarketSnapshot`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 156.00 Tm
+(• `OhlcvBar`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 142.00 Tm
+(• `OhlcvSeries`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 128.00 Tm
+(• `OptionsContractQuote`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 114.00 Tm
+(• `OptionsChainSnapshot`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 100.00 Tm
+(• `TradeStructure`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 86.00 Tm
+(• `DecisionOutput`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 72.00 Tm
+(• `OpenPosition`) Tj
+ET
+endstream
+endobj
+10 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 9 0 R >>
+endobj
+11 0 obj
+<< /Length 3604 >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 788.00 Tm
+(• `ExitDecision`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 774.00 Tm
+(• `AdaptiveParameters`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 760.00 Tm
+(• `RegimeState`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 738.00 Tm
+(Core enums:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 724.00 Tm
+(• `OptionType`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 710.00 Tm
+(• `StrategyType`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 696.00 Tm
+(• `RegimeLabel`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 674.00 Tm
+(Business meaning:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 660.00 Tm
+(• `MarketSnapshot` is the atomic input to the live or backtest decision engine.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 646.00 Tm
+(• `RegimeState` is the rich state-layer output from `regime.py`.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 632.00 Tm
+(• `DecisionOutput` is the final instruction object passed into runtime gating and) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 618.00 Tm
+(paper/live orchestration.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 604.00 Tm
+(• `TradeStructure` guarantees defined-risk structure metadata before entry.) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 582.00 Tm
+(6. Intraday data architecture) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 550.00 Tm
+(6.1 Structured training dataset) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 520.00 Tm
+(Primary builder and validator:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 506.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/dataset.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 484.00 Tm
+(Expected files in a structured dataset root:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 470.00 Tm
+(• `nifty_5m.csv`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 456.00 Tm
+(• `option_chain_decision_times.csv`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 442.00 Tm
+(• `execution_fills.csv`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 428.00 Tm
+(• `session_labels.csv`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 406.00 Tm
+(Business requirements enforced in code:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 392.00 Tm
+(• required decision-time snapshots: `09:30`, `10:00`, `13:00`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 378.00 Tm
+(• minimum training coverage: 60 trading days) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 364.00 Tm
+(• target training coverage: 120 trading days) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 350.00 Tm
+(• expected session labels:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 336.00 Tm
+(• `trend_down`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 322.00 Tm
+(• `trend_up`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 308.00 Tm
+(• `range`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 294.00 Tm
+(• `event_day`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 272.00 Tm
+(Structured dataset coverage checks include:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 258.00 Tm
+(• 5-minute OHLCV coverage) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 244.00 Tm
+(• chain snapshot coverage) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 230.00 Tm
+(• delta coverage) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 216.00 Tm
+(• IV coverage) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 202.00 Tm
+(• bid/ask coverage) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 188.00 Tm
+(• realized fill coverage) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 174.00 Tm
+(• label coverage) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 152.00 Tm
+(6.2 Research dataset) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 122.00 Tm
+(Research dataset builders:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 108.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 94.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/research.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 72.00 Tm
+(Research dataset outputs typically include:) Tj
+ET
+endstream
+endobj
+12 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 11 0 R >>
+endobj
+13 0 obj
+<< /Length 3924 >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 788.00 Tm
+(• `nifty_5m.csv`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 774.00 Tm
+(• `nifty_15m.csv`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 760.00 Tm
+(• `options_chain.csv`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 738.00 Tm
+(Business logic:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 724.00 Tm
+(• derive 15-minute bars from 5-minute bars) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 710.00 Tm
+(• assign weekly expiry using `infer_nifty_weekly_expiry`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 696.00 Tm
+(• derive delta with Black-Scholes when missing) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 682.00 Tm
+(• derive synthetic bid/ask when historical bid/ask is missing) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 668.00 Tm
+(• prepare dense benchmark-ready option-chain rows for backtest replay) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 646.00 Tm
+(6.3 Automated refresh pipeline) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 616.00 Tm
+(Pipeline orchestrator:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 602.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 588.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/pipeline.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 566.00 Tm
+(Pipeline responsibilities:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 552.00 Tm
+(• fetch missing rolling history) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 538.00 Tm
+(• refresh structured dataset from rolling history) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 524.00 Tm
+(• enrich missing deltas) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 510.00 Tm
+(• append/refresh research dataset) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 496.00 Tm
+(• write training pipeline status) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 474.00 Tm
+(State/status artifact:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 460.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 446.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_training_pipeline_st) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 432.00 Tm
+(atus.json`) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 410.00 Tm
+(7. Intraday feature and state engine) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 378.00 Tm
+(7.1 Price and structure features) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 348.00 Tm
+(Feature generation lives primarily in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 334.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 320.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/features.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 306.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/regime.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 284.00 Tm
+(Important feature families used by the current engine:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 270.00 Tm
+(• 5-minute execution structure) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 256.00 Tm
+(• 15-minute trend structure) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 242.00 Tm
+(• EMA20 / EMA50 / EMA100 alignment, slope, spacing, compression) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 228.00 Tm
+(• VWAP relation and acceptance) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 214.00 Tm
+(• opening-range relation) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 200.00 Tm
+(• candle overlap and trend efficiency) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 186.00 Tm
+(• BOS / CHoCH style structure shifts) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 172.00 Tm
+(• failed breakout / failed bounce / failed reclaim / accepted breakdown) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 158.00 Tm
+(• support and resistance distance) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 144.00 Tm
+(• open space to next level) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 130.00 Tm
+(• option-chain pressure) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 116.00 Tm
+(• call wall / put wall) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 102.00 Tm
+(• OI pressure and wall migration) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 88.00 Tm
+(• candle-pattern quality and rejection quality) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 66.00 Tm
+(7.2 Market state engine) Tj
+ET
+endstream
+endobj
+14 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 13 0 R >>
+endobj
+15 0 obj
+<< /Length 3856 >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 774.00 Tm
+(Implemented in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 760.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/regime.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 738.00 Tm
+(Current market states:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 724.00 Tm
+(• `TREND_UP`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 710.00 Tm
+(• `TREND_DOWN`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 696.00 Tm
+(• `TRUE_RANGE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 682.00 Tm
+(• `DIRECTIONAL_BALANCE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 668.00 Tm
+(• `TRANSITION`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 646.00 Tm
+(Business meaning:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 632.00 Tm
+(• `TREND_DOWN`: aligned bearish trend with continuation characteristics) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 618.00 Tm
+(• `TREND_UP`: aligned bullish trend with continuation characteristics) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 604.00 Tm
+(• `TRUE_RANGE`: unstable range / chop / low directional acceptance) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 590.00 Tm
+(• `DIRECTIONAL_BALANCE`: compressed or balanced session with directional bias and) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 576.00 Tm
+(possible bearish or bullish resolution) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 562.00 Tm
+(• `TRANSITION`: highest-priority change-of-structure / failure / rejection regime) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 540.00 Tm
+(Important design point:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 526.00 Tm
+(• `TRANSITION` is intentionally treated as a high-information state.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 512.00 Tm
+(• `TRUE_RANGE` is usually blocked for directional trading.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 498.00 Tm
+(• `DIRECTIONAL_BALANCE` was introduced to avoid over-penalizing all balanced sessions as) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 484.00 Tm
+(no-trade.) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 462.00 Tm
+(7.3 Tradability layer) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 432.00 Tm
+(Implemented in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 418.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 404.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/strategy.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 382.00 Tm
+(Tradability classes:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 368.00 Tm
+(• `TRADABLE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 354.00 Tm
+(• `LOW_EDGE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 340.00 Tm
+(• `NOT_TRADABLE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 318.00 Tm
+(Business meaning:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 304.00 Tm
+(• `TRADABLE`: eligible for spread monetization under the validated stack) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 290.00 Tm
+(• `LOW_EDGE`: structurally visible, but not strong enough for broad deployment) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 276.00 Tm
+(• `NOT_TRADABLE`: detected but blocked before spread construction because edge or) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 262.00 Tm
+(monetization is structurally unproven) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 240.00 Tm
+(Current key mappings:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 226.00 Tm
+(• stable bearish spread playbooks are `TRADABLE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 212.00 Tm
+(• late bullish reclaim remains `LOW_EDGE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 198.00 Tm
+(• bullish expansion playbooks are `NOT_TRADABLE` under the current spread framework) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 176.00 Tm
+(8. Playbooks, tiers, and business logic) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 144.00 Tm
+(Implemented in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 130.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 116.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/strategy.py`) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 94.00 Tm
+(8.1 Playbook tiers) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 64.00 Tm
+(Tier A:) Tj
+ET
+endstream
+endobj
+16 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 15 0 R >>
+endobj
+17 0 obj
+<< /Length 3499 >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 788.00 Tm
+(• `SIDEWAYS_TO_BEARISH_REJECTION`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 774.00 Tm
+(• `GAP_DOWN_BEARISH_CONTINUATION`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 760.00 Tm
+(• `GAP_UP_BEARISH_FAILURE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 746.00 Tm
+(• `RANGE_BALANCED_CONDOR`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 724.00 Tm
+(Tier B:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 710.00 Tm
+(• research-only bullish and secondary bearish families) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 696.00 Tm
+(• includes bullish reclaim/continuation variants and several bearish research families) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 674.00 Tm
+(Tier C:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 660.00 Tm
+(• detect-only / unsupported / residual routing states) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 638.00 Tm
+(8.2 Current approved live subset) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 608.00 Tm
+(Even though `RANGE_BALANCED_CONDOR` is Tier A historically, the current runtime) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 594.00 Tm
+(configuration only enables:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 580.00 Tm
+(• `SIDEWAYS_TO_BEARISH_REJECTION`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 566.00 Tm
+(• `GAP_DOWN_BEARISH_CONTINUATION`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 552.00 Tm
+(• `GAP_UP_BEARISH_FAILURE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 530.00 Tm
+(The runtime currently enables only:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 516.00 Tm
+(• `BEAR_CALL_CREDIT_SPREAD`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 494.00 Tm
+(That is an intentional operator/runtime restriction on top of the broader research) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 480.00 Tm
+(system.) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 458.00 Tm
+(8.3 Key bearish families implemented) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 428.00 Tm
+(The engine has explicit or research-level handling for:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 414.00 Tm
+(• failed reclaim) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 400.00 Tm
+(• failed bounce) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 386.00 Tm
+(• failed breakout) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 372.00 Tm
+(• accepted breakdown) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 358.00 Tm
+(• gap-down continuation / failed bounce) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 344.00 Tm
+(• sideways bearish rejection) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 330.00 Tm
+(• lower-high failure behavior) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 316.00 Tm
+(• OR-low retest failure) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 302.00 Tm
+(• supply-zone failed reclaim) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 288.00 Tm
+(• transition rejection family) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 266.00 Tm
+(8.4 Bullish logic status) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 236.00 Tm
+(Bullish logic exists in the codebase for detection and research, but not for live) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 222.00 Tm
+(deployment.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 200.00 Tm
+(Important business conclusion already embedded into the architecture:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 186.00 Tm
+(• bullish contexts are detectable) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 172.00 Tm
+(• bullish spread monetization has not been validated for live use) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 158.00 Tm
+(• bullish live routing remains blocked) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 136.00 Tm
+(9. Strategy routing and spread monetization) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 104.00 Tm
+(9.1 Strategy routing) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 74.00 Tm
+(Routing logic spans:) Tj
+ET
+endstream
+endobj
+18 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 17 0 R >>
+endobj
+19 0 obj
+<< /Length 3855 >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 788.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 774.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/strategy.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 760.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 746.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/decision.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 732.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/monitor.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 710.00 Tm
+(Current live route:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 696.00 Tm
+(• bearish context -> `BEAR_CALL_CREDIT_SPREAD`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 674.00 Tm
+(Research routes supported in the codebase:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 660.00 Tm
+(• `BULL_PUT_CREDIT_SPREAD`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 646.00 Tm
+(• `CALL_DEBIT_SPREAD`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 632.00 Tm
+(• `IRON_CONDOR`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 618.00 Tm
+(• shadow-only bullish and bearish families) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 596.00 Tm
+(9.2 Multi-candidate spread construction) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 566.00 Tm
+(Implemented in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 552.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/strikes.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 530.00 Tm
+(Business logic:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 516.00 Tm
+(• the engine evaluates multiple widths instead of a single rigid spread) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 502.00 Tm
+(• directional width candidates include `50`, `75`, `100`, `150`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 488.00 Tm
+(• condor width candidates include multiple symmetric and asymmetric combinations) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 474.00 Tm
+(• candidates are scored on monetization quality) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 460.00 Tm
+(• best valid candidate is selected) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 446.00 Tm
+(• failed candidates keep explicit rejection reasons) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 424.00 Tm
+(9.3 Monetization filters) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 394.00 Tm
+(Core directional rejection reasons include:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 380.00 Tm
+(• `LIQUIDITY_BAD`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 366.00 Tm
+(• `DELTA_TOO_HIGH`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 352.00 Tm
+(• `INVALIDATION_TOO_CLOSE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 338.00 Tm
+(• `CREDIT_TOO_LOW`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 324.00 Tm
+(• `HEDGE_TOO_EXPENSIVE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 310.00 Tm
+(• `WIDTH_TOO_LARGE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 296.00 Tm
+(• `NET_EDGE_TOO_LOW`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 274.00 Tm
+(Directional business rules include:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 260.00 Tm
+(• short strike must not be too close to invalidation) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 246.00 Tm
+(• credit/width must clear strategy-specific threshold) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 232.00 Tm
+(• hedge cost must remain acceptable) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 218.00 Tm
+(• quote spread quality must be acceptable) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 204.00 Tm
+(• net edge after assumed cost must remain positive enough) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 182.00 Tm
+(9.4 Adaptive parameters) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 152.00 Tm
+(Adaptive parameters are defined in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 138.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 124.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/data_models.p) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 110.00 Tm
+(y`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 88.00 Tm
+(They include:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 74.00 Tm
+(• score thresholds) Tj
+ET
+endstream
+endobj
+20 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 19 0 R >>
+endobj
+21 0 obj
+<< /Length 3657 >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 788.00 Tm
+(• credit/width thresholds) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 774.00 Tm
+(• hedge-cost caps) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 760.00 Tm
+(• liquidity caps) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 746.00 Tm
+(• width preferences) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 732.00 Tm
+(• shadow-session count) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 718.00 Tm
+(• bearish/bullish trade thresholds and margins) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 696.00 Tm
+(Important point:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 682.00 Tm
+(• the parameter system exists, but the runtime still keeps the frozen v83 strategy stack) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 668.00 Tm
+(and guarded promotion model.) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 646.00 Tm
+(10. Risk model and exit logic) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 614.00 Tm
+(Implemented in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 600.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/risk.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 586.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 572.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/execution.py`) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 550.00 Tm
+(10.1 Core constraints) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 520.00 Tm
+(Non-negotiable controls in the current engine:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 506.00 Tm
+(• defined-risk only) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 492.00 Tm
+(• no naked option selling) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 478.00 Tm
+(• no uncovered ratio structures in promoted logic) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 464.00 Tm
+(• max loss known before entry) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 450.00 Tm
+(• risk-based lot sizing) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 436.00 Tm
+(• margin-based lot sizing) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 422.00 Tm
+(• kill switch on realized daily loss and extreme margin utilization) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 400.00 Tm
+(10.2 Entry-time controls) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 370.00 Tm
+(Entry constraints include:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 356.00 Tm
+(• no entries before 09:15 IST) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 342.00 Tm
+(• directional entries prefer 09:30 onward) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 328.00 Tm
+(• directional entries blocked after 14:00 IST in strict v83) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 314.00 Tm
+(• time exit enforced by 15:15 IST) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 300.00 Tm
+(• current runtime also has `no_new_entries_after_hhmm` in risk governance) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 278.00 Tm
+(10.3 Exit model) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 248.00 Tm
+(Current exit engine supports:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 234.00 Tm
+(• time exit) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 220.00 Tm
+(• premium stop) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 206.00 Tm
+(• delta stop) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 192.00 Tm
+(• regime invalidation) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 178.00 Tm
+(• session profit trail) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 164.00 Tm
+(• structure profit trail) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 150.00 Tm
+(• bullish-specific relaxed delta stop for selected research playbooks) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 128.00 Tm
+(Business meaning:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 114.00 Tm
+(• the exit engine is shared by backtest, paper, and live orchestration) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 100.00 Tm
+(• the paper override path did not change exits; it only changes which paper candidates) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 86.00 Tm
+(can be simulated) Tj
+ET
+endstream
+endobj
+22 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 21 0 R >>
+endobj
+23 0 obj
+<< /Length 3725 >>
+stream
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 788.00 Tm
+(11. Learning, calibration, and benchmark research) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 756.00 Tm
+(Implemented in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 742.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 728.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/learning.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 714.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 700.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/backtest.py`) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 678.00 Tm
+(11.1 Learning store) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 648.00 Tm
+(Learning store DB:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 634.00 Tm
+(• default path: `/tmp/intraday_defined_risk_learning.sqlite3`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 620.00 Tm
+(• paper runtime currently also uses artifacts under) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 606.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_paper_live_learn) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 592.00 Tm
+(ing.sqlite3`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 570.00 Tm
+(Tables:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 556.00 Tm
+(• `decisions`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 542.00 Tm
+(• `outcomes`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 528.00 Tm
+(• `parameter_state`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 514.00 Tm
+(• `parameter_history`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 492.00 Tm
+(Business purpose:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 478.00 Tm
+(• log decisions and outcomes) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 464.00 Tm
+(• compute playbook summaries) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 450.00 Tm
+(• run guarded parameter shadow calibration) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 436.00 Tm
+(• avoid promoting candidates without objective improvement and drawdown control) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 414.00 Tm
+(11.2 Benchmark engine) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 384.00 Tm
+(Backtest engine:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 370.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 356.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/backtest.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 334.00 Tm
+(Outputs include:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 320.00 Tm
+(• trade funnel reports) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 306.00 Tm
+(• subtype reports) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 292.00 Tm
+(• rejection reason counts) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 278.00 Tm
+(• regime tradability reports) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 264.00 Tm
+(• market-state reports) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 250.00 Tm
+(• monthly missed opportunity summaries) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 236.00 Tm
+(• opportunity benchmark vs strict benchmark comparisons) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 214.00 Tm
+(Business philosophy embedded in the benchmark code:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 200.00 Tm
+(• do not optimize for 100 percent win rate alone) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 186.00 Tm
+(• separate setup quality from monetization quality) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 172.00 Tm
+(• log what was seen, what was rejected, and why) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 158.00 Tm
+(• compare strict live-eligible stack against broader opportunity layers) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 136.00 Tm
+(12. Runtime modes and operational controls) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 104.00 Tm
+(Implemented in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 90.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 76.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/ops_runtime.p) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 62.00 Tm
+(y`) Tj
+ET
+endstream
+endobj
+24 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 23 0 R >>
+endobj
+25 0 obj
+<< /Length 3713 >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 788.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/monitor.py`) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 766.00 Tm
+(12.1 Runtime modes) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 736.00 Tm
+(Supported runtime modes:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 722.00 Tm
+(• `RESEARCH`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 708.00 Tm
+(• `SHADOW_LIVE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 694.00 Tm
+(• `PAPER_LIVE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 680.00 Tm
+(• `MICRO_LIVE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 666.00 Tm
+(• `LIVE_DISABLED`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 644.00 Tm
+(Business meaning:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 630.00 Tm
+(• `RESEARCH`: offline/backtest/research evaluation only) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 616.00 Tm
+(• `SHADOW_LIVE`: live scoring, no positions) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 602.00 Tm
+(• `PAPER_LIVE`: simulated positions, same risk and exit engine, no broker orders) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 588.00 Tm
+(• `MICRO_LIVE`: real broker execution, blocked unless armed) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 574.00 Tm
+(• `LIVE_DISABLED`: hard block) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 552.00 Tm
+(12.2 Runtime risk governance) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 522.00 Tm
+(Current governance keys:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 508.00 Tm
+(• `max_lots_per_trade`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 494.00 Tm
+(• `max_open_structures`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 480.00 Tm
+(• `max_trades_per_day`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 466.00 Tm
+(• `max_daily_realized_loss_rupees`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 452.00 Tm
+(• `max_daily_total_loss_rupees`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 438.00 Tm
+(• `no_new_entries_after_hhmm`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 424.00 Tm
+(• `stop_after_first_full_loss`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 410.00 Tm
+(• `require_manual_live_arm`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 396.00 Tm
+(• `live_only_bearish`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 374.00 Tm
+(Current configured values in runtime config:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 360.00 Tm
+(• max lots per trade: 1) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 346.00 Tm
+(• max open structures: 1) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 332.00 Tm
+(• max trades per day: 1) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 318.00 Tm
+(• no new entries after: 14:00) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 304.00 Tm
+(• manual live arm required: yes) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 290.00 Tm
+(• bearish only: yes) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 268.00 Tm
+(12.3 Entry gate model) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 238.00 Tm
+(The runtime entry gate verifies:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 224.00 Tm
+(• mode allows entry) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 210.00 Tm
+(• candidate is `TRADE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 196.00 Tm
+(• playbook is live-enabled) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 182.00 Tm
+(• strategy is live-enabled) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 168.00 Tm
+(• tradability is not `NOT_TRADABLE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 154.00 Tm
+(• market state is approved) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 140.00 Tm
+(• bearish score clears required margin over no-trade score) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 126.00 Tm
+(• time window is open) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 112.00 Tm
+(• daily locks are inactive) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 98.00 Tm
+(• no active structure already exists) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 84.00 Tm
+(• health model is not blocked) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 70.00 Tm
+(• reconciliation/recovery state is clean) Tj
+ET
+endstream
+endobj
+26 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 25 0 R >>
+endobj
+27 0 obj
+<< /Length 3376 >>
+stream
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 788.00 Tm
+(13. Unified health model) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 756.00 Tm
+(Implemented in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 742.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 728.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/ops_runtime.p) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 714.00 Tm
+(y`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 700.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 686.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/data_pipeline) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 672.00 Tm
+(_health.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 650.00 Tm
+(Health statuses:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 636.00 Tm
+(• `HEALTHY`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 622.00 Tm
+(• `DEGRADED`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 608.00 Tm
+(• `BLOCKED`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 586.00 Tm
+(Components tracked:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 572.00 Tm
+(• `broker_auth_health`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 558.00 Tm
+(• `market_feed_health`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 544.00 Tm
+(• `option_chain_health`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 530.00 Tm
+(• `broker_position_sync_health`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 516.00 Tm
+(• `state_store_health`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 502.00 Tm
+(• `strategy_engine_health`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 488.00 Tm
+(• `data_pipeline_health`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 466.00 Tm
+(Primary operator artifact:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 452.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 438.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_operator_status_) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 424.00 Tm
+(report.json`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 402.00 Tm
+(This report includes:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 388.00 Tm
+(• runtime config) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 374.00 Tm
+(• runtime state) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 360.00 Tm
+(• health summary) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 346.00 Tm
+(• reconciliation summary) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 332.00 Tm
+(• recovery state) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 318.00 Tm
+(• paper and shadow summaries) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 304.00 Tm
+(• validation anomalies) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 290.00 Tm
+(• promotion gates) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 268.00 Tm
+(14. Reconciliation, recovery, and emergency controls) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 236.00 Tm
+(Implemented in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 222.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 208.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/ops_runtime.p) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 194.00 Tm
+(y`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 172.00 Tm
+(Reconciliation statuses:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 158.00 Tm
+(• `MATCHED`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 144.00 Tm
+(• `NO_POSITIONS`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 130.00 Tm
+(• `POSITION_MISMATCH`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 116.00 Tm
+(• `ORPHAN_POSITION`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 102.00 Tm
+(• `ORPHAN_STATE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 88.00 Tm
+(• `UNKNOWN`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 66.00 Tm
+(Business behavior:) Tj
+ET
+endstream
+endobj
+28 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 27 0 R >>
+endobj
+29 0 obj
+<< /Length 3915 >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 788.00 Tm
+(• mismatches or orphan states block new entries) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 774.00 Tm
+(• paper mode intentionally treats absence of broker positions as normal) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 760.00 Tm
+(• micro-live is stricter and expects broker/internal consistency) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 738.00 Tm
+(Emergency functionality:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 724.00 Tm
+(• flatten-all routine exists) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 710.00 Tm
+(• recovery state is activated on emergency flatten) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 696.00 Tm
+(• new entries remain blocked until recovery is cleared) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 674.00 Tm
+(Key artifacts:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 660.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 646.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_reconciliation_s) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 632.00 Tm
+(tatus.json`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 618.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 604.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_reconciliation_e) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 590.00 Tm
+(vents.jsonl`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 576.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 562.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_operator_events.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 548.00 Tm
+(jsonl`) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 526.00 Tm
+(15. Paper-live learning layer and experimental override) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 494.00 Tm
+(15.1 Baseline paper problem) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 464.00 Tm
+(Observed operationally:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 450.00 Tm
+(• paper mode was healthy) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 436.00 Tm
+(• strict v83 often emitted `NO_TRADE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 422.00 Tm
+(• no paper positions were created because routing was too strict for learning purposes) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 400.00 Tm
+(15.2 Paper-only override) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 370.00 Tm
+(Implemented in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 356.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/monitor.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 342.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 328.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/ops_runtime.p) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 314.00 Tm
+(y`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 292.00 Tm
+(Current paper-only learning path:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 278.00 Tm
+(• `PAPER_CONTEXT_OVERRIDE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 256.00 Tm
+(Business purpose:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 242.00 Tm
+(• allow paper-mode simulation of high-confidence bearish near-miss contexts) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 228.00 Tm
+(• do not change strict v83 live logic) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 214.00 Tm
+(• do not change `MICRO_LIVE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 200.00 Tm
+(• keep spread construction, exits, and risk model unchanged) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 178.00 Tm
+(Eligibility rules for paper override include:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 164.00 Tm
+(• mode must be `PAPER_LIVE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 150.00 Tm
+(• state in `TRANSITION`, `TREND_DOWN`, or `DIRECTIONAL_BALANCE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 136.00 Tm
+(• `tradability_class == TRADABLE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 122.00 Tm
+(• failure type in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 108.00 Tm
+(• `FAILED_RECLAIM`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 94.00 Tm
+(• `FAILED_BOUNCE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 80.00 Tm
+(• `FAILED_BREAKOUT`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 66.00 Tm
+(• `ACCEPTED_BREAKDOWN`) Tj
+ET
+endstream
+endobj
+30 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 29 0 R >>
+endobj
+31 0 obj
+<< /Length 3817 >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 788.00 Tm
+(• bearish score >= paper override threshold) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 774.00 Tm
+(• bearish score > no-trade score + paper override margin) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 760.00 Tm
+(• no `TRUE_RANGE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 746.00 Tm
+(• no bullish context) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 732.00 Tm
+(• no active paper structure) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 718.00 Tm
+(• health gate must pass) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 704.00 Tm
+(• within paper experiment time window) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 682.00 Tm
+(Current paper override artifacts:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 668.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 654.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/paper_context_override_report) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 640.00 Tm
+(.json`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 626.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/near_trade_candidates.csv`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 612.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 598.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/paper_time_window_audit.json`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 576.00 Tm
+(Important note:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 562.00 Tm
+(• historical validation rows generated before the override was added are marked as legacy) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 548.00 Tm
+(and require replay for true override performance statistics) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 526.00 Tm
+(15.3 Decision attribution) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 496.00 Tm
+(Paper decisions are separated into:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 482.00 Tm
+(• `V83_APPROVED`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 468.00 Tm
+(• `PAPER_CONTEXT_OVERRIDE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 446.00 Tm
+(This is important because the paper learning layer must not pollute strict v83) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 432.00 Tm
+(performance accounting.) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 410.00 Tm
+(16. Operational files and reports) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 378.00 Tm
+(Core runtime files) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 348.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 334.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_runtime_config.j) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 320.00 Tm
+(son`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 306.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 292.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_runtime_state.js) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 278.00 Tm
+(on`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 264.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 250.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_run_live_config.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 236.00 Tm
+(json`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 222.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_runner.log`) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 200.00 Tm
+(Paper and shadow reports) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 170.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 156.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_shadow_live_repo) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 142.00 Tm
+(rt.json`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 128.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 114.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_paper_live_repor) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 100.00 Tm
+(t.json`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 86.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 72.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_paper_live_valid) Tj
+ET
+endstream
+endobj
+32 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 31 0 R >>
+endobj
+33 0 obj
+<< /Length 3549 >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 788.00 Tm
+(ation_report.json`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 774.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 760.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_paper_live_valid) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 746.00 Tm
+(ation_decisions.jsonl`) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 724.00 Tm
+(New paper override reports) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 694.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 680.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/paper_context_override_report) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 666.00 Tm
+(.json`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 652.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/near_trade_candidates.csv`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 638.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 624.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/paper_time_window_audit.json`) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 602.00 Tm
+(Weekly research outputs) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 572.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/weekly_defined_risk/*.json`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 558.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/weekly_defined_risk/*.csv`) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 536.00 Tm
+(17. Weekly defined-risk research engine) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 504.00 Tm
+(Implemented in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 490.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/weekly_defined_risk/research.py`) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 468.00 Tm
+(17.1 Objective) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 438.00 Tm
+(Research whether weekly holding strategies can improve trade frequency or risk-adjusted) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 424.00 Tm
+(return versus intraday v83.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 402.00 Tm
+(This module is explicitly separate from the intraday runtime path.) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 380.00 Tm
+(17.2 Weekly dataset model) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 350.00 Tm
+(Each week context includes:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 336.00 Tm
+(• deployment date) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 322.00 Tm
+(• deployment weekday) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 308.00 Tm
+(• preferred next weekly expiry) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 294.00 Tm
+(• observed historical expiry) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 280.00 Tm
+(• spot) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 266.00 Tm
+(• Monday gap percent) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 252.00 Tm
+(• weekly ATR) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 238.00 Tm
+(• daily ATR) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 224.00 Tm
+(• proxy India VIX / ATM IV) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 210.00 Tm
+(• previous week high / low / close) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 196.00 Tm
+(• daily trend state) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 182.00 Tm
+(• 60-minute trend state) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 168.00 Tm
+(• option-chain snapshot summary) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 154.00 Tm
+(• call wall / put wall / PCR / OI pressure) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 140.00 Tm
+(• support / resistance) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 126.00 Tm
+(• event flags) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 112.00 Tm
+(• missing-data flags) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 98.00 Tm
+(• trade-ready and no-trade reason) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 76.00 Tm
+(17.3 Weekly regimes) Tj
+ET
+endstream
+endobj
+34 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 33 0 R >>
+endobj
+35 0 obj
+<< /Length 3480 >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 780.00 Tm
+(Current weekly regimes:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 766.00 Tm
+(• `BULLISH_CONTINUATION`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 752.00 Tm
+(• `BEARISH_CONTINUATION`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 738.00 Tm
+(• `SIDEWAYS_RANGE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 724.00 Tm
+(• `HIGH_VOL_EVENT`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 710.00 Tm
+(• `GAP_UP_FAILURE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 696.00 Tm
+(• `GAP_DOWN_RECOVERY`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 682.00 Tm
+(• `LOW_EDGE_NO_TRADE`) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 660.00 Tm
+(17.4 Weekly structures researched) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 630.00 Tm
+(Defined-risk only:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 616.00 Tm
+(• `BULL_PUT_CREDIT_SPREAD`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 602.00 Tm
+(• `BEAR_CALL_CREDIT_SPREAD`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 588.00 Tm
+(• `IRON_CONDOR`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 574.00 Tm
+(• `BROKEN_WING_CALL_FLY`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 560.00 Tm
+(• `BROKEN_WING_PUT_FLY`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 546.00 Tm
+(• `NO_TRADE`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 524.00 Tm
+(Business constraints:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 510.00 Tm
+(• no naked shorts) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 496.00 Tm
+(• no uncovered ratio structures) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 482.00 Tm
+(• max loss must be known before entry) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 460.00 Tm
+(17.5 Weekly expiry calendar handling) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 430.00 Tm
+(Implemented in:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 416.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/utils/nifty_expiry_calendar.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 394.00 Tm
+(Current logic:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 380.00 Tm
+(• legacy weekly expiry weekday: Thursday) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 366.00 Tm
+(• current weekly expiry weekday after 2025-09-01 regime change: Tuesday) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 352.00 Tm
+(• expiry is aligned to prior trading day when the nominal expiry day is absent due to) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 338.00 Tm
+(holiday or dataset gap) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 316.00 Tm
+(17.6 Weekly research conclusion) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 286.00 Tm
+(The weekly engine exists and runs, but it remains research-only because:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 272.00 Tm
+(• sample size is small) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 258.00 Tm
+(• robustness is weak) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 244.00 Tm
+(• intraday v83 remains superior on validated evidence) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 230.00 Tm
+(• weekly promotion has not cleared the current promotion bar) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 208.00 Tm
+(18. CLI entry points) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 176.00 Tm
+(Primary intraday CLI:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 162.00 Tm
+(• `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/cli.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 140.00 Tm
+(Key supported commands include:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 126.00 Tm
+(• `run_live`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 112.00 Tm
+(• `run_backtest`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 98.00 Tm
+(• `calibrate`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 84.00 Tm
+(• `validate_dataset`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 70.00 Tm
+(• `scaffold_dataset`) Tj
+ET
+endstream
+endobj
+36 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 35 0 R >>
+endobj
+37 0 obj
+<< /Length 3683 >>
+stream
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 788.00 Tm
+(• `build_structured_dataset`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 774.00 Tm
+(• `collect_chain_snapshot`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 760.00 Tm
+(• `run_chain_schedule`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 746.00 Tm
+(• `run_daily_chain_schedule`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 732.00 Tm
+(• `enrich_chain_deltas`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 718.00 Tm
+(• `build_research_dataset`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 704.00 Tm
+(• `build_research_dataset_from_rolling`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 690.00 Tm
+(• `append_research_dataset_from_rolling`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 676.00 Tm
+(• `refresh_structured_training_dataset`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 662.00 Tm
+(• `refresh_training_data`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 648.00 Tm
+(• `run_training_data_pipeline`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 634.00 Tm
+(• `optimize_backtest`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 620.00 Tm
+(• `ops_status`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 606.00 Tm
+(• `set_runtime_mode`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 592.00 Tm
+(• `flatten_all`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 578.00 Tm
+(• `write_operational_reports`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 556.00 Tm
+(Weekly research CLI:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 542.00 Tm
+(•) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 528.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/scripts/run_weekly_defined_risk_res) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 514.00 Tm
+(earch.py`) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 492.00 Tm
+(19. Current business logic summary) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 460.00 Tm
+(What the engine is trying to do) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 430.00 Tm
+(The active system is not a generic pattern trader.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 416.00 Tm
+(It is a context-aware defined-risk options engine that works in this order:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 402.00 Tm
+(• build market snapshot) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 388.00 Tm
+(• classify state and structure) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 374.00 Tm
+(• classify tradability) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 360.00 Tm
+(• choose playbook) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 346.00 Tm
+(• choose strategy) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 332.00 Tm
+(• construct best valid spread candidate) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 318.00 Tm
+(• pass risk and runtime gates) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 304.00 Tm
+(• enter only if the opportunity is both structurally valid and monetizable) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 282.00 Tm
+(What is currently validated) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 252.00 Tm
+(Validated for strict v83:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 238.00 Tm
+(• bearish intraday defined-risk credit spreads) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 224.00 Tm
+(• strongest on transition / trend-down bearish contexts) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 210.00 Tm
+(• especially through the three approved live bearish playbooks) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 188.00 Tm
+(What is intentionally not promoted) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 158.00 Tm
+(Not promoted live:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 144.00 Tm
+(• bullish live trading) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 130.00 Tm
+(• condor live routing) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 116.00 Tm
+(• weekly engine) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 102.00 Tm
+(• broad paper override results) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 88.00 Tm
+(• broad failed-breakout family promotion) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 74.00 Tm
+(• blanket loosening of thresholds) Tj
+ET
+endstream
+endobj
+38 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 37 0 R >>
+endobj
+39 0 obj
+<< /Length 3961 >>
+stream
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 788.00 Tm
+(What the architecture is optimized for) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 758.00 Tm
+(The codebase is optimized for:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 744.00 Tm
+(• honest opportunity logging) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 730.00 Tm
+(• separation of structure from monetization) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 716.00 Tm
+(• state-aware routing) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 702.00 Tm
+(• exact rejection attribution) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 688.00 Tm
+(• guarded runtime modes) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 674.00 Tm
+(• strong operator visibility) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 660.00 Tm
+(• defined-risk enforcement) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 638.00 Tm
+(20. Known constraints and current gaps) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 606.00 Tm
+(Current operational caveats) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 576.00 Tm
+(The operator status report can legitimately show `BLOCKED` on non-trading days or stale) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 562.00 Tm
+(structured data days.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 548.00 Tm
+(That does not necessarily imply a strategy bug; it can be a freshness gate doing its job.) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 526.00 Tm
+(Current paper-learning caveat) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 496.00 Tm
+(The new `PAPER_CONTEXT_OVERRIDE` path exists, but historical rows generated before its) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 482.00 Tm
+(implementation cannot retroactively prove its performance without replay.) Tj
+ET
+BT
+/F2 12.00 Tf
+1 0 0 1 48.00 460.00 Tm
+(Current weekly caveat) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 430.00 Tm
+(The weekly research engine has been corrected for expiry calendar handling, but it still) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 416.00 Tm
+(does not have enough robust evidence to outrank intraday v83.) Tj
+ET
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 394.00 Tm
+(21. Recommended reading order in the code) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 362.00 Tm
+(If you want to understand the engine quickly, read in this order:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 340.00 Tm
+(1.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 326.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/data_models.p) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 312.00 Tm
+(y`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 298.00 Tm
+(2. `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/regime.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 284.00 Tm
+(3.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 270.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/strategy.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 256.00 Tm
+(4.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 242.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/strikes.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 228.00 Tm
+(5. `/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/risk.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 214.00 Tm
+(6.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 200.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/execution.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 186.00 Tm
+(7.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 172.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/monitor.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 158.00 Tm
+(8.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 144.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/ops_runtime.p) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 130.00 Tm
+(y`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 116.00 Tm
+(9.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 102.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/intraday_defined_risk/backtest.py`) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 88.00 Tm
+(10.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 74.00 Tm
+(`/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/weekly_defined_risk/research.py`) Tj
+ET
+endstream
+endobj
+40 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 39 0 R >>
+endobj
+41 0 obj
+<< /Length 908 >>
+stream
+BT
+/F2 14.00 Tf
+1 0 0 1 48.00 788.00 Tm
+(22. Summary) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 756.00 Tm
+(The implemented system today is best understood as two separate layers:) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 734.00 Tm
+(1. A frozen intraday v83 bearish defined-risk production candidate with strict runtime) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 720.00 Tm
+(controls.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 706.00 Tm
+(2. A research framework around it for dataset building, benchmarking, subtype mining,) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 692.00 Tm
+(paper-only override learning, and weekly defined-risk exploration.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 670.00 Tm
+(That separation is deliberate.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 656.00 Tm
+(The production path stays narrow and controlled.) Tj
+ET
+BT
+/F1 10.50 Tf
+1 0 0 1 48.00 642.00 Tm
+(The research path is broad, diagnostic, and attribution-heavy.) Tj
+ET
+endstream
+endobj
+42 0 obj
+<< /Type /Page /Parent 4 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R /F2 2 0 R /F3 3 0 R >> >> /Contents 41 0 R >>
+endobj
+43 0 obj
+<< /Type /Catalog /Pages 4 0 R >>
+endobj
+xref
+0 44
+0000000000 65535 f 
+0000000015 00000 n 
+0000000085 00000 n 
+0000000160 00000 n 
+0000000228 00000 n 
+0000000411 00000 n 
+0000004158 00000 n 
+0000004304 00000 n 
+0000008711 00000 n 
+0000008857 00000 n 
+0000013296 00000 n 
+0000013443 00000 n 
+0000017100 00000 n 
+0000017248 00000 n 
+0000021225 00000 n 
+0000021373 00000 n 
+0000025282 00000 n 
+0000025430 00000 n 
+0000028982 00000 n 
+0000029130 00000 n 
+0000033038 00000 n 
+0000033186 00000 n 
+0000036896 00000 n 
+0000037044 00000 n 
+0000040822 00000 n 
+0000040970 00000 n 
+0000044736 00000 n 
+0000044884 00000 n 
+0000048313 00000 n 
+0000048461 00000 n 
+0000052429 00000 n 
+0000052577 00000 n 
+0000056447 00000 n 
+0000056595 00000 n 
+0000060197 00000 n 
+0000060345 00000 n 
+0000063878 00000 n 
+0000064026 00000 n 
+0000067762 00000 n 
+0000067910 00000 n 
+0000071924 00000 n 
+0000072072 00000 n 
+0000073032 00000 n 
+0000073180 00000 n 
+trailer
+<< /Size 44 /Root 43 0 R >>
+startxref
+73230
+%%EOF

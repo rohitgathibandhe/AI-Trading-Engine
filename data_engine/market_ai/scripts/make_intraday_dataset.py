@@ -13,16 +13,23 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 import os
+import sys
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
+
+from market_ai.utils.nifty_expiry_calendar import infer_nifty_weekly_expiry, next_weekday_on_or_after
 
 TIMEZONE = "Asia/Kolkata"
-WEEKLY_EXPIRY_WEEKDAY = int(os.environ.get("MARKET_AI_WEEKLY_EXPIRY_WEEKDAY", "1"))  # 0=Mon
+WEEKLY_EXPIRY_WEEKDAY = os.environ.get("MARKET_AI_WEEKLY_EXPIRY_WEEKDAY")
 CALL_ALIASES = {"CALL", "CE"}
 PUT_ALIASES = {"PUT", "PE"}
 
@@ -46,12 +53,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _weekly_expiry_for(trade_day: datetime, target_weekday: int = WEEKLY_EXPIRY_WEEKDAY) -> datetime:
-    """Return the first target_weekday on/after trade_day."""
-    date_only = trade_day.date()
-    weekday = date_only.weekday()
-    delta = (target_weekday - weekday) % 7
-    return datetime.combine(date_only + timedelta(days=delta), datetime.min.time())
+def _weekly_expiry_for(trade_day: datetime, trading_days: set[date] | None = None) -> datetime:
+    if WEEKLY_EXPIRY_WEEKDAY is not None:
+        target = next_weekday_on_or_after(trade_day.date(), int(WEEKLY_EXPIRY_WEEKDAY))
+    else:
+        target = infer_nifty_weekly_expiry(trade_day.date(), trading_days=trading_days)
+    if target is None:
+        raise ValueError(f"Could not infer weekly expiry for {trade_day.date().isoformat()}")
+    return datetime.combine(target, datetime.min.time())
 
 
 def _clean_option_type(value: str) -> Optional[str]:
@@ -174,7 +183,7 @@ def _pick_by_distance(
     return pd.DataFrame.from_records(records)
 
 
-def process_day(day_dir: Path, selectors: List[str], tz: str) -> Optional[pd.DataFrame]:
+def process_day(day_dir: Path, selectors: List[str], tz: str, trading_days: set[date] | None = None) -> Optional[pd.DataFrame]:
     parquet_path = day_dir / "rolling_option.parquet"
     if not parquet_path.exists():
         raise FileNotFoundError(f"{parquet_path} not found")
@@ -265,7 +274,7 @@ def process_day(day_dir: Path, selectors: List[str], tz: str) -> Optional[pd.Dat
     merged["expiryDate"] = pd.to_datetime(merged["expiryDate"], errors="coerce")
     if merged["expiryDate"].isna().all():
         trade_day = datetime.strptime(day_dir.name, "%Y-%m-%d")
-        inferred = _weekly_expiry_for(trade_day)
+        inferred = _weekly_expiry_for(trade_day, trading_days=trading_days)
         merged["expiryDate"] = pd.Timestamp(inferred)
     ts_naive = merged["timestamp"].dt.tz_localize(None)
     expiry_naive = merged["expiryDate"]
@@ -321,6 +330,11 @@ def main() -> None:
         dates = sorted([p.name for p in args.root.iterdir() if p.is_dir()])
     else:
         dates = [d.strip() for d in args.dates.split(",") if d.strip()]
+    trading_days = {
+        datetime.strptime(day, "%Y-%m-%d").date()
+        for day in dates
+        if len(day) == 10
+    }
     all_rows: List[pd.DataFrame] = []
     for day in dates:
         day_dir = args.root / day
@@ -328,7 +342,7 @@ def main() -> None:
             print(f"[make_intraday_dataset] skipping {day} (directory missing)")
             continue
         try:
-            df = process_day(day_dir, selectors, args.tz)
+            df = process_day(day_dir, selectors, args.tz, trading_days=trading_days)
         except Exception as exc:
             print(f"[make_intraday_dataset] failed for {day}: {exc}")
             continue

@@ -18,6 +18,7 @@ from .features import (
     bullish_vwap_hold_higher_low_setup,
     closes,
     close_location_value,
+    compute_pcr_trend,
     compute_opening_range,
     compute_vwap,
     ema,
@@ -48,6 +49,7 @@ from .features import (
     rolling_window_bars,
     session_bars,
     sideways_bullish_reclaim_setup,
+    put_call_ratio_by_oi,
 )
 
 
@@ -860,6 +862,10 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         snapshot.option_chain.quotes,
         snapshot.previous_option_chain.quotes if snapshot.previous_option_chain is not None else None,
     )
+    previous_quotes = snapshot.previous_option_chain.quotes if snapshot.previous_option_chain is not None else None
+    current_pcr = put_call_ratio_by_oi(snapshot.option_chain.quotes)
+    previous_pcr = put_call_ratio_by_oi(previous_quotes or [])
+    pcr_trend = compute_pcr_trend(snapshot.option_chain.quotes, previous_quotes)
     support_ref = support_5m[0] if support_5m else (support_15m[0] if support_15m else None)
     resistance_ref = resistance_5m[0] if resistance_5m else (resistance_15m[0] if resistance_15m else None)
     session_open = bars_5m[0].open if bars_5m else None
@@ -900,6 +906,9 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "bullish_wall_score": wall_migration["bullish_wall_score"],
         "bearish_wall_score": wall_migration["bearish_wall_score"],
         "wall_migration_bias": wall_migration["wall_migration_bias"],
+        "pcr_by_oi": round(current_pcr, 4) if current_pcr is not None else None,
+        "previous_pcr_by_oi": round(previous_pcr, 4) if previous_pcr is not None else None,
+        "pcr_trend": pcr_trend,
         "bullish_entry_ready": False,
         "bullish_setup": None,
         "bullish_support_quality_score": 0.0,
@@ -1049,6 +1058,12 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["bearish_candle_pattern"] = str(bearish_candle_state["pattern"])
     metadata["bullish_candle_quality_score"] = float(bullish_candle_state["quality_score"])
     metadata["bearish_candle_quality_score"] = float(bearish_candle_state["quality_score"])
+    metadata["bullish_upper_wick_fraction"] = float(bullish_candle_state.get("upper_wick_fraction") or 0.0)
+    metadata["bullish_close_location"] = float(bullish_candle_state.get("close_location") or 0.5)
+    metadata["bullish_body_fraction"] = float(bullish_candle_state.get("body_fraction") or 0.0)
+    metadata["bearish_upper_wick_fraction"] = float(bearish_candle_state.get("upper_wick_fraction") or 0.0)
+    metadata["bearish_close_location"] = float(bearish_candle_state.get("close_location") or 0.5)
+    metadata["bearish_body_fraction"] = float(bearish_candle_state.get("body_fraction") or 0.0)
     bullish_structure_score = 0.0
     bearish_structure_score = 0.0
     if bool(metadata.get("bullish_bos")):

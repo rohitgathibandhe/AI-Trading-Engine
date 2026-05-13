@@ -104,6 +104,9 @@ def test_select_strategy_allows_bearish_rejection_transition_context() -> None:
         no_trade_score=0.0,
         trade_score_margin_bearish=1.0,
         bearish_trade_score_threshold=6.1,
+        bearish_upper_wick_fraction=0.60,
+        bearish_close_location=0.40,
+        bearish_candle_quality_score=0.60,
     )
     strategy, reasons = select_strategy(regime, time(12, 10), allowed_playbook_tiers=("A", "B"))
     assert strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD

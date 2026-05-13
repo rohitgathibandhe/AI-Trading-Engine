@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from math import inf
 
 from .data_models import (
@@ -17,8 +18,10 @@ from .data_models import (
 DIRECTIONAL_WIDTH_CHOICES = (50.0, 75.0, 100.0, 150.0)
 CANDIDATE_REJECTION_PRIORITY = (
     "LIQUIDITY_BAD",
+    "OI_WALL_BELOW_SHORT_STRIKE",
     "DELTA_TOO_HIGH",
     "INVALIDATION_TOO_CLOSE",
+    "CREDIT_TOO_LOW_IV_ADJUSTED",
     "CREDIT_TOO_LOW",
     "HEDGE_TOO_EXPENSIVE",
     "WIDTH_TOO_LARGE",
@@ -170,6 +173,34 @@ def _effective_hedge_cost_ratio_cap(
     return params.hedge_cost_ratio_cap
 
 
+def _iv_adjusted_credit_ratio(
+    required_credit_ratio: float,
+    avg_chain_iv: float | None,
+) -> tuple[float, bool]:
+    if avg_chain_iv is None:
+        return required_credit_ratio, False
+    if float(avg_chain_iv) <= 15.0:
+        return required_credit_ratio * 0.72, True
+    if float(avg_chain_iv) <= 18.0:
+        return required_credit_ratio * 0.88, True
+    if float(avg_chain_iv) >= 22.0:
+        return required_credit_ratio * 1.15, True
+    return required_credit_ratio, False
+
+
+def _width_preference_bonus(
+    width_points: float,
+    avg_chain_iv: float | None,
+) -> float:
+    if avg_chain_iv is None:
+        return 0.0
+    if float(avg_chain_iv) > 22.0 and width_points == 75.0:
+        return 0.35
+    if float(avg_chain_iv) < 15.0 and width_points == 50.0:
+        return 0.20
+    return 0.0
+
+
 def _candidate_selection_mode(
     *,
     has_deltas: bool,
@@ -247,6 +278,7 @@ def _evaluate_vertical_candidates(
     setup_quality_score: float,
     playbook_tier: str,
     allow_distance_fallback_when_deltas_present: bool = True,
+    allow_wider_width_fallback: bool = True,
     min_short_strike: float | None = None,
     max_short_strike: float | None = None,
     candidate_quotes: list[OptionsContractQuote] | None = None,
@@ -276,17 +308,30 @@ def _evaluate_vertical_candidates(
     preferred_width = regime_state.metadata.get("preferred_width_points")
     preferred_widths = tuple(float(value) for value in (regime_state.metadata.get("allowed_width_points") or ()))
     target_short_put_buffer = regime_state.metadata.get("target_short_put_buffer_points")
-    required_credit_ratio = _effective_directional_credit_ratio(
+    base_required_credit_ratio = _effective_directional_credit_ratio(
         regime_state,
         params,
         setup_quality_score=setup_quality_score,
         playbook_tier=playbook_tier,
+    )
+    avg_chain_iv = (
+        float(regime_state.metadata.get("avg_chain_iv"))
+        if regime_state.metadata.get("avg_chain_iv") is not None
+        else None
+    )
+    required_credit_ratio, iv_adjusted_credit_floor_active = _iv_adjusted_credit_ratio(
+        base_required_credit_ratio,
+        avg_chain_iv,
     )
     max_hedge_cost_ratio = _effective_hedge_cost_ratio_cap(
         params,
         setup_quality_score=setup_quality_score,
         playbook_tier=playbook_tier,
     )
+    call_wall_strike = None
+    if option_type == OptionType.CALL:
+        raw_call_wall = regime_state.metadata.get("current_call_wall") or regime_state.metadata.get("call_resistance_strike")
+        call_wall_strike = float(raw_call_wall) if raw_call_wall is not None else None
     rv_points = snapshot.option_chain.spot * regime_state.rv30_pct / 100.0
     hours_remaining = max(
         (
@@ -305,6 +350,22 @@ def _evaluate_vertical_candidates(
             if min_short_strike is not None and short_quote.strike < min_short_strike:
                 continue
             if max_short_strike is not None and short_quote.strike > max_short_strike:
+                continue
+            if option_type == OptionType.CALL and call_wall_strike is not None and short_quote.strike < call_wall_strike:
+                width_seen = True
+                candidate_evaluations.append(
+                    {
+                        "requested_width_points": requested_width,
+                        "width_points": requested_width,
+                        "short_strike": short_quote.strike,
+                        "long_strike": None,
+                        "call_wall_strike": call_wall_strike,
+                        "valid": False,
+                        "selection_mode": "NONE",
+                        "canonical_rejection_reason": "OI_WALL_BELOW_SHORT_STRIKE",
+                        "rejection_detail": "Bear-call short strike must be at or above the nearby call wall.",
+                    }
+                )
                 continue
             long_strike = short_quote.strike + requested_width if option_type == OptionType.CALL else short_quote.strike - requested_width
             long_quote = quote_by_strike.get(long_strike)
@@ -400,11 +461,14 @@ def _evaluate_vertical_candidates(
                 if preferred_widths and requested_width not in preferred_widths
                 else 0.0
             )
-            monetization_score = round(monetization_score - preferred_width_penalty, 4)
+            width_preference_bonus = _width_preference_bonus(width, avg_chain_iv)
+            monetization_score = round(monetization_score - preferred_width_penalty + width_preference_bonus, 4)
             rejection_flags = {
                 "LIQUIDITY_BAD": passed_liquidity,
+                "OI_WALL_BELOW_SHORT_STRIKE": True,
                 "DELTA_TOO_HIGH": passed_delta or (selection_mode == "STRUCTURE_DISTANCE_FALLBACK"),
                 "INVALIDATION_TOO_CLOSE": passed_anchor_distance,
+                "CREDIT_TOO_LOW_IV_ADJUSTED": (passed_credit_width or not iv_adjusted_credit_floor_active),
                 "CREDIT_TOO_LOW": passed_credit_width,
                 "HEDGE_TOO_EXPENSIVE": passed_hedge_cost,
                 "WIDTH_TOO_LARGE": True,
@@ -414,9 +478,11 @@ def _evaluate_vertical_candidates(
                     "requested_width_points": requested_width,
                     "width_points": width,
                     "preferred_width_penalty": round(preferred_width_penalty, 4),
+                    "width_preference_bonus": round(width_preference_bonus, 4),
                     "playbook_preferred_widths": preferred_widths,
                     "short_strike": short_quote.strike,
                     "long_strike": long_quote.strike,
+                    "call_wall_strike": call_wall_strike,
                     "anchor_level": anchor_level,
                     "anchor_distance_points": anchor_distance,
                     "target_anchor_buffer_points": target_short_put_buffer,
@@ -424,7 +490,10 @@ def _evaluate_vertical_candidates(
                     "long_delta_abs": long_abs,
                     "credit_points": round(credit, 4),
                     "credit_width_ratio": round(credit_ratio, 4),
+                    "base_required_credit_width_ratio": round(base_required_credit_ratio, 4),
                     "required_credit_width_ratio": round(required_credit_ratio, 4),
+                    "iv_adjusted_credit_floor_active": iv_adjusted_credit_floor_active,
+                    "avg_chain_iv": round(avg_chain_iv, 4) if avg_chain_iv is not None else None,
                     "max_hedge_cost_ratio": round(max_hedge_cost_ratio, 4),
                     "hedge_cost_points": round(long_mid, 4),
                     "hedge_cost_ratio": round(hedge_cost_ratio, 4),
@@ -489,6 +558,55 @@ def _evaluate_vertical_candidates(
             )
         ),
     }
+    if best_candidate is None and allow_wider_width_fallback:
+        meaningful_failures = [
+            candidate
+            for candidate in failed_candidates
+            if candidate.get("canonical_rejection_reason") != "WIDTH_TOO_LARGE"
+        ]
+        if meaningful_failures and all(
+            str(candidate.get("canonical_rejection_reason") or "") == "INVALIDATION_TOO_CLOSE"
+            for candidate in meaningful_failures
+        ):
+            fallback_width = min(max(params.candidate_widths) * 1.5, 200.0)
+            if fallback_width not in params.candidate_widths:
+                fallback_params = replace(params, candidate_widths=(fallback_width,))
+                fallback_structure, fallback_reasons, fallback_report = _evaluate_vertical_candidates(
+                    strategy=strategy,
+                    snapshot=snapshot,
+                    regime_state=regime_state,
+                    option_type=option_type,
+                    short_delta_band=short_delta_band,
+                    long_delta_band=long_delta_band,
+                    params=fallback_params,
+                    setup_quality_score=setup_quality_score,
+                    playbook_tier=playbook_tier,
+                    allow_distance_fallback_when_deltas_present=allow_distance_fallback_when_deltas_present,
+                    allow_wider_width_fallback=False,
+                    min_short_strike=min_short_strike,
+                    max_short_strike=max_short_strike,
+                    candidate_quotes=quotes,
+                )
+                for candidate in fallback_report.get("candidate_evaluations") or []:
+                    if isinstance(candidate, dict):
+                        candidate["fallback_width_retry"] = True
+                        candidate_evaluations.append(candidate)
+                if fallback_structure is not None:
+                    fallback_structure.metadata["fallback_width_retry"] = True
+                    fallback_structure.metadata["fallback_from_invalidations"] = True
+                    fallback_report["candidate_evaluations"] = candidate_evaluations
+                    fallback_report["used_fallback_width_retry"] = True
+                    return (
+                        fallback_structure,
+                        ["All primary candidates failed because invalidation was too close; retried with one wider fallback width."]
+                        + fallback_reasons,
+                        fallback_report,
+                    )
+                report["candidate_evaluations"] = candidate_evaluations
+                report["used_fallback_width_retry"] = True
+                report["canonical_rejection_reason"] = str(
+                    fallback_report.get("canonical_rejection_reason") or report["canonical_rejection_reason"]
+                )
     if best_candidate is None:
         return None, ["No vertical spread satisfied liquidity, delta/distance, and credit-efficiency rules."], report
 
@@ -518,6 +636,7 @@ def _evaluate_vertical_candidates(
             "selection_mode": str(best_candidate["selection_mode"]),
             "preferred_width_points": preferred_width,
             "preferred_width_penalty": best_candidate.get("preferred_width_penalty"),
+            "width_preference_bonus": best_candidate.get("width_preference_bonus"),
             "margin_source": "BROKER_ESTIMATE" if snapshot.option_chain.margin_estimate_per_lot is not None else "MAX_LOSS_PROXY",
             "monetization_score": float(best_candidate["monetization_score"]),
             "setup_quality_score": setup_quality_score,
@@ -525,6 +644,7 @@ def _evaluate_vertical_candidates(
             "short_delta_abs": best_candidate.get("short_delta_abs"),
             "credit_width_ratio": best_candidate.get("credit_width_ratio"),
             "anchor_distance_points": best_candidate.get("anchor_distance_points"),
+            "avg_chain_iv": best_candidate.get("avg_chain_iv"),
         },
     )
     return structure, structure_reasons, report

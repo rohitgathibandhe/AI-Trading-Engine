@@ -1109,6 +1109,33 @@ def option_chain_pressure(spot: float, quotes: list[OptionsContractQuote], depth
     }
 
 
+def put_call_ratio_by_oi(quotes: list[OptionsContractQuote]) -> float | None:
+    total_put_oi = sum(float(quote.oi or 0.0) for quote in quotes if quote.option_type == OptionType.PUT)
+    total_call_oi = sum(float(quote.oi or 0.0) for quote in quotes if quote.option_type == OptionType.CALL)
+    if total_put_oi <= 0 or total_call_oi <= 0:
+        return None
+    return total_put_oi / total_call_oi
+
+
+def compute_pcr_trend(
+    current_quotes: list[OptionsContractQuote],
+    previous_quotes: list[OptionsContractQuote] | None,
+    threshold: float = 0.05,
+) -> str:
+    if not previous_quotes:
+        return "UNKNOWN"
+    current_pcr = put_call_ratio_by_oi(current_quotes)
+    previous_pcr = put_call_ratio_by_oi(previous_quotes)
+    if current_pcr is None or previous_pcr is None:
+        return "UNKNOWN"
+    delta = current_pcr - previous_pcr
+    if delta > threshold:
+        return "RISING"
+    if delta < -threshold:
+        return "FALLING"
+    return "STABLE"
+
+
 def option_chain_oi_flow(
     spot: float,
     current_quotes: list[OptionsContractQuote],

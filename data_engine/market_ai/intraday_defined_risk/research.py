@@ -13,6 +13,7 @@ from .backtest import run_backtest
 from .data_models import AdaptiveParameters, AccountRiskLimits
 from .dataset import _build_5m_bars, _filter_session_spot_outliers, _prepare_spot_series, _resolve_expiry_text
 from .enrichment import derive_bid_ask_from_ltp, derive_delta_from_iv, float_or_none
+from ..utils.nifty_expiry_calendar import infer_nifty_weekly_expiry
 
 
 DEFAULT_RISK_FREE_RATE = 0.06
@@ -129,10 +130,16 @@ def build_research_backtest_dataset(
     ohlcv_15m_out = output_root / "nifty_15m.csv"
     ohlcv_5m.to_csv(ohlcv_5m_out, index=False)
     ohlcv_15m.to_csv(ohlcv_15m_out, index=False)
+    trading_days = {session_day for session_day in ohlcv_5m["timestamp"].dt.date.unique()}
 
     chain = pd.read_csv(structured_root / "option_chain_decision_times.csv")
     chain["timestamp"] = pd.to_datetime(chain["timestamp"], errors="coerce")
     chain = chain.dropna(subset=["timestamp", "ltp", "strike", "option_type", "spot"])
+    chain["expiry"] = chain["timestamp"].dt.date.map(
+        lambda session_day: (
+            infer_nifty_weekly_expiry(session_day, trading_days=trading_days) or session_day
+        ).isoformat()
+    )
     if from_date:
         chain = chain.loc[chain["timestamp"].dt.date >= date.fromisoformat(from_date)]
     if to_date:
@@ -147,7 +154,7 @@ def build_research_backtest_dataset(
 
     missing_delta = chain["delta"].isna()
     if missing_delta.any():
-        chain.loc[missing_delta, "delta"] = chain.loc[missing_delta].apply(
+        derived_delta = chain.loc[missing_delta].apply(
             lambda row: derive_delta_from_iv(
                 spot=float(row["spot"]),
                 strike=float(row["strike"]),
@@ -159,6 +166,7 @@ def build_research_backtest_dataset(
             ),
             axis=1,
         )
+        chain.loc[missing_delta, "delta"] = pd.to_numeric(derived_delta, errors="coerce")
         chain.loc[missing_delta & chain["delta"].notna(), "delta_source"] = "derived_bs"
 
     missing_bid_ask = chain["bid"].isna() | chain["ask"].isna() | (chain["bid"] <= 0) | (chain["ask"] <= 0)

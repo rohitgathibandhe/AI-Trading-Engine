@@ -26,7 +26,7 @@ EARLY_BALANCE_BEARISH_END = time(11, 15)
 HIGH_CONFLUENCE_BEARISH_START = time(10, 0)
 HIGH_CONFLUENCE_BEARISH_END = time(11, 15)
 SIDEWAYS_BEARISH_REJECTION_START = time(11, 30)
-SIDEWAYS_BEARISH_REJECTION_END = time(12, 45)
+SIDEWAYS_BEARISH_REJECTION_END = time(14, 30)
 GAP_BEARISH_START = time(9, 45)
 GAP_BEARISH_END = time(13, 0)
 GAP_DOWN_BEARISH_CONTINUATION_END = time(12, 0)
@@ -285,6 +285,18 @@ def playbook_time_window(
     return None, None
 
 
+def is_tradable_bearish_rejection(regime_state: RegimeState) -> bool:
+    metadata = regime_state.metadata
+    upper_wick_fraction = float(metadata.get("bearish_upper_wick_fraction") or 0.0)
+    close_location = float(metadata.get("bearish_close_location") or 1.0)
+    rejection_quality_score = float(metadata.get("bearish_candle_quality_score") or 0.0)
+    return bool(
+        upper_wick_fraction >= 0.50
+        and close_location <= 0.45
+        and rejection_quality_score >= 0.55
+    )
+
+
 def select_strategy(
     regime_state: RegimeState,
     now_time: time,
@@ -323,8 +335,8 @@ def select_strategy(
     if now_time < time(9, 15):
         reasons.append("Pre-market entry is not allowed.")
         return StrategyType.NO_TRADE, reasons
-    if context_layer_active and now_time >= time(14, 0):
-        reasons.append("No new entries are allowed after 14:00 IST under the context-aware late-session penalty.")
+    if context_layer_active and now_time >= time(14, 30):
+        reasons.append("No new entries are allowed after 14:30 IST under the context-aware late-session penalty.")
         return StrategyType.NO_TRADE, reasons
     if (
         bool(metadata.get("enable_market_state_gating"))
@@ -390,6 +402,11 @@ def select_strategy(
             return StrategyType.NO_TRADE, reasons
         if day_archetype == "SIDEWAYS_TO_BEARISH" and (bearish_setup != "PULLBACK_REJECTION" or playbook != "SIDEWAYS_TO_BEARISH_REJECTION"):
             reasons.append("Sideways-to-bearish sessions require the dedicated sideways bearish rejection playbook before deployment.")
+            return StrategyType.NO_TRADE, reasons
+        if playbook == "SIDEWAYS_TO_BEARISH_REJECTION" and not is_tradable_bearish_rejection(regime_state):
+            reasons.append(
+                "Sideways-to-bearish rejection requires a high-quality rejection candle with upper wick >= 50% and a close in the lower 45% of the range."
+            )
             return StrategyType.NO_TRADE, reasons
         if day_archetype == "GAP_UP_FAILURE" and (bearish_setup != "GAP_FAILURE" or playbook != "GAP_UP_BEARISH_FAILURE"):
             reasons.append("Gap-up bearish sessions require the dedicated gap-failure playbook before deployment.")

@@ -10,6 +10,7 @@ import sqlite3
 import pandas as pd
 
 from .enrichment import derive_delta_from_iv, float_or_none
+from ..utils.nifty_expiry_calendar import infer_nifty_weekly_expiry
 
 
 REQUIRED_DECISION_TIMES = ("09:30", "10:00", "13:00")
@@ -237,6 +238,11 @@ def build_structured_dataset_from_rolling(
         session_dirs = [p for p in session_dirs if p.name >= from_date]
     if to_date:
         session_dirs = [p for p in session_dirs if p.name <= to_date]
+    trading_days = {
+        datetime.strptime(p.name, "%Y-%m-%d").date()
+        for p in session_dirs
+        if len(p.name) == 10
+    }
 
     chain_lookup = _HistoricalChainLookup(option_chain_db_path)
 
@@ -270,6 +276,7 @@ def build_structured_dataset_from_rolling(
             session_df,
             session_date=session_dir.name,
             chain_lookup=chain_lookup,
+            trading_days=trading_days,
         )
         if not chain_snapshot_df.empty:
             chain_frames.append(chain_snapshot_df)
@@ -606,6 +613,7 @@ def _build_decision_time_chain(
     *,
     session_date: str,
     chain_lookup: "_HistoricalChainLookup",
+    trading_days: set[date] | None = None,
 ) -> pd.DataFrame:
     work = df.copy()
     work["timestamp"] = pd.to_datetime(
@@ -631,8 +639,12 @@ def _build_decision_time_chain(
         if nearest is None or abs(nearest - target) > pd.Timedelta(minutes=5):
             continue
         snap = work.loc[work["timestamp"] == nearest].copy()
+        inferred_expiry = infer_nifty_weekly_expiry(session_date, trading_days=trading_days)
         for record in snap.to_dict(orient="records"):
-            expiry, _ = _resolve_expiry_text(record.get("expiryDate"), session_date=session_date)
+            expiry = inferred_expiry.isoformat() if inferred_expiry is not None else _resolve_expiry_text(
+                record.get("expiryDate"),
+                session_date=session_date,
+            )[0]
             option_type = _normalize_option_type(record.get("optionType"))
             if not option_type:
                 continue
@@ -804,12 +816,7 @@ def _resolve_expiry_date(expiry_value: object, *, session_date: object | None = 
 
 
 def _infer_weekly_expiry(session_date_value: object) -> date | None:
-    session_date = pd.to_datetime(session_date_value, errors="coerce")
-    if pd.isna(session_date):
-        return None
-    current = session_date.date()
-    days_ahead = (3 - current.weekday()) % 7
-    return current + timedelta(days=days_ahead)
+    return infer_nifty_weekly_expiry(session_date_value)
 
 
 def _filter_session_spot_outliers(df: pd.DataFrame) -> pd.DataFrame:
