@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.algoagent.weekly_ic_close_alert</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Rohit/.venvs/data_engine_py310/bin/python</string>
+        <string>/Users/Rohit/AI-Trading-Engine/scripts/weekly_ic_executor.py</string>
+        <string>--close</string>
+    </array>
+
+    <!-- Tuesday 3:00 PM IST = 9:30 AM UTC — 20 min before 3:20 PM exit deadline -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key><integer>2</integer>
+        <key>Hour</key><integer>9</integer>
+        <key>Minute</key><integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Rohit/AI-Trading-Engine/logs/weekly_ic_close_alert.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Rohit/AI-Trading-Engine/logs/weekly_ic_close_alert.log</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

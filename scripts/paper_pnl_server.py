@@ -73,6 +73,8 @@ TELEGRAM_COMMAND_STATUS_JSON = STATE_DIR / "telegram_command_status.json"
 BATMAN_BKM_TUNING_ADVICE_JSON = STATE_DIR / "batman_bkm_tuning_advice.json"
 BATMAN_BKM_TUNING_HISTORY_JSONL = STATE_DIR / "batman_bkm_tuning_history.jsonl"
 CREDS_FILE = STATE_DIR / "creds.json"
+WEEKLY_IC_PENDING_FILE  = STATE_DIR / "weekly_ic_pending.json"
+WEEKLY_IC_POSITION_FILE = STATE_DIR / "weekly_ic_position.json"
 LAST_STRATEGY_FILE = STATE_DIR / "last_strategy.json"
 PID_FILE = STATE_DIR / "agent.pid"
 AGENT_ENTRY = ROOT / "data_engine" / "market_ai" / "start_agent.py"
@@ -3156,10 +3158,10 @@ def _write_v83_run_config(*, trade_mode: str) -> Path:
         "underlying_seg": INDEX_EXCHANGE_SEG,
         "lot_size": 65,
         "slippage_points": 0.5,
-        "margin_estimate_per_lot": 10_000.0,
-        "max_risk_rupees_per_trade": 10_000.0,
-        "max_margin_rupees": 200_000.0,
-        "max_daily_loss_rupees": 10_000.0,
+        "margin_estimate_per_lot": 20_000.0,
+        "max_risk_rupees_per_trade": 18_000.0,
+        "max_margin_rupees": 810_000.0,
+        "max_daily_loss_rupees": 18_000.0,
         "dhan_http_timeout_sec": 8,
         "dhan_http_retries": 1,
         "dhan_option_chain_attempts": 1,
@@ -3350,11 +3352,192 @@ def _apply_batman_bkm_tuning_proposal_with_safety(proposal_id: str) -> Dict[str,
     return apply_batman_bkm_tuning_proposal(paths=_batman_bkm_tuning_paths(), proposal_id=proposal_id)
 
 
+# ── Weekly Iron Condor deploy / close helpers ─────────────────────────────────
+
+def _dhan_place_order(
+    creds: dict,
+    side: str,
+    security_id: int,
+    quantity: int,
+    price: float,
+    exchange_seg: str = "NSE_FNO",
+    product_type: str = "MARGIN",
+    order_type: str = "LIMIT",
+) -> Dict[str, Any]:
+    """Place a single order via Dhan /v2/orders. Returns the JSON response."""
+    import requests as _req
+    base = os.getenv("DHAN_API_BASE", "https://api.dhan.co").rstrip("/")
+    headers = {
+        "client-id": str(creds.get("client_id") or ""),
+        "access-token": str(creds.get("access_token") or ""),
+        "Content-Type": "application/json",
+    }
+    payload: Dict[str, Any] = {
+        "transactionType": side.upper(),
+        "exchangeSegment": exchange_seg,
+        "productType": product_type.upper(),
+        "orderType": order_type,
+        "validity": "DAY",
+        "securityId": str(security_id),
+        "quantity": int(quantity),
+        "price": round(float(price), 2) if order_type == "LIMIT" else 0,
+        "afterMarketOrder": False,
+        "amoTime": None,
+        "dhanClientId": str(creds.get("client_id") or ""),
+    }
+    resp = _req.post(f"{base}/v2/orders", headers=headers, json=payload, timeout=12)
+    try:
+        js = resp.json()
+    except Exception:
+        js = {"raw": resp.text[:300]}
+    js["_http_status"] = resp.status_code
+    return js
+
+
+def _deploy_weekly_ic(pending: Dict[str, Any]) -> Dict[str, Any]:
+    """Place all 4 IC legs and return a result dict with per-leg status."""
+    creds = _json_read(CREDS_FILE)
+    qty = int(pending.get("quantity") or 0)
+    legs = [
+        ("SELL", pending.get("sc_sid"), pending.get("sc_ltp", 0), f"SELL {pending.get('short_call')} CE"),
+        ("BUY",  pending.get("lc_sid"), pending.get("lc_ltp", 0), f"BUY  {pending.get('long_call')}  CE"),
+        ("SELL", pending.get("sp_sid"), pending.get("sp_ltp", 0), f"SELL {pending.get('short_put')}  PE"),
+        ("BUY",  pending.get("lp_sid"), pending.get("lp_ltp", 0), f"BUY  {pending.get('long_put')}   PE"),
+    ]
+    results = []
+    for side, sid, ltp, label in legs:
+        if not sid:
+            results.append({"label": label, "ok": False, "error": "no security_id"})
+            continue
+        try:
+            r = _dhan_place_order(creds, side, int(sid), qty, float(ltp or 0))
+            ok = r.get("_http_status", 0) < 400 and r.get("status") != "failed"
+            results.append({"label": label, "ok": ok, "order_id": r.get("orderId") or r.get("order_id"), "resp": r})
+        except Exception as exc:
+            results.append({"label": label, "ok": False, "error": str(exc)})
+    all_ok = all(r["ok"] for r in results)
+    return {"ok": all_ok, "legs": results}
+
+
+def _close_weekly_ic(position: Dict[str, Any]) -> Dict[str, Any]:
+    """Reverse all 4 IC legs (BUY back shorts, SELL longs)."""
+    creds = _json_read(CREDS_FILE)
+    qty = int(position.get("quantity") or 0)
+    legs = [
+        ("BUY",  position.get("sc_sid"), position.get("sc_ltp", 0), f"BUY  {position.get('short_call')} CE"),
+        ("SELL", position.get("lc_sid"), position.get("lc_ltp", 0), f"SELL {position.get('long_call')}  CE"),
+        ("BUY",  position.get("sp_sid"), position.get("sp_ltp", 0), f"BUY  {position.get('short_put')}  PE"),
+        ("SELL", position.get("lp_sid"), position.get("lp_ltp", 0), f"SELL {position.get('long_put')}   PE"),
+    ]
+    results = []
+    for side, sid, ltp, label in legs:
+        if not sid:
+            results.append({"label": label, "ok": False, "error": "no security_id"})
+            continue
+        try:
+            r = _dhan_place_order(creds, side, int(sid), qty, float(ltp or 0))
+            ok = r.get("_http_status", 0) < 400 and r.get("status") != "failed"
+            results.append({"label": label, "ok": ok, "order_id": r.get("orderId") or r.get("order_id"), "resp": r})
+        except Exception as exc:
+            results.append({"label": label, "ok": False, "error": str(exc)})
+    all_ok = all(r["ok"] for r in results)
+    return {"ok": all_ok, "legs": results}
+
+
+_WEEKLY_IC_HTML_STYLE = """
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; background: #0d1117; color: #c9d1d9;
+         max-width: 600px; margin: 60px auto; padding: 24px; }
+  h2 { color: #58a6ff; }
+  .ok   { color: #3fb950; }
+  .fail { color: #f85149; }
+  .leg  { font-family: monospace; padding: 6px 0; border-bottom: 1px solid #21262d; }
+  .box  { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin: 16px 0; }
+  a     { color: #58a6ff; }
+</style>
+"""
+
+
+def _weekly_ic_deploy_page(pending: Dict[str, Any], result: Dict[str, Any]) -> str:
+    expiry = pending.get("expiry", "?")
+    spot   = pending.get("spot_at_entry", 0)
+    legs_html = "".join(
+        f'<div class="leg {"ok" if r["ok"] else "fail"}">'
+        f'{"✅" if r["ok"] else "❌"} {r["label"]} — '
+        f'{"Order " + str(r.get("order_id") or "sent") if r["ok"] else r.get("error", "failed")}'
+        f"</div>"
+        for r in result["legs"]
+    )
+    status_cls = "ok" if result["ok"] else "fail"
+    status_txt = "✅ All 4 legs placed" if result["ok"] else "⚠️ Some legs failed — check Dhan order book"
+    return f"""<!DOCTYPE html><html><head><title>Weekly IC Deploy</title>{_WEEKLY_IC_HTML_STYLE}</head>
+<body>
+<h2>📊 Weekly IC Deploy — {expiry}</h2>
+<div class="box">
+  <b>NIFTY spot at plan:</b> {spot:,.0f}&nbsp;&nbsp;
+  <b>Expiry:</b> {expiry}<br><br>
+  {legs_html}
+</div>
+<p class="{status_cls}"><b>{status_txt}</b></p>
+<p>Check your <a href="https://web.dhan.co" target="_blank">Dhan order book</a> to verify fills.
+Prices were set at plan LTP — adjust manually if needed.</p>
+<p style="color:#8b949e;font-size:0.85em">Exit by next Tuesday before 3:20 PM IST.<br>
+Use the close link from your Telegram alert when ready to exit.</p>
+</body></html>"""
+
+
+def _weekly_ic_close_page(position: Dict[str, Any], result: Dict[str, Any]) -> str:
+    expiry = position.get("expiry", "?")
+    legs_html = "".join(
+        f'<div class="leg {"ok" if r["ok"] else "fail"}">'
+        f'{"✅" if r["ok"] else "❌"} {r["label"]} — '
+        f'{"Order " + str(r.get("order_id") or "sent") if r["ok"] else r.get("error", "failed")}'
+        f"</div>"
+        for r in result["legs"]
+    )
+    status_cls = "ok" if result["ok"] else "fail"
+    status_txt = "✅ All 4 close orders placed" if result["ok"] else "⚠️ Some close orders failed — check Dhan"
+    return f"""<!DOCTYPE html><html><head><title>Weekly IC Close</title>{_WEEKLY_IC_HTML_STYLE}</head>
+<body>
+<h2>🔴 Weekly IC Close — {expiry}</h2>
+<div class="box">
+  {legs_html}
+</div>
+<p class="{status_cls}"><b>{status_txt}</b></p>
+<p>Check your <a href="https://web.dhan.co" target="_blank">Dhan order book</a> to verify fills.</p>
+</body></html>"""
+
+
+def _send_weekly_ic_telegram(text: str) -> None:
+    try:
+        creds = _json_read(CREDS_FILE)
+        bot_token = str(creds.get("telegram_bot_token") or "").strip()
+        chat_id   = str(creds.get("telegram_chat_id") or "").strip()
+        if not bot_token or not chat_id:
+            return
+        import requests as _req
+        _req.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
 class PaperHandler(SimpleHTTPRequestHandler):
     def _send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
         body = json.dumps(payload, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, html: str, status: int = 200) -> None:
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -4249,6 +4432,110 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 self._send_json({"lines": lines})
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
+            return
+
+        # ── Weekly IC deploy ──────────────────────────────────────────────
+        if self.path.startswith("/api/weekly_ic/deploy"):
+            try:
+                from urllib.parse import urlparse, parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                token = (qs.get("token") or [""])[0].strip()
+                pending: Dict[str, Any] = {}
+                if WEEKLY_IC_PENDING_FILE.exists():
+                    try:
+                        pending = json.loads(WEEKLY_IC_PENDING_FILE.read_text())
+                    except Exception:
+                        pass
+
+                if not pending:
+                    self._send_html("<h2>No pending IC plan found.</h2><p>Run the weekly IC executor first.</p>", status=404)
+                    return
+                if pending.get("status") == "DEPLOYED":
+                    self._send_html("<h2>Already deployed.</h2><p>This IC plan has already been executed.</p>")
+                    return
+                if pending.get("token") != token:
+                    self._send_html("<h2>Invalid or expired token.</h2>", status=403)
+                    return
+
+                result = _deploy_weekly_ic(pending)
+
+                # Update state
+                pending["status"] = "DEPLOYED"
+                pending["deployed_at"] = datetime.now(timezone(timedelta(hours=5, minutes=30))).isoformat()
+                pending["deploy_result"] = result
+                WEEKLY_IC_PENDING_FILE.write_text(json.dumps(pending, indent=2, default=str))
+                WEEKLY_IC_POSITION_FILE.write_text(json.dumps({**pending, "status": "OPEN"}, indent=2, default=str))
+
+                # Telegram notification
+                legs_txt = "\n".join(
+                    f'  {"✅" if r["ok"] else "❌"} {r["label"]}'
+                    for r in result["legs"]
+                )
+                status_txt = "All 4 legs placed ✅" if result["ok"] else "⚠️ Some legs failed"
+                _send_weekly_ic_telegram(
+                    f"📊 <b>Weekly IC Deployed — {pending.get('expiry')}</b>\n\n"
+                    f"{legs_txt}\n\n"
+                    f"<b>{status_txt}</b>\n"
+                    f"Net credit: ~Rs {pending.get('gross_credit', 0):,.0f}\n"
+                    f"Max loss: Rs {pending.get('max_loss', 0):,.0f}\n"
+                    f"Exit: Next Tuesday before 3:20 PM IST"
+                )
+
+                html = _weekly_ic_deploy_page(pending, result)
+                self._send_html(html)
+            except Exception as exc:
+                self._send_html(f"<h2>Error</h2><pre>{exc}</pre>", status=500)
+            return
+
+        # ── Weekly IC close ───────────────────────────────────────────────
+        if self.path.startswith("/api/weekly_ic/close"):
+            try:
+                from urllib.parse import urlparse, parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                token = (qs.get("token") or [""])[0].strip()
+
+                position: Dict[str, Any] = {}
+                for fpath in (WEEKLY_IC_POSITION_FILE, WEEKLY_IC_PENDING_FILE):
+                    if fpath.exists():
+                        try:
+                            data = json.loads(fpath.read_text())
+                            if data.get("status") in ("OPEN", "DEPLOYED"):
+                                position = data
+                                break
+                        except Exception:
+                            pass
+
+                if not position:
+                    self._send_html("<h2>No open IC position found.</h2>", status=404)
+                    return
+                if position.get("close_token") != token:
+                    self._send_html("<h2>Invalid or expired close token.</h2>", status=403)
+                    return
+
+                result = _close_weekly_ic(position)
+
+                # Update state
+                position["status"] = "CLOSED"
+                position["closed_at"] = datetime.now(timezone(timedelta(hours=5, minutes=30))).isoformat()
+                position["close_result"] = result
+                WEEKLY_IC_POSITION_FILE.write_text(json.dumps(position, indent=2, default=str))
+                WEEKLY_IC_PENDING_FILE.write_text(json.dumps(position, indent=2, default=str))
+
+                legs_txt = "\n".join(
+                    f'  {"✅" if r["ok"] else "❌"} {r["label"]}'
+                    for r in result["legs"]
+                )
+                status_txt = "All 4 legs closed ✅" if result["ok"] else "⚠️ Some close orders failed"
+                _send_weekly_ic_telegram(
+                    f"🔴 <b>Weekly IC Closed — {position.get('expiry')}</b>\n\n"
+                    f"{legs_txt}\n\n"
+                    f"<b>{status_txt}</b>"
+                )
+
+                html = _weekly_ic_close_page(position, result)
+                self._send_html(html)
+            except Exception as exc:
+                self._send_html(f"<h2>Error</h2><pre>{exc}</pre>", status=500)
             return
 
         # Serve static frontend
