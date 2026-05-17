@@ -387,10 +387,11 @@ def _telegram_entry_msg(plan: dict, token: str) -> str:
         f"{conf_emoji} <b>Confidence: {plan['confidence_label']} ({plan['confidence']}/8)</b>\n"
         f"{notes}\n\n"
         f"{'─'*36}\n"
-        f"<b>👇 Tap to deploy (places all 4 orders):</b>\n"
+        f"<b>👇 Deploy Wednesday morning when market opens (9:15 AM+):</b>\n"
         f"<a href='{deploy_url}'>✅ DEPLOY TRADE</a>\n\n"
-        f"<i>Exit: Next Tuesday before 3:20 PM\n"
-        f"Or tap when ready: <a href='{close_later_url}'>🔴 CLOSE ALL LEGS</a></i>"
+        f"<i>⏰ Market is closed now — tap the link Wednesday 9:15 AM onwards.\n"
+        f"Exit: Next Tuesday before 3:20 PM\n"
+        f"Close link (use Tuesday morning): <a href='{close_later_url}'>🔴 CLOSE ALL LEGS</a></i>"
     )
 
 
