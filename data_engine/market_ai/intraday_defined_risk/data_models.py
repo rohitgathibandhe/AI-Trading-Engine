@@ -50,9 +50,9 @@ class AdaptiveParameters:
     width_preference_penalty: float = 1.25
     shadow_sessions: int = 5
     bearish_trade_score_threshold: float = 6.5
-    bullish_trade_score_threshold: float = 7.5
+    bullish_trade_score_threshold: float = 7.0
     bearish_trade_margin: float = 1.5
-    bullish_trade_margin: float = 2.0
+    bullish_trade_margin: float = 1.8
     failed_breakout_transition_shadow_buffer: float = 0.25
 
     def clamped(self) -> "AdaptiveParameters":
@@ -254,6 +254,7 @@ class MarketSnapshot:
     slippage_points: float = 0.0
     previous_option_chain: OptionsChainSnapshot | None = None
     previous_session_close: float | None = None
+    nifty_daily: OhlcvSeries | None = None  # Last N daily bars for multi-timeframe trend context
 
     def validate(self) -> None:
         self.nifty_5m.validate()

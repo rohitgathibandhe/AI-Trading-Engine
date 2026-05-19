@@ -50,6 +50,7 @@ from .features import (
     session_bars,
     sideways_bullish_reclaim_setup,
     put_call_ratio_by_oi,
+    compute_daily_trend_features,
 )
 
 
@@ -866,6 +867,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     current_pcr = put_call_ratio_by_oi(snapshot.option_chain.quotes)
     previous_pcr = put_call_ratio_by_oi(previous_quotes or [])
     pcr_trend = compute_pcr_trend(snapshot.option_chain.quotes, previous_quotes)
+    daily_tf = compute_daily_trend_features(snapshot.nifty_daily)
     support_ref = support_5m[0] if support_5m else (support_15m[0] if support_15m else None)
     resistance_ref = resistance_5m[0] if resistance_5m else (resistance_15m[0] if resistance_15m else None)
     session_open = bars_5m[0].open if bars_5m else None
@@ -909,6 +911,17 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "pcr_by_oi": round(current_pcr, 4) if current_pcr is not None else None,
         "previous_pcr_by_oi": round(previous_pcr, 4) if previous_pcr is not None else None,
         "pcr_trend": pcr_trend,
+        # Multi-timeframe daily context
+        "daily_trend": daily_tf["daily_trend"],
+        "daily_bias_score": daily_tf["daily_bias_score"],
+        "daily_ema20": daily_tf["daily_ema20"],
+        "daily_ema50": daily_tf["daily_ema50"],
+        "daily_ema200": daily_tf["daily_ema200"],
+        "weekly_high": daily_tf["weekly_high"],
+        "weekly_low": daily_tf["weekly_low"],
+        "daily_atr": daily_tf["daily_atr"],
+        "price_vs_ema50_pct": daily_tf["price_vs_ema50_pct"],
+        "higher_tf_available": daily_tf["higher_tf_available"],
         "bullish_entry_ready": False,
         "bullish_setup": None,
         "bullish_support_quality_score": 0.0,
@@ -2621,6 +2634,19 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         effective_bearish_threshold = max(5.45, params.bearish_trade_score_threshold - 0.9)
         effective_bearish_margin = max(0.8, params.bearish_trade_margin - 0.7)
 
+    # Symmetric dynamic relaxation for bullish side
+    effective_bullish_threshold = params.bullish_trade_score_threshold
+    effective_bullish_margin = params.bullish_trade_margin
+    if market_state == "TREND_UP":
+        effective_bullish_threshold = max(6.1, params.bullish_trade_score_threshold - 0.3)
+        effective_bullish_margin = max(1.1, params.bullish_trade_margin - 0.3)
+    elif market_state == "TRANSITION":
+        effective_bullish_threshold = max(5.9, params.bullish_trade_score_threshold - 0.4)
+        effective_bullish_margin = max(1.0, params.bullish_trade_margin - 0.4)
+    elif market_state == "DIRECTIONAL_BALANCE":
+        effective_bullish_threshold = max(5.5, params.bullish_trade_score_threshold - 0.8)
+        effective_bullish_margin = max(0.8, params.bullish_trade_margin - 0.7)
+
     bearish_failure_context = failure_type in {"FAILED_BREAKOUT", "FAILED_RECLAIM", "FAILED_BOUNCE", "BEARISH_REJECTION_TRANSITION", "ACCEPTED_BREAKDOWN"}
     directional_balance_tradable = bool(
         market_state == "DIRECTIONAL_BALANCE"
@@ -2703,9 +2729,9 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["range_penalty_score"] = round(range_penalty_score, 4)
     metadata["structure_is_monetizable"] = bool(max(bearish_monetization_score, bullish_monetization_score) >= 2.5)
     metadata["trade_score_margin_bearish"] = round(effective_bearish_margin, 4)
-    metadata["trade_score_margin_bullish"] = params.bullish_trade_margin
+    metadata["trade_score_margin_bullish"] = round(effective_bullish_margin, 4)
     metadata["bearish_trade_score_threshold"] = round(effective_bearish_threshold, 4)
-    metadata["bullish_trade_score_threshold"] = params.bullish_trade_score_threshold
+    metadata["bullish_trade_score_threshold"] = round(effective_bullish_threshold, 4)
     metadata["state_confidence"] = state_confidence_score
     if tradability_class == "TRADABLE":
         reasons.append(tradability_reason)

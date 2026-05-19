@@ -329,9 +329,9 @@ def select_strategy(
     open_space_up = float(metadata.get("open_space_up") or 0.0)
     overhead_call_pressure_score = float(metadata.get("overhead_call_pressure_score") or 0.0)
     bearish_margin = float(metadata.get("trade_score_margin_bearish") or 1.5)
-    bullish_margin = float(metadata.get("trade_score_margin_bullish") or 2.0)
+    bullish_margin = float(metadata.get("trade_score_margin_bullish") or 1.8)
     bearish_threshold = float(metadata.get("bearish_trade_score_threshold") or 6.5)
-    bullish_threshold = float(metadata.get("bullish_trade_score_threshold") or 7.5)
+    bullish_threshold = float(metadata.get("bullish_trade_score_threshold") or 7.0)
     if now_time < time(9, 15):
         reasons.append("Pre-market entry is not allowed.")
         return StrategyType.NO_TRADE, reasons
@@ -347,6 +347,20 @@ def select_strategy(
         return StrategyType.NO_TRADE, reasons
     if context_layer_active and tradability == REGIME_TRADABILITY_NOT_TRADABLE and str(metadata.get("playbook") or "UNKNOWN") != "RANGE_BALANCED_CONDOR":
         reasons.append(tradability_reason)
+        return StrategyType.NO_TRADE, reasons
+
+    # Multi-timeframe daily bias gate: block strongly counter-trend intraday trades
+    daily_trend = str(metadata.get("daily_trend") or "NEUTRAL")
+    daily_bias_score = int(metadata.get("daily_bias_score") or 0)
+    if regime_state.regime == RegimeLabel.DOWN_TREND and daily_trend == "STRONGLY_BULLISH":
+        reasons.append(
+            f"Daily trend is STRONGLY_BULLISH (bias_score={daily_bias_score}); short-side entry is blocked against the higher-timeframe trend."
+        )
+        return StrategyType.NO_TRADE, reasons
+    if regime_state.regime == RegimeLabel.UP_TREND and daily_trend == "STRONGLY_BEARISH":
+        reasons.append(
+            f"Daily trend is STRONGLY_BEARISH (bias_score={daily_bias_score}); long-side entry is blocked against the higher-timeframe trend."
+        )
         return StrategyType.NO_TRADE, reasons
 
     if regime_state.regime == RegimeLabel.DOWN_TREND:
