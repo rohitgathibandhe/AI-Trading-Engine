@@ -3,27 +3,28 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.algoagent.weekly_ic_close_alert</string>
+    <string>com.algoagent.weekly_ic_morning_review</string>
 
     <key>ProgramArguments</key>
     <array>
         <string>/Users/Rohit/.venvs/data_engine_py310/bin/python</string>
         <string>/Users/Rohit/AI-Trading-Engine/scripts/weekly_ic_executor.py</string>
-        <string>--close</string>
+        <string>--morning-review</string>
     </array>
 
-    <!-- Tuesday 3:00 PM IST — 20 min before 3:20 PM exit deadline — launchd uses local IST -->
+    <!-- Wednesday 9:00 AM IST — re-check overnight market conditions,
+         refresh strikes with live data, send updated deploy link -->
     <key>StartCalendarInterval</key>
     <dict>
-        <key>Weekday</key><integer>2</integer>
-        <key>Hour</key><integer>15</integer>
+        <key>Weekday</key><integer>3</integer>
+        <key>Hour</key><integer>9</integer>
         <key>Minute</key><integer>0</integer>
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Users/Rohit/AI-Trading-Engine/logs/weekly_ic_close_alert.log</string>
+    <string>/Users/Rohit/AI-Trading-Engine/logs/weekly_ic_morning_review.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/Rohit/AI-Trading-Engine/logs/weekly_ic_close_alert.log</string>
+    <string>/Users/Rohit/AI-Trading-Engine/logs/weekly_ic_morning_review.log</string>
     <key>RunAtLoad</key>
     <false/>
 </dict>

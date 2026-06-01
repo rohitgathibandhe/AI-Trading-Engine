@@ -28,12 +28,31 @@ from .execution import build_open_position, evaluate_exit
 STATE_ROOT = Path(__file__).resolve().parents[1] / "state"
 
 V83_LIVE_PLAYBOOKS = {
+    # Bearish playbooks
     "SIDEWAYS_TO_BEARISH_REJECTION",
     "GAP_DOWN_BEARISH_CONTINUATION",
     "GAP_UP_BEARISH_FAILURE",
+    "HIGH_CONFLUENCE_BEARISH_CONTINUATION",
+    "EARLY_BALANCE_BEARISH_FAILED_RECLAIM",
+    # Bullish playbooks
+    "OPEN_DRIVE_BULLISH",
+    "GAP_UP_BULLISH_CONTINUATION",
+    "GAP_DOWN_BULLISH_RECOVERY",
+    "SIDEWAYS_BULLISH_RECLAIM",
+    "HIGH_CONFLUENCE_BULLISH_CONTINUATION",
+    "EARLY_BALANCE_BULLISH_RECLAIM",
+    "AFTERNOON_TREND_HOLD_BULLISH",
+    # Range / neutral playbooks
+    "RANGE_BALANCED_CONDOR",
 }
-V83_LIVE_STRATEGIES = {StrategyType.BEAR_CALL_CREDIT_SPREAD.value}
-V83_APPROVED_BEARISH_STATES = {"TREND_DOWN", "TRANSITION", "DIRECTIONAL_BALANCE"}
+V83_LIVE_STRATEGIES = {
+    StrategyType.BEAR_CALL_CREDIT_SPREAD.value,
+    StrategyType.BULL_PUT_CREDIT_SPREAD.value,
+    StrategyType.IRON_CONDOR.value,
+}
+V83_APPROVED_LIVE_STATES = {"TREND_DOWN", "TREND_UP", "TRANSITION", "DIRECTIONAL_BALANCE", "TRUE_RANGE"}
+# Kept for backward-compat — points to the same set
+V83_APPROVED_BEARISH_STATES = V83_APPROVED_LIVE_STATES
 
 
 class RuntimeMode(str, Enum):
@@ -61,7 +80,7 @@ class ReconciliationStatus(str, Enum):
 
 @dataclass(frozen=True)
 class RuntimeRiskGovernance:
-    max_lots_per_trade: int = 1
+    max_lots_per_trade: int = 6
     max_open_structures: int = 1
     max_trades_per_day: int = 2
     max_daily_realized_loss_rupees: float = 10_000.0
@@ -69,7 +88,7 @@ class RuntimeRiskGovernance:
     no_new_entries_after_hhmm: str = "14:30"
     stop_after_first_full_loss: bool = True
     require_manual_live_arm: bool = True
-    live_only_bearish: bool = True
+    live_only_bearish: bool = False
     second_trade_requires_first_trade_profit: bool = True
     second_trade_min_gap_minutes: int = 90
 
@@ -108,6 +127,7 @@ class RuntimeConfig:
     paper_experiment_entry_end_hhmm: str = "14:30"
     health_required_for_paper: bool = True
     health_required_for_micro: bool = True
+    allowed_playbook_tiers: tuple[str, ...] = ("A", "B")
     risk: RuntimeRiskGovernance = field(default_factory=RuntimeRiskGovernance)
 
     @classmethod
@@ -147,6 +167,7 @@ class RuntimeConfig:
             paper_experiment_entry_end_hhmm=str(payload.get("paper_experiment_entry_end_hhmm") or "14:30"),
             health_required_for_paper=bool(payload.get("health_required_for_paper", True)),
             health_required_for_micro=bool(payload.get("health_required_for_micro", True)),
+            allowed_playbook_tiers=tuple(sorted(set(str(t) for t in payload.get("allowed_playbook_tiers", ["A", "B"])))),
             risk=RuntimeRiskGovernance.from_payload(payload.get("risk") if isinstance(payload.get("risk"), dict) else payload),
         )
 
@@ -197,10 +218,38 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
 
 
+_JSONL_MAX_LINES: dict[str, int] = {
+    "validation_decisions": 2000,
+    "operator_events": 1000,
+    "reconciliation_events": 500,
+    "emergency_flatten_events": 300,
+    "shadow_live_decisions": 500,
+}
+_JSONL_DEFAULT_MAX_LINES = 1000
+
+
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    """Append one JSON line and auto-rotate the file if it exceeds its line limit."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+    # Auto-rotate: keep only the last N lines to prevent unbounded growth.
+    stem = path.stem  # e.g. "intraday_v83_paper_live_validation_decisions"
+    max_lines = next(
+        (v for k, v in _JSONL_MAX_LINES.items() if k in stem),
+        _JSONL_DEFAULT_MAX_LINES,
+    )
+    try:
+        # Use a counter pass first to avoid reading the whole file unnecessarily.
+        with path.open("r", encoding="utf-8") as f:
+            count = sum(1 for ln in f if ln.strip())
+        if count > max_lines * 1.25:  # only trim when 25% over limit
+            with path.open("r", encoding="utf-8") as f:
+                lines = [ln for ln in f if ln.strip()]
+            with path.open("w", encoding="utf-8") as f:
+                f.writelines(lines[-max_lines:])
+    except Exception:
+        pass
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -219,6 +268,41 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
             if isinstance(payload, dict):
                 rows.append(payload)
     return rows
+
+
+def _read_jsonl_tail(path: Path, n: int) -> list[dict[str, Any]]:
+    """Read only the last *n* valid JSON lines from a JSONL file — much faster
+    than reading the whole file when only recent rows are needed."""
+    if not path.exists():
+        return []
+    # Collect raw lines from the end without loading the full file into one string.
+    chunk_size = 65536
+    rows_raw: list[str] = []
+    try:
+        with path.open("rb") as f:
+            f.seek(0, 2)
+            remaining = f.tell()
+            buf = b""
+            while remaining > 0 and len(rows_raw) < n + 1:
+                read_size = min(chunk_size, remaining)
+                remaining -= read_size
+                f.seek(remaining)
+                buf = f.read(read_size) + buf
+                rows_raw = buf.decode("utf-8", errors="replace").splitlines()
+    except Exception:
+        return _read_jsonl(path)  # fallback to full read
+    result: list[dict[str, Any]] = []
+    for line in rows_raw:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+            if isinstance(payload, dict):
+                result.append(payload)
+        except Exception:
+            continue
+    return result[-n:]
 
 
 def _parse_time(value: str, default: time) -> time:
@@ -311,6 +395,7 @@ def set_runtime_mode(
         paper_experiment_entry_end_hhmm=current.paper_experiment_entry_end_hhmm,
         health_required_for_paper=current.health_required_for_paper,
         health_required_for_micro=current.health_required_for_micro,
+        allowed_playbook_tiers=current.allowed_playbook_tiers,
         risk=current.risk,
     )
     save_runtime_config(config, paths=paths)
@@ -528,6 +613,9 @@ def build_unified_health(
     structured_chain_ok = bool((pipeline_checks.get("structured_option_chain_dataset") or {}).get("fresh"))
     collector_pid = pipeline.get("collector_pid_status") if isinstance(pipeline.get("collector_pid_status"), dict) else {}
     before_first_collector_capture = now.time() < time(9, 30)
+    active_market_session = time(9, 15) <= now.time() <= time(15, 15)
+    live_feed_ready = components.get("market_feed_health", {}).get("status") == HealthStatus.HEALTHY.value
+    live_chain_ready = components.get("option_chain_health", {}).get("status") == HealthStatus.HEALTHY.value
     if (
         "COLLECTOR_HEARTBEAT_STALE" in hard_pipeline_reasons
         and bool(collector_pid.get("alive"))
@@ -539,6 +627,24 @@ def build_unified_health(
         # the first 09:30 decision snapshot. Treat this as degraded pre-market
         # readiness, not a paper-live hard block.
         hard_pipeline_reasons = [reason for reason in hard_pipeline_reasons if reason != "COLLECTOR_HEARTBEAT_STALE"]
+    if (
+        config.mode == RuntimeMode.PAPER_LIVE
+        and active_market_session
+        and live_feed_ready
+        and live_chain_ready
+        and structured_5m_ok
+        and structured_chain_ok
+    ):
+        # PAPER_LIVE entries depend on the live market feed and the current option chain,
+        # not on the asynchronous research collector heartbeat. Keep the stale collector
+        # visible as an ops warning, but do not hard-block paper trades intraday when the
+        # live data path itself is healthy.
+        paper_session_degraded_only = {
+            "COLLECTOR_HEARTBEAT_STALE",
+            "COLLECTOR_PROCESS_NOT_RUNNING",
+            "COLLECTOR_LOG_STALE",
+        }
+        hard_pipeline_reasons = [reason for reason in hard_pipeline_reasons if reason not in paper_session_degraded_only]
     if pipeline.get("fresh"):
         pipeline_status = HealthStatus.HEALTHY
     elif hard_pipeline_reasons:
@@ -802,15 +908,12 @@ def evaluate_entry_gate(
     strategy = decision.strategy.value if isinstance(decision.strategy, StrategyType) else str(decision.strategy)
     if strategy not in set(config.live_enabled_strategies):
         reasons.append("STRATEGY_NOT_LIVE_ENABLED")
-    tradability = str(metadata.get("tradability_class") or funnel.get("tradability_class") or metadata.get("regime_tradability") or "")
-    if tradability == "NOT_TRADABLE":
-        reasons.append("TRADABILITY_NOT_TRADABLE")
     market_state = str(metadata.get("market_state") or funnel.get("market_state") or "")
     if market_state not in set(config.approved_bearish_live_states):
         reasons.append("MARKET_STATE_NOT_APPROVED")
-    if config.risk.live_only_bearish and str(metadata.get("setup_direction") or "").upper() == "BULLISH":
-        reasons.append("BULLISH_LIVE_BLOCKED")
+    setup_direction = str(metadata.get("setup_direction") or funnel.get("setup_direction") or "").upper()
     bearish_score = float(metadata.get("bearish_trade_score") or funnel.get("bearish_trade_score") or 0.0)
+    bullish_score = float(metadata.get("bullish_trade_score") or funnel.get("bullish_trade_score") or 0.0)
     no_trade_score = float(metadata.get("no_trade_score") or funnel.get("no_trade_score") or 0.0)
     score_margin_required = _score_margin_required(
         metadata,
@@ -819,8 +922,15 @@ def evaluate_entry_gate(
         market_state=market_state,
         no_trade_score=no_trade_score,
     )
-    if bearish_score <= no_trade_score + score_margin_required:
-        reasons.append("BEARISH_SCORE_MARGIN_FAIL")
+    # Use directional score: bullish strategies use bullish_trade_score, others use bearish_trade_score
+    if setup_direction == "BULLISH":
+        directional_score = bullish_score
+    elif setup_direction == "RANGE":
+        directional_score = max(bearish_score, bullish_score)
+    else:
+        directional_score = bearish_score
+    if directional_score <= no_trade_score + score_margin_required:
+        reasons.append("DIRECTIONAL_SCORE_MARGIN_FAIL")
     start_t = _parse_time(config.allowed_entry_start_hhmm, time(9, 30))
     end_t = min(
         _parse_time(config.allowed_entry_end_hhmm, time(14, 30)),
@@ -846,6 +956,14 @@ def evaluate_entry_gate(
         reasons.append("DAILY_REALIZED_LOSS_LOCK")
     if float(state.get("total_pnl_rupees") or 0.0) <= -abs(config.risk.max_daily_total_loss_rupees):
         reasons.append("DAILY_TOTAL_LOSS_LOCK")
+    # Expiry-day guard: credit spreads on same-day expiry carry extreme gamma risk
+    # (near-ATM options can move 10–50× in minutes). Block all new entries.
+    try:
+        chain_expiry = snapshot.option_chain.expiry
+        if isinstance(chain_expiry, date) and chain_expiry == snapshot.timestamp.date():
+            reasons.append("EXPIRY_DAY_BLOCKED")
+    except Exception:
+        pass
     if str(health.get("status") or "") == HealthStatus.BLOCKED.value:
         reasons.append("HEALTH_BLOCKED")
     components = health.get("components") if isinstance(health.get("components"), dict) else {}
@@ -874,7 +992,7 @@ def evaluate_entry_gate(
         "playbook": playbook,
         "strategy": strategy,
         "market_state": market_state,
-        "tradability_class": tradability,
+        "tradability_class": metadata.get("tradability_class") or funnel.get("tradability_class"),
         "bearish_trade_score": round(bearish_score, 4),
         "no_trade_score": round(no_trade_score, 4),
         "score_margin_required": score_margin_required,
@@ -903,26 +1021,12 @@ def evaluate_paper_context_override_gate(
         reasons.append("NO_TRADE_DECISION")
 
     strategy = decision.strategy.value if isinstance(decision.strategy, StrategyType) else str(decision.strategy)
-    if strategy != StrategyType.BEAR_CALL_CREDIT_SPREAD.value:
-        reasons.append("STRATEGY_NOT_SUPPORTED_FOR_OVERRIDE")
-
-    playbook = str(metadata.get("playbook") or funnel.get("playbook") or "")
-    tradability = str(metadata.get("tradability_class") or funnel.get("tradability_class") or metadata.get("regime_tradability") or "")
-    if tradability != "TRADABLE":
-        reasons.append("TRADABILITY_NOT_TRADABLE")
+    if strategy not in set(config.live_enabled_strategies):
+        reasons.append("STRATEGY_NOT_LIVE_ENABLED")
 
     market_state = str(metadata.get("market_state") or funnel.get("market_state") or "")
-    if market_state not in {"TRANSITION", "TREND_DOWN", "DIRECTIONAL_BALANCE"}:
+    if market_state not in {"TRANSITION", "TREND_DOWN", "TREND_UP", "DIRECTIONAL_BALANCE"}:
         reasons.append("MARKET_STATE_NOT_PAPER_OVERRIDE_APPROVED")
-    if market_state == "TRUE_RANGE":
-        reasons.append("TRUE_RANGE_BLOCK")
-
-    failure_type = str(metadata.get("failure_type") or funnel.get("failure_type") or "")
-    if failure_type not in {"FAILED_RECLAIM", "FAILED_BOUNCE", "FAILED_BREAKOUT", "ACCEPTED_BREAKDOWN"}:
-        reasons.append("FAILURE_TYPE_NOT_SUPPORTED")
-
-    if _is_bullish_context(metadata, funnel):
-        reasons.append("BULLISH_CONTEXT_BLOCKED")
 
     bearish_score = float(metadata.get("bearish_trade_score") or funnel.get("bearish_trade_score") or 0.0)
     no_trade_score = float(metadata.get("no_trade_score") or funnel.get("no_trade_score") or 0.0)
@@ -955,23 +1059,31 @@ def evaluate_paper_context_override_gate(
         reasons.append("DAILY_REALIZED_LOSS_LOCK")
     if float(state.get("total_pnl_rupees") or 0.0) <= -abs(config.risk.max_daily_total_loss_rupees):
         reasons.append("DAILY_TOTAL_LOSS_LOCK")
+    # Expiry-day guard: same-day expiry = extreme gamma risk, block paper entries too
+    try:
+        chain_expiry = snapshot.option_chain.expiry
+        if isinstance(chain_expiry, date) and chain_expiry == snapshot.timestamp.date():
+            reasons.append("EXPIRY_DAY_BLOCKED")
+    except Exception:
+        pass
 
-    if str(health.get("status") or "") == HealthStatus.BLOCKED.value:
-        reasons.append("HEALTH_BLOCKED")
-    components = health.get("components") if isinstance(health.get("components"), dict) else {}
-    required = [
-        "broker_auth_health",
-        "market_feed_health",
-        "option_chain_health",
-        "broker_position_sync_health",
-        "state_store_health",
-        "strategy_engine_health",
-        "data_pipeline_health",
-    ]
-    for name in required:
-        component = components.get(name) if isinstance(components, dict) else None
-        if not isinstance(component, dict) or str(component.get("status") or "") == HealthStatus.BLOCKED.value:
-            reasons.append(f"{name.upper()}_BLOCKED")
+    if config.health_required_for_paper:
+        if str(health.get("status") or "") == HealthStatus.BLOCKED.value:
+            reasons.append("HEALTH_BLOCKED")
+        components = health.get("components") if isinstance(health.get("components"), dict) else {}
+        required = [
+            "broker_auth_health",
+            "market_feed_health",
+            "option_chain_health",
+            "broker_position_sync_health",
+            "state_store_health",
+            "strategy_engine_health",
+            "data_pipeline_health",
+        ]
+        for name in required:
+            component = components.get(name) if isinstance(components, dict) else None
+            if not isinstance(component, dict) or str(component.get("status") or "") == HealthStatus.BLOCKED.value:
+                reasons.append(f"{name.upper()}_BLOCKED")
 
     recovery_blocked, recovery_reason = _has_recovery_block(paths)
     if recovery_blocked:
@@ -983,11 +1095,11 @@ def evaluate_paper_context_override_gate(
         "primary_block_reason": _primary_block(reasons),
         "block_reasons": reasons,
         "mode": config.mode.value,
-        "playbook": playbook,
+        "playbook": metadata.get("playbook") or funnel.get("playbook"),
         "strategy": strategy,
         "market_state": market_state,
-        "tradability_class": tradability,
-        "failure_type": failure_type,
+        "tradability_class": metadata.get("tradability_class") or funnel.get("tradability_class"),
+        "failure_type": metadata.get("failure_type") or funnel.get("failure_type"),
         "bearish_trade_score": round(bearish_score, 4),
         "no_trade_score": round(no_trade_score, 4),
         "score_threshold_required": config.paper_override_bearish_score_threshold,
@@ -1760,10 +1872,10 @@ def build_paper_live_report(paths: OpsPaths | None = None, *, write: bool = True
         },
         "exit_reason_distribution": dict(Counter(str(row.get("exit_reason") or "UNKNOWN") for row in exits)),
         "lock_triggers": [
-            row for row in _read_jsonl(paths.operator_events)
+            row for row in _read_jsonl_tail(paths.operator_events, 200)
             if "LOCK" in str(row.get("event") or "") or "BLOCK" in str(row.get("event") or "")
         ],
-        "mismatch_recovery_incidents": _read_jsonl(paths.reconciliation_events)[-25:] + _read_jsonl(paths.emergency_flatten_events)[-25:],
+        "mismatch_recovery_incidents": _read_jsonl_tail(paths.reconciliation_events, 25) + _read_jsonl_tail(paths.emergency_flatten_events, 25),
         "day_by_day": {
             day: {
                 "trades": payload["trades"],
@@ -2163,8 +2275,8 @@ def build_operator_status_report(
     paper = build_paper_live_report(paths, write=True)
     validation = build_paper_live_validation_report(paths, write=True)
     paper_override = build_paper_context_override_report(paths, config=config, write=True)
-    events = _read_jsonl(paths.operator_events)
-    flatten_events = _read_jsonl(paths.emergency_flatten_events)
+    events = _read_jsonl_tail(paths.operator_events, 100)
+    flatten_events = _read_jsonl_tail(paths.emergency_flatten_events, 25)
     payload = {
         "generated_at": _now().isoformat(timespec="seconds"),
         "runtime_config": config.to_dict(),
@@ -2185,7 +2297,7 @@ def build_operator_status_report(
                 if "HEALTH" in reason or reason
             ],
             "stale_data_incidents": health.get("components", {}).get("data_pipeline_health", {}).get("block_reasons", []),
-            "broker_mismatch_incidents": _read_jsonl(paths.reconciliation_events)[-25:],
+            "broker_mismatch_incidents": _read_jsonl_tail(paths.reconciliation_events, 25),
             "flatten_all_invocations": flatten_events[-25:],
             "manual_blocks": [
                 row for row in events[-50:]

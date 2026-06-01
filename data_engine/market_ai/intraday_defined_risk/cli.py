@@ -5,6 +5,11 @@ import json
 from pathlib import Path
 
 from .backtest import run_backtest
+from .backtest_dataset_tools import (
+    build_dense_backtest_dataset,
+    compare_benchmark_results,
+    inspect_backtest_dataset,
+)
 from .collector import capture_decision_time_snapshot, run_daily_chain_schedule, run_decision_time_schedule
 from .dataset import (
     assess_structured_dataset,
@@ -60,6 +65,23 @@ def build_parser() -> argparse.ArgumentParser:
     backtest_parser.add_argument("--output_json")
     backtest_parser.add_argument("--entry_times", default="AUTO")
     backtest_parser.add_argument("--round_trip_cost_rupees_per_lot", type=float, default=0.0)
+    backtest_parser.add_argument("--fail_on_sparse_dataset", action="store_true")
+
+    inspect_dataset_parser = subparsers.add_parser("inspect_dataset")
+    inspect_dataset_parser.add_argument("--data_path", required=True)
+    inspect_dataset_parser.add_argument("--start")
+    inspect_dataset_parser.add_argument("--end")
+
+    dense_dataset_parser = subparsers.add_parser("build_dataset")
+    dense_dataset_parser.add_argument("--rolling_root", required=True)
+    dense_dataset_parser.add_argument("--start", required=True)
+    dense_dataset_parser.add_argument("--end", required=True)
+    dense_dataset_parser.add_argument("--interval", default="5m")
+    dense_dataset_parser.add_argument("--output_path", required=True)
+
+    compare_parser = subparsers.add_parser("compare_results")
+    compare_parser.add_argument("--old_json", required=True)
+    compare_parser.add_argument("--new_json", required=True)
 
     calibrate_parser = subparsers.add_parser("calibrate")
     calibrate_parser.add_argument("--window", type=int, default=60)
@@ -229,6 +251,7 @@ def main(argv: list[str] | None = None) -> int:
             end=args.end,
             entry_times=None if args.entry_times.upper() == "AUTO" else {piece.strip() for piece in args.entry_times.split(",") if piece.strip()},
             round_trip_cost_rupees_per_lot=args.round_trip_cost_rupees_per_lot,
+            fail_on_sparse_dataset=args.fail_on_sparse_dataset,
         )
         summary_json = json.dumps(result["summary"], indent=2, sort_keys=True)
         if args.output_json:
@@ -236,6 +259,23 @@ def main(argv: list[str] | None = None) -> int:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(summary_json + "\n")
         print(summary_json)
+        return 0
+    if args.command == "inspect_dataset":
+        report = inspect_backtest_dataset(args.data_path, start=args.start, end=args.end)
+        print(report.to_json())
+        return 0
+    if args.command == "build_dataset":
+        report = build_dense_backtest_dataset(
+            args.rolling_root,
+            args.output_path,
+            start_date=args.start,
+            end_date=args.end,
+            interval=args.interval,
+        )
+        print(report.to_json())
+        return 0
+    if args.command == "compare_results":
+        print(json.dumps(compare_benchmark_results(args.old_json, args.new_json), indent=2, sort_keys=True))
         return 0
     if args.command == "calibrate":
         store = LearningStore(args.db_path)

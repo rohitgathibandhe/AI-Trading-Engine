@@ -35,6 +35,8 @@ import requests
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "data_engine"))
 
+from market_ai.dhan_wrapper import DhanWrapper  # noqa: E402
+
 STATE_DIR  = ROOT / "data_engine" / "market_ai" / "state"
 CREDS_FILE = STATE_DIR / "creds.json"
 PENDING_FILE  = STATE_DIR / "weekly_ic_pending.json"
@@ -109,13 +111,11 @@ def _get_nifty_ltp(creds: dict) -> float | None:
 
 def _get_raw_chain(creds: dict, expiry: str) -> dict[str, Any]:
     try:
-        r = requests.post(
-            "https://api.dhan.co/optionchain",
-            headers=_dhan_headers(creds),
-            json={"UnderlyingScrip": 13, "UnderlyingSeg": "IDX_I", "Expiry": expiry},
-            timeout=10,
+        dw = DhanWrapper(
+            dhan_client_id=str(creds.get("client_id") or "").strip(),
+            access_token=str(creds.get("access_token") or "").strip(),
         )
-        return r.json()
+        return dw.get_option_chain(13, "IDX_I", expiry) or {}
     except Exception as e:
         print(f"[chain] {e}", file=sys.stderr)
         return {}
@@ -228,11 +228,13 @@ def _select_legs(
     strikes  = parsed["strikes"]
     available = analysis["available_strikes"]
 
-    # Short strikes: 1.15× expected move, pulled in toward OI wall, snapped to 50pt grid
+    # Short strikes: 1.15× expected move, pulled toward OI wall but never closer than 0.9× em
     raw_sc = spot + em * 1.15
     raw_sp = spot - em * 1.15
-    short_call_raw = min(raw_sc, analysis["call_wall"] - 50)
-    short_put_raw  = max(raw_sp, analysis["put_wall"]  + 50)
+    min_sc = spot + em * 0.9   # floor: never let wall drag short call too close to spot
+    max_sp = spot - em * 0.9   # ceiling: symmetric for puts
+    short_call_raw = max(min_sc, min(raw_sc, analysis["call_wall"] - 50))
+    short_put_raw  = min(max_sp, max(raw_sp, analysis["put_wall"]  + 50))
     short_call = _round_strike(short_call_raw)
     short_put  = _round_strike(short_put_raw)
     long_call  = short_call + WING_WIDTH_CALL
@@ -370,28 +372,27 @@ def _telegram_entry_msg(plan: dict, token: str) -> str:
     sid_status = "✅" if all([plan.get("sc_sid"), plan.get("lc_sid"), plan.get("sp_sid"), plan.get("lp_sid")]) else "⚠️ (some IDs missing — verify manually)"
 
     return (
-        f"📊 <b>Weekly IC Plan — Expiry {plan['expiry']}</b>\n"
-        f"NIFTY spot: <b>{plan['spot_at_entry']:,.0f}</b>  |  "
+        f"📋 <b>Weekly IC Preview — Expiry {plan['expiry']}</b>\n"
+        f"NIFTY spot at close: <b>{plan['spot_at_entry']:,.0f}</b>  |  "
         f"Expected move: ±{plan.get('expected_move', '?')} pts\n\n"
-        f"<b>4 Legs ({plan['lots']} lots × {LOT_SIZE} units = {plan['quantity']} qty each)</b>\n\n"
+        f"<b>Tentative legs ({plan['lots']} lots × {LOT_SIZE} = {plan['quantity']} qty each)</b>\n\n"
         f"  📉 SELL {plan['short_call']:,.0f} CE  @ ~{plan['sc_ltp']:.1f}\n"
         f"  🛡 BUY  {plan['long_call']:,.0f} CE  @ ~{plan['lc_ltp']:.1f}\n"
         f"  📈 SELL {plan['short_put']:,.0f} PE  @ ~{plan['sp_ltp']:.1f}\n"
         f"  🛡 BUY  {plan['long_put']:,.0f} PE  @ ~{plan['lp_ltp']:.1f}\n\n"
-        f"Security IDs: {sid_status}\n\n"
-        f"Net credit:      ~Rs {plan['gross_credit']:,.0f}\n"
-        f"Target (70%):    ~Rs {plan['target_keep']:,.0f}/week\n"
-        f"Max loss:         Rs {plan['max_loss']:,.0f} (one side breach)\n"
-        f"Stop at loss:     Rs {plan['stop_trigger_loss']:,.0f}\n"
-        f"Margin needed:   ~Rs {plan['margin_required']:,.0f}\n\n"
+        f"Net credit:    ~₹{plan['gross_credit']:,.0f}\n"
+        f"Target (70%):  ~₹{plan['target_keep']:,.0f}/week\n"
+        f"Max loss:       ₹{plan['max_loss']:,.0f}  |  Stop: ₹{plan['stop_trigger_loss']:,.0f}\n"
+        f"Margin needed: ~₹{plan['margin_required']:,.0f}\n\n"
         f"{conf_emoji} <b>Confidence: {plan['confidence_label']} ({plan['confidence']}/8)</b>\n"
         f"{notes}\n\n"
         f"{'─'*36}\n"
-        f"<b>👇 Deploy Wednesday morning when market opens (9:15 AM+):</b>\n"
-        f"<a href='{deploy_url}'>✅ DEPLOY TRADE</a>\n\n"
-        f"<i>⏰ Market is closed now — tap the link Wednesday 9:15 AM onwards.\n"
-        f"Exit: Next Tuesday before 3:20 PM\n"
-        f"Close link (use Tuesday morning): <a href='{close_later_url}'>🔴 CLOSE ALL LEGS</a></i>"
+        f"⏳ <b>DO NOT deploy yet.</b>\n"
+        f"A fresh morning review fires at <b>9:00 AM tomorrow</b> with updated strikes "
+        f"based on live market data.\n\n"
+        f"<i>Overnight gaps or news can shift optimal strikes significantly. "
+        f"Deploy only after the 9 AM refresh confirms the plan.</i>\n\n"
+        f"<i>Close link (use next Tuesday morning): <a href='{close_later_url}'>🔴 CLOSE ALL LEGS</a></i>"
     )
 
 
@@ -416,6 +417,425 @@ def _telegram_close_msg(position: dict, token: str) -> str:
         f"<b>👇 Tap to close all 4 legs:</b>\n"
         f"<a href='{close_url}'>🔴 CLOSE ALL LEGS NOW</a>"
     )
+
+
+# ── morning review flow ───────────────────────────────────────────────────────
+
+def run_morning_review(force: bool = False) -> None:
+    """Wednesday 9:00 AM IST — refresh pending IC plan with live market data.
+
+    The entry plan is built Tuesday at 3:35 PM on post-close data.  Overnight
+    gaps, news, or regime shifts can make those strikes dangerous by Wednesday
+    morning.  This step:
+
+      1. Checks whether a PENDING plan exists (from the previous evening).
+      2. Re-fetches live spot + option chain for next Tuesday's expiry.
+      3. Re-selects optimal strikes using *current* market data.
+      4. Saves an updated pending plan (overwrites the stale one).
+      5. Sends a fresh Telegram with updated strikes + a live deploy link.
+         The user decides whether to deploy based on the morning context.
+
+    If market conditions have deteriorated (IV > 28%, chain not available, etc.)
+    it sends a SKIP alert and marks the plan as CANCELLED so the stale link
+    can no longer deploy.
+    """
+    now = datetime.now(IST)
+    weekday = now.weekday()   # 2 = Wednesday
+
+    if not force:
+        if weekday != 2:
+            print(f"[weekly_ic_review] Not Wednesday — skipping (today={now.strftime('%A')}).")
+            return
+        hhmm = now.hour * 100 + now.minute
+        if hhmm < 900:
+            print("[weekly_ic_review] Before 9:00 AM IST — skipping.")
+            return
+
+    # Load the pending plan from last evening
+    pending = _load_pending()
+    if not pending or pending.get("status") not in ("PENDING", None):
+        print("[weekly_ic_review] No pending plan to review — nothing to do.")
+        return
+
+    plan_age_hours = 0.0
+    try:
+        created = datetime.fromisoformat(str(pending.get("created_at") or ""))
+        plan_age_hours = (now - created).total_seconds() / 3600.0
+    except Exception:
+        pass
+
+    creds = _load_creds()
+    bot_token = str(creds.get("telegram_bot_token") or "").strip()
+    chat_id   = str(creds.get("telegram_chat_id") or "").strip()
+    if not bot_token or not chat_id:
+        print("[weekly_ic_review] Telegram not configured.")
+        return
+
+    expiry_str = str(pending.get("expiry") or "")
+    old_sc = pending.get("short_call")
+    old_sp = pending.get("short_put")
+    old_spot = pending.get("spot_at_entry")
+
+    print(f"[weekly_ic_review] Refreshing plan for {expiry_str} (plan was {plan_age_hours:.1f}h old) ...")
+
+    # Re-fetch live market data
+    # Market data is not available before 9:15 AM IST — if we're pre-market,
+    # send a plan-summary (no fresh data needed) and defer to the 10:15 AM assessment.
+    pre_market = (now.hour * 100 + now.minute) < 915
+    spot = _get_nifty_ltp(creds)
+    if not spot:
+        if pre_market:
+            # Normal — market hasn't opened yet. Just remind about the plan.
+            _send_telegram(bot_token, chat_id,
+                f"🌅 <b>Weekly IC Plan Ready — {expiry_str}</b>\n\n"
+                f"Market not yet open (data available after 9:15 AM).\n\n"
+                f"<b>Tentative strikes (built on Tuesday close data):</b>\n"
+                f"  📉 SELL {old_sc:,.0f} CE  |  📈 SELL {old_sp:,.0f} PE\n"
+                f"  Spot at plan: {old_spot:,.0f}  |  Credit: ~₹{pending.get('gross_credit',0):,.0f}\n\n"
+                f"⏳ <b>Market assessment fires at 10:15 AM</b> with live data.\n"
+                f"Strikes will be re-validated before any deploy link is issued.\n\n"
+                f"<i>No action needed — assessment runs automatically.</i>"
+            )
+            print(f"[weekly_ic_review] Pre-market (before 9:15 AM) — no live data. "
+                  f"Sent plan reminder. Assessment fires at 10:15 AM.")
+            return
+        # Post 9:15 AM with no spot = real failure (token issue)
+        _send_telegram(bot_token, chat_id,
+            f"⚠️ <b>Weekly IC Morning Review — FAILED</b>\n\n"
+            f"Could not fetch live NIFTY spot. Dhan token may have expired.\n\n"
+            f"<i>Stale plan (spot={old_spot:,.0f}, SC={old_sc}, SP={old_sp}) is still pending "
+            f"but NOT recommended to deploy without fresh data.</i>"
+        )
+        return
+
+    spot_move = round(spot - old_spot, 1) if old_spot else 0
+    spot_move_str = f"+{spot_move:+,.0f}" if spot_move >= 0 else f"{spot_move:,.0f}"
+
+    raw = _get_raw_chain(creds, expiry_str)
+    parsed = _parse_chain(raw, spot)
+
+    if not parsed["strikes"]:
+        # Cancel the stale plan so the old link cannot fire
+        pending["status"] = "CANCELLED"
+        PENDING_FILE.write_text(json.dumps(pending, indent=2))
+        _send_telegram(bot_token, chat_id,
+            f"⏭ <b>Weekly IC Morning Review — SKIPPED</b>\n\n"
+            f"Option chain for {expiry_str} is not available.\n"
+            f"Stale plan cancelled — do NOT deploy.\n\n"
+            f"Spot now: {spot:,.0f}  (was {old_spot:,.0f}, move={spot_move_str})"
+        )
+        return
+
+    analysis = _analyse(parsed)
+    if not analysis["ok"] or analysis["avg_iv"] > 28:
+        pending["status"] = "CANCELLED"
+        PENDING_FILE.write_text(json.dumps(pending, indent=2))
+        reason = f"IV={analysis['avg_iv']:.1f}% too high (>28%)" if analysis["avg_iv"] > 28 else analysis.get("reason", "Analysis failed")
+        _send_telegram(bot_token, chat_id,
+            f"⏭ <b>Weekly IC Morning Review — CONDITIONS CHANGED, SKIP</b>\n\n"
+            f"{reason}\n"
+            f"Stale plan cancelled — holding cash this week.\n\n"
+            f"Spot now: {spot:,.0f}  (was {old_spot:,.0f}, move={spot_move_str})"
+        )
+        return
+
+    # Rebuild fresh plan
+    new_plan = _select_legs(parsed, analysis, expiry_str, lots=DEFAULT_LOTS)
+    if new_plan is None:
+        pending["status"] = "CANCELLED"
+        PENDING_FILE.write_text(json.dumps(pending, indent=2))
+        _send_telegram(bot_token, chat_id,
+            f"⏭ <b>Weekly IC Morning Review — NO VALID LEGS</b>\n\n"
+            f"Spot moved to {spot:,.0f} (was {old_spot:,.0f}, {spot_move_str}).\n"
+            f"Could not build valid IC legs — strikes too close or zero credit.\n"
+            f"Stale plan cancelled."
+        )
+        return
+
+    new_plan["avg_iv"]        = analysis["avg_iv"]
+    new_plan["expected_move"] = analysis["expected_move"]
+    new_plan["pcr"]           = analysis["pcr"]
+
+    # Generate a fresh token (invalidates the old deploy link)
+    new_token = str(uuid.uuid4()).replace("-", "")[:16]
+    _save_pending(new_plan, new_token)
+
+    # Strike change summary
+    sc_chg = f"{new_plan['short_call']:,.0f} (was {old_sc:,.0f})" if old_sc != new_plan["short_call"] else f"{new_plan['short_call']:,.0f} ✓ unchanged"
+    sp_chg = f"{new_plan['short_put']:,.0f} (was {old_sp:,.0f})" if old_sp != new_plan["short_put"] else f"{new_plan['short_put']:,.0f} ✓ unchanged"
+
+    conf_emoji = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}.get(new_plan["confidence_label"], "⚪")
+    notes = "\n".join(f"  {n}" for n in new_plan["confidence_notes"])
+    deploy_url = f"{UI_BASE}/api/weekly_ic/deploy?token={new_token}"
+
+    msg = (
+        f"🌅 <b>Weekly IC Morning Review — {expiry_str}</b>\n"
+        f"Spot: <b>{spot:,.0f}</b>  (overnight move: {spot_move_str} pts)\n\n"
+        f"<b>Updated strikes (refreshed from live chain):</b>\n"
+        f"  📉 SELL {new_plan['short_call']:,.0f} CE  →  {sc_chg}\n"
+        f"  🛡 BUY  {new_plan['long_call']:,.0f} CE\n"
+        f"  📈 SELL {new_plan['short_put']:,.0f} PE  →  {sp_chg}\n"
+        f"  🛡 BUY  {new_plan['long_put']:,.0f} PE\n\n"
+        f"Net credit: ~₹{new_plan['gross_credit']:,.0f}  |  "
+        f"Max loss: ₹{new_plan['max_loss']:,.0f}\n"
+        f"IV: {new_plan['avg_iv']:.1f}%  |  Expected move: ±{new_plan['expected_move']:.0f} pts\n\n"
+        f"{conf_emoji} <b>Confidence: {new_plan['confidence_label']} ({new_plan['confidence']}/8)</b>\n"
+        f"{notes}\n\n"
+        f"{'─'*36}\n"
+        f"⏳ <b>Market assessment fires at 10:15 AM.</b>\n"
+        f"If structure looks good, a deploy link will be sent then.\n"
+        f"<i>Opening range needs to settle before entry — avoid 9:15 AM volatility.</i>"
+    )
+    ok = _send_telegram(bot_token, chat_id, msg)
+    print(f"[weekly_ic_review] Refreshed. SC={new_plan['short_call']}, SP={new_plan['short_put']}. "
+          f"Spot move={spot_move_str}. Token={new_token}. Telegram={'OK' if ok else 'FAILED'}. "
+          f"Deploy link withheld — assessment fires at 10:15 AM.")
+
+
+# ── 10:15 AM market assessment ────────────────────────────────────────────────
+
+# Thresholds for the 10:15 AM gate
+_MAX_IV_AT_ENTRY       = 22.0   # % — above this, IC premium looks good but gamma risk is high
+_MIN_SPOT_MARGIN_RATIO = 0.80   # spot must be ≥ 80% of expected_move away from both short strikes
+_MAX_DAY_RANGE_RATIO   = 0.50   # day's high-low range must be < 50% of expected weekly move
+_PCR_LOW               = 0.70   # below this = very bearish (call writers dominating)
+_PCR_HIGH              = 1.80   # above this = very complacent (put writers dominating)
+
+
+def _get_nifty_ohlc_today(creds: dict) -> dict[str, float | None]:
+    """Fetch today's OHLC for NIFTY from Dhan intraday endpoint."""
+    try:
+        r = requests.post(
+            "https://api.dhan.co/v2/charts/intraday",
+            headers=_dhan_headers(creds),
+            json={
+                "securityId": "13",
+                "exchangeSegment": "IDX_I",
+                "instrument": "INDEX",
+                "interval": "5",
+                "oi": False,
+            },
+            timeout=10,
+        )
+        d = r.json()
+        opens  = d.get("open")  or []
+        highs  = d.get("high")  or []
+        lows   = d.get("low")   or []
+        closes = d.get("close") or []
+        if not closes:
+            return {"open": None, "high": None, "low": None, "close": None, "candles": 0}
+        return {
+            "open":    float(opens[0])   if opens   else None,
+            "high":    float(max(highs)) if highs   else None,
+            "low":     float(min(lows))  if lows    else None,
+            "close":   float(closes[-1]) if closes  else None,
+            "candles": len(closes),
+        }
+    except Exception as e:
+        print(f"[ohlc] {e}", file=sys.stderr)
+        return {"open": None, "high": None, "low": None, "close": None, "candles": 0}
+
+
+def run_market_assessment(force: bool = False) -> None:
+    """Wednesday 10:15 AM IST — multi-factor gate before issuing IC deploy link.
+
+    Checks after the opening range has established (~1 hour of price action):
+
+      1. Opening range contained   — day high-low < 50% of weekly expected move
+      2. IV settled                — ATM IV < 22% (not a panic/volatile day)
+      3. Spot safety margin        — spot ≥ 80% of expected_move from both short strikes
+      4. PCR balanced              — between 0.70 and 1.80 (no extreme skew)
+      5. Enough candles            — at least 8 × 5-min candles (= 40 min of data)
+
+    If all gates pass  → sends Telegram with a fresh deploy link (valid deploy token).
+    If any gate fails  → sends a conditional alert explaining which factor failed,
+                         with guidance ("wait until 11 AM" or "skip this week").
+    If conditions are  → borderline (2+ warnings), sends deploy link with caution note.
+    """
+    now = datetime.now(IST)
+    weekday = now.weekday()  # 2 = Wednesday
+
+    if not force:
+        if weekday != 2:
+            print(f"[weekly_ic_assess] Not Wednesday — skipping (today={now.strftime('%A')}).")
+            return
+        hhmm = now.hour * 100 + now.minute
+        if hhmm < 1015:
+            print("[weekly_ic_assess] Before 10:15 AM IST — skipping.")
+            return
+
+    pending = _load_pending()
+    if not pending or pending.get("status") not in ("PENDING", None):
+        print("[weekly_ic_assess] No pending plan — nothing to assess.")
+        return
+
+    creds = _load_creds()
+    bot_token = str(creds.get("telegram_bot_token") or "").strip()
+    chat_id   = str(creds.get("telegram_chat_id") or "").strip()
+    if not bot_token or not chat_id:
+        print("[weekly_ic_assess] Telegram not configured.")
+        return
+
+    expiry_str    = str(pending.get("expiry") or "")
+    planned_sc    = float(pending.get("short_call") or 0)
+    planned_sp    = float(pending.get("short_put")  or 0)
+    expected_move = float(pending.get("expected_move") or 400)
+    plan_credit   = float(pending.get("gross_credit") or 0)
+
+    print(f"[weekly_ic_assess] Assessing market for {expiry_str} IC entry ...")
+
+    # ── Fetch live data ───────────────────────────────────────────────────────
+    spot = _get_nifty_ltp(creds)
+    if not spot:
+        _send_telegram(bot_token, chat_id,
+            f"⚠️ <b>Weekly IC Assessment — FAILED (10:15 AM)</b>\n\n"
+            f"Cannot fetch NIFTY spot. Dhan token may have expired.\n"
+            f"Please check manually and deploy if conditions look safe."
+        )
+        return
+
+    ohlc    = _get_nifty_ohlc_today(creds)
+    raw     = _get_raw_chain(creds, expiry_str)
+    parsed  = _parse_chain(raw, spot)
+    analysis = _analyse(parsed) if parsed["strikes"] else {}
+
+    # Current IV from live chain (fallback to plan's IV)
+    current_iv  = float(analysis.get("avg_iv") or pending.get("avg_iv") or 15.0)
+    current_pcr = float(analysis.get("pcr")    or pending.get("pcr")    or 1.0)
+
+    # Day range
+    day_high   = ohlc.get("high")
+    day_low    = ohlc.get("low")
+    day_open   = ohlc.get("open")
+    num_candles = int(ohlc.get("candles") or 0)
+    day_range  = (day_high - day_low) if (day_high and day_low) else None
+
+    # Spot distance to short strikes (positive = safe side)
+    sc_margin = planned_sc - spot   # call side: spot below SC
+    sp_margin = spot - planned_sp   # put side:  spot above SP
+    min_required_margin = expected_move * _MIN_SPOT_MARGIN_RATIO
+
+    # ── Gate checks ───────────────────────────────────────────────────────────
+    gates: list[tuple[bool, str, str]] = []   # (passed, label, detail)
+
+    # 1. Enough opening data
+    gates.append((
+        num_candles >= 8,
+        "Opening data",
+        f"{num_candles} × 5-min candles  {'✅' if num_candles >= 8 else '⚠️ (< 40 min data)'}"
+    ))
+
+    # 2. Opening range contained
+    if day_range is not None:
+        range_ratio = day_range / expected_move
+        gates.append((
+            range_ratio < _MAX_DAY_RANGE_RATIO,
+            "Day range",
+            f"Range={day_range:.0f} pts = {range_ratio*100:.0f}% of expected move "
+            f"{'✅' if range_ratio < _MAX_DAY_RANGE_RATIO else '⚠️ trending day — IC risky'}"
+        ))
+    else:
+        gates.append((False, "Day range", "⚠️ Could not fetch intraday OHLC"))
+
+    # 3. IV settled
+    gates.append((
+        current_iv <= _MAX_IV_AT_ENTRY,
+        "IV",
+        f"ATM IV={current_iv:.1f}%  "
+        f"{'✅ settled' if current_iv <= _MAX_IV_AT_ENTRY else f'⚠️ elevated (>{_MAX_IV_AT_ENTRY}%) — wider spreads'}"
+    ))
+
+    # 4. Spot margin from short strikes
+    call_safe = sc_margin >= min_required_margin
+    put_safe  = sp_margin >= min_required_margin
+    gates.append((
+        call_safe and put_safe,
+        "Strike margin",
+        f"Call side: {sc_margin:.0f} pts {'✅' if call_safe else '🚨 too close'}  |  "
+        f"Put side: {sp_margin:.0f} pts {'✅' if put_safe else '🚨 too close'}  "
+        f"(min={min_required_margin:.0f})"
+    ))
+
+    # 5. PCR balanced
+    gates.append((
+        _PCR_LOW <= current_pcr <= _PCR_HIGH,
+        "PCR",
+        f"PCR={current_pcr:.2f}  "
+        f"{'✅ balanced' if _PCR_LOW <= current_pcr <= _PCR_HIGH else ('⚠️ extremely bearish' if current_pcr < _PCR_LOW else '⚠️ extremely complacent')}"
+    ))
+
+    passed   = [g for g in gates if g[0]]
+    failed   = [g for g in gates if not g[0]]
+    n_passed = len(passed)
+    n_gates  = len(gates)
+
+    # ── Decision ─────────────────────────────────────────────────────────────
+    gate_lines = "\n".join(f"  {'✅' if g[0] else '❌'} {g[1]}: {g[2]}" for g in gates)
+
+    if n_passed == n_gates:
+        # All clear — issue deploy link
+        new_token = str(uuid.uuid4()).replace("-", "")[:16]
+        pending["token"] = new_token
+        pending["assessment_at"] = now.isoformat()
+        PENDING_FILE.write_text(json.dumps(pending, indent=2))
+        deploy_url = f"{UI_BASE}/api/weekly_ic/deploy?token={new_token}"
+
+        msg = (
+            f"🟢 <b>Weekly IC — ALL CLEAR — Deploy when ready</b>\n"
+            f"Expiry: {expiry_str}  |  Spot: {spot:,.0f}\n\n"
+            f"<b>Gates (10:15 AM assessment):</b>\n{gate_lines}\n\n"
+            f"<b>Position:</b>\n"
+            f"  📉 SELL {planned_sc:,.0f} CE  |  📈 SELL {planned_sp:,.0f} PE\n"
+            f"  Credit: ~₹{plan_credit:,.0f}  |  IV: {current_iv:.1f}%  |  PCR: {current_pcr:.2f}\n\n"
+            f"<b>👇 Tap after 10:15 AM when ready:</b>\n"
+            f"<a href='{deploy_url}'>✅ DEPLOY IC NOW</a>\n\n"
+            f"<i>Exit next Tuesday before 3:20 PM IST</i>"
+        )
+        result_str = "ALL_CLEAR"
+
+    elif n_passed >= n_gates - 1:
+        # One failure — caution deploy
+        new_token = str(uuid.uuid4()).replace("-", "")[:16]
+        pending["token"] = new_token
+        pending["assessment_at"] = now.isoformat()
+        PENDING_FILE.write_text(json.dumps(pending, indent=2))
+        deploy_url = f"{UI_BASE}/api/weekly_ic/deploy?token={new_token}"
+
+        msg = (
+            f"🟡 <b>Weekly IC — BORDERLINE — Deploy with caution</b>\n"
+            f"Expiry: {expiry_str}  |  Spot: {spot:,.0f}\n\n"
+            f"<b>Gates (10:15 AM assessment):</b>\n{gate_lines}\n\n"
+            f"<b>Caution:</b> {failed[0][2]}\n"
+            f"Consider waiting until 11:00 AM if conditions improve.\n\n"
+            f"<b>Position if you proceed:</b>\n"
+            f"  📉 SELL {planned_sc:,.0f} CE  |  📈 SELL {planned_sp:,.0f} PE\n"
+            f"  Credit: ~₹{plan_credit:,.0f}  |  IV: {current_iv:.1f}%  |  PCR: {current_pcr:.2f}\n\n"
+            f"<b>👇 Deploy only if you are comfortable with the risk:</b>\n"
+            f"<a href='{deploy_url}'>⚠️ DEPLOY IC (CAUTION)</a>"
+        )
+        result_str = "BORDERLINE"
+
+    else:
+        # 2+ failures — skip or wait
+        pending["status"] = "ASSESSMENT_HOLD"
+        PENDING_FILE.write_text(json.dumps(pending, indent=2))
+
+        msg = (
+            f"🔴 <b>Weekly IC — NOT SUITABLE YET ({n_passed}/{n_gates} gates)</b>\n"
+            f"Expiry: {expiry_str}  |  Spot: {spot:,.0f}\n\n"
+            f"<b>Gates (10:15 AM assessment):</b>\n{gate_lines}\n\n"
+            f"<b>Recommendation:</b> Wait for conditions to improve.\n"
+            f"A re-check message will fire at <b>11:30 AM</b> — if still failing, skip this week.\n\n"
+            f"<i>No deploy link issued. Re-run manually if conditions change:\n"
+            f"python scripts/weekly_ic_executor.py --assess --now</i>"
+        )
+        result_str = "HOLD"
+
+    ok = _send_telegram(bot_token, chat_id, msg)
+    print(f"[weekly_ic_assess] Result={result_str} ({n_passed}/{n_gates}). "
+          f"IV={current_iv:.1f}% PCR={current_pcr:.2f} "
+          f"SC_margin={sc_margin:.0f} SP_margin={sp_margin:.0f}. "
+          f"Telegram={'OK' if ok else 'FAILED'}.")
 
 
 # ── entry flow ────────────────────────────────────────────────────────────────
@@ -489,7 +909,8 @@ def run_entry(force: bool = False) -> None:
     _save_pending(plan, token)
     msg = _telegram_entry_msg(plan, token)
     ok = _send_telegram(bot_token, chat_id, msg)
-    print(f"[weekly_ic] Plan sent. Confidence={plan['confidence_label']}. Token={token}. Telegram={'OK' if ok else 'FAILED'}.")
+    print(f"[weekly_ic] Plan saved. Confidence={plan['confidence_label']}. Token={token}. "
+          f"Telegram={'OK' if ok else 'FAILED'}. Morning review fires at 09:00 AM tomorrow.")
 
 
 # ── close flow ────────────────────────────────────────────────────────────────
@@ -529,11 +950,17 @@ def run_close_alert() -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Weekly IC Executor")
-    parser.add_argument("--now",   action="store_true", help="Force entry run (ignore day/time check)")
-    parser.add_argument("--close", action="store_true", help="Send close alert for open position")
+    parser.add_argument("--now",            action="store_true", help="Force run (ignore day/time check)")
+    parser.add_argument("--close",          action="store_true", help="Send close alert for open position")
+    parser.add_argument("--morning-review", action="store_true", help="Wednesday 9:00 AM — refresh pending plan")
+    parser.add_argument("--assess",         action="store_true", help="Wednesday 10:15 AM — market assessment gate")
     args = parser.parse_args()
 
     if args.close:
         run_close_alert()
+    elif args.morning_review:
+        run_morning_review(force=args.now)
+    elif args.assess:
+        run_market_assessment(force=args.now)
     else:
         run_entry(force=args.now)

@@ -217,11 +217,9 @@ def _load_dhan_creds(creds_path: str | Path | None = None) -> tuple[str, str]:
     else:
         candidates = _default_dhan_creds_candidates()
 
-    client_id = (os.environ.get("DHAN_CLIENT_ID") or "").strip()
-    token = (os.environ.get("DHAN_ACCESS_TOKEN") or "").strip()
-    if client_id and token:
-        return client_id, token
-
+    # Prefer persisted UI/runtime credentials over inherited shell env so
+    # long-running terminals do not keep using a stale token after the UI
+    # updates state/creds.json.
     for candidate in candidates:
         if not candidate.exists():
             continue
@@ -235,6 +233,11 @@ def _load_dhan_creds(creds_path: str | Path | None = None) -> tuple[str, str]:
             os.environ["DHAN_CLIENT_ID"] = client_id
             os.environ["DHAN_ACCESS_TOKEN"] = token
             return client_id, token
+
+    client_id = (os.environ.get("DHAN_CLIENT_ID") or "").strip()
+    token = (os.environ.get("DHAN_ACCESS_TOKEN") or "").strip()
+    if client_id and token:
+        return client_id, token
     raise DhanError("Missing DHAN credentials: update state/creds.json or export DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN")
 
 

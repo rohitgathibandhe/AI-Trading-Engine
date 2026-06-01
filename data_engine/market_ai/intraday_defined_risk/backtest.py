@@ -6,6 +6,7 @@ from datetime import date, datetime
 from pathlib import Path
 from statistics import mean, median
 
+from .backtest_dataset_tools import assess_dataset_density
 from .data_models import (
     AdaptiveParameters,
     AccountRiskLimits,
@@ -548,9 +549,19 @@ def run_backtest(
     experimental_policy: dict[str, object] | None = None,
     use_regime_tradability_layer: bool = True,
     use_market_state_engine: bool = False,
+    fail_on_sparse_dataset: bool = False,
 ) -> dict[str, object]:
     if reset_learning_db:
         Path(learning_db_path).unlink(missing_ok=True)
+    density_guardrail = assess_dataset_density(data_path, start=start, end=end)
+    if density_guardrail.warning_required:
+        message = (
+            "DATASET_DENSITY_LOW: result is not comparable to dense benchmark. "
+            f"reasons={','.join(density_guardrail.reasons)}"
+        )
+        print(message)
+        if fail_on_sparse_dataset:
+            raise ValueError(message)
     dataset = load_backtest_dataset(data_path)
     bars_5m = dataset["bars_5m"]
     bars_15m = dataset["bars_15m"]
@@ -801,6 +812,7 @@ def run_backtest(
         "experimental_policy": experimental_policy,
         "use_regime_tradability_layer": use_regime_tradability_layer,
         "use_market_state_engine": use_market_state_engine,
+        "dataset_density": density_guardrail.report.to_dict(),
     }
     funnel_report = _build_funnel_report(decisions, trades)
     summary["trade_funnel"] = funnel_report
@@ -824,6 +836,7 @@ def run_backtest(
             experimental_policy=experimental_policy,
             use_regime_tradability_layer=use_regime_tradability_layer,
             use_market_state_engine=use_market_state_engine,
+            fail_on_sparse_dataset=False,
         )
         summary["opportunity_benchmark"] = opportunity_result["summary"]
         summary["opportunity_gap"] = {

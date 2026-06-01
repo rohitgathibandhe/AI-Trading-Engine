@@ -11,12 +11,12 @@
         <string>/Users/Rohit/AI-Trading-Engine/scripts/weekly_ic_executor.py</string>
     </array>
 
-    <!-- Tuesday 3:35 PM IST = 10:05 AM UTC -->
+    <!-- Tuesday 3:35 PM IST — launchd uses local system time (IST on this machine) -->
     <key>StartCalendarInterval</key>
     <dict>
         <key>Weekday</key><integer>2</integer>
-        <key>Hour</key><integer>10</integer>
-        <key>Minute</key><integer>5</integer>
+        <key>Hour</key><integer>15</integer>
+        <key>Minute</key><integer>35</integer>
     </dict>
 
     <key>StandardOutPath</key>

@@ -239,13 +239,20 @@ def evaluate_exit(
         pnl_rupees = (position.entry_credit_points - liability) * position.lot_size * position.lots
         return ExitDecision(True, "TIME_EXIT", liability, pnl_rupees)
 
+    entry_time = position.entry_time
+    if entry_time.tzinfo is None and now.tzinfo is not None:
+        entry_time = entry_time.replace(tzinfo=now.tzinfo)
+    elif entry_time.tzinfo is not None and now.tzinfo is None:
+        entry_time = entry_time.replace(tzinfo=None)
+    elapsed_minutes = max(int((now - entry_time).total_seconds() // 60), 0)
+
     quick_invalidation_reason = _intrabar_regime_invalidation_reason(position, current_snapshot, now=now)
     if quick_invalidation_reason:
         liability = current_value_points if current_value_points is not None else position.stop_value_points
         pnl_rupees = (position.entry_credit_points - liability) * position.lot_size * position.lots
         return ExitDecision(True, quick_invalidation_reason, liability, pnl_rupees)
 
-    invalidation_reason = _regime_invalidation_reason(position, current_snapshot, current_regime)
+    invalidation_reason = _regime_invalidation_reason(position, current_snapshot, current_regime, minutes_since_entry=elapsed_minutes)
     if invalidation_reason:
         liability = current_value_points if current_value_points is not None else position.stop_value_points
         pnl_rupees = (position.entry_credit_points - liability) * position.lot_size * position.lots
@@ -263,12 +270,6 @@ def evaluate_exit(
         return ExitDecision(True, structure_trail_reason, current_value_points, pnl_rupees)
     effective_target_capture = position.take_profit_capture_pct
     if current_snapshot is not None:
-        entry_time = position.entry_time
-        if entry_time.tzinfo is None and now.tzinfo is not None:
-            entry_time = entry_time.replace(tzinfo=now.tzinfo)
-        elif entry_time.tzinfo is not None and now.tzinfo is None:
-            entry_time = entry_time.replace(tzinfo=None)
-        elapsed_minutes = max(int((now - entry_time).total_seconds() // 60), 0)
         current_capture_pct = max(position.entry_credit_points - current_value_points, 0.0) / max(position.entry_credit_points, 0.01)
         if should_use_conviction_exit(
             position,
@@ -310,7 +311,12 @@ def evaluate_exit(
         short_delta_limit = BULLISH_PLAYBOOK_DELTA_SL
     short_deltas = [abs(leg.quote.delta) for leg in current_legs if leg.action == "SELL" and leg.quote.delta is not None]
     if short_deltas and max(short_deltas) >= short_delta_limit:
-        if (
+        # Skip DELTA_STOP in the first 3 minutes — short leg may have entered near
+        # the threshold (pre-existing condition at entry), causing a spurious exit
+        # on the very first poll before the position has had any time to develop.
+        if elapsed_minutes < 3:
+            pass  # hold — let the position breathe before applying delta stop
+        elif (
             position.structure.strategy == StrategyType.BULL_PUT_CREDIT_SPREAD
             and position.metadata.get("playbook") in {
                 "OPEN_DRIVE_BULLISH",
@@ -323,7 +329,8 @@ def evaluate_exit(
             and pnl_rupees > 0
         ):
             return ExitDecision(False, "HOLD", current_value_points, pnl_rupees)
-        return ExitDecision(True, "DELTA_STOP", current_value_points, pnl_rupees)
+        else:
+            return ExitDecision(True, "DELTA_STOP", current_value_points, pnl_rupees)
 
     return ExitDecision(False, "HOLD", current_value_points, pnl_rupees)
 
@@ -358,6 +365,8 @@ def _regime_invalidation_reason(
     position: OpenPosition,
     current_snapshot: MarketSnapshot | None,
     current_regime: RegimeState | None,
+    *,
+    minutes_since_entry: int = 0,
 ) -> str | None:
     if current_snapshot is None:
         return None
@@ -374,27 +383,33 @@ def _regime_invalidation_reason(
 
     spot = current_snapshot.option_chain.spot
     strategy = position.structure.strategy
+    # Closed-bar checks (n=2) use pre-existing bar history and can fire immediately
+    # after entry if the condition was already true before we entered. Require at least
+    # one complete 5-minute candle (5 minutes) to have formed since entry before
+    # triggering these — this prevents the thesis being invalidated by stale bars.
+    closed_bar_check_allowed = minutes_since_entry >= 5
     if strategy == StrategyType.BULL_PUT_CREDIT_SPREAD:
-        if spot < vwap and last_n_closes_below(vwap, bars, n=2):
+        if closed_bar_check_allowed and spot < vwap and last_n_closes_below(vwap, bars, n=2):
             return "VWAP_INVALIDATION"
     elif strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD:
         ema20_5m = ema_value(closes(bars), period=20)
-        if (
+        if closed_bar_check_allowed and (
             ema20_5m is not None
             and last_n_closes_above(ema20_5m, bars, n=2)
             and (vwap is None or last_n_closes_above(vwap, bars, n=2))
         ):
             return "EMA20_INVALIDATION"
-        if (
+        if closed_bar_check_allowed and (
             bullish_reversal_structure(bars)
             and ema20_5m is not None
             and bars[-1].close > ema20_5m
             and (vwap is None or last_n_closes_above(vwap, bars, n=2))
         ):
             return "REVERSAL_STRUCTURE"
-        if spot > vwap and last_n_closes_above(vwap, bars, n=2):
+        if closed_bar_check_allowed and spot > vwap and last_n_closes_above(vwap, bars, n=2):
             return "VWAP_INVALIDATION"
     elif strategy == StrategyType.IRON_CONDOR:
+        # Regime change is a live signal, not a bar check — fire immediately.
         if current_regime is not None and current_regime.regime != RegimeLabel.RANGE:
             return "RANGE_INVALIDATION"
     return None

@@ -287,9 +287,18 @@ def playbook_time_window(
 
 def is_tradable_bearish_rejection(regime_state: RegimeState) -> bool:
     metadata = regime_state.metadata
-    upper_wick_fraction = float(metadata.get("bearish_upper_wick_fraction") or 0.0)
+    candle_pattern = str(metadata.get("bearish_candle_pattern") or "")
     close_location = float(metadata.get("bearish_close_location") or 1.0)
     rejection_quality_score = float(metadata.get("bearish_candle_quality_score") or 0.0)
+
+    # BEARISH_EXPANSION candles have near-zero upper wicks by definition — the body
+    # spans from open (near the high) to close (near the low), giving strong downside
+    # momentum. The upper_wick_fraction gate is meaningless for them; use close
+    # location and quality score instead.
+    if candle_pattern == "BEARISH_EXPANSION":
+        return bool(close_location <= 0.45 and rejection_quality_score >= 1.5)
+
+    upper_wick_fraction = float(metadata.get("bearish_upper_wick_fraction") or 0.0)
     return bool(
         upper_wick_fraction >= 0.50
         and close_location <= 0.45
@@ -419,7 +428,8 @@ def select_strategy(
             return StrategyType.NO_TRADE, reasons
         if playbook == "SIDEWAYS_TO_BEARISH_REJECTION" and not is_tradable_bearish_rejection(regime_state):
             reasons.append(
-                "Sideways-to-bearish rejection requires a high-quality rejection candle with upper wick >= 50% and a close in the lower 45% of the range."
+                "Sideways-to-bearish rejection requires a high-quality candle: either a BEARISH_EXPANSION (close in lower 45%, quality >= 1.5) "
+                "or a rejection wick candle (upper wick >= 50%, close in lower 45%, quality >= 0.55)."
             )
             return StrategyType.NO_TRADE, reasons
         if day_archetype == "GAP_UP_FAILURE" and (bearish_setup != "GAP_FAILURE" or playbook != "GAP_UP_BEARISH_FAILURE"):

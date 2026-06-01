@@ -180,6 +180,49 @@ def run_training_data_pipeline(
             current_day = today
             captured_times = _load_recorded_times(structured_root, today.isoformat())
 
+        if status_file:
+            pending_times = [item for item in decision_times if item not in captured_times]
+            if not _is_trading_day(today):
+                idle_status = {
+                    "status": "IDLE_NON_TRADING_DAY",
+                    "as_of": now.isoformat(),
+                    "session_date": today.isoformat(),
+                }
+            elif now.strftime("%H:%M") < "09:15":
+                idle_status = {
+                    "status": "PREMARKET_WAIT",
+                    "as_of": now.isoformat(),
+                    "session_date": today.isoformat(),
+                    "captured_times": sorted(captured_times),
+                    "pending_times": pending_times,
+                }
+            elif now.strftime("%H:%M") <= monitor_end:
+                idle_status = {
+                    "status": "WAITING_TO_CAPTURE",
+                    "as_of": now.isoformat(),
+                    "session_date": today.isoformat(),
+                    "captured_times": sorted(captured_times),
+                    "pending_times": pending_times,
+                }
+            elif today in refreshed_days:
+                idle_status = {
+                    "status": "REFRESHED_FOR_SESSION",
+                    "as_of": now.isoformat(),
+                    "session_date": today.isoformat(),
+                    "captured_times": sorted(captured_times),
+                    "pending_times": pending_times,
+                }
+            else:
+                idle_status = {
+                    "status": "WAITING_FOR_REFRESH_WINDOW",
+                    "as_of": now.isoformat(),
+                    "session_date": today.isoformat(),
+                    "captured_times": sorted(captured_times),
+                    "pending_times": pending_times,
+                    "refresh_after": refresh_after,
+                }
+            _write_status(status_file, idle_status)
+
         if _is_trading_day(today):
             if "09:15" <= now.strftime("%H:%M") <= monitor_end:
                 for decision_time in decision_times:
@@ -260,16 +303,6 @@ def run_training_data_pipeline(
                                 "error": str(exc),
                             },
                         )
-        else:
-            if status_file:
-                _write_status(
-                    status_file,
-                    {
-                        "status": "IDLE_NON_TRADING_DAY",
-                        "as_of": now.isoformat(),
-                        "session_date": today.isoformat(),
-                    },
-                )
         time.sleep(max(float(poll_seconds), 1.0))
     return reports
 

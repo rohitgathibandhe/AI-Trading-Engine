@@ -1305,3 +1305,117 @@ def option_chain_wall_migration(
         "bearish_wall_score": bearish_score,
         "wall_migration_bias": bias,
     }
+
+
+def _ema(values: list[float], period: int) -> float | None:
+    if len(values) < period:
+        return None
+    k = 2.0 / (period + 1)
+    ema = sum(values[:period]) / period
+    for v in values[period:]:
+        ema = v * k + ema * (1 - k)
+    return ema
+
+
+def compute_daily_trend_features(daily_series: OhlcvSeries | None) -> dict[str, object]:
+    """Multi-timeframe daily trend analysis for strategy bias.
+
+    Returns a dict with:
+    - daily_trend: STRONGLY_BULLISH / BULLISH / NEUTRAL / BEARISH / STRONGLY_BEARISH
+    - daily_bias_score: -3 (strongly bearish) to +3 (strongly bullish)
+    - daily_ema20, daily_ema50, daily_ema200
+    - weekly_high, weekly_low (last 5 trading days)
+    - daily_atr: average true range over last 14 days
+    - price_vs_ema20_pct, price_vs_ema50_pct
+    - higher_tf_available: bool
+    """
+    empty: dict[str, object] = {
+        "daily_trend": "NEUTRAL",
+        "daily_bias_score": 0,
+        "daily_ema20": None,
+        "daily_ema50": None,
+        "daily_ema200": None,
+        "weekly_high": None,
+        "weekly_low": None,
+        "daily_atr": None,
+        "price_vs_ema20_pct": None,
+        "price_vs_ema50_pct": None,
+        "higher_tf_available": False,
+    }
+    if daily_series is None or not daily_series.bars:
+        return empty
+
+    bars = daily_series.bars
+    closes = [b.close for b in bars]
+    highs = [b.high for b in bars]
+    lows = [b.low for b in bars]
+
+    last_close = closes[-1]
+    ema20 = _ema(closes, 20)
+    ema50 = _ema(closes, 50)
+    ema200 = _ema(closes, 200)
+
+    # Weekly levels: last 5 trading days
+    recent = bars[-5:] if len(bars) >= 5 else bars
+    weekly_high = max(b.high for b in recent)
+    weekly_low = min(b.low for b in recent)
+
+    # ATR (14-day)
+    atr: float | None = None
+    if len(bars) >= 15:
+        true_ranges: list[float] = []
+        for i in range(1, min(15, len(bars))):
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+            true_ranges.append(tr)
+        atr = fmean(true_ranges) if true_ranges else None
+
+    # Distance from EMAs
+    price_vs_ema20_pct = ((last_close - ema20) / ema20 * 100) if ema20 else None
+    price_vs_ema50_pct = ((last_close - ema50) / ema50 * 100) if ema50 else None
+
+    # Trend scoring: each alignment adds/subtracts from bias_score
+    bias_score = 0
+    if ema20 and ema50:
+        if last_close > ema20 > ema50:
+            bias_score += 2  # price above both short and medium EMAs
+        elif last_close > ema20:
+            bias_score += 1
+        elif last_close < ema20 < ema50:
+            bias_score -= 2
+        elif last_close < ema20:
+            bias_score -= 1
+    if ema200:
+        if last_close > ema200:
+            bias_score += 1
+        else:
+            bias_score -= 1
+
+    # Classify trend
+    if bias_score >= 3:
+        trend = "STRONGLY_BULLISH"
+    elif bias_score >= 1:
+        trend = "BULLISH"
+    elif bias_score <= -3:
+        trend = "STRONGLY_BEARISH"
+    elif bias_score <= -1:
+        trend = "BEARISH"
+    else:
+        trend = "NEUTRAL"
+
+    return {
+        "daily_trend": trend,
+        "daily_bias_score": bias_score,
+        "daily_ema20": round(ema20, 2) if ema20 else None,
+        "daily_ema50": round(ema50, 2) if ema50 else None,
+        "daily_ema200": round(ema200, 2) if ema200 else None,
+        "weekly_high": round(weekly_high, 2),
+        "weekly_low": round(weekly_low, 2),
+        "daily_atr": round(atr, 2) if atr else None,
+        "price_vs_ema20_pct": round(price_vs_ema20_pct, 3) if price_vs_ema20_pct is not None else None,
+        "price_vs_ema50_pct": round(price_vs_ema50_pct, 3) if price_vs_ema50_pct is not None else None,
+        "higher_tf_available": True,
+    }

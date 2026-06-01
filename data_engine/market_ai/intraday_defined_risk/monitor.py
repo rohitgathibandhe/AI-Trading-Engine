@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, time as dtime, timedelta, timezone
 from importlib import import_module
 from pathlib import Path
 from time import sleep
@@ -51,6 +51,10 @@ from .strategy import (
     select_strategy,
 )
 from .strikes import select_best_structure, select_structure
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+_MARKET_OPEN_TIME = dtime(9, 15)
+_MARKET_CLOSE_TIME = dtime(15, 35)
 
 ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT = 35.0
 MIN_NET_EDGE_RUPEES = 500.0
@@ -350,27 +354,14 @@ def _paper_context_override_candidate(
     inside_window = start_t <= snapshot.timestamp.time() <= end_t
     info["paper_experiment_window_allows"] = inside_window
 
-    allowed_failure_types = {"FAILED_RECLAIM", "FAILED_BOUNCE", "FAILED_BREAKOUT", "ACCEPTED_BREAKDOWN"}
     if market_state not in {"TRANSITION", "TREND_DOWN", "DIRECTIONAL_BALANCE"}:
         info["paper_candidate_reason"] = "MARKET_STATE_NOT_PAPER_OVERRIDE_APPROVED"
         return None, info
-    if tradability_class != "TRADABLE":
-        info["paper_candidate_reason"] = "TRADABILITY_NOT_TRADABLE"
-        return None, info
-    if failure_type not in allowed_failure_types:
-        info["paper_candidate_reason"] = "FAILURE_TYPE_NOT_SUPPORTED"
-        return None, info
-    if bearish_score < float(getattr(runtime_config, "paper_override_bearish_score_threshold", 6.0)):
+    if bearish_score < float(getattr(runtime_config, "paper_override_bearish_score_threshold", 5.0)):
         info["paper_candidate_reason"] = "PAPER_OVERRIDE_SCORE_TOO_LOW"
         return None, info
-    if bearish_score <= no_trade_score + float(getattr(runtime_config, "paper_override_margin", 1.0)):
+    if bearish_score <= no_trade_score + float(getattr(runtime_config, "paper_override_margin", 0.8)):
         info["paper_candidate_reason"] = "PAPER_OVERRIDE_MARGIN_FAIL"
-        return None, info
-    if setup_direction == "BULLISH" or state_bias == "BULLISH":
-        info["paper_candidate_reason"] = "BULLISH_CONTEXT_BLOCKED"
-        return None, info
-    if market_state == "TRUE_RANGE":
-        info["paper_candidate_reason"] = "TRUE_RANGE_BLOCK"
         return None, info
     if not inside_window:
         info["paper_candidate_reason"] = "PAPER_EXPERIMENT_WINDOW_CLOSED"
@@ -413,7 +404,11 @@ def _paper_context_override_candidate(
         info["spread_construction_status"] = "PASSED_RISK_BLOCKED"
         return None, info
 
-    expected_credit_rupees = max(structure.credit_points - snapshot.slippage_points, 0.0) * snapshot.lot_size * risk.lots
+    # Clamp lots to the ops-level max before building the decision so the override gate never hits LOTS_EXCEED_RUNTIME_LIMIT.
+    ops_max_lots = int(getattr(getattr(runtime_config, "risk", None), "max_lots_per_trade", None) or 6)
+    capped_lots = max(1, min(risk.lots, ops_max_lots))
+
+    expected_credit_rupees = max(structure.credit_points - snapshot.slippage_points, 0.0) * snapshot.lot_size * capped_lots
     expected_round_trip_cost_rupees = ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT * risk.lots
     expected_net_edge_rupees = expected_credit_rupees - expected_round_trip_cost_rupees
     playbook_min_edge = float(regime_metadata.get("minimum_net_edge_rupees") or 0.0)
@@ -439,7 +434,7 @@ def _paper_context_override_candidate(
         + structure_reasons,
         confidence_score=max(decision.confidence_score, regime_state.confidence),
         entry_time=snapshot.timestamp,
-        lots=risk.lots,
+        lots=capped_lots,
         lot_size=snapshot.lot_size,
         max_loss_rupees_per_lot=risk.max_loss_rupees_per_lot,
         slippage_points=snapshot.slippage_points,
@@ -517,7 +512,7 @@ class IntradayDefinedRiskAgent:
         learning_store: LearningStore | None = None,
         parameters: AdaptiveParameters | None = None,
         *,
-        allowed_playbook_tiers: tuple[str, ...] = ("A",),
+        allowed_playbook_tiers: tuple[str, ...] = ("A", "B"),
         benchmark_mode: str = "strict",
         experimental_policy: dict[str, object] | None = None,
         use_regime_tradability_layer: bool = True,
@@ -932,14 +927,37 @@ def run_live(config: dict[str, object]) -> None:
     provider = provider_cls(config)
     executor = executor_cls(config)
     learning_store = LearningStore(config.get("learning_db_path", "/tmp/intraday_defined_risk_learning.sqlite3"))
-    agent = IntradayDefinedRiskAgent(learning_store=learning_store)
     runtime_config = load_runtime_config()
+    _initial_tiers = tuple(getattr(runtime_config, "allowed_playbook_tiers", ("A", "B")))
+    agent = IntradayDefinedRiskAgent(learning_store=learning_store, allowed_playbook_tiers=_initial_tiers)
     if runtime_config.mode == RuntimeMode.PAPER_LIVE:
         agent.open_position = load_paper_position()
     poll_seconds = int(config.get("poll_seconds", 30))
+    _ops_poll_counter = 0
 
     while True:
+        _ops_poll_counter += 1
         runtime_config = load_runtime_config()
+        # Keep agent's allowed tiers in sync with runtime config (takes effect next evaluate call).
+        _tiers = tuple(getattr(runtime_config, "allowed_playbook_tiers", ("A", "B")))
+        if agent.allowed_playbook_tiers != _tiers:
+            agent.allowed_playbook_tiers = _tiers
+
+        # ── After-hours fast-skip ──────────────────────────────────────────────
+        # Between 15:35 and 09:15 IST there is nothing to trade. Sleep 5 minutes
+        # instead of 30 seconds so we don't generate ~1 080 wasted NO_TRADE
+        # decisions overnight (18 h × 60 decisions/h).
+        _ist_now = datetime.now(_IST)
+        if not (_MARKET_OPEN_TIME <= _ist_now.time() <= _MARKET_CLOSE_TIME):
+            _write_v83_agent_heartbeat(runtime_config=runtime_config, phase="v83_after_hours")
+            sleep(300)
+            continue
+        # ──────────────────────────────────────────────────────────────────────
+
+        # Throttle the expensive status-report build to every 5th poll (~150 s).
+        # On trade events / active positions the caller overrides this flag.
+        _should_report = (_ops_poll_counter % 5 == 0)
+
         _write_v83_agent_heartbeat(runtime_config=runtime_config, phase="v83_run_live_loop")
         try:
             snapshot = provider.current_snapshot()
@@ -973,7 +991,8 @@ def run_live(config: dict[str, object]) -> None:
                 data_status=data_status,
             )
             print(decision.to_json())
-            build_operator_status_report()
+            if _should_report:
+                build_operator_status_report()
             sleep(poll_seconds)
             continue
         health = build_unified_health(config=runtime_config, snapshot=snapshot)
@@ -988,7 +1007,8 @@ def run_live(config: dict[str, object]) -> None:
             log_validation_decision(decision, snapshot=snapshot, block_reason="LIVE_DISABLED")
             _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="LIVE_DISABLED")
             print(decision.to_json())
-            build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
+            if _should_report:
+                build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
             sleep(poll_seconds)
             continue
         if runtime_config.mode in {RuntimeMode.RESEARCH}:
@@ -996,7 +1016,8 @@ def run_live(config: dict[str, object]) -> None:
             log_validation_decision(decision, snapshot=snapshot, block_reason="RESEARCH_MODE")
             _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="RESEARCH_MODE")
             print(decision.to_json())
-            build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
+            if _should_report:
+                build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
             sleep(poll_seconds)
             continue
         if runtime_config.mode == RuntimeMode.PAPER_LIVE:
@@ -1168,7 +1189,10 @@ def run_live(config: dict[str, object]) -> None:
                     )
                 log_validation_decision(decision, snapshot=snapshot, paper_candidate=paper_candidate)
                 _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot)
-        build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
+        # Always build the status report when a position is active so the UI
+        # reflects real-time P&L; otherwise throttle to every 5th poll.
+        if _should_report or agent.open_position:
+            build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
         sleep(poll_seconds)
 
 

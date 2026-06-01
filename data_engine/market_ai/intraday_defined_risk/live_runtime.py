@@ -150,6 +150,47 @@ def _front_expiry(dw: Any, *, underlying_id: int, underlying_seg: str, today: da
     return sorted(valid)[0].isoformat()
 
 
+def _oi_signal_expiry(
+    dw: Any, *, underlying_id: int, underlying_seg: str, today: date, front_expiry_str: str
+) -> str:
+    """Return the expiry to use for OI-based signal computation.
+
+    On the first 2 trading days after a weekly expiry (e.g. Wednesday–Thursday),
+    the new front-week options series has near-zero open interest, which silences
+    all OI-pressure and wall signals.  In that case we load the *next* expiry chain
+    whose OI is mature, giving the regime engine meaningful directional signals.
+
+    Concretely: if front_expiry is ≥ 5 calendar days away (series ≤ 2 days old),
+    return the second expiry in the list; otherwise return front_expiry unchanged.
+    """
+    try:
+        front_date = date.fromisoformat(front_expiry_str)
+        days_to_expiry = (front_date - today).days
+        if days_to_expiry < 5:
+            # Series is established (3+ days old) — use front expiry as normal
+            return front_expiry_str
+        # Series is new (0–2 days old) — fetch the next-week expiry
+        expiries = []
+        if hasattr(dw, "get_optionchain_expirylist"):
+            expiries = list(dw.get_optionchain_expirylist(underlying_seg, underlying_id) or [])
+        valid = sorted(
+            date.fromisoformat(str(e).split("T", 1)[0])
+            for e in expiries
+            if date.fromisoformat(str(e).split("T", 1)[0]) > today
+        )
+        if len(valid) >= 2:
+            import logging
+            logging.getLogger("intraday_defined_risk.v83").info(
+                "[live_runtime] Post-expiry day (front=%s, %d days away): using next-week expiry %s "
+                "for OI signals to avoid zero-OI new-series bias.",
+                front_expiry_str, days_to_expiry, valid[1].isoformat(),
+            )
+            return valid[1].isoformat()
+    except Exception:
+        pass
+    return front_expiry_str
+
+
 def _quote_from_row(row: dict[str, Any]) -> OptionsContractQuote | None:
     try:
         option_type = OptionType(str(row.get("option_type") or "").upper())
@@ -224,6 +265,7 @@ class DhanLiveMarketDataProvider:
         self._previous_chain: OptionsChainSnapshot | None = None
         self._front_expiry_cache: tuple[date, str] | None = None
         self._previous_close_cache: tuple[date, float | None] | None = None
+        self._daily_bars_cache: tuple[date, list[OhlcvBar]] | None = None
 
     def _readiness_diagnostics(
         self,
@@ -313,11 +355,33 @@ class DhanLiveMarketDataProvider:
         self._previous_close_cache = (today, close)
         return close
 
+    def _daily_candles(self, today: date) -> list[OhlcvBar]:
+        if self._daily_bars_cache and self._daily_bars_cache[0] == today:
+            return self._daily_bars_cache[1]
+        if not hasattr(self._dw, "get_daily_candles"):
+            return []
+        try:
+            start = (today - timedelta(days=90)).isoformat()
+            end = (today - timedelta(days=1)).isoformat()
+            raw = self._dw.get_daily_candles(
+                self.underlying_id,
+                self.underlying_seg,
+                "INDEX",
+                from_date=start,
+                to_date=end,
+            )
+            bars = _bars_from_candles(raw or [])
+        except Exception:
+            bars = []
+        self._daily_bars_cache = (today, bars)
+        return bars
+
     def current_snapshot(self) -> MarketSnapshot:
         now = _now_ist_naive()
         today = now.date()
         bars_5m = self._candles(interval=5, today=today)
         bars_15m = self._candles(interval=15, today=today)
+        bars_daily = self._daily_candles(today)
         if len(bars_5m) < self.min_5m_candles:
             self._raise_insufficient(
                 "MIN_5M_CANDLES_NOT_READY",
@@ -343,12 +407,21 @@ class DhanLiveMarketDataProvider:
                 spot=spot,
             )
         expiry = str(self.config.get("expiry") or "") or self._cached_front_expiry(today)
-        chain_raw = self._dw.get_option_chain(self.underlying_id, self.underlying_seg, expiry)
+        # On post-expiry day (series ≤2 days old), OI in the new front-week chain is near-zero,
+        # silencing all option-chain pressure signals.  Load the next-week chain for OI signals.
+        oi_expiry = _oi_signal_expiry(
+            self._dw,
+            underlying_id=self.underlying_id,
+            underlying_seg=self.underlying_seg,
+            today=today,
+            front_expiry_str=expiry,
+        )
+        chain_raw = self._dw.get_option_chain(self.underlying_id, self.underlying_seg, oi_expiry)
         chain_rows = _flatten_option_chain_payload(
             chain_raw,
             timestamp=now,
             decision_time=now.strftime("%H:%M"),
-            expiry=expiry,
+            expiry=oi_expiry,
         )
         quotes = [_quote_from_row(dict(row)) for row in chain_rows]
         quotes = [quote for quote in quotes if quote is not None]
@@ -373,6 +446,7 @@ class DhanLiveMarketDataProvider:
         snapshot = MarketSnapshot(
             nifty_5m=OhlcvSeries(timeframe_minutes=5, bars=bars_5m),
             nifty_15m=OhlcvSeries(timeframe_minutes=15, bars=bars_15m),
+            nifty_daily=OhlcvSeries(timeframe_minutes=1440, bars=bars_daily) if bars_daily else None,
             option_chain=chain,
             risk_limits=AccountRiskLimits(
                 max_risk_rupees_per_trade=float(self.config.get("max_risk_rupees_per_trade") or 10_000.0),

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,28 @@ FRESHNESS_THRESHOLDS_SEC = {
     "collector_log": 60.0 * 30.0,
     "agent_heartbeat": 60.0 * 2.0,
 }
+
+_MARKET_CLOSE_IST = dt_time(15, 30)
+_MARKET_OPEN_IST = dt_time(9, 15)
+
+
+def _market_aware_stale_sec(base_sec: float, now: datetime) -> float:
+    """Extend staleness threshold when markets are closed (weekends, pre-open).
+
+    NIFTY data only updates during 09:15–15:30 IST on trading weekdays.
+    On weekends and before market open, the staleness clock should be anchored
+    to the last expected market-close, not wall-clock time.
+    """
+    weekday = now.weekday()  # 0=Monday … 6=Sunday
+    current_time = now.time().replace(tzinfo=None)
+    if weekday == 5:  # Saturday — data from Friday close, ~20-44h ago
+        return base_sec + 60.0 * 60.0 * 24.0
+    if weekday == 6:  # Sunday — data from Friday close, ~44-68h ago
+        return base_sec + 60.0 * 60.0 * 48.0
+    # Weekday before market open — data from previous close, ~18h old
+    if current_time < _MARKET_OPEN_IST:
+        return base_sec + 60.0 * 60.0 * 18.0
+    return base_sec
 
 
 def _now_ist() -> datetime:
@@ -158,25 +180,25 @@ def build_data_freshness_report(
         "structured_5m_dataset": _file_check(
             "structured_5m_dataset",
             structured_root / "nifty_5m.csv",
-            stale_after_sec=FRESHNESS_THRESHOLDS_SEC["structured_5m_dataset"],
+            stale_after_sec=_market_aware_stale_sec(FRESHNESS_THRESHOLDS_SEC["structured_5m_dataset"], now_ist),
             now=now_ist,
         ),
         "structured_option_chain_dataset": _file_check(
             "structured_option_chain_dataset",
             structured_root / "option_chain_decision_times.csv",
-            stale_after_sec=FRESHNESS_THRESHOLDS_SEC["structured_option_chain_dataset"],
+            stale_after_sec=_market_aware_stale_sec(FRESHNESS_THRESHOLDS_SEC["structured_option_chain_dataset"], now_ist),
             now=now_ist,
         ),
         "research_5m_dataset": _file_check(
             "research_5m_dataset",
             research_root / "nifty_5m.csv",
-            stale_after_sec=FRESHNESS_THRESHOLDS_SEC["research_5m_dataset"],
+            stale_after_sec=_market_aware_stale_sec(FRESHNESS_THRESHOLDS_SEC["research_5m_dataset"], now_ist),
             now=now_ist,
         ),
         "research_option_chain_dataset": _file_check(
             "research_option_chain_dataset",
             research_root / "options_chain.csv",
-            stale_after_sec=FRESHNESS_THRESHOLDS_SEC["research_option_chain_dataset"],
+            stale_after_sec=_market_aware_stale_sec(FRESHNESS_THRESHOLDS_SEC["research_option_chain_dataset"], now_ist),
             now=now_ist,
         ),
         "collector_heartbeat": _json_time_check(

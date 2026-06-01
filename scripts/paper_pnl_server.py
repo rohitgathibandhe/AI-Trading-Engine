@@ -22,7 +22,7 @@ import sys
 import traceback
 from datetime import datetime
 import time
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import HTTPServer, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import subprocess
@@ -36,8 +36,9 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 
-class ReusableHTTPServer(HTTPServer):
+class ReusableHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
+    daemon_threads = True
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -80,6 +81,9 @@ PID_FILE = STATE_DIR / "agent.pid"
 AGENT_ENTRY = ROOT / "data_engine" / "market_ai" / "start_agent.py"
 V83_RUN_CONFIG_JSON = STATE_DIR / "intraday_v83_run_live_config.json"
 V83_RUNNER_LOG = STATE_DIR / "intraday_v83_runner.log"
+V83_PAPER_STATE_JSON = STATE_DIR / "intraday_v83_paper_state.json"
+V83_RUNTIME_STATE_JSON = STATE_DIR / "intraday_v83_runtime_state.json"
+V83_PAPER_LIVE_TRADES_JSONL = STATE_DIR / "intraday_v83_paper_live_trades.jsonl"
 # New unified frontend location
 STATIC_DIR = ROOT / "web" / "app"
 INDEX_SECURITY_ID = int(os.getenv("MARKET_AI_INDEX_SECURITY_ID", "13"))
@@ -2054,6 +2058,66 @@ def _load_intraday_index_chart_payload(interval_min: int = 5) -> Dict[str, Any]:
     return payload
 
 
+def _load_v83_paper_trades() -> List[Dict[str, Any]]:
+    """Parse intraday_v83_paper_live_trades.jsonl into flat completed-trade rows.
+
+    The file alternates PAPER_ENTRY / PAPER_EXIT events keyed by entry_timestamp.
+    We pair them and emit one row per closed trade.
+    """
+    if not V83_PAPER_LIVE_TRADES_JSONL.exists():
+        return []
+    entries: Dict[str, Any] = {}
+    completed: List[Dict[str, Any]] = []
+    try:
+        for line in V83_PAPER_LIVE_TRADES_JSONL.read_text(encoding="utf-8").splitlines():
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                ev = json.loads(raw)
+            except Exception:
+                continue
+            event = str(ev.get("event") or "")
+            ets = str(ev.get("entry_timestamp") or ev.get("timestamp") or "")
+            if event == "PAPER_ENTRY":
+                entries[ets] = ev
+            elif event == "PAPER_EXIT" and ets in entries:
+                entry = entries.pop(ets)
+                pnl = float(ev.get("realized_paper_pnl") or 0.0)
+                entry_ts = entry.get("entry_timestamp") or entry.get("timestamp") or ""
+                exit_ts  = ev.get("exit_timestamp") or ev.get("timestamp") or ""
+                hold_min: Optional[float] = None
+                try:
+                    from datetime import datetime as _dt
+                    t0 = _dt.fromisoformat(entry_ts)
+                    t1 = _dt.fromisoformat(exit_ts)
+                    hold_min = (t1 - t0).total_seconds() / 60.0
+                except Exception:
+                    pass
+                legs = entry.get("legs") or []
+                short_leg = next((l for l in legs if l.get("action") == "SELL"), {})
+                completed.append({
+                    "trade_mode": "paper",
+                    "pnl_rs": pnl,
+                    "reason": str(ev.get("exit_reason") or "UNKNOWN").upper(),
+                    "hold_minutes": hold_min,
+                    "strategy_type": str(entry.get("strategy") or "").upper(),
+                    "market_bias": str((entry.get("gate") or {}).get("market_state") or "").upper(),
+                    "price_action_bias": None,
+                    "retest_status": None,
+                    "entry_time": entry_ts,
+                    "exit_time": exit_ts,
+                    "short_strike": short_leg.get("strike"),
+                    "short_delta": short_leg.get("delta"),
+                    "exit_mode": str(ev.get("exit_mode") or ""),
+                    "mae_rupees": float(ev.get("mae_rupees") or 0.0),
+                    "mfe_rupees": float(ev.get("mfe_rupees") or 0.0),
+                })
+    except Exception:
+        pass
+    return completed
+
+
 def _load_intraday_trade_history(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     if not INTRADAY_AI_TRADE_HISTORY_JSONL.exists():
@@ -2078,9 +2142,89 @@ def _load_intraday_trade_history(limit: Optional[int] = None) -> List[Dict[str, 
     return rows
 
 
+def _build_v83_open_position_payload() -> Dict[str, Any]:
+    """Return the current v83 paper open position in a UI-ready format.
+
+    Reads from ``intraday_v83_paper_state.json`` which the agent keeps updated.
+    Returns an empty dict when no position is open.
+    """
+    try:
+        state = _json_read(V83_PAPER_STATE_JSON) or {}
+    except Exception:
+        state = {}
+    if not state or not state.get("structure"):
+        return {"open": False, "legs": [], "open_mtm": None, "expiry": None, "playbook": None}
+
+    structure = state.get("structure") or {}
+    legs_raw = structure.get("legs") or []
+    mfe = _parse_float(state.get("mfe_rupees"), 0.0)
+    mae = _parse_float(state.get("mae_rupees"), 0.0)
+    mark_pnl = _parse_float(state.get("last_mark_pnl_rupees"), None)
+    playbook = (state.get("metadata") or {}).get("playbook")
+    expiry = None
+
+    ui_legs: List[Dict[str, Any]] = []
+    for leg in legs_raw:
+        strike = leg.get("strike")
+        option_type = leg.get("option_type") or leg.get("instrument_type") or ""
+        action = str(leg.get("action") or "").upper()
+        qty = abs(int(leg.get("quantity") or leg.get("qty") or 0))
+        entry_price = _parse_float(leg.get("entry_price") or leg.get("ltp"), None)
+        ltp = _parse_float(leg.get("ltp"), entry_price)
+        exp = leg.get("expiry")
+        if exp and expiry is None:
+            expiry = exp
+        pnl = None
+        if entry_price is not None and ltp is not None and qty > 0:
+            pnl = (entry_price - ltp) * qty if action == "SELL" else (ltp - entry_price) * qty
+        ui_legs.append({
+            "side": action,
+            "option_type": option_type,
+            "strike": strike,
+            "expiry": exp,
+            "qty": qty,
+            "entry": entry_price,
+            "ltp": ltp,
+            "pnl": round(pnl, 2) if pnl is not None else None,
+        })
+
+    return {
+        "open": True,
+        "legs": ui_legs,
+        "open_mtm": mark_pnl,
+        "mfe_rupees": mfe,
+        "mae_rupees": mae,
+        "expiry": expiry,
+        "playbook": playbook,
+    }
+
+
+def _get_v83_market_state() -> str:
+    """Return the latest v83 market state label from runtime state."""
+    try:
+        rs = _json_read(V83_RUNTIME_STATE_JSON) or {}
+        candidate = rs.get("last_candidate") or {}
+        mkt = candidate.get("market_state")
+        if mkt:
+            return str(mkt)
+        # Also check last simulated order
+        sim = rs.get("last_simulated_order") or {}
+        gate = sim.get("gate") or {}
+        mkt2 = gate.get("market_state")
+        if mkt2:
+            return str(mkt2)
+    except Exception:
+        pass
+    return "—"
+
+
 def _build_intraday_performance_payload(*, trade_mode: str) -> Dict[str, Any]:
     mode = str(trade_mode or "").strip().lower()
-    rows = [row for row in _load_intraday_trade_history() if str(row.get("trade_mode") or "").strip().lower() == mode]
+    # For paper mode: use v83 trades as primary source (old intraday_ai_trade_history is Batman BKM)
+    if mode == "paper":
+        rows = _load_v83_paper_trades()
+    else:
+        rows = [row for row in _load_intraday_trade_history() if str(row.get("trade_mode") or "").strip().lower() == mode]
     total_trades = len(rows)
     wins = 0
     losses = 0
@@ -2118,22 +2262,28 @@ def _build_intraday_performance_payload(*, trade_mode: str) -> Dict[str, Any]:
         exit_reason_counts[reason] = int(exit_reason_counts.get(reason, 0)) + 1
         entry_features = row.get("entry_features") if isinstance(row.get("entry_features"), dict) else {}
         _add_setup_stat("strategy_type", row.get("strategy_type"), pnl)
-        _add_setup_stat("market_bias", entry_features.get("market_bias"), pnl)
+        _add_setup_stat("market_bias", row.get("market_bias") or entry_features.get("market_bias"), pnl)
         _add_setup_stat("price_action_bias", entry_features.get("price_action_bias"), pnl)
         _add_setup_stat("retest_status", entry_features.get("retest_status"), pnl)
 
     rows_desc = list(reversed(rows))
     for row in rows_desc[:10]:
+        pnl_val = round(_parse_float(row.get("pnl_rs"), 0.0), 2)
         recent_trades.append(
             {
                 "position_id": row.get("position_id"),
-                "strategy_label": row.get("strategy_label"),
-                "closed_at": row.get("closed_at"),
-                "pnl_rs": round(_parse_float(row.get("pnl_rs"), 0.0), 2),
+                "strategy_label": row.get("strategy_type") or row.get("strategy_label"),
+                "closed_at": row.get("exit_time") or row.get("closed_at"),
+                "entry_time": row.get("entry_time"),
+                "pnl_rs": pnl_val,
                 "hold_minutes": row.get("hold_minutes"),
                 "reason": row.get("reason"),
-                "result": row.get("result"),
-                "expiry": row.get("expiry"),
+                "exit_mode": row.get("exit_mode"),
+                "result": "WIN" if pnl_val > 0 else ("LOSS" if pnl_val < 0 else "FLAT"),
+                "short_strike": row.get("short_strike"),
+                "short_delta": row.get("short_delta"),
+                "mae_rupees": row.get("mae_rupees"),
+                "mfe_rupees": row.get("mfe_rupees"),
             }
         )
 
@@ -3109,7 +3259,21 @@ def _send_telegram_test_message(text: Optional[str] = None) -> Dict[str, Any]:
     return forwarder.send_test_message(creds=creds if isinstance(creds, dict) else {}, text=text)
 
 
+_v83_ops_cache: Dict[str, Any] = {}
+_v83_ops_cache_ts: float = 0.0
+_V83_OPS_CACHE_TTL = 12.0
+
+# Caches for secondary payloads not shown in the primary UI (60s TTL is fine).
+_secondary_pnl_cache: Dict[str, Any] = {}
+_secondary_pnl_cache_ts: float = 0.0
+_SECONDARY_PNL_CACHE_TTL = 60.0
+
+
 def _load_v83_ops_status() -> Dict[str, Any]:
+    global _v83_ops_cache, _v83_ops_cache_ts
+    now = time.time()
+    if _v83_ops_cache and (now - _v83_ops_cache_ts) < _V83_OPS_CACHE_TTL:
+        return _v83_ops_cache
     try:
         cfg = _v83_load_runtime_config()
         broker_positions = None
@@ -3117,7 +3281,10 @@ def _load_v83_ops_status() -> Dict[str, Any]:
             broker_payload = _load_broker_live_positions()
             positions = broker_payload.get("positions") if isinstance(broker_payload, dict) else None
             broker_positions = positions if isinstance(positions, list) else None
-        return _v83_operator_status_report(write=True, broker_positions=broker_positions)
+        result = _v83_operator_status_report(write=True, broker_positions=broker_positions)
+        _v83_ops_cache.update(result)
+        _v83_ops_cache_ts = time.time()
+        return _v83_ops_cache
     except Exception as exc:
         return {
             "generated_at": _ist_now().isoformat(timespec="seconds"),
@@ -3133,9 +3300,18 @@ def _load_v83_ops_status() -> Dict[str, Any]:
 def _is_process_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
-        return True
     except Exception:
         return False
+    # os.kill(pid, 0) succeeds for zombie processes too — exclude them.
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2,
+        )
+        stat = result.stdout.strip()
+        return bool(stat) and not stat.startswith("Z")
+    except Exception:
+        return True
 
 
 def _api_error_payload(exc: BaseException, *, code: str) -> Dict[str, Any]:
@@ -3942,18 +4118,46 @@ class PaperHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:  # type: ignore[override]
         if self.path.startswith("/api/paper_positions"):
             try:
-                payload = load_positions(BLOTTER_CSV, mode="paper")
-                # also include strategy status for context
-                try:
-                    state = json.loads(STRATEGY_STATE.read_text())
-                except Exception:
-                    state = {}
-                payload["strategy_state"] = state
-                payload["intraday_performance"] = _build_intraday_performance_payload(trade_mode="paper")
-                payload["committee_review"] = _build_committee_review_payload(trade_mode="paper")
-                payload["intraday_learning"] = _load_intraday_learning_status()
-                payload["batman_bkm_review"] = _build_batman_bkm_review_payload(trade_mode="paper")
-                payload["batman_bkm_learning"] = _build_batman_bkm_learning_payload(trade_mode="paper")
+                # ── V83-specific data (primary source of truth for PnL tab) ──
+                intraday_perf = _build_intraday_performance_payload(trade_mode="paper")
+                v83_open = _build_v83_open_position_payload()
+                v83_market_state = _get_v83_market_state()
+
+                # ── Legacy blotter payload kept for payoff-chart spot price ──
+                blotter = load_positions(BLOTTER_CSV, mode="paper")
+
+                payload: Dict[str, Any] = {
+                    # V83 open position — authoritative source for Open Legs / MTM
+                    "v83_open_position": v83_open,
+                    "positions": v83_open["legs"],          # UI legs-table uses this
+                    "total_pnl": v83_open["open_mtm"] or 0.0,
+                    # V83 realized P&L — authoritative source (intraday_performance)
+                    "realized_pnl": intraday_perf["realized_pnl_rs"],
+                    # Market state for the "Market Status" card
+                    "v83_market_state": v83_market_state,
+                    # Pass-through fields the UI also uses
+                    "spot": blotter.get("spot"),
+                    "ltp_status": blotter.get("ltp_status"),
+                    "as_of": blotter.get("as_of"),
+                    # Full performance payload for Trade History section
+                    "intraday_performance": intraday_perf,
+                    # Strategy state kept for any legacy widget that still reads it
+                    "strategy_state": {},
+                }
+
+                # Secondary payloads (batman/committee/learning) cached 60 s —
+                # no longer rendered in main UI but kept for completeness.
+                global _secondary_pnl_cache, _secondary_pnl_cache_ts
+                _now_ts = time.time()
+                if not _secondary_pnl_cache or (_now_ts - _secondary_pnl_cache_ts) > _SECONDARY_PNL_CACHE_TTL:
+                    _secondary_pnl_cache = {
+                        "committee_review": _build_committee_review_payload(trade_mode="paper"),
+                        "intraday_learning": _load_intraday_learning_status(),
+                        "batman_bkm_review": _build_batman_bkm_review_payload(trade_mode="paper"),
+                        "batman_bkm_learning": _build_batman_bkm_learning_payload(trade_mode="paper"),
+                    }
+                    _secondary_pnl_cache_ts = _now_ts
+                payload.update(_secondary_pnl_cache)
                 self._send_json(payload)
             except Exception as exc:  # pragma: no cover - defensive
                 self._send_json({"error": str(exc)}, status=500)

@@ -5,6 +5,57 @@ import math
 from .data_models import AccountRiskLimits, AccountState, RiskAssessment, StrategyType, TradeStructure
 
 
+def _confidence_lot_cap(
+    confidence: float,
+    daily_bias_score: int,
+    strategy: StrategyType,
+    max_lots: int,
+) -> int:
+    """Scale allowed lots by regime confidence and daily trend alignment.
+
+    Higher conviction (confidence + matching daily trend) → more lots, up to max.
+    Counter-trend intraday trades get reduced sizing.
+
+    Scaling table (with aligned daily):
+      confidence >= 0.90 → full max_lots
+      confidence >= 0.80 → 80% of max_lots
+      confidence >= 0.70 → 60% of max_lots
+      confidence >= 0.60 → 40% of max_lots
+      confidence <  0.60 → 1 lot (minimum conviction)
+
+    daily_bias_score adjustment (bearish for Bear Call, bullish for Bull Put):
+      score >= 2 (aligned):      +1 extra lot up to max
+      score == 0 (neutral):       no change
+      score <= -1 (counter-trend): halve the lot cap
+    """
+    if confidence >= 0.90:
+        base_fraction = 1.0
+    elif confidence >= 0.80:
+        base_fraction = 0.80
+    elif confidence >= 0.70:
+        base_fraction = 0.60
+    elif confidence >= 0.60:
+        base_fraction = 0.40
+    else:
+        return 1
+
+    cap = max(1, round(max_lots * base_fraction))
+
+    # Daily alignment modifier
+    is_bearish_strategy = strategy in {StrategyType.BEAR_CALL_CREDIT_SPREAD}
+    is_bullish_strategy = strategy in {StrategyType.BULL_PUT_CREDIT_SPREAD}
+    aligned_bearish = is_bearish_strategy and daily_bias_score <= -2
+    aligned_bullish = is_bullish_strategy and daily_bias_score >= 2
+    counter_trend = (is_bearish_strategy and daily_bias_score >= 1) or (is_bullish_strategy and daily_bias_score <= -1)
+
+    if aligned_bearish or aligned_bullish:
+        cap = min(cap + 1, max_lots)  # daily trend confirms intraday → bonus lot
+    elif counter_trend:
+        cap = max(1, cap // 2)  # going against daily trend → cut size
+
+    return max(1, cap)
+
+
 def kill_switch_triggered(account_state: AccountState, risk_limits: AccountRiskLimits) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     if account_state.realised_pnl_rupees <= -risk_limits.max_daily_loss_rupees:
@@ -63,6 +114,14 @@ def assess_trade_risk(
     available_margin = max(risk_limits.max_margin_rupees - account_state.margin_used_rupees, 0.0)
     max_lots_by_margin = math.floor(available_margin / effective_margin)
     lots = max(min(max_lots_by_risk, max_lots_by_margin), 0)
+    # Apply confidence + daily-alignment scaling: high-conviction trades get more lots
+    confidence_cap = _confidence_lot_cap(
+        confidence=float(getattr(structure, "confidence", 1.0)),
+        daily_bias_score=int(getattr(structure, "daily_bias_score", 0)),
+        strategy=structure.strategy,
+        max_lots=lots,
+    )
+    lots = min(lots, confidence_cap)
     projected_margin = account_state.margin_used_rupees + (lots * effective_margin)
     projected_utilisation = projected_margin / risk_limits.max_margin_rupees if risk_limits.max_margin_rupees > 0 else 1.0
 

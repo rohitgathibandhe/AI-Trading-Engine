@@ -237,6 +237,37 @@ def test_research_dataset_staleness_is_degraded_not_paper_blocking(monkeypatch, 
     assert "DATA_PIPELINE_HEALTH_BLOCKED" not in gate["block_reasons"]
 
 
+def test_collector_staleness_does_not_block_paper_live_when_live_data_is_healthy(monkeypatch, tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    paths.creds_path.write_text('{"client_id":"client","access_token":"token"}')
+    paths.reconciliation_status.write_text('{"status":"NO_POSITIONS"}')
+
+    monkeypatch.setattr(
+        ops_runtime,
+        "build_data_freshness_report",
+        lambda **_kwargs: {
+            "fresh": False,
+            "as_of": "2026-05-15T10:05:00+05:30",
+            "stale_reasons": ["COLLECTOR_HEARTBEAT_STALE", "COLLECTOR_PROCESS_NOT_RUNNING", "COLLECTOR_LOG_STALE"],
+            "checks": {
+                "structured_5m_dataset": {"fresh": True},
+                "structured_option_chain_dataset": {"fresh": True},
+            },
+            "collector_pid_status": {"alive": False},
+        },
+    )
+
+    snapshot = _snapshot(datetime(2026, 5, 15, 10, 5))
+
+    health = build_unified_health(config=RuntimeConfig(mode=RuntimeMode.PAPER_LIVE), paths=paths, snapshot=snapshot)
+
+    assert health["status"] == HealthStatus.DEGRADED.value
+    assert health["components"]["data_pipeline_health"]["status"] == HealthStatus.DEGRADED.value
+    gate = evaluate_entry_gate(_decision(), snapshot, config=RuntimeConfig(mode=RuntimeMode.PAPER_LIVE), health=health, paths=paths)
+    assert "HEALTH_BLOCKED" not in gate["block_reasons"]
+    assert "DATA_PIPELINE_HEALTH_BLOCKED" not in gate["block_reasons"]
+
+
 def test_paper_position_persists_without_broker_orphan_in_paper_mode(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     position = open_position_from_decision(_decision(), _snapshot())
