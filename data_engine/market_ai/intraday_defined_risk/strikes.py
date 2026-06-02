@@ -64,12 +64,12 @@ def select_best_structure(
             snapshot=snapshot,
             regime_state=regime_state,
             option_type=OptionType.CALL,
-            short_delta_band=(0.18, 0.35),
+            short_delta_band=(0.18, 0.30),
             long_delta_band=(0.05, 0.20),
             params=params,
             setup_quality_score=setup_quality,
             playbook_tier=playbook_tier,
-            allow_distance_fallback_when_deltas_present=True,
+            allow_distance_fallback_when_deltas_present=False,
             min_short_strike=regime_state.metadata.get("min_short_call_strike"),
         )
     if strategy == StrategyType.BULL_PUT_CREDIT_SPREAD:
