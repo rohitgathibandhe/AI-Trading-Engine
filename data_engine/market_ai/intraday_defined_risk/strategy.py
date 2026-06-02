@@ -33,6 +33,11 @@ GAP_DOWN_BEARISH_CONTINUATION_END = time(12, 0)
 GAP_UP_BEARISH_FAILURE_END = time(11, 15)
 RANGE_CONDOR_START = time(11, 30)
 RANGE_CONDOR_END = time(13, 30)
+# Wednesday = Day 1 of new weekly series (post-Tuesday expiry).
+# IC can start earlier on Wednesday — morning range is well-defined after the
+# previous day's expiry flush, and 7DTE options carry the most weekly premium.
+RANGE_CONDOR_POST_EXPIRY_START = time(10, 45)   # 45 min earlier than normal
+RANGE_CONDOR_POST_EXPIRY_END = time(13, 30)      # same close — no extra risk
 OPEN_DRIVE_BULLISH_MIN_CONFIDENCE = 0.64
 GAP_UP_BULLISH_MIN_CONFIDENCE = 0.68
 GAP_DOWN_BULLISH_RECOVERY_MIN_CONFIDENCE = 0.70
@@ -672,16 +677,32 @@ def select_strategy(
                 f"Playbook {playbook} is Tier {playbook_tier(playbook)}; current benchmark mode allows only tiers {', '.join(allowed_playbook_tiers)}."
             )
             return StrategyType.NO_TRADE, reasons
-        if regime_state.rv30_pct > 0.20:
-            reasons.append("Iron Condor requires a cleaner low-volatility range regime.")
+        # Wednesday (Day 1 of new weekly series, post-Tuesday expiry):
+        # 7DTE options carry maximum weekly premium — best IC deployment day.
+        # Start 45 min earlier than normal, same RV30 limit.
+        is_post_expiry_day = bool(regime_state.metadata.get("is_post_expiry_day"))
+        is_expiry_day = bool(regime_state.metadata.get("is_expiry_day"))
+        _rv30_limit = 0.20
+        _condor_start = RANGE_CONDOR_POST_EXPIRY_START if is_post_expiry_day else RANGE_CONDOR_START
+        _condor_end = RANGE_CONDOR_POST_EXPIRY_END if is_post_expiry_day else RANGE_CONDOR_END
+        if is_expiry_day:
+            # Tuesday expiry day: same-day expiry chain → extreme gamma → no IC
+            reasons.append("Expiry day (Tuesday): Iron Condor blocked — same-day expiry gamma risk is unacceptable.")
             return StrategyType.NO_TRADE, reasons
-        if now_time > RANGE_CONDOR_END:
-            reasons.append(f"Iron Condor entries are avoided after {RANGE_CONDOR_END.strftime('%H:%M')} IST to prevent late-session compression traps.")
+        if regime_state.rv30_pct > _rv30_limit:
+            reasons.append(f"Iron Condor requires low-volatility range (rv30={regime_state.rv30_pct:.3f} > {_rv30_limit}).")
             return StrategyType.NO_TRADE, reasons
-        if now_time >= RANGE_CONDOR_START:
-            reasons.append(f"Neutral 15m regime + balanced range playbook ({range_balance_score:.2f}) -> Iron Condor.")
+        if now_time > _condor_end:
+            reasons.append(f"Iron Condor entries are avoided after {_condor_end.strftime('%H:%M')} IST.")
+            return StrategyType.NO_TRADE, reasons
+        if now_time >= _condor_start:
+            weekly_note = (
+                f" [Day-1 weekly series: 7DTE, wider strikes, credit_ratio={regime_state.metadata.get('range_condor_credit_ratio', 0.16):.2f}]"
+                if is_post_expiry_day else ""
+            )
+            reasons.append(f"Neutral 15m regime + balanced range playbook ({range_balance_score:.2f}) -> Iron Condor{weekly_note}.")
             return StrategyType.IRON_CONDOR, reasons
-        reasons.append(f"Iron Condor is allowed only after {RANGE_CONDOR_START.strftime('%H:%M')} IST.")
+        reasons.append(f"Iron Condor is allowed only after {_condor_start.strftime('%H:%M')} IST.")
         return StrategyType.NO_TRADE, reasons
 
     reasons.append("No aligned regime/trigger pair available.")

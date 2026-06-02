@@ -1677,10 +1677,23 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     if oi_flow["smart_money_bias"] == "NEUTRAL":
         range_balance_score += 1.0
     metadata["range_balance_score"] = range_balance_score
+    # NIFTY weekly expiry is on Tuesday (shifts to Monday if Tuesday is a holiday).
+    # Wednesday = Day 1 of the new weekly series — 7 DTE, maximum premium available.
+    # This is the ideal IC deployment day: full theta ahead, manageable gamma.
+    # Relax the range_balance threshold slightly to let the IC fire in the morning window.
+    _weekday = snapshot.timestamp.weekday()  # 0=Mon 1=Tue 2=Wed 3=Thu 4=Fri
+    _is_expiry_day = _weekday == 1           # Tuesday = expiry
+    _is_post_expiry_day = _weekday == 2      # Wednesday = day 1 of new weekly series (best IC day)
+    _is_pre_expiry_day = _weekday == 0       # Monday = day before expiry (high gamma caution)
+    metadata["is_expiry_day"] = _is_expiry_day
+    metadata["is_post_expiry_day"] = _is_post_expiry_day
+    metadata["weekly_series_day"] = _weekday
+    # Post-expiry Wednesday: relax balance requirement — fresh series, clean slate, full premium
+    _range_balance_min = 3.5 if _is_post_expiry_day else 4.0
     metadata["range_entry_ready"] = bool(
         execution_5m == "RANGE_CONFIRMED"
         and snapshot.timestamp.time() >= RANGE_GATE_TIME
-        and range_balance_score >= 4.0
+        and range_balance_score >= _range_balance_min
         and abs(gap_pct) <= 0.15
         and balanced_range_condor_setup(
             bars_5m,
@@ -1689,11 +1702,22 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             rv30_pct=rv30_pct,
         )
     )
-    metadata["range_condor_credit_ratio"] = 0.16
+    # Post-expiry Wednesday: more generous credit ratio — 7DTE options are premium-rich
+    metadata["range_condor_credit_ratio"] = 0.13 if _is_post_expiry_day else 0.16
     if metadata["range_entry_ready"]:
-        metadata["preferred_width_points"] = 100.0
-        metadata["allowed_width_points"] = (100.0,)
-        metadata["minimum_net_edge_rupees"] = 500.0
+        if _is_post_expiry_day:
+            # Wednesday (Day 1 of new weekly series): 7DTE options are richest.
+            # Use wider spreads to capture more premium; tighter short delta since
+            # we want to stay far OTM with a full week of uncertainty ahead.
+            metadata["preferred_width_points"] = 150.0
+            metadata["allowed_width_points"] = (100.0, 150.0)
+            metadata["minimum_net_edge_rupees"] = 650.0
+            metadata["condor_short_delta_band_bias"] = "08_14"  # ~10-14 delta = far OTM
+            metadata["condor_shape_bias"] = "SYMMETRIC"
+        else:
+            metadata["preferred_width_points"] = 100.0
+            metadata["allowed_width_points"] = (100.0,)
+            metadata["minimum_net_edge_rupees"] = 500.0
     failed_reclaim = False
     if (
         (trend_15m == "TREND_DOWN" and execution_5m == "DOWN_CONFIRMED")

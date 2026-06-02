@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.algoagent.pre_market_check</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Rohit/.venvs/data_engine_py310/bin/python</string>
+        <string>/Users/Rohit/AI-Trading-Engine/scripts/pre_market_check.py</string>
+    </array>
+
+    <!-- 09:00 IST = 03:30 UTC, Mon–Fri only.
+         Runs 15 minutes before market opens to verify the agent is alive,
+         session state is clean, config is sane, and OI/chain feeds are up.
+         Sends a Telegram report so you know exactly what to expect before 09:15. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <!-- Monday -->
+        <dict>
+            <key>Weekday</key><integer>1</integer>
+            <key>Hour</key><integer>9</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <!-- Tuesday -->
+        <dict>
+            <key>Weekday</key><integer>2</integer>
+            <key>Hour</key><integer>9</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <!-- Wednesday -->
+        <dict>
+            <key>Weekday</key><integer>3</integer>
+            <key>Hour</key><integer>9</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <!-- Thursday -->
+        <dict>
+            <key>Weekday</key><integer>4</integer>
+            <key>Hour</key><integer>9</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <!-- Friday -->
+        <dict>
+            <key>Weekday</key><integer>5</integer>
+            <key>Hour</key><integer>9</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/Rohit/AI-Trading-Engine/data_engine</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Rohit/AI-Trading-Engine/logs/pre_market_check.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Rohit/AI-Trading-Engine/logs/pre_market_check.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/Rohit/AI-Trading-Engine/data_engine</string>
+    </dict>
+</dict>
+</plist>
