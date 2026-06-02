@@ -132,6 +132,13 @@ class LiveDataReadinessError(RuntimeError):
 
 
 def _front_expiry(dw: Any, *, underlying_id: int, underlying_seg: str, today: date) -> str:
+    """Return the front expiry to use for intraday option chain data.
+
+    On expiry day itself we skip today's expiry and use the next one so that:
+    - The option chain has healthy gamma (no same-day pin risk)
+    - EXPIRY_DAY_BLOCKED never fires (chain_expiry > today)
+    - Intraday trades use next-week options which are safe to trade
+    """
     expiries = []
     if hasattr(dw, "get_optionchain_expirylist"):
         expiries = list(dw.get_optionchain_expirylist(underlying_seg, underlying_id) or [])
@@ -143,11 +150,17 @@ def _front_expiry(dw: Any, *, underlying_id: int, underlying_seg: str, today: da
             expiry = date.fromisoformat(str(item).split("T", 1)[0])
         except Exception:
             continue
-        if expiry >= today:
+        if expiry > today:  # strictly greater: skip same-day expiry
             valid.append(expiry)
     if not valid:
         raise RuntimeError("No future NIFTY option expiry available from Dhan.")
-    return sorted(valid)[0].isoformat()
+    chosen = sorted(valid)[0]
+    if chosen == today:
+        # Defensive fallback: if somehow today slipped through, grab the next one
+        valid2 = [e for e in sorted(valid) if e > today]
+        if valid2:
+            chosen = valid2[0]
+    return chosen.isoformat()
 
 
 def _oi_signal_expiry(
