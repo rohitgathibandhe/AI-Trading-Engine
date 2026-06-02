@@ -1063,6 +1063,13 @@ def run_live(config: dict[str, object]) -> None:
                 print(exit_decision.to_json())
         else:
             decision = agent.evaluate(snapshot)
+            # Clamp lots to the operator cap *before* any gate check so that
+            # LOTS_EXCEED_RUNTIME_LIMIT can never fire.  The risk engine already
+            # computed a safe lot count; the runtime cap is a ceiling, not a veto.
+            if decision.action == "TRADE":
+                ops_max = int(getattr(getattr(runtime_config, "risk", None), "max_lots_per_trade", None) or 6)
+                if decision.lots > ops_max:
+                    decision.lots = ops_max
             print(decision.to_json())
             if decision.action == "TRADE":
                 if runtime_config.mode == RuntimeMode.SHADOW_LIVE:
