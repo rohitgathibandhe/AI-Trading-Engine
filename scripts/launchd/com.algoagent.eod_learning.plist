@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.algoagent.eod_learning</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Rohit/.venvs/data_engine_py310/bin/python</string>
+        <string>/Users/Rohit/AI-Trading-Engine/scripts/eod_learning.py</string>
+    </array>
+
+    <!-- 15:35 IST = 10:05 UTC, Mon–Fri only.
+         Runs after market close (15:30) to capture all completed trades,
+         feed outcomes to the learning store, adapt thresholds, and
+         send the daily Telegram P&L + learning report. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <!-- Monday -->
+        <dict>
+            <key>Weekday</key><integer>1</integer>
+            <key>Hour</key><integer>15</integer>
+            <key>Minute</key><integer>35</integer>
+        </dict>
+        <!-- Tuesday -->
+        <dict>
+            <key>Weekday</key><integer>2</integer>
+            <key>Hour</key><integer>15</integer>
+            <key>Minute</key><integer>35</integer>
+        </dict>
+        <!-- Wednesday -->
+        <dict>
+            <key>Weekday</key><integer>3</integer>
+            <key>Hour</key><integer>15</integer>
+            <key>Minute</key><integer>35</integer>
+        </dict>
+        <!-- Thursday -->
+        <dict>
+            <key>Weekday</key><integer>4</integer>
+            <key>Hour</key><integer>15</integer>
+            <key>Minute</key><integer>35</integer>
+        </dict>
+        <!-- Friday -->
+        <dict>
+            <key>Weekday</key><integer>5</integer>
+            <key>Hour</key><integer>15</integer>
+            <key>Minute</key><integer>35</integer>
+        </dict>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/Rohit/AI-Trading-Engine/data_engine</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Rohit/AI-Trading-Engine/logs/eod_learning.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Rohit/AI-Trading-Engine/logs/eod_learning.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/Rohit/AI-Trading-Engine/data_engine</string>
+    </dict>
+</dict>
+</plist>
