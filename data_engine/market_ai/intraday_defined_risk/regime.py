@@ -2522,19 +2522,62 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         0.0,
         10.0,
     )
+    # PCR-aware scoring: use current pcr and trend from metadata
+    _pcr = metadata.get("pcr_by_oi")
+    _pcr_val = float(_pcr) if _pcr is not None else None
+    _pcr_trend = str(metadata.get("pcr_trend") or "UNKNOWN")
+    # Bearish PCR bonus/penalty:
+    #   PCR < 0.65 → call-heavy → institutions selling calls → strong bearish headwind
+    #   PCR 0.65–0.80 → mild call dominance → modest headwind
+    #   PCR > 1.30 → put-heavy → support-selling environment → tailwind for bearish spreads
+    #   PCR FALLING → puts being shed / calls accumulating → bearish headwind
+    #   PCR RISING  → puts being added / calls shed → bearish tailwind
+    _pcr_bearish_adj = 0.0
+    if _pcr_val is not None:
+        if _pcr_val < 0.65:
+            _pcr_bearish_adj = -2.0   # strong bullish OI positioning — hard block territory
+        elif _pcr_val < 0.80:
+            _pcr_bearish_adj = -1.0   # mild call dominance
+        elif _pcr_val > 1.30:
+            _pcr_bearish_adj = +0.75  # put-heavy → bearish supported
+    if _pcr_trend == "FALLING":
+        _pcr_bearish_adj -= 0.5   # puts being shed = bullish drift
+    elif _pcr_trend == "RISING":
+        _pcr_bearish_adj += 0.5   # puts building = bearish supported
+
+    # Bullish PCR bonus/penalty:
+    #   PCR < 0.65 → call-heavy → strong bullish tailwind
+    #   PCR > 1.20 → put-heavy → support selling = not inherently bullish
+    _pcr_bullish_adj = 0.0
+    if _pcr_val is not None:
+        if _pcr_val < 0.65:
+            _pcr_bullish_adj = +1.5  # strong bullish OI positioning
+        elif _pcr_val < 0.80:
+            _pcr_bullish_adj = +0.75
+        elif _pcr_val > 1.20:
+            _pcr_bullish_adj = -0.5  # put-heavy is not inherently bullish
+    if _pcr_trend == "FALLING":
+        _pcr_bullish_adj += 0.5   # puts being shed = bullish
+    elif _pcr_trend == "RISING":
+        _pcr_bullish_adj -= 0.5   # puts building = bearish pressure
+
     bearish_option_chain_pressure_score = _clamp(
         (max(float(metadata.get("oi_pressure_imbalance") or 0.0), 0.0) * 6.0)
         + (2.0 if metadata.get("smart_money_bias") == "BEARISH" else 0.0)
+        + (-2.0 if metadata.get("smart_money_bias") == "BULLISH" else 0.0)  # active penalty: institutions are bullish
         + (1.5 if metadata.get("option_chain_pressure_state") in {"OVERHEAD_CALL_PRESSURE", "BEARISH_WALL_SHIFT"} else 0.0)
-        + (0.75 if metadata.get("price_into_overhead_call_wall") else 0.0),
+        + (0.75 if metadata.get("price_into_overhead_call_wall") else 0.0)
+        + _pcr_bearish_adj,
         0.0,
         10.0,
     )
     bullish_option_chain_pressure_score = _clamp(
         (max(-float(metadata.get("oi_pressure_imbalance") or 0.0), 0.0) * 6.0)
         + (2.0 if metadata.get("smart_money_bias") == "BULLISH" else 0.0)
+        + (-1.5 if metadata.get("smart_money_bias") == "BEARISH" else 0.0)  # active penalty: institutions are bearish
         + (1.5 if metadata.get("option_chain_pressure_state") in {"DOWNSIDE_PUT_SUPPORT", "BULLISH_WALL_SHIFT"} else 0.0)
-        - (float(metadata.get("overhead_call_pressure_score") or 0.0) * 0.75),
+        - (float(metadata.get("overhead_call_pressure_score") or 0.0) * 0.75)
+        + _pcr_bullish_adj,
         0.0,
         10.0,
     )
@@ -2591,6 +2634,22 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         conflicting_signal_penalty += 1.5
     if market_state == "TRANSITION" and market_state_bias == "BEARISH" and failure_type == "ACCEPTED_BREAKOUT":
         conflicting_signal_penalty += 1.5
+    # OI directional conflict: smart money and PCR opposing the likely trade direction
+    _smart_bias = str(metadata.get("smart_money_bias") or "NEUTRAL")
+    _wall_bias = str(metadata.get("wall_migration_bias") or "NEUTRAL")
+    # If both smart money AND walls say bullish but market state is bearish → strong conflict
+    if _smart_bias == "BULLISH" and _wall_bias == "BULLISH":
+        conflicting_signal_penalty += 2.0
+    elif _smart_bias == "BULLISH" or _wall_bias == "BULLISH":
+        conflicting_signal_penalty += 1.0
+    # Conversely, if institutions are bearish and market state is bullish → conflict
+    if _smart_bias == "BEARISH" and _wall_bias == "BEARISH" and market_state_bias == "BULLISH":
+        conflicting_signal_penalty += 1.5
+    # PCR extreme conflict: PCR < 0.65 = call-heavy market = very hard to profit from bearish spreads
+    if _pcr_val is not None and _pcr_val < 0.65 and market_state_bias == "BEARISH":
+        conflicting_signal_penalty += 1.5
+    elif _pcr_val is not None and _pcr_val < 0.80 and market_state_bias == "BEARISH":
+        conflicting_signal_penalty += 0.75
     no_trade_score = (
         0.35 * range_penalty_score
         + 0.20 * low_liquidity_penalty

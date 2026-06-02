@@ -1089,6 +1089,26 @@ def evaluate_paper_context_override_gate(
     if recovery_blocked:
         reasons.append(f"RECOVERY_BLOCK:{recovery_reason}")
 
+    # ── OI directional conflict guards ──────────────────────────────────────
+    # For bearish override trades: block if option chain signals strongly oppose the direction.
+    # Smart money (institutional OI flow) and wall migration are the most reliable signals.
+    # PCR < 0.65 = call-heavy market = institutions positioned bullish = high risk for bear spreads.
+    _is_bearish_strategy = strategy in {
+        StrategyType.BEAR_CALL_CREDIT_SPREAD.value,
+        "BEAR_CALL_CREDIT_SPREAD",
+    }
+    if _is_bearish_strategy:
+        smart_money_bias = str(metadata.get("smart_money_bias") or funnel.get("smart_money_bias") or "NEUTRAL")
+        wall_migration_bias = str(metadata.get("wall_migration_bias") or funnel.get("wall_migration_bias") or "NEUTRAL")
+        pcr = metadata.get("pcr_by_oi") or funnel.get("pcr_by_oi")
+        pcr_val = float(pcr) if pcr is not None else None
+        if smart_money_bias == "BULLISH":
+            reasons.append("OI_FLOW_OPPOSES_BEARISH_ENTRY")
+        if wall_migration_bias == "BULLISH":
+            reasons.append("WALL_MIGRATION_OPPOSES_BEARISH_ENTRY")
+        if pcr_val is not None and pcr_val < 0.65:
+            reasons.append(f"PCR_TOO_LOW_FOR_BEARISH_ENTRY:{pcr_val:.2f}")
+
     allowed = not reasons
     return {
         "allowed": allowed,
@@ -1296,6 +1316,13 @@ def _decision_log_payload(decision: DecisionOutput, *, snapshot: MarketSnapshot,
         "bearish_trade_score": metadata.get("bearish_trade_score") or funnel.get("bearish_trade_score"),
         "bullish_trade_score": metadata.get("bullish_trade_score") or funnel.get("bullish_trade_score"),
         "no_trade_score": metadata.get("no_trade_score") or funnel.get("no_trade_score"),
+        # OI intelligence fields — key for directional conflict diagnosis
+        "pcr_by_oi": metadata.get("pcr_by_oi") or funnel.get("pcr_by_oi"),
+        "pcr_trend": metadata.get("pcr_trend") or funnel.get("pcr_trend"),
+        "smart_money_bias": metadata.get("smart_money_bias") or funnel.get("smart_money_bias"),
+        "wall_migration_bias": metadata.get("wall_migration_bias") or funnel.get("wall_migration_bias"),
+        "bearish_option_chain_pressure_score": metadata.get("bearish_option_chain_pressure_score") or funnel.get("bearish_option_chain_pressure_score"),
+        "bullish_option_chain_pressure_score": metadata.get("bullish_option_chain_pressure_score") or funnel.get("bullish_option_chain_pressure_score"),
         "chosen_action": action,
         "chosen_strategy": decision.strategy.value if isinstance(decision.strategy, StrategyType) else str(decision.strategy),
         "block_reason": block_reason,

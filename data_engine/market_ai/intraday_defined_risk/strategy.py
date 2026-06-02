@@ -384,6 +384,31 @@ def select_strategy(
                 "Bearish downtrend detected, but price has not yet printed a valid bearish pullback rejection, failed reclaim, or shallow continuation setup."
             )
             return StrategyType.NO_TRADE, reasons
+        # OI conflict gate: if institutions are positioned bullish, require meaningfully higher score.
+        # Three signals: smart_money_bias (OI flow), wall_migration_bias (call/put wall drift), PCR.
+        # 2+ signals opposing → add a surcharge to the score threshold.
+        # All 3 opposing (hard conflict: smart money BULLISH + PCR < 0.70) → hard block.
+        _oi_threshold_surcharge = 0.0
+        if context_layer_active:
+            smart_money_bias = str(metadata.get("smart_money_bias") or "NEUTRAL")
+            wall_migration_bias = str(metadata.get("wall_migration_bias") or "NEUTRAL")
+            pcr_val = metadata.get("pcr_by_oi")
+            _pcr_conflict = pcr_val is not None and float(pcr_val) < 0.70
+            oi_conflict_count = sum([
+                smart_money_bias == "BULLISH",
+                wall_migration_bias == "BULLISH",
+                _pcr_conflict,
+            ])
+            if oi_conflict_count >= 2:
+                # Hard block: institutional flow + PCR both say bullish — don't fight them
+                if smart_money_bias == "BULLISH" and _pcr_conflict:
+                    reasons.append(
+                        f"Hard OI conflict: smart_money=BULLISH and PCR={pcr_val:.2f} (<0.70). "
+                        "Institutions are positioned bullish; bear spread entry blocked."
+                    )
+                    return StrategyType.NO_TRADE, reasons
+                # Soft block: 2/3 signals oppose → raise score threshold by 0.5
+                _oi_threshold_surcharge = 0.5
         if context_layer_active and failure_type not in BEARISH_CONTEXT_FAILURE_TYPES:
             reasons.append(
                 f"Bearish routing requires a recognized failure/acceptance context; current failure type is {failure_type}."
@@ -399,9 +424,11 @@ def select_strategy(
                 f"Bearish location score {bearish_location_live_score:.2f} is below the required 1.50."
             )
             return StrategyType.NO_TRADE, reasons
-        if context_layer_active and bearish_trade_score < bearish_threshold:
+        _effective_bearish_threshold = bearish_threshold + _oi_threshold_surcharge
+        if context_layer_active and bearish_trade_score < _effective_bearish_threshold:
+            _surcharge_note = f" (+{_oi_threshold_surcharge:.1f} OI-conflict surcharge)" if _oi_threshold_surcharge > 0 else ""
             reasons.append(
-                f"Bearish trade score {bearish_trade_score:.2f} is below the required {bearish_threshold:.2f}."
+                f"Bearish trade score {bearish_trade_score:.2f} is below the required {_effective_bearish_threshold:.2f}{_surcharge_note}."
             )
             return StrategyType.NO_TRADE, reasons
         if context_layer_active and bearish_trade_score <= no_trade_score + bearish_margin:
