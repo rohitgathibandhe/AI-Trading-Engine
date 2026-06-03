@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.algoagent.weekly_ic_recheck</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Rohit/.venvs/data_engine_py310/bin/python</string>
+        <string>/Users/Rohit/AI-Trading-Engine/scripts/weekly_ic_executor.py</string>
+        <string>--assess</string>
+    </array>
+
+    <!-- Wednesday 11:30 AM IST — re-check if 10:15 AM assessment was ASSESSMENT_HOLD.
+         If conditions have improved (≥4/5 gates), auto-deploys in PAPER mode or
+         sends a deploy link in LIVE mode. If still failing, cancels the plan for the week. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key><integer>3</integer>
+        <key>Hour</key><integer>11</integer>
+        <key>Minute</key><integer>30</integer>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/Rohit/AI-Trading-Engine/data_engine</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Rohit/AI-Trading-Engine/logs/weekly_ic_market_assessment.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Rohit/AI-Trading-Engine/logs/weekly_ic_market_assessment.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/Rohit/AI-Trading-Engine/data_engine</string>
+    </dict>
+</dict>
+</plist>

@@ -451,10 +451,10 @@ def run_morning_review(force: bool = False) -> None:
             print("[weekly_ic_review] Before 9:00 AM IST — skipping.")
             return
 
-    # Load the pending plan from last evening
+    # Load the pending plan from last evening (also refresh ASSESSMENT_HOLD plans)
     pending = _load_pending()
-    if not pending or pending.get("status") not in ("PENDING", None):
-        print("[weekly_ic_review] No pending plan to review — nothing to do.")
+    if not pending or pending.get("status") not in ("PENDING", "ASSESSMENT_HOLD", None):
+        print(f"[weekly_ic_review] Status={pending.get('status') if pending else 'none'} — nothing to review.")
         return
 
     plan_age_hours = 0.0
@@ -636,6 +636,30 @@ def _get_nifty_ohlc_today(creds: dict) -> dict[str, float | None]:
         return {"open": None, "high": None, "low": None, "close": None, "candles": 0}
 
 
+def _is_paper_mode() -> bool:
+    """Return True if the agent is running in PAPER_LIVE mode."""
+    try:
+        rc_path = STATE_DIR / "intraday_v83_runtime_config.json"
+        rc = json.loads(rc_path.read_text())
+        return str(rc.get("mode") or "").startswith("PAPER")
+    except Exception:
+        return False
+
+
+def _auto_deploy_paper(token: str) -> tuple[bool, str]:
+    """Call the local UI server to deploy the IC in paper mode.
+
+    Returns (success, message).
+    """
+    try:
+        r = requests.get(f"{UI_BASE}/api/weekly_ic/deploy?token={token}", timeout=15)
+        if r.status_code == 200:
+            return True, "Auto-deployed via UI server"
+        return False, f"UI server returned HTTP {r.status_code}"
+    except Exception as exc:
+        return False, f"Auto-deploy call failed: {exc}"
+
+
 def run_market_assessment(force: bool = False) -> None:
     """Wednesday 10:15 AM IST — multi-factor gate before issuing IC deploy link.
 
@@ -647,10 +671,9 @@ def run_market_assessment(force: bool = False) -> None:
       4. PCR balanced              — between 0.70 and 1.80 (no extreme skew)
       5. Enough candles            — at least 8 × 5-min candles (= 40 min of data)
 
-    If all gates pass  → sends Telegram with a fresh deploy link (valid deploy token).
-    If any gate fails  → sends a conditional alert explaining which factor failed,
-                         with guidance ("wait until 11 AM" or "skip this week").
-    If conditions are  → borderline (2+ warnings), sends deploy link with caution note.
+    In PAPER_LIVE mode:  auto-deploys immediately when ≥4/5 gates pass.
+    In LIVE mode:        sends Telegram deploy link for manual confirmation.
+    If 2+ gates fail:   sends a HOLD alert; 11:30 AM re-check fires automatically.
     """
     now = datetime.now(IST)
     weekday = now.weekday()  # 2 = Wednesday
@@ -665,8 +688,9 @@ def run_market_assessment(force: bool = False) -> None:
             return
 
     pending = _load_pending()
-    if not pending or pending.get("status") not in ("PENDING", None):
-        print("[weekly_ic_assess] No pending plan — nothing to assess.")
+    # Accept PENDING, None, and ASSESSMENT_HOLD (re-check after earlier failure)
+    if not pending or pending.get("status") not in ("PENDING", "ASSESSMENT_HOLD", None):
+        print(f"[weekly_ic_assess] Status={pending.get('status') if pending else 'none'} — nothing to assess.")
         return
 
     creds = _load_creds()
@@ -771,69 +795,106 @@ def run_market_assessment(force: bool = False) -> None:
 
     # ── Decision ─────────────────────────────────────────────────────────────
     gate_lines = "\n".join(f"  {'✅' if g[0] else '❌'} {g[1]}: {g[2]}" for g in gates)
+    paper_mode = _is_paper_mode()
+    assessment_label = now.strftime("%-I:%M %p")   # e.g. "10:15 AM"
 
-    if n_passed == n_gates:
-        # All clear — issue deploy link
+    if n_passed >= n_gates - 1:
+        # All clear (5/5) or borderline (4/5) — deploy or issue link
         new_token = str(uuid.uuid4()).replace("-", "")[:16]
         pending["token"] = new_token
         pending["assessment_at"] = now.isoformat()
         PENDING_FILE.write_text(json.dumps(pending, indent=2))
         deploy_url = f"{UI_BASE}/api/weekly_ic/deploy?token={new_token}"
 
-        msg = (
-            f"🟢 <b>Weekly IC — ALL CLEAR — Deploy when ready</b>\n"
-            f"Expiry: {expiry_str}  |  Spot: {spot:,.0f}\n\n"
-            f"<b>Gates (10:15 AM assessment):</b>\n{gate_lines}\n\n"
-            f"<b>Position:</b>\n"
-            f"  📉 SELL {planned_sc:,.0f} CE  |  📈 SELL {planned_sp:,.0f} PE\n"
-            f"  Credit: ~₹{plan_credit:,.0f}  |  IV: {current_iv:.1f}%  |  PCR: {current_pcr:.2f}\n\n"
-            f"<b>👇 Tap after 10:15 AM when ready:</b>\n"
-            f"<a href='{deploy_url}'>✅ DEPLOY IC NOW</a>\n\n"
-            f"<i>Exit next Tuesday before 3:20 PM IST</i>"
+        clarity = "ALL CLEAR" if n_passed == n_gates else "BORDERLINE"
+        clarity_emoji = "🟢" if n_passed == n_gates else "🟡"
+        caution_note = (
+            f"\n<b>Note:</b> {failed[0][2]}\n" if failed else ""
         )
-        result_str = "ALL_CLEAR"
 
-    elif n_passed >= n_gates - 1:
-        # One failure — caution deploy
-        new_token = str(uuid.uuid4()).replace("-", "")[:16]
-        pending["token"] = new_token
-        pending["assessment_at"] = now.isoformat()
-        PENDING_FILE.write_text(json.dumps(pending, indent=2))
-        deploy_url = f"{UI_BASE}/api/weekly_ic/deploy?token={new_token}"
-
-        msg = (
-            f"🟡 <b>Weekly IC — BORDERLINE — Deploy with caution</b>\n"
-            f"Expiry: {expiry_str}  |  Spot: {spot:,.0f}\n\n"
-            f"<b>Gates (10:15 AM assessment):</b>\n{gate_lines}\n\n"
-            f"<b>Caution:</b> {failed[0][2]}\n"
-            f"Consider waiting until 11:00 AM if conditions improve.\n\n"
-            f"<b>Position if you proceed:</b>\n"
-            f"  📉 SELL {planned_sc:,.0f} CE  |  📈 SELL {planned_sp:,.0f} PE\n"
-            f"  Credit: ~₹{plan_credit:,.0f}  |  IV: {current_iv:.1f}%  |  PCR: {current_pcr:.2f}\n\n"
-            f"<b>👇 Deploy only if you are comfortable with the risk:</b>\n"
-            f"<a href='{deploy_url}'>⚠️ DEPLOY IC (CAUTION)</a>"
-        )
-        result_str = "BORDERLINE"
+        if paper_mode:
+            # ── PAPER MODE: auto-deploy immediately ──────────────────────────
+            auto_ok, auto_msg = _auto_deploy_paper(new_token)
+            if auto_ok:
+                msg = (
+                    f"{clarity_emoji} <b>Weekly IC — {clarity} — Auto-deployed (PAPER)</b>\n"
+                    f"Expiry: {expiry_str}  |  Spot: {spot:,.0f}  |  {assessment_label} assessment\n\n"
+                    f"<b>Gates:</b>\n{gate_lines}\n"
+                    f"{caution_note}\n"
+                    f"<b>Position deployed:</b>\n"
+                    f"  📉 SELL {planned_sc:,.0f} CE  |  📈 SELL {planned_sp:,.0f} PE\n"
+                    f"  Credit: ~₹{plan_credit:,.0f}  |  IV: {current_iv:.1f}%  |  PCR: {current_pcr:.2f}\n\n"
+                    f"✅ <b>All 4 legs submitted automatically in PAPER mode.</b>\n"
+                    f"<i>Exit next Tuesday before 3:20 PM IST</i>"
+                )
+                result_str = f"AUTO_DEPLOYED_{clarity}"
+            else:
+                # Auto-deploy failed — fall back to manual link
+                msg = (
+                    f"{clarity_emoji} <b>Weekly IC — {clarity} — Auto-deploy FAILED (PAPER)</b>\n"
+                    f"Expiry: {expiry_str}  |  Spot: {spot:,.0f}\n\n"
+                    f"<b>Gates:</b>\n{gate_lines}\n"
+                    f"{caution_note}\n"
+                    f"⚠️ Auto-deploy error: {auto_msg}\n\n"
+                    f"<b>👇 Deploy manually:</b>\n"
+                    f"<a href='{deploy_url}'>{'✅ DEPLOY IC NOW' if n_passed == n_gates else '⚠️ DEPLOY IC (CAUTION)'}</a>"
+                )
+                result_str = f"AUTO_DEPLOY_FAILED_{clarity}"
+                print(f"[weekly_ic_assess] Auto-deploy failed: {auto_msg}")
+        else:
+            # ── LIVE MODE: send deploy link for manual confirmation ───────────
+            msg = (
+                f"{clarity_emoji} <b>Weekly IC — {clarity} — Deploy when ready</b>\n"
+                f"Expiry: {expiry_str}  |  Spot: {spot:,.0f}  |  {assessment_label} assessment\n\n"
+                f"<b>Gates:</b>\n{gate_lines}\n"
+                f"{caution_note}\n"
+                f"<b>Position:</b>\n"
+                f"  📉 SELL {planned_sc:,.0f} CE  |  📈 SELL {planned_sp:,.0f} PE\n"
+                f"  Credit: ~₹{plan_credit:,.0f}  |  IV: {current_iv:.1f}%  |  PCR: {current_pcr:.2f}\n\n"
+                f"<b>👇 Tap to deploy:</b>\n"
+                f"<a href='{deploy_url}'>{'✅ DEPLOY IC NOW' if n_passed == n_gates else '⚠️ DEPLOY IC (CAUTION)'}</a>\n\n"
+                f"<i>Exit next Tuesday before 3:20 PM IST</i>"
+            )
+            result_str = clarity
 
     else:
-        # 2+ failures — skip or wait
-        pending["status"] = "ASSESSMENT_HOLD"
-        PENDING_FILE.write_text(json.dumps(pending, indent=2))
+        # 2+ failures
+        failed_labels = ", ".join(g[1] for g in failed)
+        hhmm = now.hour * 100 + now.minute
 
-        msg = (
-            f"🔴 <b>Weekly IC — NOT SUITABLE YET ({n_passed}/{n_gates} gates)</b>\n"
-            f"Expiry: {expiry_str}  |  Spot: {spot:,.0f}\n\n"
-            f"<b>Gates (10:15 AM assessment):</b>\n{gate_lines}\n\n"
-            f"<b>Recommendation:</b> Wait for conditions to improve.\n"
-            f"A re-check message will fire at <b>11:30 AM</b> — if still failing, skip this week.\n\n"
-            f"<i>No deploy link issued. Re-run manually if conditions change:\n"
-            f"python scripts/weekly_ic_executor.py --assess --now</i>"
-        )
-        result_str = "HOLD"
+        if hhmm >= 1130 or pending.get("status") == "ASSESSMENT_HOLD":
+            # This is the 11:30 AM re-check (or a forced re-run after a prior HOLD)
+            # Conditions still bad — cancel for the week
+            pending["status"] = "CANCELLED"
+            PENDING_FILE.write_text(json.dumps(pending, indent=2))
+            msg = (
+                f"⏭ <b>Weekly IC — CANCELLED for this week ({n_passed}/{n_gates} gates)</b>\n"
+                f"Expiry: {expiry_str}  |  Spot: {spot:,.0f}  |  {assessment_label} re-check\n\n"
+                f"<b>Gates:</b>\n{gate_lines}\n\n"
+                f"<b>Failed:</b> {failed_labels}\n\n"
+                f"Conditions did not improve since the earlier assessment.\n"
+                f"<b>Plan cancelled — holding cash this week.</b>\n"
+                f"Next opportunity: Tuesday after 3:35 PM IST."
+            )
+            result_str = "CANCELLED"
+        else:
+            # First assessment at 10:15 AM — hold and wait for 11:30 AM re-check
+            pending["status"] = "ASSESSMENT_HOLD"
+            PENDING_FILE.write_text(json.dumps(pending, indent=2))
+            msg = (
+                f"🔴 <b>Weekly IC — NOT SUITABLE YET ({n_passed}/{n_gates} gates)</b>\n"
+                f"Expiry: {expiry_str}  |  Spot: {spot:,.0f}  |  {assessment_label} assessment\n\n"
+                f"<b>Gates:</b>\n{gate_lines}\n\n"
+                f"<b>Failed:</b> {failed_labels}\n"
+                f"<b>Re-check fires automatically at 11:30 AM IST.</b>\n"
+                f"If still failing at 11:30, the plan will be cancelled for this week.\n\n"
+                f"<i>Manual re-check: python scripts/weekly_ic_executor.py --assess --now</i>"
+            )
+            result_str = "HOLD"
 
     ok = _send_telegram(bot_token, chat_id, msg)
     print(f"[weekly_ic_assess] Result={result_str} ({n_passed}/{n_gates}). "
-          f"IV={current_iv:.1f}% PCR={current_pcr:.2f} "
+          f"Paper={paper_mode} IV={current_iv:.1f}% PCR={current_pcr:.2f} "
           f"SC_margin={sc_margin:.0f} SP_margin={sp_margin:.0f}. "
           f"Telegram={'OK' if ok else 'FAILED'}.")
 
