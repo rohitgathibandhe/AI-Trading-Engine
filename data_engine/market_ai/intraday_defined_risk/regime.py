@@ -1302,6 +1302,20 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         bullish_entry_score -= 0.50
     if support_ref is not None and (spot - support_ref) / max(spot, 1.0) <= 0.004:
         bullish_entry_score += 0.5
+    # Structural trend quality — if EMAs are aligned bullish AND higher lows are confirmed,
+    # this is a clean trending structure regardless of whether a textbook pullback is forming.
+    # Gives 0.5 only when both signals agree to avoid false entries in choppy markets.
+    if (
+        metadata.get("ema_alignment") == "BULLISH"
+        and metadata.get("higher_low_confirmed")
+        and bullish_trend_score >= 3.0
+    ):
+        bullish_entry_score += 0.5
+    # PCR-aligned bull entry: when PCR is balanced-to-bullish (0.75-1.30), institutions
+    # are not aggressively selling puts — put spread trades have tailwind.
+    _pcr_for_entry = metadata.get("pcr_by_oi")
+    if _pcr_for_entry is not None and 0.75 <= float(_pcr_for_entry) <= 1.30:
+        bullish_entry_score += 0.3
     if metadata["trend_follow_ready_bearish"]:
         bearish_entry_score += 1.5
     if bearish_pullback:
@@ -2493,7 +2507,10 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     bullish_trend_quality_score = _clamp(
         (bullish_trend_score * 1.55)
         + (1.0 if market_state == "TREND_UP" else 0.0)
-        + (0.5 if current_structure_signal == "BULLISH_BOS" else 0.0)
+        # Symmetric bias boosts — mirrors bearish TRANSITION/DIRECTIONAL_BALANCE bonuses
+        + (0.75 if market_state == "TRANSITION" and market_state_bias == "BULLISH" else 0.0)
+        + (0.50 if market_state == "DIRECTIONAL_BALANCE" and market_state_bias == "BULLISH" else 0.0)
+        + (0.5 if current_structure_signal in {"BULLISH_BOS", "BULLISH_CHOCH"} else 0.0)
         + (float(path_quality["momentum_persistence_score"]) * 0.4),
         0.0,
         10.0,
@@ -2502,6 +2519,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         (bearish_trend_score * 1.55)
         + (1.0 if market_state == "TREND_DOWN" else 0.0)
         + (0.75 if market_state == "TRANSITION" and market_state_bias == "BEARISH" else 0.0)
+        + (0.50 if market_state == "DIRECTIONAL_BALANCE" and market_state_bias == "BEARISH" else 0.0)
         + (0.5 if current_structure_signal in {"BEARISH_BOS", "BEARISH_CHOCH"} else 0.0)
         + (float(path_quality["momentum_persistence_score"]) * 0.4),
         0.0,
@@ -2524,10 +2542,19 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     bearish_failure_score += min(float(metadata.get("bearish_candle_quality_score") or 0.0), 2.0)
     if accepted_breakout:
         bullish_failure_score += 1.5
+    if accepted_breakdown:
+        # Breakdown accepted then reversed = failed breakdown = bullish confirmation
+        bullish_failure_score += 1.5
     if current_structure_signal == "BULLISH_CHOCH":
-        bullish_failure_score += 1.0
+        bullish_failure_score += 1.5   # was 1.0 — symmetric with BEARISH_CHOCH
+    if current_structure_signal == "BULLISH_BOS":
+        bullish_failure_score += 1.0   # structure break is directional confirmation
     if opening_range_break_state == "FAILED_DOWN":
-        bullish_failure_score += 2.5
+        bullish_failure_score += 2.5   # strongest bullish signal: ORB failed downside
+    if failed_bounce:
+        # Market tried to bounce and failed — this is now a bearish signal, not bullish
+        # But if market then reverses hard from that failed bounce, it's a trap
+        pass
     bullish_failure_score += min(float(metadata.get("bullish_candle_quality_score") or 0.0), 2.0)
 
     bearish_location_live_score = _clamp(
@@ -2692,11 +2719,11 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     )
     bullish_trade_score = (
         0.20 * bullish_trend_quality_score
-        + 0.12 * bullish_failure_score
-        + 0.20 * bullish_location_live_score
+        + 0.20 * bullish_failure_score        # was 0.12 — now symmetric with bearish
+        + 0.18 * bullish_location_live_score  # was 0.20
         + 0.14 * bullish_option_chain_pressure_score
         + 0.14 * bullish_monetization_score
-        + 0.20 * market_state_score
+        + 0.14 * market_state_score           # was 0.20 — redistributed to failure_score
     )
 
     stable_range = bool(
@@ -2731,6 +2758,12 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         effective_bullish_margin = max(0.8, params.bullish_trade_margin - 0.7)
 
     bearish_failure_context = failure_type in {"FAILED_BREAKOUT", "FAILED_RECLAIM", "FAILED_BOUNCE", "BEARISH_REJECTION_TRANSITION", "ACCEPTED_BREAKDOWN"}
+    bullish_recovery_context = (
+        opening_range_break_state == "FAILED_DOWN"
+        or current_structure_signal in {"BULLISH_BOS", "BULLISH_CHOCH"}
+        or accepted_breakout
+        or accepted_breakdown  # breakdown then reversal = trap squeeze
+    )
     directional_balance_tradable = bool(
         market_state == "DIRECTIONAL_BALANCE"
         and market_state_bias == "BEARISH"
@@ -2739,12 +2772,36 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         and bearish_location_live_score >= 1.5
         and bearish_trade_score > no_trade_score + 0.35
     )
+    bullish_confluence_score_v = float(metadata.get("bullish_confluence_score") or 0.0)
+    directional_balance_bullish_tradable = bool(
+        market_state == "DIRECTIONAL_BALANCE"
+        and market_state_bias == "BULLISH"
+        and (
+            bullish_recovery_context  # structural break, ORB failure, or BOS
+            or (
+                # Strong confluence + clean trending structure even without a textbook breakout
+                bullish_trend_score >= 3.0
+                and bullish_confluence_score_v >= 6.0
+                and float(metadata.get("bullish_candle_quality_score") or 0.0) >= 2.0
+                and bool(metadata.get("higher_low_confirmed"))
+            )
+        )
+        and bullish_failure_score >= 2.0
+        and bullish_location_live_score >= 1.5
+        and bullish_trade_score > no_trade_score + 0.35
+    )
     if market_state in {"TREND_DOWN", "TRANSITION"} and bearish_failure_context and bearish_trade_score > no_trade_score + 0.05:
         tradability_class = "TRADABLE"
         tradability_reason = f"{market_state} with {failure_type} and aligned bearish structure/chain pressure is spread-tradable."
+    elif market_state in {"TREND_UP", "TRANSITION"} and bullish_recovery_context and bullish_trade_score > no_trade_score + 0.05:
+        tradability_class = "TRADABLE"
+        tradability_reason = f"{market_state} with bullish recovery context and aligned structure is spread-tradable."
     elif directional_balance_tradable:
         tradability_class = "TRADABLE"
         tradability_reason = "Directional balance with bearish failure context is tradable even though the session is not a fully aligned trend yet."
+    elif directional_balance_bullish_tradable:
+        tradability_class = "TRADABLE"
+        tradability_reason = "Directional balance with bullish recovery context (BULLISH bias + structure break) is tradable for put-spread strategies."
     elif market_state == "TRUE_RANGE" and stable_range and bool(metadata.get("range_entry_ready")):
         tradability_class = "TRADABLE"
         tradability_reason = "Stable range with compressed EMAs and balanced option walls is tradable only through a strict condor."
