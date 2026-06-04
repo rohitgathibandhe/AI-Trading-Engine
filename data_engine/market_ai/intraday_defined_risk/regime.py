@@ -1439,28 +1439,28 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     open_drive_bullish_ready = (
         open_drive_bullish
         and open_drive_bullish_reclaim
-        and bullish_entry_score >= 3.0
-        and bullish_trend_score >= 3.5
-        and bullish_support_quality >= 4.0
-        and (bullish_planner_alignment or bullish_support_quality >= 3.5)
+        and bullish_entry_score >= 2.5
+        and bullish_trend_score >= 3.0
+        and bullish_support_quality >= 3.0
+        and (bullish_planner_alignment or bullish_support_quality >= 3.0)
     )
     sideways_bullish_reclaim_ready = (
         sideways_to_bullish
         and sideways_bullish_reclaim
-        and bullish_entry_score >= 3.0
-        and (bullish_planner_alignment or bullish_support_quality >= 3.5)
+        and bullish_entry_score >= 2.5
+        and (bullish_planner_alignment or bullish_support_quality >= 2.5)
         and wall_migration["wall_migration_bias"] != "BEARISH"
     )
     sideways_bullish_shallow_ready = (
         sideways_to_bullish
         and bullish_shallow
-        and bullish_entry_score >= 3.2
-        and bullish_support_quality >= 4.0
-        and (bullish_planner_alignment or option_pressure["bullish_pressure"] >= 0.55)
+        and bullish_entry_score >= 2.5
+        and bullish_support_quality >= 3.0
+        and (bullish_planner_alignment or option_pressure["bullish_pressure"] >= 0.50)
         and wall_migration["wall_migration_bias"] != "BEARISH"
         and (
-            option_pressure["bullish_pressure"] >= 0.45
-            or hour_change_pct >= 0.18
+            option_pressure["bullish_pressure"] >= 0.40
+            or hour_change_pct >= 0.15
             or wall_migration["put_wall_shift"] > 0.0
         )
     )
@@ -2781,12 +2781,12 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             or (
                 # Strong confluence + clean trending structure even without a textbook breakout
                 bullish_trend_score >= 3.0
-                and bullish_confluence_score_v >= 6.0
-                and float(metadata.get("bullish_candle_quality_score") or 0.0) >= 2.0
+                and bullish_confluence_score_v >= 5.0
+                and float(metadata.get("bullish_candle_quality_score") or 0.0) >= 0.8
                 and bool(metadata.get("higher_low_confirmed"))
             )
         )
-        and bullish_failure_score >= 2.0
+        and bullish_failure_score >= 0.5
         and bullish_location_live_score >= 1.5
         and bullish_trade_score > no_trade_score + 0.35
     )
@@ -2808,7 +2808,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     elif str(metadata.get("playbook") or "") == "LATE_SESSION_BULLISH_RECLAIM" or (
         market_state == "TREND_UP"
         and (
-            float(metadata.get("open_space_up") or 0.0) < 100.0
+            float(metadata.get("open_space_up") or 0.0) < 60.0
             or bool(metadata.get("price_into_overhead_call_wall"))
             or time_remaining_minutes < 90
         )

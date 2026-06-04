@@ -29,6 +29,11 @@ except Exception:  # pragma: no cover
 
 from logging.handlers import RotatingFileHandler
 
+try:
+    import pandas as pd  # type: ignore
+except ImportError:  # pragma: no cover
+    pd = None  # type: ignore
+
 # ── Path/setup ────────────────────────────────────────────────────────────────
 THIS_FILE = Path(__file__).resolve()
 ENGINE_DIR = THIS_FILE.parent
@@ -617,7 +622,9 @@ def _build_monthly_filters_config(settings: Dict[str, Any]) -> MonthlyFiltersCon
     return MonthlyFiltersConfig.from_dict(merged)
 
 
-def _paper_positions_from_blotter() -> Optional[pd.DataFrame]:
+def _paper_positions_from_blotter() -> "Optional[pd.DataFrame]":
+    if pd is None:
+        return None
     try:
         df = pd.read_csv(TRADE_BLOTTER_PATH)
     except Exception:
@@ -900,9 +907,7 @@ def _rebuild_bkm_basket_from_blotter(expiry: datetime.date, trade_mode: str, cfg
     """
     On restart, reconstruct the BKM basket legs from the blotter so MTM can resume.
     """
-    try:
-        import pandas as pd  # type: ignore
-    except Exception:
+    if pd is None:
         return None
     if not TRADE_BLOTTER_PATH.exists():
         return None
@@ -3365,6 +3370,8 @@ def _build_bkm_mtf_trend_context(dw: DhanWrapper, *, trade_day: dt_date) -> Dict
         "nearest_resistance": None,
     }
     try:
+        if pd is None:
+            raise ImportError("pandas not available")
         zone_frames: Dict[str, pd.DataFrame] = {}
         for interval, candles in candles_by_interval.items():
             tf_label = f"{int(interval)}m"
