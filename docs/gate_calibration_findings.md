@@ -51,13 +51,32 @@ Reproduce with: `python scripts/gate_calibration_backtest.py`
 2. **Entry window start 09:30 → 11:00** (`intraday_v83_runtime_config.json`).
    Single biggest lever: removes the ~19–20% win-rate morning trades.
 
+## Real-premium validation (no proxy)
+
+`scripts/real_premium_backtest.py` re-runs the analysis using the archived option
+chain (`state/rolling_option/<date>/`, per-minute strike-level LTP + Greeks),
+constructing the actual credit spread at the wall, pricing it with REAL premiums,
+and simulating TP(50%)/SL(1x)/square-off exits. Overlap: 7 sessions / 12 trades
+(chain archive ends 2026-05-15).
+
+| Direction | Trades | Win % | Net P&L | Expectancy |
+|---|---|---|---|---|
+| BEAR_CALL | 6 | **83%** | **+₹2,243** | **+₹374/trade** |
+| BULL_PUT  | 6 | **17%** | **−₹1,069** | **−₹178/trade** |
+
+The directional edge holds with **real money**: bearish credit spreads are
+profitable, bullish ones lose. This is the strongest, most actionable finding and
+it agrees with the proxy.
+
 ## Caveats
 
-- "Win" is a proxy (short strike never breached + adverse < half the cushion,
-  held to close), not realized P&L with fills/slippage. Directional asymmetry and
-  the time/distance gradients are robust; exact percentages are not.
-- 21 sessions is a small sample. Treat thresholds as a starting point and
-  re-run this backtest as more paper sessions accumulate.
+- The proxy "win" (short strike never breached + adverse < half cushion) is
+  directionally right but not P&L. The real-premium run above is P&L but only 12
+  trades — the **direction** signal is strong; time-of-day / distance cuts need a
+  bigger sample (most real-premium trades landed at 09:00 here, so that run can't
+  confirm the midday edge — the larger proxy sample does).
+- 21 proxy sessions / 7 real-premium sessions is small. Re-run both as forward
+  paper trading (real premiums via PaperOnlyExecutor) accumulates outcomes.
 
 ## Next candidate (not yet applied — needs more data)
 
