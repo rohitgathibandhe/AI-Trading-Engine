@@ -78,8 +78,33 @@ it agrees with the proxy.
 - 21 proxy sessions / 7 real-premium sessions is small. Re-run both as forward
   paper trading (real premiums via PaperOnlyExecutor) accumulates outcomes.
 
+## Bias detector is anti-predictive — and the fix (2026-06-08)
+
+The agent's raw directional bias is worse than a coin flip at the intraday→close
+horizon: **BULLISH bias is correct only 36%** of the time, BEARISH 44% (n=10,086).
+So bull-put losses are not a strategy flaw — the agent deploys bullish into
+markets that then fall. Disabling bull-put outright was rejected; instead we found
+*what conditionally makes a bullish read win* via within-bucket feature
+separation.
+
+**`option_chain_pressure_state` is the decisive separator for bull-put:**
+
+| Chain pressure state | Bull-put win | n |
+|---|---|---|
+| NEUTRAL | 69% | 972 |
+| OVERHEAD_CALL_PRESSURE | 54% | 971 |
+| DOWNSIDE_PUT_SUPPORT | 27% | 651 |
+| BALANCED_WALLS | 15% | 1455 |
+
+Gating bullish entry to NEUTRAL/OVERHEAD_CALL_PRESSURE lifts win rate **39% → 62%**
+(n=1943); the excluded states win 18%.
+
+**Applied:** `regime.py` now vetoes `bullish_entry_ready` when
+`option_chain_pressure_state` is `BALANCED_WALLS` or `DOWNSIDE_PUT_SUPPORT`.
+Bearish is left broad (already 80%); best when `ema_alignment != BULLISH` (82%).
+
 ## Next candidate (not yet applied — needs more data)
 
-- Bias playbook selection toward bearish Tier-A setups; bull-put spreads only
-  midday + far-from-wall. Hold until a larger sample confirms the bull-side
-  filter generalises.
+- Re-run this within-bucket separation as forward sessions accumulate; the
+  bullish veto is the highest-impact lever so far and should be re-validated on
+  real-premium outcomes once the agent has traded under it.

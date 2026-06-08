@@ -1645,6 +1645,23 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         metadata["allowed_width_points"] = (100.0,)
         metadata["target_short_put_buffer_points"] = 55.0
         metadata["minimum_net_edge_rupees"] = 1000.0
+    # ── Data-calibrated bullish veto (see docs/gate_calibration_findings.md) ──
+    # Bull-put credit spreads win only ~18% when option-chain pressure is
+    # BALANCED_WALLS or DOWNSIDE_PUT_SUPPORT, vs ~62% in NEUTRAL /
+    # OVERHEAD_CALL_PRESSURE (n=4049 historical decisions). The agent's raw
+    # bullish bias is anti-predictive (36% end-of-day accuracy); this gate keeps
+    # bullish deployment only in the chain-pressure states where it actually wins.
+    if metadata.get("bullish_entry_ready"):
+        _chain_state = str(metadata.get("option_chain_pressure_state") or "")
+        if _chain_state in {"BALANCED_WALLS", "DOWNSIDE_PUT_SUPPORT"}:
+            metadata["bullish_entry_ready"] = False
+            metadata["bullish_setup"] = None
+            metadata["playbook"] = "NO_TRADE"
+            reasons.append(
+                f"Bullish entry vetoed: option-chain pressure {_chain_state} "
+                f"historically yields ~18% win for bull-put spreads (need "
+                f"NEUTRAL or OVERHEAD_CALL_PRESSURE)."
+            )
     if bearish_entry_score >= 3.0 and (bearish_pullback or bearish_shallow) and (bearish_planner_alignment or bearish_entry_score >= 4.0):
         metadata["bearish_entry_ready"] = True
         metadata["bearish_setup"] = "PULLBACK_REJECTION" if bearish_pullback else "SHALLOW_CONTINUATION"
