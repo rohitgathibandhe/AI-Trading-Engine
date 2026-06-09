@@ -104,6 +104,14 @@ def select_best_structure(
             setup_quality_score=setup_quality,
             playbook_tier=playbook_tier,
         )
+    if strategy == StrategyType.SHORT_STRANGLE:
+        return _select_strangle_candidates(
+            snapshot=snapshot,
+            regime_state=regime_state,
+            params=params,
+            setup_quality_score=setup_quality,
+            playbook_tier=playbook_tier,
+        )
     report = {
         "strategy": strategy.value,
         "setup_quality_score": round(setup_quality, 4),
@@ -906,6 +914,165 @@ def _select_condor_candidates(
             "setup_quality_score": setup_quality_score,
             "final_trade_score": round(setup_quality_score + float(best_candidate["monetization_score"]), 4),
             "credit_width_ratio": best_candidate.get("credit_width_ratio"),
+        },
+    )
+    return structure, rationale, report
+
+
+def _select_strangle_candidates(
+    snapshot: MarketSnapshot,
+    regime_state: RegimeState,
+    params: AdaptiveParameters,
+    *,
+    setup_quality_score: float,
+    playbook_tier: str,
+) -> tuple[TradeStructure | None, list[str], dict[str, object]]:
+    """Select a short strangle: naked short OTM call + naked short OTM put.
+
+    Used when the market is range-bound but IV is elevated enough that condor
+    wing premiums are expensive relative to the short credit (hedge cost too high).
+    Risk is capped practically at 2x credit (PREMIUM_SL_MULTIPLIER), sized through
+    compute_max_loss_rupees_per_lot accordingly.
+    """
+    spot = snapshot.option_chain.spot
+    avg_chain_iv = float(regime_state.metadata.get("avg_chain_iv") or 0.0)
+    call_quotes = _liquid_otm_quotes(snapshot.option_chain.quotes, OptionType.CALL, spot)
+    put_quotes = _liquid_otm_quotes(snapshot.option_chain.quotes, OptionType.PUT, spot)
+
+    _empty_report: dict[str, object] = {
+        "strategy": StrategyType.SHORT_STRANGLE.value,
+        "setup_quality_score": round(setup_quality_score, 4),
+        "monetization_score": 0.0,
+        "final_trade_score": 0.0,
+        "passed_spread_construction": False,
+        "passed_liquidity": False,
+        "passed_credit_width": False,
+        "passed_delta_band": False,
+        "passed_anchor_distance": True,
+        "canonical_rejection_reason": "LIQUIDITY_BAD",
+        "best_candidate": None,
+        "best_failed_candidate": None,
+        "candidate_evaluations": [],
+    }
+
+    if not call_quotes or not put_quotes:
+        return None, ["Short strangle: no liquid OTM calls or puts found."], _empty_report
+
+    # Target delta: 0.15-0.28 per side — enough OTM to survive intraday noise
+    short_delta_band = (0.15, 0.28)
+    min_total_credit = max(60.0, spot * 0.0025)  # at least 60pts or 0.25% of spot
+
+    candidate_evaluations: list[dict[str, object]] = []
+    best_valid: dict[str, object] | None = None
+    best_failed: dict[str, object] | None = None
+
+    for short_call in call_quotes:
+        if short_call.delta is None:
+            continue
+        call_delta = abs(short_call.delta)
+        if not (short_delta_band[0] <= call_delta <= short_delta_band[1]):
+            continue
+        for short_put in put_quotes:
+            if short_put.delta is None:
+                continue
+            put_delta = abs(short_put.delta)
+            if not (short_delta_band[0] <= put_delta <= short_delta_band[1]):
+                continue
+            call_credit = short_call.mid_price or short_call.ltp or 0.0
+            put_credit = short_put.mid_price or short_put.ltp or 0.0
+            total_credit = call_credit + put_credit
+            width_points = short_call.strike - short_put.strike
+            avg_spread_ratio = (short_call.spread_ratio + short_put.spread_ratio) / 2.0
+
+            passed_liquidity = avg_spread_ratio <= params.liquidity_spread_ratio_cap
+            passed_credit = total_credit >= min_total_credit
+            passed_delta = True  # already filtered above
+            valid = passed_liquidity and passed_credit
+
+            # Score: reward higher credit and tighter spread; penalise extreme deltas
+            delta_balance = 1.0 - abs(call_delta - put_delta) / max(call_delta + put_delta, 0.01)
+            liq_quality = max(0.0, 1.0 - avg_spread_ratio / max(params.liquidity_spread_ratio_cap, 0.01))
+            monetization_score = round(
+                (total_credit / max(spot * 0.01, 1.0)) * 10.0
+                + delta_balance * 0.5
+                + liq_quality * 0.3
+                - (0.2 if avg_chain_iv < 18.0 else 0.0),
+                4,
+            )
+
+            rejection_flags = {
+                "LIQUIDITY_BAD": passed_liquidity,
+                "CREDIT_TOO_LOW": passed_credit,
+                "DELTA_TOO_HIGH": passed_delta,
+            }
+            entry = {
+                "short_call_strike": short_call.strike,
+                "short_put_strike": short_put.strike,
+                "call_credit": round(call_credit, 4),
+                "put_credit": round(put_credit, 4),
+                "total_credit": round(total_credit, 4),
+                "width_points": round(width_points, 4),
+                "call_delta": round(call_delta, 4),
+                "put_delta": round(put_delta, 4),
+                "avg_spread_ratio": round(avg_spread_ratio, 4),
+                "valid": valid,
+                "monetization_score": monetization_score,
+                "canonical_rejection_reason": "NONE" if valid else _candidate_rejection_reason(rejection_flags),
+            }
+            candidate_evaluations.append(entry)
+            if valid:
+                if best_valid is None or monetization_score > float(best_valid.get("monetization_score") or 0.0):
+                    best_valid = entry
+            else:
+                if best_failed is None or monetization_score > float(best_failed.get("monetization_score") or 0.0):
+                    best_failed = entry
+
+    report: dict[str, object] = {
+        "strategy": StrategyType.SHORT_STRANGLE.value,
+        "setup_quality_score": round(setup_quality_score, 4),
+        "monetization_score": round(float(best_valid.get("monetization_score") or 0.0) if best_valid else float(best_failed.get("monetization_score") or 0.0) if best_failed else 0.0, 4),
+        "final_trade_score": round(setup_quality_score + (float(best_valid.get("monetization_score") or 0.0) if best_valid else 0.0), 4),
+        "passed_spread_construction": best_valid is not None,
+        "passed_liquidity": any(bool(c.get("passed_liquidity", True)) for c in candidate_evaluations),
+        "passed_credit_width": any(bool(c.get("passed_credit", True)) for c in candidate_evaluations),
+        "passed_delta_band": True,
+        "passed_anchor_distance": True,
+        "canonical_rejection_reason": "NONE" if best_valid else str(best_failed.get("canonical_rejection_reason") or "CREDIT_TOO_LOW") if best_failed else "LIQUIDITY_BAD",
+        "best_candidate": best_valid,
+        "best_failed_candidate": best_failed,
+        "candidate_evaluations": candidate_evaluations,
+    }
+
+    if best_valid is None:
+        return None, ["Short strangle: no candidate met credit and liquidity thresholds."], report
+
+    short_call_q = next(q for q in call_quotes if q.strike == best_valid["short_call_strike"])
+    short_put_q = next(q for q in put_quotes if q.strike == best_valid["short_put_strike"])
+    total_credit = float(best_valid["total_credit"])
+    width_points = float(best_valid["width_points"])
+    rationale = [
+        f"Short strangle: sell {short_call_q.strike} call + sell {short_put_q.strike} put.",
+        f"Total credit {total_credit:.2f} pts, width {width_points:.0f} pts, avg IV {avg_chain_iv:.1f}%.",
+        f"Deltas: call {best_valid['call_delta']:.3f}, put {best_valid['put_delta']:.3f}. Stop at 2x credit.",
+    ]
+    structure = TradeStructure(
+        strategy=StrategyType.SHORT_STRANGLE,
+        legs=[
+            StrategyLeg(action="SELL", option_type=OptionType.CALL, strike=short_call_q.strike, quote=short_call_q),
+            StrategyLeg(action="SELL", option_type=OptionType.PUT, strike=short_put_q.strike, quote=short_put_q),
+        ],
+        credit_points=total_credit,
+        width_points=width_points,
+        call_width_points=0.0,
+        put_width_points=0.0,
+        margin_estimate_per_lot=snapshot.option_chain.margin_estimate_per_lot,
+        rationale=rationale,
+        metadata={
+            "selection_mode": "STRANGLE",
+            "short_call_strike": short_call_q.strike,
+            "short_put_strike": short_put_q.strike,
+            "avg_chain_iv": avg_chain_iv,
+            "monetization_score": best_valid["monetization_score"],
         },
     )
     return structure, rationale, report
