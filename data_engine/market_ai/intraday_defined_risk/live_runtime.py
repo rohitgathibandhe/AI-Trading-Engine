@@ -279,6 +279,7 @@ class DhanLiveMarketDataProvider:
         self._front_expiry_cache: tuple[date, str] | None = None
         self._previous_close_cache: tuple[date, float | None] | None = None
         self._daily_bars_cache: tuple[date, list[OhlcvBar]] | None = None
+        self._chain_miss_streak: int = 0
 
     def _readiness_diagnostics(
         self,
@@ -439,6 +440,20 @@ class DhanLiveMarketDataProvider:
         quotes = [_quote_from_row(dict(row)) for row in chain_rows]
         quotes = [quote for quote in quotes if quote is not None]
         if not quotes:
+            self._chain_miss_streak += 1
+            _log = logging.getLogger("intraday_defined_risk.v83")
+            if self._chain_miss_streak == 5:
+                _log.warning(
+                    "[option_chain] HEALTH ALERT: chain unavailable for %d consecutive polls "
+                    "(expiry=%s, seg=%s). Check Dhan API connectivity and token validity.",
+                    self._chain_miss_streak, oi_expiry, self.underlying_seg,
+                )
+            elif self._chain_miss_streak % 20 == 0:
+                _log.error(
+                    "[option_chain] PERSISTENT OUTAGE: chain missing for %d consecutive polls. "
+                    "Entire session is flying blind.",
+                    self._chain_miss_streak,
+                )
             self._raise_insufficient(
                 "OPTION_CHAIN_QUOTES_UNAVAILABLE",
                 now=now,
@@ -448,6 +463,7 @@ class DhanLiveMarketDataProvider:
                 quotes=quotes,
                 expiry=expiry,
             )
+        self._chain_miss_streak = 0
 
         chain = OptionsChainSnapshot(
             timestamp=now,

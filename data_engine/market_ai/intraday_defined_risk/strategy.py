@@ -33,6 +33,8 @@ GAP_DOWN_BEARISH_CONTINUATION_END = time(12, 0)
 GAP_UP_BEARISH_FAILURE_END = time(11, 15)
 RANGE_CONDOR_START = time(11, 30)
 RANGE_CONDOR_END = time(13, 30)
+RANGE_STRANGLE_START = time(11, 30)
+RANGE_STRANGLE_END = time(13, 30)
 # Wednesday = Day 1 of new weekly series (post-Tuesday expiry).
 # IC can start earlier on Wednesday — morning range is well-defined after the
 # previous day's expiry flush, and 7DTE options carry the most weekly premium.
@@ -686,8 +688,23 @@ def select_strategy(
         _condor_start = RANGE_CONDOR_POST_EXPIRY_START if is_post_expiry_day else RANGE_CONDOR_START
         _condor_end = RANGE_CONDOR_POST_EXPIRY_END if is_post_expiry_day else RANGE_CONDOR_END
         if is_expiry_day:
-            # Tuesday expiry day: same-day expiry chain → extreme gamma → no IC
-            reasons.append("Expiry day (Tuesday): Iron Condor blocked — same-day expiry gamma risk is unacceptable.")
+            # Tuesday expiry day: same-day expiry chain → extreme gamma → no IC or strangle
+            reasons.append("Expiry day (Tuesday): Iron Condor / Strangle blocked — same-day expiry gamma risk is unacceptable.")
+            return StrategyType.NO_TRADE, reasons
+        # Elevated IV path: rv30 0.20–0.30 makes condor wings expensive → use short strangle instead
+        _strangle_rv30_limit = 0.30
+        avg_chain_iv = float(regime_state.metadata.get("avg_chain_iv") or 0.0)
+        if _rv30_limit < regime_state.rv30_pct <= _strangle_rv30_limit and avg_chain_iv >= 18.0:
+            if now_time > RANGE_STRANGLE_END:
+                reasons.append(f"Short Strangle entries avoided after {RANGE_STRANGLE_END.strftime('%H:%M')} IST.")
+                return StrategyType.NO_TRADE, reasons
+            if now_time >= RANGE_STRANGLE_START:
+                reasons.append(
+                    f"Range day with elevated IV (rv30={regime_state.rv30_pct:.3f}, avg_iv={avg_chain_iv:.1f}%): "
+                    "condor wings too expensive → Short Strangle."
+                )
+                return StrategyType.SHORT_STRANGLE, reasons
+            reasons.append(f"Short Strangle allowed only after {RANGE_STRANGLE_START.strftime('%H:%M')} IST.")
             return StrategyType.NO_TRADE, reasons
         if regime_state.rv30_pct > _rv30_limit:
             reasons.append(f"Iron Condor requires low-volatility range (rv30={regime_state.rv30_pct:.3f} > {_rv30_limit}).")

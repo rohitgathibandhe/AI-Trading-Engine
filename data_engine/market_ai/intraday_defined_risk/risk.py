@@ -78,6 +78,10 @@ def compute_max_loss_rupees_per_lot(structure: TradeStructure, lot_size: int) ->
         call_side = max(structure.call_width_points - structure.credit_points, 0.0)
         put_side = max(structure.put_width_points - structure.credit_points, 0.0)
         return max(call_side, put_side) * lot_size
+    if structure.strategy == StrategyType.SHORT_STRANGLE:
+        # Naked — no defined width cap. Use 2x credit as the practical stop (consistent
+        # with PREMIUM_SL_MULTIPLIER=2.0 in execution) so lot sizing matches actual stop risk.
+        return structure.credit_points * 2.0 * lot_size
     return 0.0
 
 
