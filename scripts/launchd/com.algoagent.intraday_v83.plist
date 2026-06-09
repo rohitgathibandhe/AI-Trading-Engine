@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.algoagent.intraday_v83</string>
+
+    <!-- The v83 intraday defined-risk trader (PaperOnlyExecutor). Writes the
+         decisions/outcomes learning DB. KeepAlive restarts it on crash and at
+         boot so it is always present during market hours; monitor.py self-
+         throttles to a 5-min sleep outside 09:15-15:35 IST, so 24/7 is cheap. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Rohit/.venvs/data_engine_py310/bin/python3</string>
+        <string>-u</string>
+        <string>-m</string>
+        <string>market_ai.intraday_defined_risk.cli</string>
+        <string>run_live</string>
+        <string>--config</string>
+        <string>/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_run_live_config.json</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/Rohit/AI-Trading-Engine/data_engine</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/Rohit/AI-Trading-Engine/data_engine</string>
+        <key>TRADE_MODE</key>
+        <string>paper</string>
+        <key>PYTHONDONTWRITEBYTECODE</key>
+        <string>1</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_runner.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/intraday_v83_runner.log</string>
+</dict>
+</plist>

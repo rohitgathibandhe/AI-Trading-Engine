@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.algoagent.orchestrator</string>
+
+    <!-- Regime-aware orchestrator (start_agent.py): deploys the weekly Batman
+         BKM strategy at 15:16 IST and runs the intraday-AI deploy path. Wrapper
+         forces strategy_file=batman_bkm_monthly so a restart is self-healing
+         even if the UI reset the selection. KeepAlive + RunAtLoad so it is
+         always present; it self-throttles outside market hours. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/Rohit/AI-Trading-Engine/scripts/launchd/run_orchestrator_launchd.sh</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TRADE_MODE</key>
+        <string>paper</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/agent.log</string>
+</dict>
+</plist>
