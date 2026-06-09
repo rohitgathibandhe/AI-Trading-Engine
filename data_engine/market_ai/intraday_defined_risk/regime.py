@@ -1036,8 +1036,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         elif (
             snapshot.timestamp.time() >= RANGE_GATE_TIME
             and rv30_pct < params.rv_mid_cutoff
-            and remains_inside_opening_range(bars_5m, opening_range, required_bars=9)
-            and oscillates_around_vwap(bars_5m, vwap, required_bars=9)
+            and remains_inside_opening_range(bars_5m, opening_range, required_bars=6)
+            and oscillates_around_vwap(bars_5m, vwap, required_bars=6)
         ):
             execution_5m = "RANGE_CONFIRMED"
             reasons.append("Price remains inside opening range and oscillates around VWAP after 10:00.")
@@ -1720,7 +1720,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["is_post_expiry_day"] = _is_post_expiry_day
     metadata["weekly_series_day"] = _weekday
     # Post-expiry Wednesday: relax balance requirement — fresh series, clean slate, full premium
-    _range_balance_min = 3.5 if _is_post_expiry_day else 4.0
+    _range_balance_min = 3.0 if _is_post_expiry_day else 3.5
     metadata["range_entry_ready"] = bool(
         execution_5m == "RANGE_CONFIRMED"
         and snapshot.timestamp.time() >= RANGE_GATE_TIME

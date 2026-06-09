@@ -814,19 +814,19 @@ def balanced_range_condor_setup(
         return False
     if bars[-1].timestamp.time() < time(11, 30):
         return False
-    if rv30_pct >= 0.22:
+    if rv30_pct >= 0.30:
         return False
     recent = bars[-12:]
     inside_count = sum(1 for bar in recent if bar.high <= opening_range.high and bar.low >= opening_range.low)
-    if inside_count / len(recent) < 0.80:
+    if inside_count / len(recent) < 0.67:
         return False
-    if not oscillates_around_vwap(recent, vwap, required_bars=min(8, len(recent))):
+    if not oscillates_around_vwap(recent, vwap, required_bars=min(6, len(recent))):
         return False
     recent_range_pct = price_change_pct(min(bar.low for bar in recent), max(bar.high for bar in recent))
-    if recent_range_pct >= 0.45:
+    if recent_range_pct >= 0.55:
         return False
     range_mid = (opening_range.high + opening_range.low) / 2.0
-    return abs(bars[-1].close - range_mid) / max(bars[-1].close, 1.0) <= 0.0018
+    return abs(bars[-1].close - range_mid) / max(bars[-1].close, 1.0) <= 0.0025
 
 
 def bearish_pullback_rejection_setup(
