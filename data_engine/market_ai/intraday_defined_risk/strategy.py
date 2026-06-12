@@ -449,9 +449,9 @@ def select_strategy(
                 f"Bearish setup detected, but conviction {regime_state.confidence:.2f} is below the required {required_bear_confidence:.2f}."
             )
             return StrategyType.NO_TRADE, reasons
-        if day_archetype not in {"OPEN_DRIVE_BEARISH", "EARLY_BALANCE_TO_BEARISH", "SIDEWAYS_TO_BEARISH", "GAP_UP_FAILURE", "GAP_DOWN_CONTINUATION", "HIGH_CONFLUENCE_BEARISH"}:
+        if day_archetype not in {"OPEN_DRIVE_BEARISH", "EARLY_BALANCE_TO_BEARISH", "SIDEWAYS_TO_BEARISH", "GAP_UP_FAILURE", "GAP_DOWN_CONTINUATION", "HIGH_CONFLUENCE_BEARISH", "TREND_BEARISH"}:
             reasons.append(
-                f"Bearish regime is generic {day_archetype}; only gap/open-drive/sideways bearish archetypes are eligible for downside deployment."
+                f"Bearish regime is generic {day_archetype}; only gap/open-drive/sideways/trend-bearish archetypes are eligible for downside deployment."
             )
             return StrategyType.NO_TRADE, reasons
         if day_archetype == "OPEN_DRIVE_BEARISH" and bearish_setup != "TIGHT_BREAKDOWN":
