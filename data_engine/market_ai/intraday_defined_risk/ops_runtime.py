@@ -634,14 +634,14 @@ def build_unified_health(
         and active_market_session
         and live_feed_ready
         and live_chain_ready
-        and structured_5m_ok
-        and structured_chain_ok
     ):
-        # PAPER_LIVE entries depend on the live market feed and the current option chain,
-        # not on the asynchronous research collector heartbeat. Keep the stale collector
-        # visible as an ops warning, but do not hard-block paper trades intraday when the
-        # live data path itself is healthy.
+        # PAPER_LIVE intraday entries use the live market feed and current option chain.
+        # Structured/research dataset files and the async collector are not part of the
+        # live decision path. Demote all of these to degraded-only so that stale training
+        # artifacts or a dead collector cannot hard-block paper trades when live data is healthy.
         paper_session_degraded_only = {
+            "STRUCTURED_5M_DATASET_STALE",
+            "STRUCTURED_OPTION_CHAIN_STALE",
             "COLLECTOR_HEARTBEAT_STALE",
             "COLLECTOR_PROCESS_NOT_RUNNING",
             "COLLECTOR_LOG_STALE",
