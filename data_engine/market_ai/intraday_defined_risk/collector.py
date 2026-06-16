@@ -285,6 +285,36 @@ def _fetch_option_chain_payload(
     return _post_json_with_backoff(client, "/v2/optionchain", payload)
 
 
+def _coerce_oc_to_dict(raw_oc: Any) -> dict[str, Any]:
+    """Convert oc field to strike→{ce,pe} dict regardless of whether Dhan returned a dict or list."""
+    if isinstance(raw_oc, dict):
+        return raw_oc
+    if not isinstance(raw_oc, list):
+        return {}
+    out: dict[str, Any] = {}
+    for row in raw_oc:
+        if not isinstance(row, dict):
+            continue
+        strike = row.get("strike") or row.get("strikePrice") or row.get("strikeprice") or row.get("StrikePrice")
+        if strike is None:
+            continue
+        try:
+            sv = float(strike)
+        except Exception:
+            continue
+        key = str(int(sv)) if abs(sv - int(sv)) < 1e-6 else str(sv)
+        ce = row.get("ce") or row.get("CE") or row.get("call") or row.get("Call")
+        pe = row.get("pe") or row.get("PE") or row.get("put") or row.get("Put")
+        entry: dict[str, Any] = {}
+        if ce:
+            entry["ce"] = ce
+        if pe:
+            entry["pe"] = pe
+        if entry:
+            out[key] = entry
+    return out
+
+
 def _flatten_option_chain_payload(
     payload: dict[str, Any],
     *,
@@ -295,10 +325,11 @@ def _flatten_option_chain_payload(
     if not isinstance(payload, dict):
         return []
     data = payload.get("data") or payload
-    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+    if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)):
         data = data.get("data") or data
-    oc = data.get("oc") if isinstance(data, dict) else None
-    if not isinstance(oc, dict):
+    raw_oc = data.get("oc") if isinstance(data, dict) else None
+    oc = _coerce_oc_to_dict(raw_oc)
+    if not oc:
         return []
     spot = _num(data.get("last_price") or data.get("lastPrice") or data.get("spot"))
     session_date = timestamp.strftime("%Y-%m-%d")
