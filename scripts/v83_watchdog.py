@@ -269,21 +269,43 @@ def run_watchdog() -> None:
         fixes_applied.append(fix)
         _send_telegram(f"⚠️ <b>V83 Watchdog</b>\n{fix} at {now.strftime('%H:%M IST')}")
         _save_wdog_state(state)
-        return  # Let it restart before next checks
+        # Allow 2 min for the restarted agent to write its first log line
+        state["restart_grace_until"] = (now + timedelta(minutes=2)).isoformat()
+        return
 
     # ── 3. Analyse recent decisions ──────────────────────────────────────────
+    # Skip checks if we're still in a restart grace window
+    grace_until_str = state.get("restart_grace_until", "")
+    if grace_until_str:
+        try:
+            grace_until = datetime.fromisoformat(grace_until_str).replace(tzinfo=IST)
+            if now < grace_until:
+                _log(f"In restart grace window until {grace_until.strftime('%H:%M:%S')} — skipping checks.")
+                _save_wdog_state(state)
+                return
+        except Exception:
+            pass
+        state.pop("restart_grace_until", None)
+
     decisions = _recent_decisions(n=20)
     age = _last_decision_age_minutes(decisions)
 
     # ── 4. Stale log — agent running but not deciding ────────────────────────
-    if age is not None and age > 10:
-        _log(f"Last decision was {age:.1f} min ago — agent may be stuck")
+    # Before 9:45 AM the agent is accumulating candles and may sleep several
+    # minutes between retries without writing a log line — allow more slack.
+    stale_threshold = 20 if now.strftime("%H%M") < "0945" else 10
+    if age is not None and age > stale_threshold:
+        _log(f"Last decision was {age:.1f} min ago — agent may be stuck, restarting")
         ok = _restart_agent()
         fixes_applied.append(f"Agent log stale ({age:.1f} min) → restarted")
-        _send_telegram(
-            f"⚠️ <b>V83 Watchdog</b>\n"
-            f"Agent log stale ({age:.1f} min) — restarted at {now.strftime('%H:%M IST')}"
-        )
+        # Alert only if stale for a long time (not just a brief API retry gap)
+        if age > 20:
+            _send_telegram(
+                f"⚠️ <b>V83 Watchdog</b>\n"
+                f"Agent log stale ({age:.1f} min) — restarted at {now.strftime('%H:%M IST')}"
+            )
+        # Grace period: don't re-check for 3 min after restart
+        state["restart_grace_until"] = (now + timedelta(minutes=3)).isoformat()
 
     # ── 5. Token expiry ──────────────────────────────────────────────────────
     if _token_looks_expired(decisions):
