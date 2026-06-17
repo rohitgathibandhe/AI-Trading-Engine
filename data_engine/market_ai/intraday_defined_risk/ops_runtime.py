@@ -124,6 +124,7 @@ class RuntimeConfig:
     directional_balance_score_margin_override: float = 0.08
     allowed_entry_start_hhmm: str = "09:30"
     allowed_entry_end_hhmm: str = "14:30"
+    allowed_bullish_entry_start_hhmm: str = "10:00"
     paper_override_bearish_score_threshold: float = 6.5
     paper_override_margin: float = 1.0
     paper_experiment_entry_end_hhmm: str = "14:30"
@@ -164,6 +165,7 @@ class RuntimeConfig:
             ),
             allowed_entry_start_hhmm=str(payload.get("allowed_entry_start_hhmm") or "09:30"),
             allowed_entry_end_hhmm=str(payload.get("allowed_entry_end_hhmm") or "14:30"),
+            allowed_bullish_entry_start_hhmm=str(payload.get("allowed_bullish_entry_start_hhmm") or "10:00"),
             paper_override_bearish_score_threshold=float(payload.get("paper_override_bearish_score_threshold", 6.5) or 6.5),
             paper_override_margin=float(payload.get("paper_override_margin", 1.0) or 1.0),
             paper_experiment_entry_end_hhmm=str(payload.get("paper_experiment_entry_end_hhmm") or "14:30"),
@@ -392,6 +394,7 @@ def set_runtime_mode(
         directional_balance_score_margin_override=current.directional_balance_score_margin_override,
         allowed_entry_start_hhmm=current.allowed_entry_start_hhmm,
         allowed_entry_end_hhmm=current.allowed_entry_end_hhmm,
+        allowed_bullish_entry_start_hhmm=current.allowed_bullish_entry_start_hhmm,
         paper_override_bearish_score_threshold=current.paper_override_bearish_score_threshold,
         paper_override_margin=current.paper_override_margin,
         paper_experiment_entry_end_hhmm=current.paper_experiment_entry_end_hhmm,
@@ -933,7 +936,12 @@ def evaluate_entry_gate(
         directional_score = bearish_score
     if directional_score <= no_trade_score + score_margin_required:
         reasons.append("DIRECTIONAL_SCORE_MARGIN_FAIL")
-    start_t = _parse_time(config.allowed_entry_start_hhmm, time(9, 30))
+    # Bullish setups use an earlier start time so gap-up continuation plays can
+    # be entered from 10:00 AM instead of waiting for the bearish window (11:00).
+    if setup_direction == "BULLISH":
+        start_t = _parse_time(config.allowed_bullish_entry_start_hhmm, time(10, 0))
+    else:
+        start_t = _parse_time(config.allowed_entry_start_hhmm, time(9, 30))
     end_t = min(
         _parse_time(config.allowed_entry_end_hhmm, time(14, 30)),
         _parse_time(config.risk.no_new_entries_after_hhmm, time(14, 30)),
