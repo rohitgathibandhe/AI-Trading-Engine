@@ -786,6 +786,7 @@ class DhanWrapper:
         Fetch intraday OHLCV from /charts/intraday via the HistoricalData helper.
         Returns a list of dicts sorted by timestamp with keys: timestamp, open, high, low, close, volume.
         """
+        self._refresh_token_if_stale()
         from_str = (from_date or dt_date.today().isoformat()).strip()
         to_str = (to_date or from_str).strip()
         try:
@@ -802,6 +803,9 @@ class DhanWrapper:
             return []
 
         data: Any = resp
+        if isinstance(data, dict) and data.get("status") == "failure":
+            self.log.error("[historical] intraday fetch failure: %s", data.get("remarks", data))
+            return []
         if isinstance(data, dict):
             for key in ("data", "Data", "candles", "CANDLES"):
                 if key in data:
@@ -834,6 +838,7 @@ class DhanWrapper:
                 )
             data = temp
         if not isinstance(data, list):
+            self.log.warning("[historical] intraday unexpected response type=%s: %s", type(data).__name__, str(data)[:200])
             return []
 
         candles: List[Dict[str, Any]] = []
