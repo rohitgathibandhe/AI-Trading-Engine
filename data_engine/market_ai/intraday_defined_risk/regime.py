@@ -1653,7 +1653,11 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     # bullish deployment only in the chain-pressure states where it actually wins.
     if metadata.get("bullish_entry_ready"):
         _chain_state = str(metadata.get("option_chain_pressure_state") or "")
-        if _chain_state in {"BALANCED_WALLS", "DOWNSIDE_PUT_SUPPORT"}:
+        _or_break_up = str(metadata.get("opening_range_break_state") or "") == "UP"
+        # BALANCED_WALLS veto is skipped when price has broken above the opening range —
+        # a confirmed OR breakout provides directional conviction that overrides the veto.
+        _veto_states = {"DOWNSIDE_PUT_SUPPORT"} if _or_break_up else {"BALANCED_WALLS", "DOWNSIDE_PUT_SUPPORT"}
+        if _chain_state in _veto_states:
             metadata["bullish_entry_ready"] = False
             metadata["bullish_setup"] = None
             metadata["playbook"] = "NO_TRADE"
@@ -2254,6 +2258,33 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         reasons.append(
             "Trend continuation bullish: slow grind up with TRANSITION/DIRECTIONAL_BALANCE bias, "
             "entry/trend scores confirmed, spot above VWAP, no active overhead resistance."
+        )
+
+    # OR breakout: spot clears opening range high in first 90 min — fires regardless of gap size.
+    or_breakout_bullish_ready = (
+        not metadata.get("bullish_entry_ready")
+        and str(metadata.get("opening_range_break_state") or "") == "UP"
+        and market_state_bias == "BULLISH"
+        and market_state in {"TREND_UP", "DIRECTIONAL_BALANCE", "TRANSITION"}
+        and bullish_trend_score >= 3.5
+        and bullish_support_quality >= 3.5
+        and vwap is not None
+        and spot > vwap
+        and str(metadata.get("option_chain_pressure_state") or "") != "DOWNSIDE_PUT_SUPPORT"
+        and time(9, 15) <= snapshot.timestamp.time() <= time(11, 0)
+        and not big_gap_up
+    )
+    if or_breakout_bullish_ready:
+        metadata["bullish_entry_ready"] = True
+        metadata["bullish_setup"] = "OR_BREAKOUT"
+        metadata["playbook"] = "EARLY_BALANCE_BULLISH_RECLAIM"
+        metadata["preferred_width_points"] = 100.0
+        metadata["allowed_width_points"] = (100.0,)
+        metadata["target_short_put_buffer_points"] = 50.0
+        metadata["minimum_net_edge_rupees"] = 900.0
+        reasons.append(
+            "OR breakout bullish: price cleared opening range high with bullish bias, "
+            "spot above VWAP, trend and support scores confirmed."
         )
 
     if snapshot.timestamp.time() >= time(14, 0):
