@@ -50,10 +50,10 @@ class AdaptiveParameters:
     strict_hedge_cost_ratio_cap: float = 0.75
     width_preference_penalty: float = 1.25
     shadow_sessions: int = 5
-    bearish_trade_score_threshold: float = 6.5
-    bullish_trade_score_threshold: float = 7.0
-    bearish_trade_margin: float = 1.5
-    bullish_trade_margin: float = 1.8
+    bearish_trade_score_threshold: float = 5.8
+    bullish_trade_score_threshold: float = 6.2
+    bearish_trade_margin: float = 1.0
+    bullish_trade_margin: float = 1.2
     failed_breakout_transition_shadow_buffer: float = 0.25
 
     def clamped(self) -> "AdaptiveParameters":
