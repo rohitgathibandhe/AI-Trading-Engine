@@ -1520,24 +1520,6 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         and ema20_5m_value > ema50_5m_value
         and recent_trend_close_location >= 0.52
     )
-    # Fires on slow-grind bullish days (no gap, no open drive) where the
-    # market drifts up steadily — TRANSITION or DIRECTIONAL_BALANCE with a
-    # clear bullish bias and high entry/trend score but no textbook breakout.
-    trend_continuation_bullish_ready = (
-        market_state in {"TRANSITION", "DIRECTIONAL_BALANCE"}
-        and market_state_bias == "BULLISH"
-        and (trend_15m == "TREND_UP" or execution_5m == "UP_CONFIRMED")
-        and bullish_entry_score >= 3.5
-        and bullish_trend_score >= 3.8
-        and bullish_support_quality >= 3.5
-        and (bullish_pullback or bullish_shallow or bullish_vwap_hold or metadata["trend_follow_ready_bullish"])
-        and vwap is not None
-        and spot > vwap
-        and wall_migration["wall_migration_bias"] != "BEARISH"
-        and time(10, 30) <= snapshot.timestamp.time() <= time(13, 30)
-        and not big_gap_up
-        and not open_drive_bullish
-    )
     high_confluence_bullish_ready = (
         trend_15m == "NEUTRAL"
         and execution_5m == "UP_CONFIRMED"
@@ -1663,18 +1645,6 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         metadata["allowed_width_points"] = (100.0,)
         metadata["target_short_put_buffer_points"] = 55.0
         metadata["minimum_net_edge_rupees"] = 1000.0
-    elif trend_continuation_bullish_ready:
-        metadata["bullish_entry_ready"] = True
-        metadata["bullish_setup"] = "TREND_CONTINUATION"
-        metadata["playbook"] = "SIDEWAYS_TO_BULLISH_RECLAIM"
-        metadata["preferred_width_points"] = 100.0
-        metadata["allowed_width_points"] = (100.0,)
-        metadata["target_short_put_buffer_points"] = 40.0
-        metadata["minimum_net_edge_rupees"] = 900.0
-        reasons.append(
-            "Trend continuation bullish: slow grind up with TRANSITION/DIRECTIONAL_BALANCE bias, "
-            "entry/trend scores confirmed, spot above VWAP, no active overhead resistance."
-        )
     # ── Data-calibrated bullish veto (see docs/gate_calibration_findings.md) ──
     # Bull-put credit spreads win only ~18% when option-chain pressure is
     # BALANCED_WALLS or DOWNSIDE_PUT_SUPPORT, vs ~62% in NEUTRAL /
@@ -2254,6 +2224,38 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["state_quality_score"] = state_quality_score
     metadata["state_confidence_score"] = state_confidence_score
     reasons.extend(market_state_reasons)
+
+    # Fires on slow-grind bullish days (no gap, no open drive) — needs market_state
+    # which is only available after _market_state_classification above.
+    trend_continuation_bullish_ready = (
+        market_state in {"TRANSITION", "DIRECTIONAL_BALANCE"}
+        and market_state_bias == "BULLISH"
+        and not metadata.get("bullish_entry_ready")
+        and (trend_15m == "TREND_UP" or execution_5m == "UP_CONFIRMED")
+        and bullish_entry_score >= 3.5
+        and bullish_trend_score >= 3.8
+        and bullish_support_quality >= 3.5
+        and (bullish_pullback or bullish_shallow or bullish_vwap_hold or metadata["trend_follow_ready_bullish"])
+        and vwap is not None
+        and spot > vwap
+        and wall_migration["wall_migration_bias"] != "BEARISH"
+        and time(10, 30) <= snapshot.timestamp.time() <= time(13, 30)
+        and not big_gap_up
+        and not open_drive_bullish
+    )
+    if trend_continuation_bullish_ready:
+        metadata["bullish_entry_ready"] = True
+        metadata["bullish_setup"] = "TREND_CONTINUATION"
+        metadata["playbook"] = "SIDEWAYS_TO_BULLISH_RECLAIM"
+        metadata["preferred_width_points"] = 100.0
+        metadata["allowed_width_points"] = (100.0,)
+        metadata["target_short_put_buffer_points"] = 40.0
+        metadata["minimum_net_edge_rupees"] = 900.0
+        reasons.append(
+            "Trend continuation bullish: slow grind up with TRANSITION/DIRECTIONAL_BALANCE bias, "
+            "entry/trend scores confirmed, spot above VWAP, no active overhead resistance."
+        )
+
     if snapshot.timestamp.time() >= time(14, 0):
         confidence = max(0.0, confidence - 0.05)
 
