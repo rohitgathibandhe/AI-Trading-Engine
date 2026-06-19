@@ -49,7 +49,7 @@ HIGH_CONFLUENCE_BULLISH_MIN_CONFIDENCE = 0.88
 AFTERNOON_TREND_BULLISH_MIN_CONFIDENCE = 0.72
 RANGE_CONDOR_MIN_CONFIDENCE = 0.55
 CONFIDENCE_EPSILON = 1e-6
-BEAR_CALL_MIN_CONFIDENCE = 0.85
+BEAR_CALL_MIN_CONFIDENCE = 0.62
 REGIME_TRADABILITY_TRADABLE = "TRADABLE"
 REGIME_TRADABILITY_SPREAD = REGIME_TRADABILITY_TRADABLE
 REGIME_TRADABILITY_LOW_EDGE = "LOW_EDGE"
@@ -83,6 +83,10 @@ TIER_A_PLAYBOOKS = {
     "GAP_DOWN_BEARISH_CONTINUATION",
     "GAP_UP_BEARISH_FAILURE",
     "RANGE_BALANCED_CONDOR",
+    "EARLY_BALANCE_BEARISH_FAILED_RECLAIM",
+    "HIGH_CONFLUENCE_BEARISH_CONTINUATION",
+    "BEARISH_FAILED_RECLAIM",
+    "BEARISH_CONTINUATION",
     # Live-enabled bullish spread playbooks — promoted from Tier B
     "GAP_DOWN_BULLISH_RECOVERY",
     "SIDEWAYS_TO_BULLISH_RECLAIM",
@@ -92,19 +96,19 @@ TIER_A_PLAYBOOKS = {
 }
 
 TIER_B_PLAYBOOKS = {
-    # Bullish playbooks still in research / not yet enabled live
+    # Playbooks still in research / not yet enabled live
     "OPEN_DRIVE_BULLISH",
     "GAP_UP_BULLISH_CONTINUATION",
-    "EARLY_BALANCE_BEARISH_FAILED_RECLAIM",
-    "HIGH_CONFLUENCE_BEARISH_CONTINUATION",
-    "BEARISH_FAILED_RECLAIM",
-    "BEARISH_CONTINUATION",
 }
 
 STABLE_SPREAD_PLAYBOOKS = {
     "GAP_DOWN_BEARISH_CONTINUATION",
     "SIDEWAYS_TO_BEARISH_REJECTION",
     "GAP_UP_BEARISH_FAILURE",
+    "EARLY_BALANCE_BEARISH_FAILED_RECLAIM",
+    "HIGH_CONFLUENCE_BEARISH_CONTINUATION",
+    "BEARISH_FAILED_RECLAIM",
+    "BEARISH_CONTINUATION",
 }
 
 NOT_TRADABLE_EXPANSION_PLAYBOOKS = {
@@ -416,19 +420,19 @@ def select_strategy(
                     return StrategyType.NO_TRADE, reasons
                 # Soft block: 2/3 signals oppose → raise score threshold by 0.5
                 _oi_threshold_surcharge = 0.5
-        if context_layer_active and failure_type not in BEARISH_CONTEXT_FAILURE_TYPES:
+        if context_layer_active and failure_type not in BEARISH_CONTEXT_FAILURE_TYPES and bearish_trade_score < 5.5:
             reasons.append(
                 f"Bearish routing requires a recognized failure/acceptance context; current failure type is {failure_type}."
             )
             return StrategyType.NO_TRADE, reasons
-        if context_layer_active and bearish_failure_score < 2.5:
+        if context_layer_active and bearish_failure_score < 1.2:
             reasons.append(
-                f"Bearish failure score {bearish_failure_score:.2f} is below the required 2.50."
+                f"Bearish failure score {bearish_failure_score:.2f} is below the required 1.20."
             )
             return StrategyType.NO_TRADE, reasons
-        if context_layer_active and bearish_location_live_score < 1.5:
+        if context_layer_active and bearish_location_live_score < 0.8:
             reasons.append(
-                f"Bearish location score {bearish_location_live_score:.2f} is below the required 1.50."
+                f"Bearish location score {bearish_location_live_score:.2f} is below the required 0.80."
             )
             return StrategyType.NO_TRADE, reasons
         _effective_bearish_threshold = bearish_threshold + _oi_threshold_surcharge

@@ -1770,6 +1770,22 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                 or high_confluence_bearish_ready
             )
         )
+        or (
+            # Failed ORB or execution confirmed with bearish structure — triggers DOWN_TREND
+            # even without 15m trend confirmation (early sessions where 15m hasn't turned yet).
+            execution_5m == "DOWN_CONFIRMED"
+            and bearish_entry_score >= 2.5
+            and bearish_trend_score >= 3.0
+            and bool(metadata.get("bearish_entry_ready"))
+        )
+        or (
+            # OR high rejection: price tried to break out, got rejected, now below OR high.
+            opening_range_break_state == "FAILED_UP"
+            and bearish_entry_score >= 2.0
+            and bearish_trend_score >= 2.5
+            and bool(metadata.get("bearish_entry_ready"))
+            and oi_flow["smart_money_bias"] != "BULLISH"
+        )
     ):
         regime = RegimeLabel.DOWN_TREND
         metadata["day_archetype"] = (
