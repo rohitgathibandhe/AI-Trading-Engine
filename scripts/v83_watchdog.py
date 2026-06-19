@@ -19,6 +19,9 @@ LAYER 2 — Data quality (API health)
 LAYER 3 — Strategy adaptation (the self-learning layer)
   - Bullish signals above threshold but ENTRY_WINDOW_CLOSED → widen bullish window
   - Bearish signals above threshold but ENTRY_WINDOW_CLOSED → widen bearish window
+  - HIGH trade score + correct market bias + entry_ready=False for 8+ cycles
+    → PLAYBOOK GAP detected → writes v83_pending_gap_report.json + Telegram alert
+    → gap report read by watchdog startup check; code fix applied before next session
   - New unknown block reasons → Telegram alert with diagnosis
   - Session ends with no trade despite ≥1 cycle where signal crossed threshold
     → diagnose and alert so the gap is fixed before tomorrow's open
@@ -202,8 +205,11 @@ def _todays_decisions(n: int = 60) -> list[dict]:
             d = json.loads(line)
         except Exception:
             continue
-        dr = d.get("metadata", {}).get("data_readiness", {}) or {}
-        ts = dr.get("timestamp", "")
+        m = d.get("metadata", {}) or {}
+        # Check both data_readiness.timestamp (error path) and trade_funnel.timestamp (success path)
+        dr_ts = (m.get("data_readiness") or {}).get("timestamp", "")
+        tf_ts = (m.get("trade_funnel") or {}).get("timestamp", "")
+        ts = dr_ts or tf_ts
         if not ts.startswith(today_str):
             continue
         results.append(d)
@@ -364,6 +370,172 @@ def _analyze_strategy_gaps(decisions: list[dict]) -> list[str]:
     if changed_rl:
         _save_rl_config(rl_cfg)
 
+    # ── LAYER 3b: Playbook gap detection ──────────────────────────────────────
+    # Detect: high trade score + correct market bias + bullish/bearish_entry_ready=False
+    # This means no playbook matched despite good conditions. Cannot auto-fix code,
+    # but write a structured gap report and alert immediately.
+    fixes += _detect_playbook_gaps(decisions)
+
+    return fixes
+
+
+# Threshold: bull/bear trade score above this with entry_ready=False triggers gap report
+_PLAYBOOK_GAP_SCORE_MIN = 4.5
+# How many consecutive cycles must have the gap before alerting
+_PLAYBOOK_GAP_CYCLES_MIN = 8
+# Pending gap report file — written so next Claude session can pick it up
+_GAP_REPORT = _STATE / "v83_pending_gap_report.json"
+
+
+def _detect_playbook_gaps(decisions: list[dict]) -> list[str]:
+    """
+    Detect when bullish/bearish trade score is high and market bias is aligned
+    but entry_ready stays False (SETUP_NOT_DETECTED). This means no playbook is
+    matching despite favourable conditions — a code gap, not a config gap.
+    Write a structured report and alert immediately.
+    """
+    fixes: list[str] = []
+    now = _now()
+    hhmm = now.strftime("%H%M")
+    # Only check during core trading window
+    if hhmm < "1030" or hhmm > "1500":
+        return fixes
+
+    today_str = str(now.date())
+
+    # Load existing gap report to avoid duplicate alerts
+    existing = {}
+    try:
+        existing = json.loads(_GAP_REPORT.read_text()) if _GAP_REPORT.exists() else {}
+    except Exception:
+        pass
+    if existing.get("date") == today_str and existing.get("alerted"):
+        return fixes
+
+    # Filter all today's decisions to the core trading window (10:30–14:30).
+    # Use rolling count (not consecutive streak) — bias oscillates within a minute.
+    # A trade having fired today means no gap.
+    window_decisions = [
+        d for d in decisions
+        if "10:30" <= str(((d.get("metadata", {}) or {}).get("trade_funnel", {}) or {}).get("timestamp", ""))[11:16] <= "14:30"
+    ]
+
+    had_trade = any(d.get("action") == "TRADE" for d in decisions)
+    if had_trade:
+        return fixes
+
+    bull_gap_cycles: list[dict] = []
+    bear_gap_cycles: list[dict] = []
+
+    for d in window_decisions:
+        m = d.get("metadata", {}) or {}
+        tf = m.get("trade_funnel", {}) or {}
+        if not tf:
+            continue
+
+        bull_score = float(tf.get("bullish_trade_score") or 0)
+        bear_score = float(tf.get("bearish_trade_score") or 0)
+        bull_ready = bool(m.get("bullish_entry_ready"))
+        bear_ready = bool(m.get("bearish_entry_ready"))
+        bias = str(tf.get("market_state_bias") or "")
+        market = str(tf.get("market_state") or "")
+        rejection = str(tf.get("canonical_rejection_reason") or "")
+        chain_state = str(m.get("option_chain_pressure_state") or "")
+        ts = str((tf.get("timestamp") or ""))[11:16]
+
+        # Bull gap: high score, bullish bias, entry_ready=False, chain not vetoing
+        if (
+            bull_score >= _PLAYBOOK_GAP_SCORE_MIN
+            and bias == "BULLISH"
+            and not bull_ready
+            and rejection in {"SETUP_NOT_DETECTED", "SETUP_PATTERN_MISMATCH", "SETUP_QUALITY_TOO_LOW", "NO_VALID_STRATEGY"}
+            and chain_state not in {"BALANCED_WALLS", "DOWNSIDE_PUT_SUPPORT"}
+        ):
+            bull_gap_cycles.append({
+                "ts": ts, "bull_score": bull_score, "market": market,
+                "rejection": rejection, "chain": chain_state,
+                "entry_score": m.get("bullish_entry_score"), "trend_score": m.get("bullish_trend_score"),
+            })
+
+        # Bear gap: high score, bearish bias, entry_ready=False
+        if (
+            bear_score >= _PLAYBOOK_GAP_SCORE_MIN
+            and bias == "BEARISH"
+            and not bear_ready
+            and rejection in {"SETUP_NOT_DETECTED", "SETUP_PATTERN_MISMATCH", "SETUP_QUALITY_TOO_LOW", "NO_VALID_STRATEGY"}
+            and chain_state not in {"BALANCED_WALLS", "OVERHEAD_CALL_PRESSURE"}
+        ):
+            bear_gap_cycles.append({
+                "ts": ts, "bear_score": bear_score, "market": market,
+                "rejection": rejection, "chain": chain_state,
+                "entry_score": m.get("bearish_entry_score"), "trend_score": m.get("bearish_trend_score"),
+            })
+
+    direction = None
+    gap_cycles = []
+    if len(bull_gap_cycles) >= _PLAYBOOK_GAP_CYCLES_MIN:
+        direction = "BULLISH"
+        gap_cycles = bull_gap_cycles
+    elif len(bear_gap_cycles) >= _PLAYBOOK_GAP_CYCLES_MIN:
+        direction = "BEARISH"
+        gap_cycles = bear_gap_cycles
+
+    if not direction:
+        return fixes
+
+    first = gap_cycles[0]
+    last = gap_cycles[-1]
+    avg_score = sum(c.get("bull_score" if direction == "BULLISH" else "bear_score", 0) for c in gap_cycles) / len(gap_cycles)
+    best_score = max(c.get("bull_score" if direction == "BULLISH" else "bear_score", 0) for c in gap_cycles)
+    sample = gap_cycles[0]
+
+    report = {
+        "date": today_str,
+        "detected_at": now.isoformat(),
+        "direction": direction,
+        "gap_cycles": len(gap_cycles),
+        "window": f"{first['ts']}–{last['ts']}",
+        "avg_score": round(avg_score, 2),
+        "best_score": round(best_score, 2),
+        "rejection": sample.get("rejection"),
+        "market_state": sample.get("market"),
+        "chain_state": sample.get("chain"),
+        "bullish_entry_score": sample.get("entry_score"),
+        "bullish_trend_score": sample.get("trend_score"),
+        "alerted": False,
+        "action_required": (
+            f"Add/loosen a playbook condition for {direction} {sample['market']} "
+            f"with score {best_score:.1f}. Rejection was {sample['rejection']}. "
+            f"Check regime.py entry_ready conditions."
+        ),
+    }
+
+    _GAP_REPORT.write_text(json.dumps(report, indent=2, default=str))
+    _log(
+        f"PLAYBOOK GAP DETECTED: {direction} score {best_score:.2f} for {len(gap_cycles)} cycles "
+        f"({first['ts']}–{last['ts']}) but entry_ready=False. "
+        f"Rejection={sample['rejection']} chain={sample['chain']}. "
+        f"Report written to v83_pending_gap_report.json."
+    )
+
+    msg = (
+        f"🚨 <b>V83 Watchdog — PLAYBOOK GAP</b>\n\n"
+        f"<b>{direction}</b> trade score <b>{best_score:.2f}</b> for {len(gap_cycles)} cycles "
+        f"({first['ts']}–{last['ts']}) but <b>no playbook matched</b>.\n\n"
+        f"Market: {sample['market']} | Chain: {sample['chain']}\n"
+        f"Rejection: {sample['rejection']}\n"
+        f"entry_score={sample['entry_score']} | trend_score={sample['trend_score']}\n\n"
+        f"⚠️ This is a code gap — a new regime.py condition is needed.\n"
+        f"Gap report saved to <code>v83_pending_gap_report.json</code> for next Claude session."
+    )
+    sent = _send_telegram(msg)
+    report["alerted"] = True
+    _GAP_REPORT.write_text(json.dumps(report, indent=2, default=str))
+
+    fixes.append(
+        f"PLAYBOOK GAP: {direction} score {best_score:.2f} for {len(gap_cycles)} cycles — "
+        f"gap report written, alert {'sent' if sent else 'FAILED (network)'}"
+    )
     return fixes
 
 
@@ -423,9 +595,33 @@ def _end_of_session_diagnosis(decisions: list[dict], state: dict) -> None:
 
 # ─── Main watchdog logic ──────────────────────────────────────────────────────
 
+def _check_pending_gap_report() -> None:
+    """On each tick, if a pending gap report exists from today or yesterday, log it prominently."""
+    if not _GAP_REPORT.exists():
+        return
+    try:
+        report = json.loads(_GAP_REPORT.read_text())
+    except Exception:
+        return
+    now = _now()
+    report_date = report.get("date", "")
+    # Show report for up to 2 days so it's visible at next-morning startup
+    if report_date not in {str(now.date()), str((now - timedelta(days=1)).date())}:
+        return
+    if report.get("gap_fixed"):
+        return
+    _log(
+        f"⚠️  PENDING GAP REPORT ({report_date}): {report.get('direction')} playbook gap — "
+        f"score {report.get('best_score')} for {report.get('gap_cycles')} cycles "
+        f"({report.get('window')}). Rejection={report.get('rejection')}. "
+        f"ACTION: {report.get('action_required')}"
+    )
+
+
 def run_watchdog() -> None:
     now = _now()
     _log(f"Watchdog tick at {now.strftime('%H:%M:%S IST')}")
+    _check_pending_gap_report()
 
     if not _is_market_hours(now):
         _log("Outside market hours — nothing to do.")
@@ -481,7 +677,7 @@ def run_watchdog() -> None:
             _log("CRITICAL: Token expired — alerted")
 
     # ── LAYER 1: Stale log ────────────────────────────────────────────────────
-    decisions = _todays_decisions(n=60)
+    decisions = _todays_decisions(n=600)  # large n: gap detection needs full day window
     age = _last_decision_age_minutes(decisions)
     stale_threshold = STALE_THRESHOLD_EARLY if now.strftime("%H%M") < "0945" else STALE_THRESHOLD_LATE
     if age is not None and age > stale_threshold:
