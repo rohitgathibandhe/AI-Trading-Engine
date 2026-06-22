@@ -1020,6 +1020,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     vwap = snapshot.live_vwap if snapshot.live_vwap is not None else compute_vwap(bars_5m)
     metadata["bars_above_vwap"] = sum(1 for bar in bars_5m[-10:] if vwap is not None and bar.close > vwap)
     metadata["bars_below_vwap"] = sum(1 for bar in bars_5m[-10:] if vwap is not None and bar.close < vwap)
+    # Pre-initialize; overwritten at the canonical assignment below (~line 2175).
+    opening_range_break_state = "NONE"
     execution_5m = "UNCONFIRMED"
 
     if opening_range and vwap:
