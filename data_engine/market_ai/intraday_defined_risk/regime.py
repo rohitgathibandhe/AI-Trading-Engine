@@ -2266,9 +2266,11 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         and not open_drive_bullish
     )
     if trend_continuation_bullish_ready:
+        regime = RegimeLabel.UP_TREND
         metadata["bullish_entry_ready"] = True
         metadata["bullish_setup"] = "TREND_CONTINUATION"
         metadata["playbook"] = "SIDEWAYS_TO_BULLISH_RECLAIM"
+        metadata["day_archetype"] = "TREND_CONTINUATION_BULLISH"
         metadata["preferred_width_points"] = 100.0
         metadata["allowed_width_points"] = (100.0,)
         metadata["target_short_put_buffer_points"] = 40.0
@@ -2293,9 +2295,11 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         and not big_gap_down
     )
     if failed_orb_bearish_ready:
+        regime = RegimeLabel.DOWN_TREND
         metadata["bearish_entry_ready"] = True
         metadata["bearish_setup"] = "FAILED_ORB"
         metadata["playbook"] = "SIDEWAYS_TO_BEARISH_REJECTION"
+        metadata["day_archetype"] = "FAILED_ORB_BEARISH"
         metadata["preferred_width_points"] = 100.0
         metadata["allowed_width_points"] = (100.0,)
         metadata["target_short_call_buffer_points"] = 50.0
@@ -2319,9 +2323,11 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         and time(10, 0) <= snapshot.timestamp.time() <= time(14, 0)
     )
     if vwap_rejection_bearish_ready:
+        regime = RegimeLabel.DOWN_TREND
         metadata["bearish_entry_ready"] = True
         metadata["bearish_setup"] = "VWAP_REJECTION"
         metadata["playbook"] = "BEARISH_CONTINUATION"
+        metadata["day_archetype"] = "VWAP_REJECTION_BEARISH"
         metadata["preferred_width_points"] = 100.0
         metadata["allowed_width_points"] = (100.0,)
         metadata["target_short_call_buffer_points"] = 40.0
@@ -2346,9 +2352,11 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         and not big_gap_up
     )
     if or_breakout_bullish_ready:
+        regime = RegimeLabel.UP_TREND
         metadata["bullish_entry_ready"] = True
         metadata["bullish_setup"] = "OR_BREAKOUT"
         metadata["playbook"] = "EARLY_BALANCE_BULLISH_RECLAIM"
+        metadata["day_archetype"] = "OR_BREAKOUT_BULLISH"
         metadata["preferred_width_points"] = 100.0
         metadata["allowed_width_points"] = (100.0,)
         metadata["target_short_put_buffer_points"] = 50.0
