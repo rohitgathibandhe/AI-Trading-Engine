@@ -2284,7 +2284,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     # Research: failed-breakout reversals have 65-72% win rate in trending markets.
     failed_orb_bearish_ready = (
         not metadata.get("bearish_entry_ready")
-        and str(metadata.get("opening_range_break_state") or "") in {"FAILED_UP", "NONE"}
+        and opening_range_break_state in {"FAILED_UP", "NONE"}
         and market_state_bias == "BEARISH"
         and market_state in {"TREND_DOWN", "DIRECTIONAL_BALANCE", "TRANSITION"}
         and bearish_trend_score >= 3.0
@@ -2340,7 +2340,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     # OR breakout: spot clears opening range high in first 90 min — fires regardless of gap size.
     or_breakout_bullish_ready = (
         not metadata.get("bullish_entry_ready")
-        and str(metadata.get("opening_range_break_state") or "") == "UP"
+        and opening_range_break_state == "UP"
         and market_state_bias == "BULLISH"
         and market_state in {"TREND_UP", "DIRECTIONAL_BALANCE", "TRANSITION"}
         and bullish_trend_score >= 3.5
