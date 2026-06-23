@@ -2254,9 +2254,9 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         and market_state_bias == "BULLISH"
         and not metadata.get("bullish_entry_ready")
         and (trend_15m == "TREND_UP" or execution_5m == "UP_CONFIRMED")
-        and bullish_entry_score >= 3.5
-        and bullish_trend_score >= 3.8
-        and bullish_support_quality >= 3.5
+        and bullish_entry_score >= 3.0
+        and bullish_trend_score >= 3.5
+        and bullish_support_quality >= 3.0
         and (bullish_pullback or bullish_shallow or bullish_vwap_hold or metadata["trend_follow_ready_bullish"])
         and vwap is not None
         and spot > vwap
@@ -2343,8 +2343,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         and opening_range_break_state == "UP"
         and market_state_bias == "BULLISH"
         and market_state in {"TREND_UP", "DIRECTIONAL_BALANCE", "TRANSITION"}
-        and bullish_trend_score >= 3.5
-        and bullish_support_quality >= 3.5
+        and bullish_trend_score >= 3.0
+        and bullish_support_quality >= 3.0
         and vwap is not None
         and spot > vwap
         and str(metadata.get("option_chain_pressure_state") or "") != "DOWNSIDE_PUT_SUPPORT"
@@ -2731,8 +2731,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     bullish_location_live_score = _clamp(
         (float(metadata.get("bullish_location_score") or 0.0) * 2.0)
         + (min(float(metadata.get("open_space_up") or 0.0), 250.0) / 80.0)
-        + (0.75 if metadata.get("at_first_test_of_level") else 0.0)
-        - float(metadata.get("overhead_call_pressure_score") or 0.0),
+        + (0.75 if metadata.get("at_first_test_of_level") else 0.0),
         0.0,
         10.0,
     )
@@ -2765,11 +2764,11 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     _pcr_bullish_adj = 0.0
     if _pcr_val is not None:
         if _pcr_val < 0.65:
-            _pcr_bullish_adj = +1.5  # strong bullish OI positioning
+            _pcr_bullish_adj = +2.0  # symmetric with bearish penalty at PCR<0.65
         elif _pcr_val < 0.80:
-            _pcr_bullish_adj = +0.75
-        elif _pcr_val > 1.20:
-            _pcr_bullish_adj = -0.5  # put-heavy is not inherently bullish
+            _pcr_bullish_adj = +1.0  # symmetric with bearish -1.0
+        elif _pcr_val > 1.30:
+            _pcr_bullish_adj = -0.75  # put-heavy = institutions hedging = headwind for bullish spreads
     if _pcr_trend == "FALLING":
         _pcr_bullish_adj += 0.5   # puts being shed = bullish
     elif _pcr_trend == "RISING":
@@ -2788,9 +2787,9 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     bullish_option_chain_pressure_score = _clamp(
         (max(-float(metadata.get("oi_pressure_imbalance") or 0.0), 0.0) * 6.0)
         + (2.0 if metadata.get("smart_money_bias") == "BULLISH" else 0.0)
-        + (-1.5 if metadata.get("smart_money_bias") == "BEARISH" else 0.0)  # active penalty: institutions are bearish
+        + (-2.0 if metadata.get("smart_money_bias") == "BEARISH" else 0.0)  # symmetric with bearish penalty
         + (1.5 if metadata.get("option_chain_pressure_state") in {"DOWNSIDE_PUT_SUPPORT", "BULLISH_WALL_SHIFT"} else 0.0)
-        - (float(metadata.get("overhead_call_pressure_score") or 0.0) * 0.75)
+        + (0.75 if metadata.get("price_into_downside_put_wall") else 0.0)
         + _pcr_bullish_adj,
         0.0,
         10.0,
@@ -2881,12 +2880,12 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         + 0.10 * market_state_score
     )
     bullish_trade_score = (
-        0.20 * bullish_trend_quality_score
-        + 0.20 * bullish_failure_score        # was 0.12 — now symmetric with bearish
-        + 0.18 * bullish_location_live_score  # was 0.20
-        + 0.14 * bullish_option_chain_pressure_score
-        + 0.14 * bullish_monetization_score
-        + 0.14 * market_state_score           # was 0.20 — redistributed to failure_score
+        0.22 * bullish_trend_quality_score
+        + 0.24 * bullish_failure_score
+        + 0.16 * bullish_location_live_score
+        + 0.16 * bullish_option_chain_pressure_score
+        + 0.12 * bullish_monetization_score
+        + 0.10 * market_state_score
     )
 
     stable_range = bool(
@@ -2911,13 +2910,13 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     effective_bullish_threshold = params.bullish_trade_score_threshold
     effective_bullish_margin = params.bullish_trade_margin
     if market_state == "TREND_UP":
-        effective_bullish_threshold = max(5.2, params.bullish_trade_score_threshold - 0.4)
+        effective_bullish_threshold = max(5.0, params.bullish_trade_score_threshold - 0.4)
         effective_bullish_margin = max(0.8, params.bullish_trade_margin - 0.3)
     elif market_state == "TRANSITION":
-        effective_bullish_threshold = max(5.0, params.bullish_trade_score_threshold - 0.6)
+        effective_bullish_threshold = max(4.8, params.bullish_trade_score_threshold - 0.6)
         effective_bullish_margin = max(0.7, params.bullish_trade_margin - 0.4)
     elif market_state == "DIRECTIONAL_BALANCE":
-        effective_bullish_threshold = max(4.8, params.bullish_trade_score_threshold - 0.8)
+        effective_bullish_threshold = max(4.5, params.bullish_trade_score_threshold - 0.9)
         effective_bullish_margin = max(0.6, params.bullish_trade_margin - 0.5)
 
     bearish_failure_context = failure_type in {"FAILED_BREAKOUT", "FAILED_RECLAIM", "FAILED_BOUNCE", "BEARISH_REJECTION_TRANSITION", "ACCEPTED_BREAKDOWN"}

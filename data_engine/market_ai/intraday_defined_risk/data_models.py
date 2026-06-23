@@ -51,9 +51,9 @@ class AdaptiveParameters:
     width_preference_penalty: float = 1.25
     shadow_sessions: int = 5
     bearish_trade_score_threshold: float = 5.8
-    bullish_trade_score_threshold: float = 6.2
+    bullish_trade_score_threshold: float = 5.8
     bearish_trade_margin: float = 1.0
-    bullish_trade_margin: float = 1.2
+    bullish_trade_margin: float = 1.0
     failed_breakout_transition_shadow_buffer: float = 0.25
 
     def clamped(self) -> "AdaptiveParameters":

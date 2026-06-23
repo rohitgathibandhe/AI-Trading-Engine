@@ -1025,7 +1025,8 @@ def evaluate_paper_context_override_gate(
 
     if config.mode != RuntimeMode.PAPER_LIVE:
         reasons.append("MODE_NOT_PAPER_LIVE")
-    if _decision_origin(decision) != "PAPER_CONTEXT_OVERRIDE":
+    _origin = _decision_origin(decision)
+    if _origin not in {"PAPER_CONTEXT_OVERRIDE", "PAPER_CONTEXT_OVERRIDE_BULLISH"}:
         reasons.append("NOT_PAPER_CONTEXT_OVERRIDE")
     if decision.action != "TRADE":
         reasons.append("NO_TRADE_DECISION")
@@ -1038,11 +1039,15 @@ def evaluate_paper_context_override_gate(
     if market_state not in {"TRANSITION", "TREND_DOWN", "TREND_UP", "DIRECTIONAL_BALANCE"}:
         reasons.append("MARKET_STATE_NOT_PAPER_OVERRIDE_APPROVED")
 
+    _is_bullish_override = (_origin == "PAPER_CONTEXT_OVERRIDE_BULLISH")
     bearish_score = float(metadata.get("bearish_trade_score") or funnel.get("bearish_trade_score") or 0.0)
+    bullish_score = float(metadata.get("bullish_trade_score") or funnel.get("bullish_trade_score") or 0.0)
     no_trade_score = float(metadata.get("no_trade_score") or funnel.get("no_trade_score") or 0.0)
-    if bearish_score < config.paper_override_bearish_score_threshold:
+    _active_score = bullish_score if _is_bullish_override else bearish_score
+    _score_threshold = float(getattr(config, "paper_override_bullish_score_threshold", config.paper_override_bearish_score_threshold)) if _is_bullish_override else config.paper_override_bearish_score_threshold
+    if _active_score < _score_threshold:
         reasons.append("PAPER_OVERRIDE_SCORE_TOO_LOW")
-    if bearish_score <= no_trade_score + config.paper_override_margin:
+    if _active_score <= no_trade_score + config.paper_override_margin:
         reasons.append("PAPER_OVERRIDE_MARGIN_FAIL")
 
     start_t = _parse_time(config.allowed_entry_start_hhmm, time(9, 30))
