@@ -2609,8 +2609,12 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     )
     accepted_breakout = bool(
         opening_range_break_state == "UP"
-        and current_structure_signal == "BULLISH_BOS"
-        and market_state == "TREND_UP"
+        and (
+            # Classic: confirmed BOS in a full uptrend
+            (current_structure_signal == "BULLISH_BOS" and market_state == "TREND_UP")
+            # OR breakout in balance/transition: price clears OR high with bullish bias — valid even without full TREND_UP
+            or (market_state in {"DIRECTIONAL_BALANCE", "TRANSITION"} and market_state_bias == "BULLISH")
+        )
     )
     accepted_breakdown = bool(
         opening_range_break_state == "DOWN"
@@ -2932,11 +2936,13 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         and bearish_trade_score > no_trade_score + 0.35
     )
     bullish_confluence_score_v = float(metadata.get("bullish_confluence_score") or 0.0)
+    _or_break_up = opening_range_break_state == "UP"
     directional_balance_bullish_tradable = bool(
         market_state == "DIRECTIONAL_BALANCE"
         and market_state_bias == "BULLISH"
         and (
             bullish_recovery_context  # structural break, ORB failure, or BOS
+            or _or_break_up  # price cleared opening range high — directional conviction
             or (
                 # Strong confluence + clean trending structure even without a textbook breakout
                 bullish_trend_score >= 3.0
@@ -2945,7 +2951,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                 and bool(metadata.get("higher_low_confirmed"))
             )
         )
-        and bullish_failure_score >= 2.0
+        # Waive failure_score gate on a confirmed OR breakout — price already proven directional intent
+        and (bullish_failure_score >= 2.0 or (_or_break_up and bullish_trade_score > no_trade_score + 0.5))
         and bullish_location_live_score >= 1.5
         and bullish_trade_score > no_trade_score + 0.35
     )
