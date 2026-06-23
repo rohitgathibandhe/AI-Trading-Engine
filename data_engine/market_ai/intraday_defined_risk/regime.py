@@ -2959,6 +2959,12 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     if market_state in {"TREND_DOWN", "TRANSITION"} and bearish_failure_context and bearish_trade_score > no_trade_score + 0.05:
         tradability_class = "TRADABLE"
         tradability_reason = f"{market_state} with {failure_type} and aligned bearish structure/chain pressure is spread-tradable."
+    elif bool(metadata.get("bearish_entry_ready")) and bearish_trade_score > no_trade_score + 0.35:
+        tradability_class = "TRADABLE"
+        tradability_reason = "Bearish secondary entry path confirmed (VWAP rejection / failed ORB) with sufficient score margin — spread-tradable."
+    elif bool(metadata.get("bullish_entry_ready")) and bullish_trade_score > no_trade_score + 0.35:
+        tradability_class = "TRADABLE"
+        tradability_reason = "Bullish secondary entry path confirmed (OR breakout / trend continuation) with sufficient score margin — spread-tradable."
     elif market_state in {"TREND_UP", "TRANSITION"} and bullish_recovery_context and bullish_trade_score > no_trade_score + 0.05:
         tradability_class = "TRADABLE"
         tradability_reason = f"{market_state} with bullish recovery context and aligned structure is spread-tradable."
