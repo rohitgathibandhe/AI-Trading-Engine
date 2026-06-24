@@ -309,6 +309,114 @@ def _shadow_only_failed_breakout_candidate(
     )
 
 
+def _structural_entry_quality_check(
+    metadata: dict,
+    direction: str,  # "BULLISH" or "BEARISH"
+) -> tuple[bool, str]:
+    """
+    Gate both bullish and bearish paper overrides against structural quality:
+    ORB break, BOS/CHoCH, impulse strength, option chain confirmation, OI pressure.
+    Returns (passed, block_reason).
+    """
+    orb_state = str(metadata.get("opening_range_break_state") or "NONE")
+    bullish_bos = bool(metadata.get("bullish_bos"))
+    bullish_choch = bool(metadata.get("bullish_choch"))
+    bearish_bos = bool(metadata.get("bearish_bos"))
+    bearish_choch = bool(metadata.get("bearish_choch"))
+    impulse = float(metadata.get("impulse_strength") or 0.0)
+    price_vs_or_high = float(metadata.get("price_vs_or_high") or 0.0)
+    price_vs_or_low = float(metadata.get("price_vs_or_low") or 0.0)
+    price_vs_vwap = float(metadata.get("price_vs_vwap") or 0.0)
+    bars_above = int(metadata.get("bars_above_vwap") or 0)
+    bars_below = int(metadata.get("bars_below_vwap") or 0)
+    smart_money = str(metadata.get("smart_money_bias") or "NEUTRAL").upper()
+    oi_pressure = str(metadata.get("oi_pressure_bias") or "NEUTRAL").upper()
+    option_chain_state = str(metadata.get("option_chain_pressure_state") or "NEUTRAL").upper()
+    pcr = float(metadata.get("pcr_by_oi") or 1.0)
+    call_wall_migration = str(metadata.get("call_wall_migration") or "NONE").upper()
+    put_wall_migration = str(metadata.get("put_wall_migration") or "NONE").upper()
+    open_space_up = float(metadata.get("open_space_up") or 0.0)
+    open_space_down = float(metadata.get("open_space_down") or 0.0)
+    overhead_call_pressure = float(metadata.get("overhead_call_pressure_score") or 0.0)
+    downside_put_support = float(metadata.get("downside_put_support_score") or 0.0)
+    higher_low = bool(metadata.get("higher_low_confirmed"))
+    lower_high = bool(metadata.get("lower_high_confirmed"))
+
+    if direction == "BULLISH":
+        # 1. Require at least one structural confirmation: BOS, CHoCH, ORB breakout, or price clearly above OR high
+        has_structure = bullish_bos or bullish_choch or orb_state == "BREAKOUT_UP" or price_vs_or_high > 30 or higher_low
+        if not has_structure:
+            return False, "BULL_NO_STRUCTURE_CONFIRMATION"
+
+        # 2. Reject if price is below VWAP and most bars are below — market is not bullish enough
+        if price_vs_vwap < -15 and bars_below > bars_above:
+            return False, "BULL_PRICE_BELOW_VWAP"
+
+        # 3. Reject if smart money is actively bearish (not just neutral)
+        if smart_money == "BEARISH":
+            return False, "BULL_SMART_MONEY_BEARISH"
+
+        # 4. Reject if OI pressure is strongly bearish
+        if oi_pressure == "BEARISH":
+            return False, "BULL_OI_PRESSURE_BEARISH"
+
+        # 5. Overhead call wall blocks entry UNLESS price has broken above OR high by meaningful margin
+        if option_chain_state == "OVERHEAD_CALL_PRESSURE" and overhead_call_pressure > 1.5 and price_vs_or_high < 50:
+            return False, "BULL_OVERHEAD_CALL_WALL_BLOCKING"
+
+        # 6. Require meaningful open space above for put spread to be valid
+        if open_space_up < 30:
+            return False, "BULL_INSUFFICIENT_UPSIDE_ROOM"
+
+        # 7. Require at least minimal impulse. Relax threshold when both BOS + CHoCH confirmed (doubly proven structure).
+        _impulse_min = 1.0 if (bullish_bos and bullish_choch) else 1.5
+        if impulse < _impulse_min:
+            return False, "BULL_IMPULSE_TOO_WEAK"
+
+        # 8. PCR sanity: very high PCR (> 1.6) signals heavy put loading = bearish positioning
+        if pcr > 1.6:
+            return False, "BULL_PCR_EXCESSIVE_PUT_LOADING"
+
+        return True, "STRUCTURAL_GATE_PASSED"
+
+    else:  # BEARISH
+        # 1. Require at least one structural confirmation: BOS, CHoCH, ORB breakdown, or price clearly below OR low
+        has_structure = bearish_bos or bearish_choch or orb_state == "BREAKDOWN" or price_vs_or_low < -30 or lower_high
+        if not has_structure:
+            return False, "BEAR_NO_STRUCTURE_CONFIRMATION"
+
+        # 2. Reject if price is above VWAP and most bars are above — market is not bearish enough
+        if price_vs_vwap > 15 and bars_above > bars_below:
+            return False, "BEAR_PRICE_ABOVE_VWAP"
+
+        # 3. Reject if smart money is actively bullish
+        if smart_money == "BULLISH":
+            return False, "BEAR_SMART_MONEY_BULLISH"
+
+        # 4. Reject if OI pressure is strongly bullish
+        if oi_pressure == "BULLISH":
+            return False, "BEAR_OI_PRESSURE_BULLISH"
+
+        # 5. Strong put support below blocks bearish entry UNLESS price has broken down through OR low
+        if option_chain_state == "DOWNSIDE_PUT_SUPPORT" and downside_put_support > 1.5 and price_vs_or_low > -50:
+            return False, "BEAR_PUT_WALL_BLOCKING"
+
+        # 6. Require meaningful open space below for call spread to be valid
+        if open_space_down < 30:
+            return False, "BEAR_INSUFFICIENT_DOWNSIDE_ROOM"
+
+        # 7. Require at least minimal impulse. Relax when both BOS + CHoCH confirmed.
+        _impulse_min = 1.0 if (bearish_bos and bearish_choch) else 1.5
+        if impulse < _impulse_min:
+            return False, "BEAR_IMPULSE_TOO_WEAK"
+
+        # 8. PCR sanity: very low PCR (< 0.5) signals heavy call loading = bullish positioning; wrong for bear trade
+        if pcr < 0.5:
+            return False, "BEAR_PCR_EXCESSIVE_CALL_LOADING"
+
+        return True, "STRUCTURAL_GATE_PASSED"
+
+
 def _paper_context_override_candidate(
     *,
     snapshot: MarketSnapshot,
@@ -385,6 +493,12 @@ def _paper_context_override_candidate(
         return None, info
     if not inside_window:
         info["paper_candidate_reason"] = "PAPER_EXPERIMENT_WINDOW_CLOSED"
+        return None, info
+
+    # Structural quality gate: require ORB break / BOS / CHoCH / option chain alignment
+    _struct_passed, _struct_reason = _structural_entry_quality_check(metadata, "BEARISH")
+    if not _struct_passed:
+        info["paper_candidate_reason"] = _struct_reason
         return None, info
 
     regime_state = classify_regime(snapshot, agent.parameters)
@@ -521,6 +635,14 @@ def _build_bullish_paper_override(
         from .regime import classify_regime
         regime_state = classify_regime(snapshot, agent.parameters)
     regime_metadata = regime_state.metadata if isinstance(regime_state.metadata, dict) else {}
+
+    # Structural quality gate: require ORB break / BOS / CHoCH / option chain alignment
+    _combined_meta = {**metadata, **regime_metadata}
+    _struct_passed, _struct_reason = _structural_entry_quality_check(_combined_meta, "BULLISH")
+    if not _struct_passed:
+        info["paper_candidate_reason"] = _struct_reason
+        info["spread_construction_status"] = "STRUCTURAL_GATE_BLOCKED"
+        return None, info
 
     entry_context_allowed, entry_context_reason = validate_entry_context(StrategyType.BULL_PUT_CREDIT_SPREAD, snapshot, regime_state)
     if not entry_context_allowed:
