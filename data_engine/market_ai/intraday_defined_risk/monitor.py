@@ -63,7 +63,7 @@ PLAYBOOK_MIN_SAMPLES = 8.0
 PLAYBOOK_BAD_PROFIT_FACTOR = 0.90
 PLAYBOOK_GOOD_PROFIT_FACTOR = 1.20
 STATE_ROOT = Path(__file__).resolve().parents[1] / "state"
-AGENT_HEARTBEAT_PATH = STATE_ROOT / "agent_heartbeat.json"
+AGENT_HEARTBEAT_PATH = STATE_ROOT / "intraday_v83_heartbeat.json"
 
 
 def _write_v83_agent_heartbeat(*, runtime_config: object, phase: str) -> None:
