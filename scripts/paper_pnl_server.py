@@ -3353,12 +3353,27 @@ _V83_LAUNCHD_LABEL = "com.algoagent.intraday_v83"
 
 def _kickstart_v83_via_launchd() -> subprocess.CompletedProcess:
     """Use launchctl kickstart to restart the canonical launchd-managed v83 job."""
-    return subprocess.run(
-        ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{_V83_LAUNCHD_LABEL}"],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
+    # Kill any running instances first so kickstart -k doesn't hang waiting for
+    # a slow graceful shutdown (agent can take >15s to exit during market hours).
+    for p in _find_all_v83_pids():
+        try:
+            os.kill(p, 9)
+        except OSError:
+            pass
+    time.sleep(0.5)
+    try:
+        return subprocess.run(
+            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{_V83_LAUNCHD_LABEL}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        # Return a fake failed result so _start_v83_process falls through to the
+        # subprocess fallback path.
+        return subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="launchctl kickstart timed out"
+        )
 
 
 def _start_v83_process(*, trade_mode: str) -> Dict[str, Any]:
