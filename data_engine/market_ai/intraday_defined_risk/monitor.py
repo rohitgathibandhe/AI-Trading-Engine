@@ -1229,6 +1229,50 @@ def run_live(config: dict[str, object]) -> None:
                 "snapshot_status": "UNAVAILABLE",
                 "reason": f"{type(exc).__name__}: {exc}",
             }
+
+            # ── EOD force-exit when data is unavailable ──────────────────────
+            # If it's past 15:15 and there's an open paper position, close it
+            # at last-known value rather than leaving it orphaned overnight.
+            _now_ist = datetime.now(_IST)
+            _eod_force_exit_time = dtime(15, 15)
+            if _now_ist.time() >= _eod_force_exit_time and runtime_config.mode == RuntimeMode.PAPER_LIVE:
+                _stuck_position = load_paper_position()
+                if _stuck_position is not None:
+                    from .ops_runtime import save_paper_position, OpsPaths
+                    _paths = OpsPaths()
+                    try:
+                        import json as _json
+                        _state_raw = _paths.paper_state.read_text() if _paths.paper_state.exists() else "{}"
+                        _state = _json.loads(_state_raw)
+                    except Exception:
+                        _state = {}
+                    _mfe = float(_state.get("mfe_rupees") or 0.0)
+                    _mae = float(_state.get("mae_rupees") or 0.0)
+                    _exit_event = {
+                        "event": "PAPER_EXIT",
+                        "timestamp": _now_ist.isoformat(),
+                        "session_date": _now_ist.date().isoformat(),
+                        "entry_timestamp": _stuck_position.entry_time.isoformat(),
+                        "exit_timestamp": _now_ist.isoformat(),
+                        "exit_reason": "EOD_DATA_LOSS_FORCE_EXIT",
+                        "playbook": _stuck_position.metadata.get("playbook"),
+                        "paper_trade_attribution": _stuck_position.metadata.get("paper_trade_attribution"),
+                        "paper_candidate_reason": _stuck_position.metadata.get("paper_candidate_reason"),
+                        "strategy": _stuck_position.structure.strategy.value,
+                        "realized_paper_pnl": None,
+                        "mfe_rupees": round(_mfe, 2),
+                        "mae_rupees": round(_mae, 2),
+                        "note": "Force-closed at EOD: option chain data unavailable, PnL unknown.",
+                    }
+                    try:
+                        with open(_paths.paper_trades, "a") as _f:
+                            _f.write(_json.dumps(_exit_event) + "\n")
+                        save_paper_position(None, paths=_paths, extra={"last_exit": _exit_event, "mfe_rupees": 0.0, "mae_rupees": 0.0})
+                        agent.open_position = None
+                    except Exception:
+                        pass
+            # ─────────────────────────────────────────────────────────────────
+
             runtime_state = load_runtime_state(config=runtime_config)
             runtime_state["mode"] = runtime_config.mode.value
             runtime_state["live_arm"] = runtime_config.live_arm
