@@ -63,7 +63,7 @@ PLAYBOOK_MIN_SAMPLES = 8.0
 PLAYBOOK_BAD_PROFIT_FACTOR = 0.90
 PLAYBOOK_GOOD_PROFIT_FACTOR = 1.20
 STATE_ROOT = Path(__file__).resolve().parents[1] / "state"
-AGENT_HEARTBEAT_PATH = STATE_ROOT / "agent_heartbeat.json"
+AGENT_HEARTBEAT_PATH = STATE_ROOT / "intraday_v83_heartbeat.json"
 
 
 def _write_v83_agent_heartbeat(*, runtime_config: object, phase: str) -> None:
@@ -309,6 +309,114 @@ def _shadow_only_failed_breakout_candidate(
     )
 
 
+def _structural_entry_quality_check(
+    metadata: dict,
+    direction: str,  # "BULLISH" or "BEARISH"
+) -> tuple[bool, str]:
+    """
+    Gate both bullish and bearish paper overrides against structural quality:
+    ORB break, BOS/CHoCH, impulse strength, option chain confirmation, OI pressure.
+    Returns (passed, block_reason).
+    """
+    orb_state = str(metadata.get("opening_range_break_state") or "NONE")
+    bullish_bos = bool(metadata.get("bullish_bos"))
+    bullish_choch = bool(metadata.get("bullish_choch"))
+    bearish_bos = bool(metadata.get("bearish_bos"))
+    bearish_choch = bool(metadata.get("bearish_choch"))
+    impulse = float(metadata.get("impulse_strength") or 0.0)
+    price_vs_or_high = float(metadata.get("price_vs_or_high") or 0.0)
+    price_vs_or_low = float(metadata.get("price_vs_or_low") or 0.0)
+    price_vs_vwap = float(metadata.get("price_vs_vwap") or 0.0)
+    bars_above = int(metadata.get("bars_above_vwap") or 0)
+    bars_below = int(metadata.get("bars_below_vwap") or 0)
+    smart_money = str(metadata.get("smart_money_bias") or "NEUTRAL").upper()
+    oi_pressure = str(metadata.get("oi_pressure_bias") or "NEUTRAL").upper()
+    option_chain_state = str(metadata.get("option_chain_pressure_state") or "NEUTRAL").upper()
+    pcr = float(metadata.get("pcr_by_oi") or 1.0)
+    call_wall_migration = str(metadata.get("call_wall_migration") or "NONE").upper()
+    put_wall_migration = str(metadata.get("put_wall_migration") or "NONE").upper()
+    open_space_up = float(metadata.get("open_space_up") or 0.0)
+    open_space_down = float(metadata.get("open_space_down") or 0.0)
+    overhead_call_pressure = float(metadata.get("overhead_call_pressure_score") or 0.0)
+    downside_put_support = float(metadata.get("downside_put_support_score") or 0.0)
+    higher_low = bool(metadata.get("higher_low_confirmed"))
+    lower_high = bool(metadata.get("lower_high_confirmed"))
+
+    if direction == "BULLISH":
+        # 1. Require at least one structural confirmation: BOS, CHoCH, ORB breakout, or price clearly above OR high
+        has_structure = bullish_bos or bullish_choch or orb_state == "BREAKOUT_UP" or price_vs_or_high > 30 or higher_low
+        if not has_structure:
+            return False, "BULL_NO_STRUCTURE_CONFIRMATION"
+
+        # 2. Reject if price is below VWAP and most bars are below — market is not bullish enough
+        if price_vs_vwap < -15 and bars_below > bars_above:
+            return False, "BULL_PRICE_BELOW_VWAP"
+
+        # 3. Reject if smart money is actively bearish (not just neutral)
+        if smart_money == "BEARISH":
+            return False, "BULL_SMART_MONEY_BEARISH"
+
+        # 4. Reject if OI pressure is strongly bearish
+        if oi_pressure == "BEARISH":
+            return False, "BULL_OI_PRESSURE_BEARISH"
+
+        # 5. Overhead call wall blocks entry UNLESS price has broken above OR high by meaningful margin
+        if option_chain_state == "OVERHEAD_CALL_PRESSURE" and overhead_call_pressure > 1.5 and price_vs_or_high < 50:
+            return False, "BULL_OVERHEAD_CALL_WALL_BLOCKING"
+
+        # 6. Require meaningful open space above for put spread to be valid
+        if open_space_up < 30:
+            return False, "BULL_INSUFFICIENT_UPSIDE_ROOM"
+
+        # 7. Require at least minimal impulse. Relax threshold when both BOS + CHoCH confirmed (doubly proven structure).
+        _impulse_min = 1.0 if (bullish_bos and bullish_choch) else 1.5
+        if impulse < _impulse_min:
+            return False, "BULL_IMPULSE_TOO_WEAK"
+
+        # 8. PCR sanity: very high PCR (> 1.6) signals heavy put loading = bearish positioning
+        if pcr > 1.6:
+            return False, "BULL_PCR_EXCESSIVE_PUT_LOADING"
+
+        return True, "STRUCTURAL_GATE_PASSED"
+
+    else:  # BEARISH
+        # 1. Require at least one structural confirmation: BOS, CHoCH, ORB breakdown, or price clearly below OR low
+        has_structure = bearish_bos or bearish_choch or orb_state == "BREAKDOWN" or price_vs_or_low < -30 or lower_high
+        if not has_structure:
+            return False, "BEAR_NO_STRUCTURE_CONFIRMATION"
+
+        # 2. Reject if price is above VWAP and most bars are above — market is not bearish enough
+        if price_vs_vwap > 15 and bars_above > bars_below:
+            return False, "BEAR_PRICE_ABOVE_VWAP"
+
+        # 3. Reject if smart money is actively bullish
+        if smart_money == "BULLISH":
+            return False, "BEAR_SMART_MONEY_BULLISH"
+
+        # 4. Reject if OI pressure is strongly bullish
+        if oi_pressure == "BULLISH":
+            return False, "BEAR_OI_PRESSURE_BULLISH"
+
+        # 5. Strong put support below blocks bearish entry UNLESS price has broken down through OR low
+        if option_chain_state == "DOWNSIDE_PUT_SUPPORT" and downside_put_support > 1.5 and price_vs_or_low > -50:
+            return False, "BEAR_PUT_WALL_BLOCKING"
+
+        # 6. Require meaningful open space below for call spread to be valid
+        if open_space_down < 30:
+            return False, "BEAR_INSUFFICIENT_DOWNSIDE_ROOM"
+
+        # 7. Require at least minimal impulse. Relax when both BOS + CHoCH confirmed.
+        _impulse_min = 1.0 if (bearish_bos and bearish_choch) else 1.5
+        if impulse < _impulse_min:
+            return False, "BEAR_IMPULSE_TOO_WEAK"
+
+        # 8. PCR sanity: very low PCR (< 0.5) signals heavy call loading = bullish positioning; wrong for bear trade
+        if pcr < 0.5:
+            return False, "BEAR_PCR_EXCESSIVE_CALL_LOADING"
+
+        return True, "STRUCTURAL_GATE_PASSED"
+
+
 def _paper_context_override_candidate(
     *,
     snapshot: MarketSnapshot,
@@ -322,6 +430,7 @@ def _paper_context_override_candidate(
     tradability_class = str(metadata.get("tradability_class") or funnel.get("tradability_class") or metadata.get("regime_tradability") or "")
     failure_type = str(metadata.get("failure_type") or funnel.get("failure_type") or "")
     bearish_score = float(metadata.get("bearish_trade_score") or funnel.get("bearish_trade_score") or 0.0)
+    bullish_score = float(metadata.get("bullish_trade_score") or funnel.get("bullish_trade_score") or 0.0)
     no_trade_score = float(metadata.get("no_trade_score") or funnel.get("no_trade_score") or 0.0)
     setup_direction = str(metadata.get("setup_direction") or funnel.get("setup_direction") or "").upper()
     state_bias = str(metadata.get("market_state_bias") or funnel.get("market_state_bias") or "").upper()
@@ -354,6 +463,25 @@ def _paper_context_override_candidate(
     inside_window = start_t <= snapshot.timestamp.time() <= end_t
     info["paper_experiment_window_allows"] = inside_window
 
+    # Route to bullish override path when market is clearly bullish
+    _bullish_override_threshold = float(getattr(runtime_config, "paper_override_bullish_score_threshold",
+                                                getattr(runtime_config, "paper_override_bearish_score_threshold", 5.0)))
+    _bullish_override_margin = float(getattr(runtime_config, "paper_override_margin", 0.8))
+    _is_bullish_override_candidate = (
+        state_bias == "BULLISH"
+        and market_state in {"TREND_UP", "TRANSITION", "DIRECTIONAL_BALANCE"}
+        and bullish_score >= _bullish_override_threshold
+        and bullish_score > no_trade_score + _bullish_override_margin
+        and inside_window
+    )
+    if _is_bullish_override_candidate:
+        return _build_bullish_paper_override(
+            snapshot=snapshot, agent=agent, decision=decision,
+            runtime_config=runtime_config, regime_state=None,
+            bullish_score=bullish_score, no_trade_score=no_trade_score,
+            v83_reason=v83_reason, info=info,
+        )
+
     if market_state not in {"TRANSITION", "TREND_DOWN", "DIRECTIONAL_BALANCE"}:
         info["paper_candidate_reason"] = "MARKET_STATE_NOT_PAPER_OVERRIDE_APPROVED"
         return None, info
@@ -365,6 +493,12 @@ def _paper_context_override_candidate(
         return None, info
     if not inside_window:
         info["paper_candidate_reason"] = "PAPER_EXPERIMENT_WINDOW_CLOSED"
+        return None, info
+
+    # Structural quality gate: require ORB break / BOS / CHoCH / option chain alignment
+    _struct_passed, _struct_reason = _structural_entry_quality_check(metadata, "BEARISH")
+    if not _struct_passed:
+        info["paper_candidate_reason"] = _struct_reason
         return None, info
 
     regime_state = classify_regime(snapshot, agent.parameters)
@@ -473,6 +607,132 @@ def _paper_context_override_candidate(
             "paper_override_source_playbook": metadata.get("playbook") or funnel.get("playbook"),
             "paper_override_source_subtype": metadata.get("setup_subtype") or metadata.get("bearish_subtype"),
             "paper_override_source_failure_type": failure_type,
+            "paper_override_source_market_state": market_state,
+            "structure_report": structure_report,
+        },
+    ), info
+
+
+def _build_bullish_paper_override(
+    *,
+    snapshot: "MarketSnapshot",
+    agent: "IntradayDefinedRiskAgent",
+    decision: "DecisionOutput",
+    runtime_config: object,
+    regime_state: object,
+    bullish_score: float,
+    no_trade_score: float,
+    v83_reason: str,
+    info: dict,
+) -> "tuple[DecisionOutput | None, dict]":
+    metadata = decision.metadata if isinstance(decision.metadata, dict) else {}
+    funnel = metadata.get("trade_funnel") if isinstance(metadata.get("trade_funnel"), dict) else {}
+    failure_type = str(metadata.get("failure_type") or funnel.get("failure_type") or "")
+    market_state = str(metadata.get("market_state") or funnel.get("market_state") or "")
+    playbook = str(metadata.get("playbook") or funnel.get("playbook") or "UNKNOWN")
+
+    if regime_state is None:
+        from .regime import classify_regime
+        regime_state = classify_regime(snapshot, agent.parameters)
+    regime_metadata = regime_state.metadata if isinstance(regime_state.metadata, dict) else {}
+
+    # Structural quality gate: require ORB break / BOS / CHoCH / option chain alignment
+    _combined_meta = {**metadata, **regime_metadata}
+    _struct_passed, _struct_reason = _structural_entry_quality_check(_combined_meta, "BULLISH")
+    if not _struct_passed:
+        info["paper_candidate_reason"] = _struct_reason
+        info["spread_construction_status"] = "STRUCTURAL_GATE_BLOCKED"
+        return None, info
+
+    entry_context_allowed, entry_context_reason = validate_entry_context(StrategyType.BULL_PUT_CREDIT_SPREAD, snapshot, regime_state)
+    if not entry_context_allowed:
+        info["paper_candidate_reason"] = str(entry_context_reason or "ENTRY_CONTEXT_REJECTED")
+        info["spread_construction_status"] = str(entry_context_reason or "ENTRY_CONTEXT_REJECTED")
+        return None, info
+
+    structure, structure_reasons, structure_report = select_best_structure(
+        StrategyType.BULL_PUT_CREDIT_SPREAD,
+        snapshot,
+        regime_state,
+        agent.parameters,
+        setup_quality_score=float(regime_metadata.get("setup_quality_score") or metadata.get("setup_quality_score") or funnel.get("setup_quality_score") or 0.0),
+        playbook_tier=playbook_tier(playbook),
+    )
+    info["spread_construction_status"] = (
+        "PASSED"
+        if structure is not None
+        else str(structure_report.get("canonical_rejection_reason") or "SPREAD_CONSTRUCTION_FAILED")
+    )
+    if structure is None:
+        info["paper_candidate_reason"] = str(structure_report.get("canonical_rejection_reason") or "SPREAD_CONSTRUCTION_FAILED")
+        return None, info
+
+    risk = assess_trade_risk(
+        structure=structure,
+        lot_size=snapshot.lot_size,
+        risk_limits=snapshot.risk_limits,
+        account_state=snapshot.account_state,
+        margin_estimate_per_lot=structure.margin_estimate_per_lot,
+    )
+    if not risk.allowed:
+        info["paper_candidate_reason"] = "RISK_LIMIT"
+        info["spread_construction_status"] = "PASSED_RISK_BLOCKED"
+        return None, info
+
+    ops_max_lots = int(getattr(getattr(runtime_config, "risk", None), "max_lots_per_trade", None) or 6)
+    capped_lots = max(1, min(risk.lots, ops_max_lots))
+
+    expected_credit_rupees = max(structure.credit_points - snapshot.slippage_points, 0.0) * snapshot.lot_size * capped_lots
+    expected_round_trip_cost_rupees = ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT * risk.lots
+    expected_net_edge_rupees = expected_credit_rupees - expected_round_trip_cost_rupees
+    playbook_min_edge = float(regime_metadata.get("minimum_net_edge_rupees") or 0.0)
+    min_required_edge = max(MIN_NET_EDGE_RUPEES, playbook_min_edge, expected_round_trip_cost_rupees * MIN_NET_EDGE_COST_MULTIPLE)
+    if expected_net_edge_rupees < min_required_edge:
+        info["paper_candidate_reason"] = "NET_EDGE_TOO_LOW"
+        info["spread_construction_status"] = "PASSED_NET_EDGE_BLOCKED"
+        return None, info
+
+    info.update({
+        "paper_candidate_decision": "TRADE",
+        "paper_candidate_reason": "PAPER_CONTEXT_OVERRIDE_BULLISH",
+        "mapped_strategy": StrategyType.BULL_PUT_CREDIT_SPREAD.value,
+        "would_create_paper_trade": True,
+    })
+    return build_trade_decision(
+        structure=structure,
+        regime=regime_state.regime,
+        rationale=list(decision.rationale)
+        + [
+            f"Bullish paper override converted v83 rejection ({v83_reason}) into a bullish candidate for learning.",
+            "5m trigger requirements remain unchanged in v83 and MICRO_LIVE; this override exists only in PAPER_LIVE.",
+        ]
+        + structure_reasons,
+        confidence_score=max(decision.confidence_score, regime_state.confidence),
+        entry_time=snapshot.timestamp,
+        lots=capped_lots,
+        lot_size=snapshot.lot_size,
+        max_loss_rupees_per_lot=risk.max_loss_rupees_per_lot,
+        slippage_points=snapshot.slippage_points,
+        extra_metadata={
+            "day_archetype": regime_metadata.get("day_archetype"),
+            "playbook": playbook,
+            "setup_subtype": regime_metadata.get("setup_subtype") or metadata.get("setup_subtype"),
+            "bullish_shadow_subtype": regime_metadata.get("bullish_shadow_subtype"),
+            "market_state": regime_metadata.get("market_state"),
+            "market_state_bias": regime_metadata.get("market_state_bias"),
+            "state_quality_score": regime_metadata.get("state_quality_score"),
+            "tradability_class": regime_metadata.get("tradability_class"),
+            "option_chain_pressure_state": regime_metadata.get("option_chain_pressure_state"),
+            "bearish_trade_score": regime_metadata.get("bearish_trade_score"),
+            "bullish_trade_score": regime_metadata.get("bullish_trade_score"),
+            "no_trade_score": regime_metadata.get("no_trade_score"),
+            "setup_quality_score": regime_metadata.get("setup_quality_score"),
+            "setup_direction": "BULLISH",
+            "playbook_tier": "PAPER_EXPERIMENT",
+            "regime_tradability": "TRADABLE",
+            "paper_trade_attribution": "PAPER_CONTEXT_OVERRIDE_BULLISH",
+            "paper_candidate_reason": "PAPER_CONTEXT_OVERRIDE_BULLISH",
+            "v83_rejection_reason": v83_reason,
             "paper_override_source_market_state": market_state,
             "structure_report": structure_report,
         },
@@ -969,6 +1229,50 @@ def run_live(config: dict[str, object]) -> None:
                 "snapshot_status": "UNAVAILABLE",
                 "reason": f"{type(exc).__name__}: {exc}",
             }
+
+            # ── EOD force-exit when data is unavailable ──────────────────────
+            # If it's past 15:15 and there's an open paper position, close it
+            # at last-known value rather than leaving it orphaned overnight.
+            _now_ist = datetime.now(_IST)
+            _eod_force_exit_time = dtime(15, 15)
+            if _now_ist.time() >= _eod_force_exit_time and runtime_config.mode == RuntimeMode.PAPER_LIVE:
+                _stuck_position = load_paper_position()
+                if _stuck_position is not None:
+                    from .ops_runtime import save_paper_position, OpsPaths
+                    _paths = OpsPaths()
+                    try:
+                        import json as _json
+                        _state_raw = _paths.paper_state.read_text() if _paths.paper_state.exists() else "{}"
+                        _state = _json.loads(_state_raw)
+                    except Exception:
+                        _state = {}
+                    _mfe = float(_state.get("mfe_rupees") or 0.0)
+                    _mae = float(_state.get("mae_rupees") or 0.0)
+                    _exit_event = {
+                        "event": "PAPER_EXIT",
+                        "timestamp": _now_ist.isoformat(),
+                        "session_date": _now_ist.date().isoformat(),
+                        "entry_timestamp": _stuck_position.entry_time.isoformat(),
+                        "exit_timestamp": _now_ist.isoformat(),
+                        "exit_reason": "EOD_DATA_LOSS_FORCE_EXIT",
+                        "playbook": _stuck_position.metadata.get("playbook"),
+                        "paper_trade_attribution": _stuck_position.metadata.get("paper_trade_attribution"),
+                        "paper_candidate_reason": _stuck_position.metadata.get("paper_candidate_reason"),
+                        "strategy": _stuck_position.structure.strategy.value,
+                        "realized_paper_pnl": None,
+                        "mfe_rupees": round(_mfe, 2),
+                        "mae_rupees": round(_mae, 2),
+                        "note": "Force-closed at EOD: option chain data unavailable, PnL unknown.",
+                    }
+                    try:
+                        with open(_paths.paper_trades, "a") as _f:
+                            _f.write(_json.dumps(_exit_event) + "\n")
+                        save_paper_position(None, paths=_paths, extra={"last_exit": _exit_event, "mfe_rupees": 0.0, "mae_rupees": 0.0})
+                        agent.open_position = None
+                    except Exception:
+                        pass
+            # ─────────────────────────────────────────────────────────────────
+
             runtime_state = load_runtime_state(config=runtime_config)
             runtime_state["mode"] = runtime_config.mode.value
             runtime_state["live_arm"] = runtime_config.live_arm
@@ -1150,8 +1454,9 @@ def run_live(config: dict[str, object]) -> None:
                             config=runtime_config,
                             health=health,
                         )
+                        _override_label = str(override_decision.metadata.get("paper_trade_attribution") or "PAPER_CONTEXT_OVERRIDE") if isinstance(override_decision.metadata, dict) else "PAPER_CONTEXT_OVERRIDE"
                         paper_candidate["paper_candidate_reason"] = str(
-                            "PAPER_CONTEXT_OVERRIDE" if override_gate["allowed"] else override_gate.get("primary_block_reason") or "ENTRY_GATE_BLOCKED"
+                            _override_label if override_gate["allowed"] else override_gate.get("primary_block_reason") or "ENTRY_GATE_BLOCKED"
                         )
                         paper_candidate["paper_experiment_window_allows"] = bool(override_gate.get("inside_paper_experiment_window"))
                         if not override_gate["allowed"]:
@@ -1171,7 +1476,7 @@ def run_live(config: dict[str, object]) -> None:
                                 snapshot=snapshot,
                                 paper_candidate=paper_candidate,
                                 actual_trade_created=True,
-                                decision_origin="PAPER_CONTEXT_OVERRIDE",
+                                decision_origin=_override_label,
                             )
                             _update_runtime_decision_state(
                                 override_decision,

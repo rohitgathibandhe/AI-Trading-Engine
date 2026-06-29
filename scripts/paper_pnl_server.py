@@ -52,7 +52,7 @@ LIVE_GATE_SESSIONS_JSONL = STATE_DIR / "live_gate_sessions.jsonl"
 POSITION_RECONCILE_STATUS_JSON = STATE_DIR / "position_reconcile_status.json"
 EXECUTION_RECOVERY_STATUS_JSON = STATE_DIR / "execution_recovery_status.json"
 EXECUTION_JOURNAL_JSONL = STATE_DIR / "execution_journal.jsonl"
-AGENT_HEARTBEAT_JSON = STATE_DIR / "agent_heartbeat.json"
+AGENT_HEARTBEAT_JSON = STATE_DIR / "intraday_v83_heartbeat.json"
 AGENT_ALERTS_JSONL = STATE_DIR / "agent_alerts.jsonl"
 TELEGRAM_ALERT_STATUS_JSON = STATE_DIR / "telegram_alert_status.json"
 BATMAN_BKM_AI_STATUS_JSON = STATE_DIR / "batman_bkm_ai_status.json"
@@ -3348,6 +3348,34 @@ def _write_v83_run_config(*, trade_mode: str) -> Path:
     return V83_RUN_CONFIG_JSON
 
 
+_V83_LAUNCHD_LABEL = "com.algoagent.intraday_v83"
+
+
+def _kickstart_v83_via_launchd() -> subprocess.CompletedProcess:
+    """Use launchctl kickstart to restart the canonical launchd-managed v83 job."""
+    # Kill any running instances first so kickstart -k doesn't hang waiting for
+    # a slow graceful shutdown (agent can take >15s to exit during market hours).
+    for p in _find_all_v83_pids():
+        try:
+            os.kill(p, 9)
+        except OSError:
+            pass
+    time.sleep(0.5)
+    try:
+        return subprocess.run(
+            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{_V83_LAUNCHD_LABEL}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        # Return a fake failed result so _start_v83_process falls through to the
+        # subprocess fallback path.
+        return subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="launchctl kickstart timed out"
+        )
+
+
 def _start_v83_process(*, trade_mode: str) -> Dict[str, Any]:
     trade_mode = str(trade_mode or "paper").strip().lower() or "paper"
     if trade_mode != "paper":
@@ -3356,8 +3384,38 @@ def _start_v83_process(*, trade_mode: str) -> Dict[str, Any]:
             "error": "V83_LIVE_START_BLOCKED",
             "message": "v83 can be started from this UI only in PAPER_LIVE. MICRO_LIVE requires explicit runtime arming.",
         }
-    run_config = _write_v83_run_config(trade_mode=trade_mode)
+    _write_v83_run_config(trade_mode=trade_mode)
     runtime_config = _v83_set_runtime_mode(V83RuntimeMode.PAPER_LIVE, live_arm=False, source="ui_start_agent")
+
+    # Prefer launchctl kickstart so the launchd-managed job is the sole running
+    # instance. Spawning via subprocess alongside a KeepAlive launchd job creates
+    # duplicate processes that race on shared state files.
+    kickstart_result = _kickstart_v83_via_launchd()
+    if kickstart_result.returncode == 0:
+        # Give launchd a moment to start the process, then find its PID.
+        time.sleep(1.5)
+        new_pids = _find_all_v83_pids()
+        new_pid = new_pids[0] if new_pids else None
+        pid_payload = {
+            "pid": new_pid,
+            "trade_mode": trade_mode,
+            "strategy_file": "intraday_defined_risk_v83",
+            "v83_runtime_mode": runtime_config.mode.value,
+            "started_at": datetime.now().isoformat(),
+        }
+        _json_write(PID_FILE, pid_payload)
+        _write_agent_heartbeat_stub(status="STARTING", phase="v83_launch_requested", pid=new_pid, trade_mode=trade_mode)
+        return {
+            "ok": True,
+            "pid": new_pid,
+            "trade_mode": trade_mode,
+            "strategy_file": "intraday_defined_risk_v83",
+            "v83_runtime_mode": runtime_config.mode.value,
+            "log_path": str(V83_RUNNER_LOG),
+            "start_method": "launchctl_kickstart",
+        }
+
+    # Fallback: launchctl not available or job not loaded — spawn directly.
     env = os.environ.copy()
     env["TRADE_MODE"] = trade_mode
     data_engine_path = str(ROOT / "data_engine")
@@ -3371,7 +3429,7 @@ def _start_v83_process(*, trade_mode: str) -> Dict[str, Any]:
         "market_ai.intraday_defined_risk.cli",
         "run_live",
         "--config",
-        str(run_config),
+        str(ROOT / "data_engine" / "market_ai" / "state" / "intraday_v83_run_live_config.json"),
     ]
     V83_RUNNER_LOG.parent.mkdir(parents=True, exist_ok=True)
     with V83_RUNNER_LOG.open("ab") as log_handle:
@@ -3397,8 +3455,9 @@ def _start_v83_process(*, trade_mode: str) -> Dict[str, Any]:
         "trade_mode": trade_mode,
         "strategy_file": "intraday_defined_risk_v83",
         "v83_runtime_mode": runtime_config.mode.value,
-        "run_config": str(run_config),
         "log_path": str(V83_RUNNER_LOG),
+        "start_method": "subprocess_fallback",
+        "launchctl_error": kickstart_result.stderr,
     }
 
 
@@ -3471,19 +3530,38 @@ def _start_agent_process(trade_mode: str) -> Dict[str, Any]:
     return out
 
 
+def _find_all_v83_pids() -> list:
+    """Return PIDs of all running run_live v83 agent processes."""
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "market_ai.intraday_defined_risk.cli"],
+            text=True,
+        ).strip()
+        return [int(p) for p in out.splitlines() if p.strip().isdigit()]
+    except subprocess.CalledProcessError:
+        return []
+
+
 def _stop_agent_process(*, auto_cleanup_bkm: bool = True, graceful_wait_sec: float = 5.0) -> Dict[str, Any]:
     pid_data = _json_read(PID_FILE)
     pid = int(pid_data.get("pid", 0)) if pid_data else 0
     trade_mode = str(pid_data.get("trade_mode") or "").lower() if isinstance(pid_data, dict) else None
-    still_running = False
-    if pid and _is_process_alive(pid):
-        os.kill(pid, signal.SIGTERM)
-        deadline = time.time() + max(0.0, float(graceful_wait_sec))
-        while time.time() < deadline:
-            if not _is_process_alive(pid):
-                break
-            time.sleep(0.2)
-        still_running = _is_process_alive(pid)
+    # Kill the PID-file process AND any launchd-managed or orphan duplicates.
+    pids_to_kill = set(_find_all_v83_pids())
+    if pid:
+        pids_to_kill.add(pid)
+    for p in pids_to_kill:
+        try:
+            if _is_process_alive(p):
+                os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + max(0.0, float(graceful_wait_sec))
+    while time.time() < deadline:
+        if not any(_is_process_alive(p) for p in pids_to_kill):
+            break
+        time.sleep(0.2)
+    still_running = any(_is_process_alive(p) for p in pids_to_kill)
     _json_write(PID_FILE, {})
     if still_running:
         _write_agent_heartbeat_stub(status="STOPPING", phase="stop_requested", pid=pid or None, trade_mode=trade_mode)

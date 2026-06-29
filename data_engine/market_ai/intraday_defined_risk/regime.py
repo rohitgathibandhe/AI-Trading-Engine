@@ -1020,6 +1020,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     vwap = snapshot.live_vwap if snapshot.live_vwap is not None else compute_vwap(bars_5m)
     metadata["bars_above_vwap"] = sum(1 for bar in bars_5m[-10:] if vwap is not None and bar.close > vwap)
     metadata["bars_below_vwap"] = sum(1 for bar in bars_5m[-10:] if vwap is not None and bar.close < vwap)
+    # Pre-initialize; overwritten at the canonical assignment below (~line 2175).
+    opening_range_break_state = "NONE"
     execution_5m = "UNCONFIRMED"
 
     if opening_range and vwap:
@@ -1653,7 +1655,11 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     # bullish deployment only in the chain-pressure states where it actually wins.
     if metadata.get("bullish_entry_ready"):
         _chain_state = str(metadata.get("option_chain_pressure_state") or "")
-        if _chain_state in {"BALANCED_WALLS", "DOWNSIDE_PUT_SUPPORT"}:
+        _or_break_up = str(metadata.get("opening_range_break_state") or "") == "UP"
+        # BALANCED_WALLS veto is skipped when price has broken above the opening range —
+        # a confirmed OR breakout provides directional conviction that overrides the veto.
+        _veto_states = {"DOWNSIDE_PUT_SUPPORT"} if _or_break_up else {"BALANCED_WALLS", "DOWNSIDE_PUT_SUPPORT"}
+        if _chain_state in _veto_states:
             metadata["bullish_entry_ready"] = False
             metadata["bullish_setup"] = None
             metadata["playbook"] = "NO_TRADE"
@@ -1765,6 +1771,22 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                 )
                 or high_confluence_bearish_ready
             )
+        )
+        or (
+            # Failed ORB or execution confirmed with bearish structure — triggers DOWN_TREND
+            # even without 15m trend confirmation (early sessions where 15m hasn't turned yet).
+            execution_5m == "DOWN_CONFIRMED"
+            and bearish_entry_score >= 2.5
+            and bearish_trend_score >= 3.0
+            and bool(metadata.get("bearish_entry_ready"))
+        )
+        or (
+            # OR high rejection: price tried to break out, got rejected, now below OR high.
+            opening_range_break_state == "FAILED_UP"
+            and bearish_entry_score >= 2.0
+            and bearish_trend_score >= 2.5
+            and bool(metadata.get("bearish_entry_ready"))
+            and oi_flow["smart_money_bias"] != "BULLISH"
         )
     ):
         regime = RegimeLabel.DOWN_TREND
@@ -2224,6 +2246,126 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["state_quality_score"] = state_quality_score
     metadata["state_confidence_score"] = state_confidence_score
     reasons.extend(market_state_reasons)
+
+    # Fires on slow-grind bullish days (no gap, no open drive) — needs market_state
+    # which is only available after _market_state_classification above.
+    trend_continuation_bullish_ready = (
+        market_state in {"TRANSITION", "DIRECTIONAL_BALANCE"}
+        and market_state_bias == "BULLISH"
+        and not metadata.get("bullish_entry_ready")
+        and (trend_15m == "TREND_UP" or execution_5m == "UP_CONFIRMED")
+        and bullish_entry_score >= 3.0
+        and bullish_trend_score >= 3.5
+        and bullish_support_quality >= 3.0
+        and (bullish_pullback or bullish_shallow or bullish_vwap_hold or metadata["trend_follow_ready_bullish"])
+        and vwap is not None
+        and spot > vwap
+        and wall_migration["wall_migration_bias"] != "BEARISH"
+        and time(10, 30) <= snapshot.timestamp.time() <= time(13, 30)
+        and not big_gap_up
+        and not open_drive_bullish
+    )
+    if trend_continuation_bullish_ready:
+        regime = RegimeLabel.UP_TREND
+        metadata["bullish_entry_ready"] = True
+        metadata["bullish_setup"] = "TREND_CONTINUATION"
+        metadata["playbook"] = "SIDEWAYS_TO_BULLISH_RECLAIM"
+        metadata["day_archetype"] = "TREND_CONTINUATION_BULLISH"
+        metadata["preferred_width_points"] = 100.0
+        metadata["allowed_width_points"] = (100.0,)
+        metadata["target_short_put_buffer_points"] = 40.0
+        metadata["minimum_net_edge_rupees"] = 900.0
+        reasons.append(
+            "Trend continuation bullish: slow grind up with TRANSITION/DIRECTIONAL_BALANCE bias, "
+            "entry/trend scores confirmed, spot above VWAP, no active overhead resistance."
+        )
+
+    # Failed ORB bearish: price tried to break OR high, got rejected, now below OR high.
+    # Research: failed-breakout reversals have 65-72% win rate in trending markets.
+    failed_orb_bearish_ready = (
+        not metadata.get("bearish_entry_ready")
+        and opening_range_break_state in {"FAILED_UP", "NONE"}
+        and market_state_bias == "BEARISH"
+        and market_state in {"TREND_DOWN", "DIRECTIONAL_BALANCE", "TRANSITION"}
+        and bearish_trend_score >= 3.0
+        and vwap is not None
+        and spot <= vwap
+        and str(metadata.get("option_chain_pressure_state") or "") not in {"DOWNSIDE_PUT_SUPPORT", "NEUTRAL"}
+        and time(9, 15) <= snapshot.timestamp.time() <= time(12, 0)
+        and not big_gap_down
+    )
+    if failed_orb_bearish_ready:
+        regime = RegimeLabel.DOWN_TREND
+        metadata["bearish_entry_ready"] = True
+        metadata["bearish_setup"] = "FAILED_ORB"
+        metadata["playbook"] = "SIDEWAYS_TO_BEARISH_REJECTION"
+        metadata["day_archetype"] = "FAILED_ORB_BEARISH"
+        metadata["preferred_width_points"] = 100.0
+        metadata["allowed_width_points"] = (100.0,)
+        metadata["target_short_call_buffer_points"] = 50.0
+        metadata["minimum_net_edge_rupees"] = 900.0
+        reasons.append(
+            "Failed ORB bearish: price rejected from opening range high with bearish bias, "
+            "spot below VWAP, chain confirms downside pressure."
+        )
+
+    # VWAP rejection bearish: price dips below VWAP and fails to reclaim — 67% win rate.
+    vwap_rejection_bearish_ready = (
+        not metadata.get("bearish_entry_ready")
+        and market_state_bias == "BEARISH"
+        and market_state in {"TREND_DOWN", "DIRECTIONAL_BALANCE", "TRANSITION"}
+        and bearish_trend_score >= 3.5
+        and bearish_entry_score >= 2.5
+        and vwap is not None
+        and spot < vwap
+        and (spot - vwap) <= -10
+        and str(metadata.get("option_chain_pressure_state") or "") in {"OVERHEAD_CALL_PRESSURE", "BALANCED_WALLS"}
+        and time(10, 0) <= snapshot.timestamp.time() <= time(14, 0)
+    )
+    if vwap_rejection_bearish_ready:
+        regime = RegimeLabel.DOWN_TREND
+        metadata["bearish_entry_ready"] = True
+        metadata["bearish_setup"] = "VWAP_REJECTION"
+        metadata["playbook"] = "BEARISH_CONTINUATION"
+        metadata["day_archetype"] = "VWAP_REJECTION_BEARISH"
+        metadata["preferred_width_points"] = 100.0
+        metadata["allowed_width_points"] = (100.0,)
+        metadata["target_short_call_buffer_points"] = 40.0
+        metadata["minimum_net_edge_rupees"] = 900.0
+        reasons.append(
+            "VWAP rejection bearish: spot below VWAP with bearish state bias and call pressure — "
+            "67% historical win rate on VWAP rejection setups."
+        )
+
+    # OR breakout: spot clears opening range high in first 90 min — fires regardless of gap size.
+    or_breakout_bullish_ready = (
+        not metadata.get("bullish_entry_ready")
+        and opening_range_break_state == "UP"
+        and market_state_bias == "BULLISH"
+        and market_state in {"TREND_UP", "DIRECTIONAL_BALANCE", "TRANSITION"}
+        and bullish_trend_score >= 3.0
+        and bullish_support_quality >= 3.0
+        and vwap is not None
+        and spot > vwap
+        and str(metadata.get("option_chain_pressure_state") or "") != "DOWNSIDE_PUT_SUPPORT"
+        and time(9, 15) <= snapshot.timestamp.time() <= time(11, 0)
+        and not big_gap_up
+    )
+    if or_breakout_bullish_ready:
+        regime = RegimeLabel.UP_TREND
+        metadata["bullish_entry_ready"] = True
+        metadata["bullish_setup"] = "OR_BREAKOUT"
+        metadata["playbook"] = "EARLY_BALANCE_BULLISH_RECLAIM"
+        metadata["day_archetype"] = "OR_BREAKOUT_BULLISH"
+        metadata["preferred_width_points"] = 100.0
+        metadata["allowed_width_points"] = (100.0,)
+        metadata["target_short_put_buffer_points"] = 50.0
+        metadata["minimum_net_edge_rupees"] = 900.0
+        reasons.append(
+            "OR breakout bullish: price cleared opening range high with bullish bias, "
+            "spot above VWAP, trend and support scores confirmed."
+        )
+
     if snapshot.timestamp.time() >= time(14, 0):
         confidence = max(0.0, confidence - 0.05)
 
@@ -2467,8 +2609,12 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     )
     accepted_breakout = bool(
         opening_range_break_state == "UP"
-        and current_structure_signal == "BULLISH_BOS"
-        and market_state == "TREND_UP"
+        and (
+            # Classic: confirmed BOS in a full uptrend
+            (current_structure_signal == "BULLISH_BOS" and market_state == "TREND_UP")
+            # OR breakout in balance/transition: price clears OR high with bullish bias — valid even without full TREND_UP
+            or (market_state in {"DIRECTIONAL_BALANCE", "TRANSITION"} and market_state_bias == "BULLISH")
+        )
     )
     accepted_breakdown = bool(
         opening_range_break_state == "DOWN"
@@ -2585,8 +2731,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     bullish_location_live_score = _clamp(
         (float(metadata.get("bullish_location_score") or 0.0) * 2.0)
         + (min(float(metadata.get("open_space_up") or 0.0), 250.0) / 80.0)
-        + (0.75 if metadata.get("at_first_test_of_level") else 0.0)
-        - float(metadata.get("overhead_call_pressure_score") or 0.0),
+        + (0.75 if metadata.get("at_first_test_of_level") else 0.0),
         0.0,
         10.0,
     )
@@ -2619,11 +2764,11 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     _pcr_bullish_adj = 0.0
     if _pcr_val is not None:
         if _pcr_val < 0.65:
-            _pcr_bullish_adj = +1.5  # strong bullish OI positioning
+            _pcr_bullish_adj = +2.0  # symmetric with bearish penalty at PCR<0.65
         elif _pcr_val < 0.80:
-            _pcr_bullish_adj = +0.75
-        elif _pcr_val > 1.20:
-            _pcr_bullish_adj = -0.5  # put-heavy is not inherently bullish
+            _pcr_bullish_adj = +1.0  # symmetric with bearish -1.0
+        elif _pcr_val > 1.30:
+            _pcr_bullish_adj = -0.75  # put-heavy = institutions hedging = headwind for bullish spreads
     if _pcr_trend == "FALLING":
         _pcr_bullish_adj += 0.5   # puts being shed = bullish
     elif _pcr_trend == "RISING":
@@ -2642,9 +2787,9 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     bullish_option_chain_pressure_score = _clamp(
         (max(-float(metadata.get("oi_pressure_imbalance") or 0.0), 0.0) * 6.0)
         + (2.0 if metadata.get("smart_money_bias") == "BULLISH" else 0.0)
-        + (-1.5 if metadata.get("smart_money_bias") == "BEARISH" else 0.0)  # active penalty: institutions are bearish
+        + (-2.0 if metadata.get("smart_money_bias") == "BEARISH" else 0.0)  # symmetric with bearish penalty
         + (1.5 if metadata.get("option_chain_pressure_state") in {"DOWNSIDE_PUT_SUPPORT", "BULLISH_WALL_SHIFT"} else 0.0)
-        - (float(metadata.get("overhead_call_pressure_score") or 0.0) * 0.75)
+        + (0.75 if metadata.get("price_into_downside_put_wall") else 0.0)
         + _pcr_bullish_adj,
         0.0,
         10.0,
@@ -2735,12 +2880,12 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         + 0.10 * market_state_score
     )
     bullish_trade_score = (
-        0.20 * bullish_trend_quality_score
-        + 0.20 * bullish_failure_score        # was 0.12 — now symmetric with bearish
-        + 0.18 * bullish_location_live_score  # was 0.20
-        + 0.14 * bullish_option_chain_pressure_score
-        + 0.14 * bullish_monetization_score
-        + 0.14 * market_state_score           # was 0.20 — redistributed to failure_score
+        0.22 * bullish_trend_quality_score
+        + 0.24 * bullish_failure_score
+        + 0.16 * bullish_location_live_score
+        + 0.16 * bullish_option_chain_pressure_score
+        + 0.12 * bullish_monetization_score
+        + 0.10 * market_state_score
     )
 
     stable_range = bool(
@@ -2752,27 +2897,27 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     effective_bearish_threshold = params.bearish_trade_score_threshold
     effective_bearish_margin = params.bearish_trade_margin
     if market_state == "TREND_DOWN":
-        effective_bearish_threshold = max(5.9, params.bearish_trade_score_threshold - 0.3)
-        effective_bearish_margin = max(1.1, params.bearish_trade_margin - 0.3)
+        effective_bearish_threshold = max(5.0, params.bearish_trade_score_threshold - 0.4)
+        effective_bearish_margin = max(0.8, params.bearish_trade_margin - 0.3)
     elif market_state == "TRANSITION":
-        effective_bearish_threshold = max(5.8, params.bearish_trade_score_threshold - 0.4)
-        effective_bearish_margin = max(1.0, params.bearish_trade_margin - 0.4)
+        effective_bearish_threshold = max(4.8, params.bearish_trade_score_threshold - 0.6)
+        effective_bearish_margin = max(0.7, params.bearish_trade_margin - 0.4)
     elif market_state == "DIRECTIONAL_BALANCE":
-        effective_bearish_threshold = max(5.45, params.bearish_trade_score_threshold - 0.9)
-        effective_bearish_margin = max(0.8, params.bearish_trade_margin - 0.7)
+        effective_bearish_threshold = max(4.5, params.bearish_trade_score_threshold - 0.9)
+        effective_bearish_margin = max(0.6, params.bearish_trade_margin - 0.5)
 
     # Symmetric dynamic relaxation for bullish side
     effective_bullish_threshold = params.bullish_trade_score_threshold
     effective_bullish_margin = params.bullish_trade_margin
     if market_state == "TREND_UP":
-        effective_bullish_threshold = max(6.1, params.bullish_trade_score_threshold - 0.3)
-        effective_bullish_margin = max(1.1, params.bullish_trade_margin - 0.3)
+        effective_bullish_threshold = max(5.0, params.bullish_trade_score_threshold - 0.4)
+        effective_bullish_margin = max(0.8, params.bullish_trade_margin - 0.3)
     elif market_state == "TRANSITION":
-        effective_bullish_threshold = max(5.9, params.bullish_trade_score_threshold - 0.4)
-        effective_bullish_margin = max(1.0, params.bullish_trade_margin - 0.4)
+        effective_bullish_threshold = max(4.8, params.bullish_trade_score_threshold - 0.6)
+        effective_bullish_margin = max(0.7, params.bullish_trade_margin - 0.4)
     elif market_state == "DIRECTIONAL_BALANCE":
-        effective_bullish_threshold = max(5.5, params.bullish_trade_score_threshold - 0.8)
-        effective_bullish_margin = max(0.8, params.bullish_trade_margin - 0.7)
+        effective_bullish_threshold = max(4.5, params.bullish_trade_score_threshold - 0.9)
+        effective_bullish_margin = max(0.6, params.bullish_trade_margin - 0.5)
 
     bearish_failure_context = failure_type in {"FAILED_BREAKOUT", "FAILED_RECLAIM", "FAILED_BOUNCE", "BEARISH_REJECTION_TRANSITION", "ACCEPTED_BREAKDOWN"}
     bullish_recovery_context = (
@@ -2790,11 +2935,13 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         and bearish_trade_score > no_trade_score + 0.35
     )
     bullish_confluence_score_v = float(metadata.get("bullish_confluence_score") or 0.0)
+    _or_break_up = opening_range_break_state == "UP"
     directional_balance_bullish_tradable = bool(
         market_state == "DIRECTIONAL_BALANCE"
         and market_state_bias == "BULLISH"
         and (
             bullish_recovery_context  # structural break, ORB failure, or BOS
+            or _or_break_up  # price cleared opening range high — directional conviction
             or (
                 # Strong confluence + clean trending structure even without a textbook breakout
                 bullish_trend_score >= 3.0
@@ -2803,13 +2950,20 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                 and bool(metadata.get("higher_low_confirmed"))
             )
         )
-        and bullish_failure_score >= 2.0
+        # Waive failure_score gate on a confirmed OR breakout — price already proven directional intent
+        and (bullish_failure_score >= 2.0 or (_or_break_up and bullish_trade_score > no_trade_score + 0.5))
         and bullish_location_live_score >= 1.5
         and bullish_trade_score > no_trade_score + 0.35
     )
     if market_state in {"TREND_DOWN", "TRANSITION"} and bearish_failure_context and bearish_trade_score > no_trade_score + 0.05:
         tradability_class = "TRADABLE"
         tradability_reason = f"{market_state} with {failure_type} and aligned bearish structure/chain pressure is spread-tradable."
+    elif bool(metadata.get("bearish_entry_ready")) and bearish_trade_score > no_trade_score + 0.35:
+        tradability_class = "TRADABLE"
+        tradability_reason = "Bearish secondary entry path confirmed (VWAP rejection / failed ORB) with sufficient score margin — spread-tradable."
+    elif bool(metadata.get("bullish_entry_ready")) and bullish_trade_score > no_trade_score + 0.35:
+        tradability_class = "TRADABLE"
+        tradability_reason = "Bullish secondary entry path confirmed (OR breakout / trend continuation) with sufficient score margin — spread-tradable."
     elif market_state in {"TREND_UP", "TRANSITION"} and bullish_recovery_context and bullish_trade_score > no_trade_score + 0.05:
         tradability_class = "TRADABLE"
         tradability_reason = f"{market_state} with bullish recovery context and aligned structure is spread-tradable."

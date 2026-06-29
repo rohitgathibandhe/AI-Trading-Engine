@@ -34,6 +34,8 @@ V83_LIVE_PLAYBOOKS = {
     "GAP_UP_BEARISH_FAILURE",
     "HIGH_CONFLUENCE_BEARISH_CONTINUATION",
     "EARLY_BALANCE_BEARISH_FAILED_RECLAIM",
+    "BEARISH_CONTINUATION",
+    "BEARISH_FAILED_RECLAIM",
     # Bullish playbooks
     "OPEN_DRIVE_BULLISH",
     "GAP_UP_BULLISH_CONTINUATION",
@@ -122,6 +124,7 @@ class RuntimeConfig:
     directional_balance_score_margin_override: float = 0.08
     allowed_entry_start_hhmm: str = "09:30"
     allowed_entry_end_hhmm: str = "14:30"
+    allowed_bullish_entry_start_hhmm: str = "10:00"
     paper_override_bearish_score_threshold: float = 6.5
     paper_override_margin: float = 1.0
     paper_experiment_entry_end_hhmm: str = "14:30"
@@ -162,6 +165,7 @@ class RuntimeConfig:
             ),
             allowed_entry_start_hhmm=str(payload.get("allowed_entry_start_hhmm") or "09:30"),
             allowed_entry_end_hhmm=str(payload.get("allowed_entry_end_hhmm") or "14:30"),
+            allowed_bullish_entry_start_hhmm=str(payload.get("allowed_bullish_entry_start_hhmm") or "10:00"),
             paper_override_bearish_score_threshold=float(payload.get("paper_override_bearish_score_threshold", 6.5) or 6.5),
             paper_override_margin=float(payload.get("paper_override_margin", 1.0) or 1.0),
             paper_experiment_entry_end_hhmm=str(payload.get("paper_experiment_entry_end_hhmm") or "14:30"),
@@ -390,6 +394,7 @@ def set_runtime_mode(
         directional_balance_score_margin_override=current.directional_balance_score_margin_override,
         allowed_entry_start_hhmm=current.allowed_entry_start_hhmm,
         allowed_entry_end_hhmm=current.allowed_entry_end_hhmm,
+        allowed_bullish_entry_start_hhmm=current.allowed_bullish_entry_start_hhmm,
         paper_override_bearish_score_threshold=current.paper_override_bearish_score_threshold,
         paper_override_margin=current.paper_override_margin,
         paper_experiment_entry_end_hhmm=current.paper_experiment_entry_end_hhmm,
@@ -632,14 +637,14 @@ def build_unified_health(
         and active_market_session
         and live_feed_ready
         and live_chain_ready
-        and structured_5m_ok
-        and structured_chain_ok
     ):
-        # PAPER_LIVE entries depend on the live market feed and the current option chain,
-        # not on the asynchronous research collector heartbeat. Keep the stale collector
-        # visible as an ops warning, but do not hard-block paper trades intraday when the
-        # live data path itself is healthy.
+        # PAPER_LIVE intraday entries use the live market feed and current option chain.
+        # Structured/research dataset files and the async collector are not part of the
+        # live decision path. Demote all of these to degraded-only so that stale training
+        # artifacts or a dead collector cannot hard-block paper trades when live data is healthy.
         paper_session_degraded_only = {
+            "STRUCTURED_5M_DATASET_STALE",
+            "STRUCTURED_OPTION_CHAIN_STALE",
             "COLLECTOR_HEARTBEAT_STALE",
             "COLLECTOR_PROCESS_NOT_RUNNING",
             "COLLECTOR_LOG_STALE",
@@ -931,7 +936,12 @@ def evaluate_entry_gate(
         directional_score = bearish_score
     if directional_score <= no_trade_score + score_margin_required:
         reasons.append("DIRECTIONAL_SCORE_MARGIN_FAIL")
-    start_t = _parse_time(config.allowed_entry_start_hhmm, time(9, 30))
+    # Bullish setups use an earlier start time so gap-up continuation plays can
+    # be entered from 10:00 AM instead of waiting for the bearish window (11:00).
+    if setup_direction == "BULLISH":
+        start_t = _parse_time(config.allowed_bullish_entry_start_hhmm, time(10, 0))
+    else:
+        start_t = _parse_time(config.allowed_entry_start_hhmm, time(9, 30))
     end_t = min(
         _parse_time(config.allowed_entry_end_hhmm, time(14, 30)),
         _parse_time(config.risk.no_new_entries_after_hhmm, time(14, 30)),
@@ -1015,7 +1025,8 @@ def evaluate_paper_context_override_gate(
 
     if config.mode != RuntimeMode.PAPER_LIVE:
         reasons.append("MODE_NOT_PAPER_LIVE")
-    if _decision_origin(decision) != "PAPER_CONTEXT_OVERRIDE":
+    _origin = _decision_origin(decision)
+    if _origin not in {"PAPER_CONTEXT_OVERRIDE", "PAPER_CONTEXT_OVERRIDE_BULLISH"}:
         reasons.append("NOT_PAPER_CONTEXT_OVERRIDE")
     if decision.action != "TRADE":
         reasons.append("NO_TRADE_DECISION")
@@ -1028,11 +1039,15 @@ def evaluate_paper_context_override_gate(
     if market_state not in {"TRANSITION", "TREND_DOWN", "TREND_UP", "DIRECTIONAL_BALANCE"}:
         reasons.append("MARKET_STATE_NOT_PAPER_OVERRIDE_APPROVED")
 
+    _is_bullish_override = (_origin == "PAPER_CONTEXT_OVERRIDE_BULLISH")
     bearish_score = float(metadata.get("bearish_trade_score") or funnel.get("bearish_trade_score") or 0.0)
+    bullish_score = float(metadata.get("bullish_trade_score") or funnel.get("bullish_trade_score") or 0.0)
     no_trade_score = float(metadata.get("no_trade_score") or funnel.get("no_trade_score") or 0.0)
-    if bearish_score < config.paper_override_bearish_score_threshold:
+    _active_score = bullish_score if _is_bullish_override else bearish_score
+    _score_threshold = float(getattr(config, "paper_override_bullish_score_threshold", config.paper_override_bearish_score_threshold)) if _is_bullish_override else config.paper_override_bearish_score_threshold
+    if _active_score < _score_threshold:
         reasons.append("PAPER_OVERRIDE_SCORE_TOO_LOW")
-    if bearish_score <= no_trade_score + config.paper_override_margin:
+    if _active_score <= no_trade_score + config.paper_override_margin:
         reasons.append("PAPER_OVERRIDE_MARGIN_FAIL")
 
     start_t = _parse_time(config.allowed_entry_start_hhmm, time(9, 30))

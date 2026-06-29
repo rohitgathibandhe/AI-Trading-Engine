@@ -254,7 +254,39 @@ class DhanWrapper:
             except Exception:
                 continue
         return sorted(unique)
+    def _refresh_token_if_stale(self) -> None:
+        """Hot-reload token from creds.json if the file changed since last read.
+        Called before every outbound API request so a mid-session token update
+        (e.g. user pastes a new Dhan token) is picked up without restarting."""
+        state_dir = Path(__file__).resolve().parent / "state"
+        creds_file = state_dir / "creds.json"
+        try:
+            mtime = creds_file.stat().st_mtime
+        except OSError:
+            return
+        if mtime <= self._creds_file_mtime:
+            return
+        try:
+            data = json.loads(creds_file.read_text())
+        except Exception:
+            return
+        tok = str(data.get("access_token") or "").strip()
+        if not tok or tok == self.access_token:
+            self._creds_file_mtime = mtime
+            return
+        self.access_token = tok
+        # Propagate into the underlying HTTP layer so ongoing connections use the new token
+        if hasattr(self.http, "access_token"):
+            self.http.access_token = tok
+        if hasattr(self.http, "header") and isinstance(self.http.header, dict):
+            self.http.header["access-token"] = tok
+        if hasattr(self.http, "_headers") and isinstance(self.http._headers, dict):
+            self.http._headers["access-token"] = tok
+        self._creds_file_mtime = mtime
+        logging.getLogger("dhan_wrapper").info("Hot-reloaded DHAN access token from state/creds.json")
+
     def _order_headers(self) -> Dict[str, str]:
+        self._refresh_token_if_stale()
         return {
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -427,6 +459,7 @@ class DhanWrapper:
         self.endpoints: DhanEndpoints = DhanEndpoints()
         self._sdk_context = _SDKContext(self.http)
         self._historical = HistoricalData(self._sdk_context)
+        self._creds_file_mtime: float = 0.0
         # Simple in-memory throttling/cache for option-chain to avoid 429
         self._last_chain_ts: Optional[float] = None
         self._last_chain_key: Optional[str] = None
@@ -753,6 +786,7 @@ class DhanWrapper:
         Fetch intraday OHLCV from /charts/intraday via the HistoricalData helper.
         Returns a list of dicts sorted by timestamp with keys: timestamp, open, high, low, close, volume.
         """
+        self._refresh_token_if_stale()
         from_str = (from_date or dt_date.today().isoformat()).strip()
         to_str = (to_date or from_str).strip()
         try:
@@ -769,6 +803,9 @@ class DhanWrapper:
             return []
 
         data: Any = resp
+        if isinstance(data, dict) and data.get("status") == "failure":
+            self.log.error("[historical] intraday fetch failure: %s", data.get("remarks", data))
+            return []
         if isinstance(data, dict):
             for key in ("data", "Data", "candles", "CANDLES"):
                 if key in data:
@@ -801,6 +838,7 @@ class DhanWrapper:
                 )
             data = temp
         if not isinstance(data, list):
+            self.log.warning("[historical] intraday unexpected response type=%s: %s", type(data).__name__, str(data)[:200])
             return []
 
         candles: List[Dict[str, Any]] = []
