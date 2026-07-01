@@ -8,6 +8,7 @@ from .data_models import (
     ExitDecision,
     MarketSnapshot,
     OpenPosition,
+    OptionType,
     RegimeLabel,
     RegimeState,
     StrategyLeg,
@@ -296,6 +297,37 @@ def evaluate_exit(
     if current_value_points >= position.stop_value_points:
         return ExitDecision(True, "PREMIUM_STOP", current_value_points, pnl_rupees)
 
+    # Theta-aware profit protection: professional rule — don't let a good trade turn bad.
+    # After 90 min with 60% captured, gamma starts working against the seller faster than
+    # theta works for them. Close the trade rather than risk giving it back.
+    current_capture_pct = max(position.entry_credit_points - current_value_points, 0.0) / max(position.entry_credit_points, 0.01)
+    if current_capture_pct >= 0.60 and elapsed_minutes >= 90:
+        return ExitDecision(True, "THETA_TARGET_HIT", current_value_points, pnl_rupees)
+    # Afternoon protection: after 13:30, gamma accelerates into close.
+    # If already 40% in profit, lock it in rather than hold through last-hour volatility.
+    if current_capture_pct >= 0.40 and now.time() >= time(13, 30):
+        return ExitDecision(True, "AFTERNOON_PROFIT_LOCK", current_value_points, pnl_rupees)
+
+    # Condor partial close: when one side is threatened, close just that side rather
+    # than exiting the full condor. This preserves the safe half which still has
+    # theta working in its favour. Trigger is 0.25 delta (before full DELTA_STOP at 0.25).
+    CONDOR_PARTIAL_CLOSE_DELTA = 0.23
+    if position.structure.strategy == StrategyType.IRON_CONDOR and current_legs:
+        call_short_deltas = [
+            abs(leg.quote.delta)
+            for leg in current_legs
+            if leg.action == "SELL" and leg.option_type == OptionType.CALL and leg.quote.delta is not None
+        ]
+        put_short_deltas = [
+            abs(leg.quote.delta)
+            for leg in current_legs
+            if leg.action == "SELL" and leg.option_type == OptionType.PUT and leg.quote.delta is not None
+        ]
+        if call_short_deltas and max(call_short_deltas) >= CONDOR_PARTIAL_CLOSE_DELTA:
+            return ExitDecision(True, "CONDOR_CALL_SIDE_CLOSE", current_value_points, pnl_rupees)
+        if put_short_deltas and max(put_short_deltas) >= CONDOR_PARTIAL_CLOSE_DELTA:
+            return ExitDecision(True, "CONDOR_PUT_SIDE_CLOSE", current_value_points, pnl_rupees)
+
     short_delta_limit = DIRECTIONAL_DELTA_SL if position.structure.strategy not in {StrategyType.IRON_CONDOR, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE} else CONDOR_DELTA_SL
     selection_mode = position.structure.metadata.get("selection_mode")
     if position.structure.strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD and selection_mode == "STRUCTURE_DISTANCE_FALLBACK":
@@ -575,6 +607,104 @@ def _structure_profit_trail_reason(
         if structure_broken:
             return "PROFIT_TRAIL_STRUCTURE"
     return None
+
+
+def evaluate_hedge_opportunity(
+    position: OpenPosition,
+    current_regime: RegimeState,
+    current_snapshot: MarketSnapshot,
+    now: datetime,
+) -> dict:
+    """
+    Detects when a directional credit spread should be converted to an Iron Condor
+    by adding the opposite leg. This fires when:
+      - We hold a bear call spread and the market has stalled/turned range-bound
+        (regime → RANGE, price recovering, but short call still safely OTM)
+      - We hold a bull put spread and the market has stalled/turned range-bound
+        (regime → RANGE, price pulling back, but short put still safely OTM)
+
+    Returns a dict with:
+      should_hedge: bool
+      reason: str
+      hedge_side: 'BULL_PUT' | 'BEAR_CALL' | None  (which spread to ADD)
+    """
+    result = {"should_hedge": False, "reason": "NO_HEDGE", "hedge_side": None}
+    strategy = position.structure.strategy
+    if strategy not in {StrategyType.BEAR_CALL_CREDIT_SPREAD, StrategyType.BULL_PUT_CREDIT_SPREAD}:
+        return result
+
+    # Already too late in session to open a new leg
+    if now.time() >= time(13, 0):
+        return result
+
+    # Must be in position long enough to have a clear picture
+    entry_time = position.entry_time
+    if entry_time.tzinfo is None and now.tzinfo is not None:
+        entry_time = entry_time.replace(tzinfo=now.tzinfo)
+    elif entry_time.tzinfo is not None and now.tzinfo is None:
+        entry_time = entry_time.replace(tzinfo=None)
+    elapsed_minutes = max(int((now - entry_time).total_seconds() // 60), 0)
+    if elapsed_minutes < 20:
+        return result
+
+    # Must have already captured some profit (position is working)
+    bars = session_bars(current_snapshot.nifty_5m)
+    if not bars:
+        return result
+    spot = current_snapshot.option_chain.spot
+    vwap = current_snapshot.live_vwap or compute_vwap(bars)
+    ema20_5m = ema_value(closes(bars), period=20)
+
+    regime = current_regime.regime
+    metadata = current_regime.metadata if isinstance(current_regime.metadata, dict) else {}
+    range_balance_score = float(metadata.get("range_balance_score") or 0.0)
+
+    if strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD:
+        # Market stalled: regime shifted to RANGE and price is holding below our short call
+        short_call_strike = min(
+            (leg.strike for leg in position.structure.legs if leg.action == "SELL" and leg.option_type == OptionType.CALL),
+            default=None,
+        )
+        if short_call_strike is None:
+            return result
+        safe_margin = (short_call_strike - spot) / max(spot, 1.0)
+        market_range_bound = (
+            regime == RegimeLabel.RANGE
+            or (vwap is not None and ema20_5m is not None and abs(spot - vwap) / max(spot, 1.0) <= 0.0020)
+        )
+        if (
+            market_range_bound
+            and safe_margin >= 0.008  # short call at least 0.8% above spot = safely OTM
+            and range_balance_score >= 2.5
+        ):
+            result["should_hedge"] = True
+            result["reason"] = "BEAR_CALL_MARKET_STALLED_ADD_BULL_PUT"
+            result["hedge_side"] = "BULL_PUT"
+            return result
+
+    elif strategy == StrategyType.BULL_PUT_CREDIT_SPREAD:
+        short_put_strike = max(
+            (leg.strike for leg in position.structure.legs if leg.action == "SELL" and leg.option_type == OptionType.PUT),
+            default=None,
+        )
+        if short_put_strike is None:
+            return result
+        safe_margin = (spot - short_put_strike) / max(spot, 1.0)
+        market_range_bound = (
+            regime == RegimeLabel.RANGE
+            or (vwap is not None and ema20_5m is not None and abs(spot - vwap) / max(spot, 1.0) <= 0.0020)
+        )
+        if (
+            market_range_bound
+            and safe_margin >= 0.008
+            and range_balance_score >= 2.5
+        ):
+            result["should_hedge"] = True
+            result["reason"] = "BULL_PUT_MARKET_STALLED_ADD_BEAR_CALL"
+            result["hedge_side"] = "BEAR_CALL"
+            return result
+
+    return result
 
 
 def _serialize_leg(leg: StrategyLeg, lots: int, lot_size: int) -> dict[str, object]:

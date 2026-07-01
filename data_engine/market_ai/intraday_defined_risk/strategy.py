@@ -467,7 +467,7 @@ def select_strategy(
                 f"Bearish setup detected, but conviction {regime_state.confidence:.2f} is below the required {required_bear_confidence:.2f}."
             )
             return StrategyType.NO_TRADE, reasons
-        if day_archetype not in {"OPEN_DRIVE_BEARISH", "EARLY_BALANCE_TO_BEARISH", "SIDEWAYS_TO_BEARISH", "GAP_UP_FAILURE", "GAP_DOWN_CONTINUATION", "HIGH_CONFLUENCE_BEARISH", "TREND_BEARISH"}:
+        if day_archetype not in {"OPEN_DRIVE_BEARISH", "EARLY_BALANCE_TO_BEARISH", "SIDEWAYS_TO_BEARISH", "GAP_UP_FAILURE", "GAP_DOWN_CONTINUATION", "HIGH_CONFLUENCE_BEARISH", "TREND_BEARISH", "EARLY_STRUCTURE_BEARISH"}:
             reasons.append(
                 f"Bearish regime is generic {day_archetype}; only gap/open-drive/sideways/trend-bearish archetypes are eligible for downside deployment."
             )
@@ -594,7 +594,7 @@ def select_strategy(
                 f"Bullish setup detected, but conviction {regime_state.confidence:.2f} is below the required {required_bull_confidence:.2f}."
             )
             return StrategyType.NO_TRADE, reasons
-        if playbook not in {"OPEN_DRIVE_BULLISH", "HIGH_CONFLUENCE_BULLISH_CONTINUATION", "SIDEWAYS_TO_BULLISH_RECLAIM", "EARLY_BALANCE_BULLISH_RECLAIM", "GAP_UP_BULLISH_CONTINUATION", "GAP_DOWN_BULLISH_RECOVERY", "AFTERNOON_TREND_HOLD_BULLISH"}:
+        if playbook not in {"OPEN_DRIVE_BULLISH", "HIGH_CONFLUENCE_BULLISH_CONTINUATION", "SIDEWAYS_TO_BULLISH_RECLAIM", "EARLY_BALANCE_BULLISH_RECLAIM", "GAP_UP_BULLISH_CONTINUATION", "GAP_DOWN_BULLISH_RECOVERY", "AFTERNOON_TREND_HOLD_BULLISH", "EARLY_STRUCTURE_BULLISH"}:
             reasons.append(
                 f"Bullish regime is generic {day_archetype} with playbook {playbook}; only dedicated gap/open-drive/sideways bullish playbooks are eligible for upside deployment."
             )
@@ -677,8 +677,18 @@ def select_strategy(
         playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
         range_ready = bool(regime_state.metadata.get("range_entry_ready"))
         range_balance_score = float(regime_state.metadata.get("range_balance_score") or 0.0)
+        premarket_bias = str(regime_state.metadata.get("premarket_bias") or "NEUTRAL")
         if context_layer_active and tradability == REGIME_TRADABILITY_NOT_TRADABLE:
             reasons.append(tradability_reason)
+            return StrategyType.NO_TRADE, reasons
+        # Pre-market bias filter: if pre-open signals strongly indicated a trending day,
+        # skip condors and strangles even if intraday structure looks range-bound.
+        # Markets that open with strong directional conviction rarely settle into a true range.
+        if premarket_bias == "TRENDING":
+            reasons.append(
+                "Pre-market bias is TRENDING (large gap, elevated IV, or extreme PCR before open). "
+                "Range/condor deployment is suppressed — wait for the directional play to resolve first."
+            )
             return StrategyType.NO_TRADE, reasons
         if playbook != "RANGE_BALANCED_CONDOR" or not range_ready:
             reasons.append("Range regime detected, but the session is not balanced enough for the dedicated condor playbook.")

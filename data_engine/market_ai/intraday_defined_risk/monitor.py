@@ -14,10 +14,13 @@ from .data_models import (
     DecisionOutput,
     MarketSnapshot,
     OpenPosition,
+    OptionType,
     RegimeLabel,
+    StrategyLeg,
     StrategyType,
+    TradeStructure,
 )
-from .execution import build_no_trade_decision, build_open_position, build_trade_decision, evaluate_exit, validate_entry_context, validate_entry_time
+from .execution import build_no_trade_decision, build_open_position, build_trade_decision, evaluate_exit, evaluate_hedge_opportunity, validate_entry_context, validate_entry_time
 from .learning import LearningStore
 from .ops_runtime import (
     RuntimeMode,
@@ -1143,6 +1146,61 @@ class IntradayDefinedRiskAgent:
             current_regime=current_regime,
             now=snapshot.timestamp,
         )
+
+        # ── Condor partial close: close only the threatened side, keep the safe half ──
+        if exit_decision.reason in {"CONDOR_CALL_SIDE_CLOSE", "CONDOR_PUT_SIDE_CLOSE"}:
+            close_option_type = OptionType.CALL if exit_decision.reason == "CONDOR_CALL_SIDE_CLOSE" else OptionType.PUT
+            keep_option_type = OptionType.PUT if close_option_type == OptionType.CALL else OptionType.CALL
+            surviving_legs = [leg for leg in self.open_position.structure.legs if leg.option_type == keep_option_type]
+            if surviving_legs:
+                keep_strategy = StrategyType.BULL_PUT_CREDIT_SPREAD if keep_option_type == OptionType.PUT else StrategyType.BEAR_CALL_CREDIT_SPREAD
+                threatened_side_cost = exit_decision.current_value_points * 0.5  # approx: each side is half
+                surviving_credit = max(self.open_position.entry_credit_points - threatened_side_cost, 0.0)
+                surviving_width = min(
+                    (abs(surviving_legs[0].strike - surviving_legs[-1].strike) if len(surviving_legs) >= 2 else self.open_position.structure.width_points / 2.0),
+                    self.open_position.structure.width_points,
+                )
+                new_structure = TradeStructure(
+                    strategy=keep_strategy,
+                    legs=surviving_legs,
+                    credit_points=surviving_credit,
+                    width_points=surviving_width,
+                    rationale=[f"Condor partial close: {close_option_type.value} side closed due to delta breach. Keeping {keep_option_type.value} spread."],
+                    metadata={**self.open_position.structure.metadata, "partial_close_from_condor": True},
+                )
+                old_meta = dict(self.open_position.metadata)
+                old_meta["condor_partial_close_reason"] = exit_decision.reason
+                old_meta["condor_partial_close_pnl_approx"] = round(exit_decision.pnl_rupees * 0.5, 2)
+                self.open_position = OpenPosition(
+                    structure=new_structure,
+                    lots=self.open_position.lots,
+                    lot_size=self.open_position.lot_size,
+                    entry_time=self.open_position.entry_time,
+                    entry_credit_points=surviving_credit,
+                    target_value_points=surviving_credit * 0.35,
+                    stop_value_points=surviving_credit * 2.0,
+                    max_loss_rupees_per_lot=surviving_width * snapshot.lot_size,
+                    take_profit_capture_pct=0.65,
+                    metadata=old_meta,
+                )
+                return None  # Position adjusted, not closed — continue monitoring
+
+        # ── Hedge opportunity: convert directional spread to Iron Condor ──
+        if not exit_decision.should_exit:
+            hedge = evaluate_hedge_opportunity(
+                self.open_position,
+                current_regime=current_regime,
+                current_snapshot=snapshot,
+                now=snapshot.timestamp,
+            )
+            if hedge["should_hedge"] and not self.open_position.metadata.get("hedge_attempted"):
+                self.open_position.metadata["hedge_attempted"] = True
+                self.open_position.metadata["hedge_reason"] = hedge["reason"]
+                # Log the hedge opportunity — actual leg addition would require a new order
+                # The agent signals intent via metadata; the runner layer executes
+                self.open_position.metadata["hedge_side_needed"] = hedge["hedge_side"]
+            return None
+
         if not exit_decision.should_exit:
             return None
 

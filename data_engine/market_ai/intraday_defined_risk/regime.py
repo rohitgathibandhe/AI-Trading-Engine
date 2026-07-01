@@ -874,6 +874,50 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     resistance_ref = resistance_5m[0] if resistance_5m else (resistance_15m[0] if resistance_15m else None)
     session_open = bars_5m[0].open if bars_5m else None
     gap_pct = opening_gap_pct(snapshot.previous_session_close, session_open)
+
+    # ── Pre-market regime bias ──────────────────────────────────────────────────
+    # Computed before any bar-based analysis using signals that are available from
+    # the moment the chain loads: gap size, IV level, PCR, and OI flow direction.
+    # Result biases strategy selection: TRENDING suppresses condors/strangles,
+    # RANGE lowers the balance threshold for condors.
+    _early_iv = _average_chain_iv(snapshot) or 0.0
+    _gap_abs = abs(gap_pct)
+    _pcr = put_call_ratio_by_oi(snapshot.option_chain.quotes) or 1.0
+    _sm_bias = oi_flow.get("smart_money_bias", "NEUTRAL") if isinstance(oi_flow, dict) else "NEUTRAL"
+    _trending_score = 0.0
+    _range_score = 0.0
+    # Gap signals: large gap = directional conviction from overnight
+    if _gap_abs >= 0.50:
+        _trending_score += 1.5
+    elif _gap_abs >= 0.30:
+        _trending_score += 0.8
+    elif _gap_abs < 0.15:
+        _range_score += 1.0
+    # IV signals: elevated IV = market expects movement
+    if _early_iv >= 22.0:
+        _trending_score += 1.0
+    elif _early_iv >= 18.0:
+        _trending_score += 0.5
+    elif _early_iv < 14.0:
+        _range_score += 1.0
+    # PCR extreme = strong directional conviction in options market
+    if _pcr < 0.80 or _pcr > 1.35:
+        _trending_score += 0.8
+    elif 0.90 <= _pcr <= 1.15:
+        _range_score += 0.8
+    # Smart money bias
+    if _sm_bias != "NEUTRAL":
+        _trending_score += 0.5
+    else:
+        _range_score += 0.5
+    # Determine bias with hysteresis (need clear lead to commit)
+    if _trending_score >= _range_score + 0.8:
+        _premarket_bias = "TRENDING"
+    elif _range_score >= _trending_score + 0.8:
+        _premarket_bias = "RANGE"
+    else:
+        _premarket_bias = "NEUTRAL"
+
     metadata: dict[str, float | str | bool | None] = {
         "day_archetype": "UNCLASSIFIED",
         "opening_gap_pct": gap_pct,
@@ -946,6 +990,9 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "allowed_width_points": None,
         "target_short_put_buffer_points": None,
         "minimum_net_edge_rupees": None,
+        "premarket_bias": _premarket_bias,
+        "premarket_trending_score": round(_trending_score, 2),
+        "premarket_range_score": round(_range_score, 2),
         "setup_quality_score": 0.0,
         "setup_direction": "NONE",
         "trend_follow_ready_bullish": False,
