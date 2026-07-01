@@ -16,6 +16,7 @@ from .data_models import (
     OpenPosition,
     OptionType,
     RegimeLabel,
+    RegimeState,
     StrategyLeg,
     StrategyType,
     TradeStructure,
@@ -1196,9 +1197,13 @@ class IntradayDefinedRiskAgent:
             if hedge["should_hedge"] and not self.open_position.metadata.get("hedge_attempted"):
                 self.open_position.metadata["hedge_attempted"] = True
                 self.open_position.metadata["hedge_reason"] = hedge["reason"]
-                # Log the hedge opportunity — actual leg addition would require a new order
-                # The agent signals intent via metadata; the runner layer executes
-                self.open_position.metadata["hedge_side_needed"] = hedge["hedge_side"]
+                hedge_decision = self._execute_hedge(
+                    hedge_side=str(hedge["hedge_side"]),
+                    snapshot=snapshot,
+                    current_regime=current_regime,
+                )
+                if hedge_decision is not None:
+                    return hedge_decision
             return None
 
         if not exit_decision.should_exit:
@@ -1223,6 +1228,135 @@ class IntradayDefinedRiskAgent:
             extra_metadata=dict(current_regime.metadata) | {
                 "exit_reason": exit_decision.reason,
                 "exit_pnl_rupees": round(exit_decision.pnl_rupees, 2),
+            },
+        )
+
+    def _execute_hedge(
+        self,
+        hedge_side: str,
+        snapshot: MarketSnapshot,
+        current_regime: RegimeState,
+    ) -> DecisionOutput | None:
+        """
+        Converts an open directional credit spread into an Iron Condor by adding
+        the complementary leg. Finds the optimal strike using select_structure(),
+        then merges the new legs into the existing open position.
+
+        Returns a DecisionOutput with action="TRADE" and is_hedge_addition=True
+        so the runner layer places only the new hedge leg orders.
+        Returns None if no valid hedge structure can be found.
+        """
+        if self.open_position is None:
+            return None
+
+        hedge_strategy = (
+            StrategyType.BULL_PUT_CREDIT_SPREAD
+            if hedge_side == "BULL_PUT"
+            else StrategyType.BEAR_CALL_CREDIT_SPREAD
+        )
+
+        # Build a synthetic regime_state that directs strike selection for the hedge leg.
+        # Use tighter width and lower edge target — this is insurance, not a primary trade.
+        hedge_metadata = dict(current_regime.metadata)
+        hedge_metadata["preferred_width_points"] = 75.0
+        hedge_metadata["allowed_width_points"] = (75.0, 100.0)
+        hedge_metadata["minimum_net_edge_rupees"] = 600.0
+        hedge_metadata["playbook"] = (
+            "SIDEWAYS_TO_BULLISH_RECLAIM" if hedge_side == "BULL_PUT" else "BEARISH_CONTINUATION"
+        )
+        hedge_metadata["bearish_entry_ready"] = True
+        hedge_metadata["bullish_entry_ready"] = True
+        hedge_regime = RegimeState(
+            regime=current_regime.regime,
+            trend_15m=current_regime.trend_15m,
+            execution_5m=current_regime.execution_5m,
+            ema20_15m=current_regime.ema20_15m,
+            ema20_slope_15m=current_regime.ema20_slope_15m,
+            rv30_pct=current_regime.rv30_pct,
+            or_length_minutes=current_regime.or_length_minutes,
+            opening_range_high=current_regime.opening_range_high,
+            opening_range_low=current_regime.opening_range_low,
+            vwap=current_regime.vwap,
+            confidence=current_regime.confidence,
+            reasons=current_regime.reasons,
+            metadata=hedge_metadata,
+        )
+
+        hedge_structure, _, _ = select_best_structure(
+            hedge_strategy,
+            snapshot,
+            hedge_regime,
+            params=self.parameters,
+            playbook_tier="A",
+        )
+        if hedge_structure is None:
+            self.open_position.metadata["hedge_attempted"] = True
+            self.open_position.metadata["hedge_failed_reason"] = "NO_VALID_STRUCTURE_FOUND"
+            return None
+
+        # Merge original legs + hedge legs into a single Iron Condor structure
+        original = self.open_position
+        merged_legs = list(original.structure.legs) + list(hedge_structure.legs)
+        merged_credit = round(original.entry_credit_points + hedge_structure.credit_points, 4)
+        merged_width = max(original.structure.width_points, hedge_structure.width_points)
+        call_legs = [l for l in merged_legs if l.option_type == OptionType.CALL]
+        put_legs = [l for l in merged_legs if l.option_type == OptionType.PUT]
+        call_width = abs(call_legs[0].strike - call_legs[-1].strike) if len(call_legs) >= 2 else merged_width
+        put_width = abs(put_legs[0].strike - put_legs[-1].strike) if len(put_legs) >= 2 else merged_width
+
+        merged_structure = TradeStructure(
+            strategy=StrategyType.IRON_CONDOR,
+            legs=merged_legs,
+            credit_points=merged_credit,
+            width_points=merged_width,
+            call_width_points=call_width,
+            put_width_points=put_width,
+            rationale=list(original.structure.rationale) + [
+                f"Hedge leg added: {hedge_side} spread converted position to Iron Condor. "
+                f"Original credit {original.entry_credit_points:.1f}pt + hedge {hedge_structure.credit_points:.1f}pt = {merged_credit:.1f}pt total."
+            ],
+            metadata={**original.structure.metadata, "hedge_addition": True, "hedge_side": hedge_side},
+        )
+
+        # Rebuild open position as the merged condor
+        merged_max_loss = merged_width * snapshot.lot_size
+        merged_meta = dict(original.metadata)
+        merged_meta["hedge_executed"] = True
+        merged_meta["hedge_side"] = hedge_side
+        merged_meta["hedge_credit_pts"] = hedge_structure.credit_points
+        self.open_position = OpenPosition(
+            structure=merged_structure,
+            lots=original.lots,
+            lot_size=original.lot_size,
+            entry_time=original.entry_time,
+            entry_credit_points=merged_credit,
+            target_value_points=merged_credit * 0.50,  # condor TP = 50% capture
+            stop_value_points=merged_credit * 2.0,
+            max_loss_rupees_per_lot=merged_max_loss,
+            take_profit_capture_pct=0.50,
+            metadata=merged_meta,
+        )
+
+        # Return a TRADE decision for only the new hedge legs so the runner places those orders
+        return build_trade_decision(
+            structure=hedge_structure,
+            regime=current_regime.regime,
+            rationale=[
+                f"Hedge addition: converting {original.structure.strategy.value} to Iron Condor.",
+                f"Market stalled with range_balance_score sufficient for range strategy.",
+                f"Adding {hedge_side} spread to lock in premium on both sides.",
+            ],
+            confidence_score=current_regime.confidence,
+            entry_time=snapshot.timestamp,
+            lots=original.lots,
+            lot_size=original.lot_size,
+            max_loss_rupees_per_lot=hedge_structure.width_points * snapshot.lot_size,
+            slippage_points=snapshot.slippage_points,
+            extra_metadata={
+                "is_hedge_addition": True,
+                "hedge_side": hedge_side,
+                "original_strategy": original.structure.strategy.value,
+                "playbook": hedge_metadata["playbook"],
             },
         )
 
@@ -1409,20 +1543,44 @@ def run_live(config: dict[str, object]) -> None:
 
         if agent.open_position:
             current_position = agent.open_position
-            exit_decision = agent.manage_position(snapshot)
-            if exit_decision is not None and current_position is not None:
-                reason = exit_decision.rationale[-2] if len(exit_decision.rationale) >= 2 else "EXIT"
-                if runtime_config.mode == RuntimeMode.MICRO_LIVE and runtime_config.live_arm:
-                    executor.exit_trade(current_position, reason)
-                    record_runtime_trade_exit(
-                        current_position,
-                        snapshot,
-                        pnl_rupees=float(exit_decision.metadata.get("exit_pnl_rupees") or 0.0),
-                        exit_reason=str(exit_decision.metadata.get("exit_reason") or reason),
+            position_decision = agent.manage_position(snapshot)
+            if position_decision is not None and current_position is not None:
+                if position_decision.action == "TRADE" and position_decision.metadata.get("is_hedge_addition"):
+                    # Hedge addition: place the new complementary leg orders
+                    if runtime_config.mode == RuntimeMode.MICRO_LIVE and runtime_config.live_arm:
+                        executor.enter_trade(position_decision)
+                        record_runtime_trade_entry(position_decision, snapshot, decision_origin="HEDGE_ADDITION")
+                    elif runtime_config.mode == RuntimeMode.PAPER_LIVE:
+                        record_paper_entry(
+                            agent.open_position,  # already updated to merged condor
+                            decision=position_decision,
+                            snapshot=snapshot,
+                            gate={"allowed": True, "primary_block_reason": "NONE"},
+                        )
+                    log_validation_decision(
+                        position_decision,
+                        snapshot=snapshot,
+                        block_reason="NONE",
+                        actual_trade_created=True,
+                        event_type="HEDGE_ENTRY",
                     )
-                log_validation_decision(exit_decision, snapshot=snapshot, block_reason="EXIT_DECISION", event_type="EXIT")
-                _update_runtime_decision_state(exit_decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="EXIT_DECISION")
-                print(exit_decision.to_json())
+                    _update_runtime_decision_state(position_decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="NONE")
+                    print(position_decision.to_json())
+                else:
+                    # Normal exit decision
+                    exit_decision = position_decision
+                    reason = exit_decision.rationale[-2] if len(exit_decision.rationale) >= 2 else "EXIT"
+                    if runtime_config.mode == RuntimeMode.MICRO_LIVE and runtime_config.live_arm:
+                        executor.exit_trade(current_position, reason)
+                        record_runtime_trade_exit(
+                            current_position,
+                            snapshot,
+                            pnl_rupees=float(exit_decision.metadata.get("exit_pnl_rupees") or 0.0),
+                            exit_reason=str(exit_decision.metadata.get("exit_reason") or reason),
+                        )
+                    log_validation_decision(exit_decision, snapshot=snapshot, block_reason="EXIT_DECISION", event_type="EXIT")
+                    _update_runtime_decision_state(exit_decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="EXIT_DECISION")
+                    print(exit_decision.to_json())
         else:
             decision = agent.evaluate(snapshot)
             # Clamp lots to the operator cap *before* any gate check so that
