@@ -2172,6 +2172,24 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             metadata["allowed_width_points"] = (100.0,)
             metadata["minimum_net_edge_rupees"] = 1050.0
 
+    # IV-aware width upgrade for bearish trending days.
+    # High IV means options are expensive — a wider spread captures more premium
+    # for the same structure. Only fires when a bearish trade is live and IV ≥ 22%.
+    # Does not downgrade any width already set to 150pt by a specific subtype.
+    _HIGH_IV_WIDTH_THRESHOLD = 22.0
+    _is_bearish_trending = (
+        metadata.get("bearish_entry_ready")
+        and regime == RegimeLabel.DOWN_TREND
+    )
+    if _is_bearish_trending and avg_chain_iv is not None and avg_chain_iv >= _HIGH_IV_WIDTH_THRESHOLD:
+        _current_pref = float(metadata.get("preferred_width_points") or 0.0)
+        if _current_pref < 150.0:
+            metadata["preferred_width_points"] = 150.0
+            _current_allowed = tuple(metadata.get("allowed_width_points") or (100.0,))
+            if 150.0 not in _current_allowed:
+                metadata["allowed_width_points"] = _current_allowed + (150.0,)
+            metadata["high_iv_width_upgrade"] = True
+
     path_quality = _recent_path_quality(bars_5m)
     metadata.update(path_quality)
     opening_range_break_state = _opening_range_break_state(
