@@ -105,19 +105,12 @@ def select_best_structure(
             playbook_tier=playbook_tier,
         )
     if strategy == StrategyType.SHORT_STRANGLE:
-        from .data_models import RegimeLabel as _RL
-        _dir = (
-            "BEARISH" if regime_state.regime == _RL.DOWN_TREND
-            else "BULLISH" if regime_state.regime == _RL.UP_TREND
-            else "NEUTRAL"
-        )
         return _select_strangle_candidates(
             snapshot=snapshot,
             regime_state=regime_state,
             params=params,
             setup_quality_score=setup_quality,
             playbook_tier=playbook_tier,
-            directional_bias=_dir,
         )
     if strategy == StrategyType.SHORT_STRADDLE:
         return _select_straddle_candidates(
@@ -941,29 +934,20 @@ def _select_strangle_candidates(
     *,
     setup_quality_score: float,
     playbook_tier: str,
-    directional_bias: str = "NEUTRAL",
 ) -> tuple[TradeStructure | None, list[str], dict[str, object]]:
     """Select a short strangle: naked short OTM call + naked short OTM put.
 
-    When directional_bias is BEARISH: primary leg is a closer OTM call (delta 0.20-0.35),
-    secondary leg is a far OTM put (delta 0.06-0.14) — captures more call premium while the
-    far put adds credit with minimal assignment risk on a downtrend day.
-    When BULLISH: primary leg is closer OTM put, secondary is far OTM call.
-    When NEUTRAL (range day): symmetric bands (delta 0.15-0.28 per side).
+    Used when the market is range-bound but IV is elevated enough that condor
+    wing premiums are expensive relative to the short credit (hedge cost too high).
+    Risk is capped practically at 2x credit (PREMIUM_SL_MULTIPLIER), sized through
+    compute_max_loss_rupees_per_lot accordingly.
     """
     spot = snapshot.option_chain.spot
     avg_chain_iv = float(regime_state.metadata.get("avg_chain_iv") or 0.0)
     call_quotes = _liquid_otm_quotes(snapshot.option_chain.quotes, OptionType.CALL, spot)
     put_quotes = _liquid_otm_quotes(snapshot.option_chain.quotes, OptionType.PUT, spot)
-    if directional_bias == "BEARISH":
-        call_delta_band = (0.20, 0.35)   # closer OTM call: primary directional leg
-        put_delta_band = (0.06, 0.14)    # far OTM put: secondary credit leg
-    elif directional_bias == "BULLISH":
-        call_delta_band = (0.06, 0.14)   # far OTM call: secondary credit leg
-        put_delta_band = (0.20, 0.35)    # closer OTM put: primary directional leg
-    else:
-        call_delta_band = (0.15, 0.28)   # symmetric neutral strangle
-        put_delta_band = (0.15, 0.28)
+    call_delta_band = (0.15, 0.28)   # symmetric OTM bands — range day, no directional bias
+    put_delta_band = (0.15, 0.28)
 
     _empty_report: dict[str, object] = {
         "strategy": StrategyType.SHORT_STRANGLE.value,
@@ -1092,8 +1076,7 @@ def _select_strangle_candidates(
         margin_estimate_per_lot=snapshot.option_chain.margin_estimate_per_lot,
         rationale=rationale,
         metadata={
-            "selection_mode": "DIRECTIONAL_STRANGLE" if directional_bias != "NEUTRAL" else "STRANGLE",
-            "directional_bias": directional_bias,
+            "selection_mode": "STRANGLE",
             "short_call_strike": short_call_q.strike,
             "short_put_strike": short_put_q.strike,
             "avg_chain_iv": avg_chain_iv,

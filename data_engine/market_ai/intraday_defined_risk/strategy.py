@@ -77,13 +77,6 @@ ENABLE_HIGH_CONFLUENCE_BULLISH_ACTIVE = True
 ENABLE_AFTERNOON_TREND_BULLISH_ACTIVE = False
 ENABLE_RANGE_CONDOR_ACTIVE = True
 
-# Directional strangle: trending day + elevated IV → sell asymmetric strangle
-# instead of a tight credit spread. Fires when avg_chain_iv >= threshold and
-# we are within the confirmed-trend window (10:30–14:00).
-DIRECTIONAL_STRANGLE_IV_FLOOR = 22.0
-DIRECTIONAL_STRANGLE_START = time(10, 30)
-DIRECTIONAL_STRANGLE_END = time(14, 0)
-
 # Short straddle: extreme IV + confirmed range day → sell ATM call + put.
 # Only fires when IV is very elevated and the session is genuinely balanced.
 SHORT_STRADDLE_IV_FLOOR = 28.0
@@ -529,13 +522,6 @@ def select_strategy(
             )
             return StrategyType.NO_TRADE, reasons
         if now_time >= required_bear_start:
-            avg_chain_iv = float(metadata.get("avg_chain_iv") or 0.0)
-            if avg_chain_iv >= DIRECTIONAL_STRANGLE_IV_FLOOR and DIRECTIONAL_STRANGLE_START <= now_time <= DIRECTIONAL_STRANGLE_END:
-                reasons.append(
-                    f"Bearish trend + elevated IV ({avg_chain_iv:.1f}%) → directional strangle "
-                    f"(closer OTM call + far OTM put) captures more premium than tight credit spread."
-                )
-                return StrategyType.SHORT_STRANGLE, reasons
             reasons.append(
                 f"15m TrendDown + bearish {(bearish_setup or 'TREND_FOLLOW')} confirmation on {day_archetype} -> Bear Call Credit Spread."
             )
@@ -671,13 +657,6 @@ def select_strategy(
             )
             return StrategyType.NO_TRADE, reasons
         if now_time >= required_bull_start:
-            avg_chain_iv = float(metadata.get("avg_chain_iv") or 0.0)
-            if avg_chain_iv >= DIRECTIONAL_STRANGLE_IV_FLOOR and DIRECTIONAL_STRANGLE_START <= now_time <= DIRECTIONAL_STRANGLE_END:
-                reasons.append(
-                    f"Bullish trend + elevated IV ({avg_chain_iv:.1f}%) → directional strangle "
-                    f"(closer OTM put + far OTM call) captures more premium than tight credit spread."
-                )
-                return StrategyType.SHORT_STRANGLE, reasons
             reasons.append(
                 f"15m TrendUp + bullish {bullish_setup or 'CONTINUATION'} confirmation on {playbook} -> Bull Put Credit Spread."
             )
