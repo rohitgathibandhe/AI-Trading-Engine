@@ -1084,6 +1084,250 @@ def market_structure_state(
     }
 
 
+def early_structure_intent_bearish(
+    bars_5m: list[OhlcvBar],
+    ema20_5m: float | None,
+    vwap: float | None,
+    opening_range_high: float | None,
+    opening_range_low: float | None,
+    bearish_chain_pressure: float,
+) -> dict:
+    """
+    Detects bearish intent in the first 2–5 bars of the session,
+    before trend_15m and execution_5m labels confirm.
+
+    Uses EMA20 position/crossover, LH/LL structure, candle quality,
+    OR location, and chain pressure as early confluence factors.
+    Fires when strength >= 2.5 AND at least one signal from each of
+    the three required categories (EMA, structure, pressure) is present.
+    """
+    result: dict = {"triggered": False, "strength": 0.0, "signals": {}}
+    if len(bars_5m) < 2:
+        return result
+
+    last = bars_5m[-1]
+    spot = last.close
+
+    # EMA signals
+    below_ema20 = ema20_5m is not None and spot < ema20_5m
+    ema20_cross_bearish = (
+        ema20_5m is not None
+        and len(bars_5m) >= 3
+        and bars_5m[-1].close < ema20_5m
+        and bars_5m[-2].close >= ema20_5m
+    )
+    ema20_holding_below = (
+        ema20_5m is not None
+        and len(bars_5m) >= 3
+        and all(b.close < ema20_5m for b in bars_5m[-3:])
+    )
+
+    # Candle signals
+    candle = bearish_candle_context(bars_5m)
+    strong_bearish_candle = float(candle.get("quality_score") or 0.0) >= 2.0
+    body_and_close = (
+        float(candle.get("body_fraction") or 0.0) >= 0.55
+        and float(candle.get("close_location") or 1.0) <= 0.30
+    )
+
+    # Market structure signals: LH/LL sequence within first few bars
+    lh_ll_sequence = len(bars_5m) >= 4 and recent_lower_highs(bars_5m[-4:], needed=2)
+    lower_high_from_open = (
+        len(bars_5m) >= 3
+        and all(b.high < bars_5m[0].high for b in bars_5m[1:])
+        and (len(bars_5m) < 3 or bars_5m[-1].high <= bars_5m[-2].high)
+    )
+
+    # OR location signals
+    or_mid = (
+        (opening_range_high + opening_range_low) / 2.0
+        if opening_range_high is not None and opening_range_low is not None
+        else None
+    )
+    below_or_mid = or_mid is not None and spot < or_mid
+    testing_or_low = opening_range_low is not None and spot <= opening_range_low * 1.001
+
+    # Pressure signals
+    strong_pressure = bearish_chain_pressure >= 0.62
+    moderate_pressure = bearish_chain_pressure >= 0.55
+
+    # VWAP
+    below_vwap = vwap is not None and spot < vwap
+
+    strength = 0.0
+    signals: dict = {}
+
+    if ema20_holding_below:
+        strength += 1.0
+        signals["ema20_holding_below"] = True
+    elif ema20_cross_bearish:
+        strength += 0.7
+        signals["ema20_cross_bearish"] = True
+    elif below_ema20:
+        strength += 0.5
+        signals["below_ema20"] = True
+
+    if strong_bearish_candle:
+        strength += 1.0
+        signals["strong_bearish_candle"] = True
+    elif body_and_close:
+        strength += 0.6
+        signals["bearish_body_and_close"] = True
+
+    if lh_ll_sequence:
+        strength += 0.8
+        signals["lh_ll_sequence"] = True
+    elif lower_high_from_open:
+        strength += 0.4
+        signals["lower_high_from_open"] = True
+
+    if strong_pressure:
+        strength += 0.8
+        signals["strong_chain_pressure"] = True
+    elif moderate_pressure:
+        strength += 0.4
+        signals["moderate_chain_pressure"] = True
+
+    if below_or_mid:
+        strength += 0.4
+        signals["below_or_mid"] = True
+    if testing_or_low:
+        strength += 0.3
+        signals["testing_or_low"] = True
+    if below_vwap:
+        strength += 0.4
+        signals["below_vwap"] = True
+
+    has_ema = bool(below_ema20 or ema20_cross_bearish or ema20_holding_below)
+    has_structure = bool(lh_ll_sequence or lower_high_from_open or strong_bearish_candle)
+    has_pressure = bool(strong_pressure or moderate_pressure)
+
+    result["triggered"] = bool(strength >= 2.5 and has_ema and has_structure and has_pressure)
+    result["strength"] = round(strength, 3)
+    result["signals"] = signals
+    return result
+
+
+def early_structure_intent_bullish(
+    bars_5m: list[OhlcvBar],
+    ema20_5m: float | None,
+    vwap: float | None,
+    opening_range_high: float | None,
+    opening_range_low: float | None,
+    bullish_chain_pressure: float,
+) -> dict:
+    """
+    Symmetric bullish counterpart to early_structure_intent_bearish.
+    Detects bullish intent in the first 2–5 bars using EMA20 position,
+    HL/HH structure, candle quality, OR location, and chain pressure.
+    """
+    result: dict = {"triggered": False, "strength": 0.0, "signals": {}}
+    if len(bars_5m) < 2:
+        return result
+
+    last = bars_5m[-1]
+    spot = last.close
+
+    # EMA signals
+    above_ema20 = ema20_5m is not None and spot > ema20_5m
+    ema20_cross_bullish = (
+        ema20_5m is not None
+        and len(bars_5m) >= 3
+        and bars_5m[-1].close > ema20_5m
+        and bars_5m[-2].close <= ema20_5m
+    )
+    ema20_holding_above = (
+        ema20_5m is not None
+        and len(bars_5m) >= 3
+        and all(b.close > ema20_5m for b in bars_5m[-3:])
+    )
+
+    # Candle signals
+    candle = bullish_candle_context(bars_5m)
+    strong_bullish_candle = float(candle.get("quality_score") or 0.0) >= 2.0
+    body_and_close = (
+        float(candle.get("body_fraction") or 0.0) >= 0.55
+        and float(candle.get("close_location") or 0.0) >= 0.70
+    )
+
+    # Market structure: HL/HH sequence
+    hl_hh_sequence = len(bars_5m) >= 4 and recent_higher_lows(bars_5m[-4:], needed=2)
+    higher_low_from_open = (
+        len(bars_5m) >= 3
+        and all(b.low > bars_5m[0].low for b in bars_5m[1:])
+        and (len(bars_5m) < 3 or bars_5m[-1].low >= bars_5m[-2].low)
+    )
+
+    # OR location
+    or_mid = (
+        (opening_range_high + opening_range_low) / 2.0
+        if opening_range_high is not None and opening_range_low is not None
+        else None
+    )
+    above_or_mid = or_mid is not None and spot > or_mid
+    testing_or_high = opening_range_high is not None and spot >= opening_range_high * 0.999
+
+    # Pressure
+    strong_pressure = bullish_chain_pressure >= 0.62
+    moderate_pressure = bullish_chain_pressure >= 0.55
+
+    # VWAP
+    above_vwap = vwap is not None and spot > vwap
+
+    strength = 0.0
+    signals: dict = {}
+
+    if ema20_holding_above:
+        strength += 1.0
+        signals["ema20_holding_above"] = True
+    elif ema20_cross_bullish:
+        strength += 0.7
+        signals["ema20_cross_bullish"] = True
+    elif above_ema20:
+        strength += 0.5
+        signals["above_ema20"] = True
+
+    if strong_bullish_candle:
+        strength += 1.0
+        signals["strong_bullish_candle"] = True
+    elif body_and_close:
+        strength += 0.6
+        signals["bullish_body_and_close"] = True
+
+    if hl_hh_sequence:
+        strength += 0.8
+        signals["hl_hh_sequence"] = True
+    elif higher_low_from_open:
+        strength += 0.4
+        signals["higher_low_from_open"] = True
+
+    if strong_pressure:
+        strength += 0.8
+        signals["strong_chain_pressure"] = True
+    elif moderate_pressure:
+        strength += 0.4
+        signals["moderate_chain_pressure"] = True
+
+    if above_or_mid:
+        strength += 0.4
+        signals["above_or_mid"] = True
+    if testing_or_high:
+        strength += 0.3
+        signals["testing_or_high"] = True
+    if above_vwap:
+        strength += 0.4
+        signals["above_vwap"] = True
+
+    has_ema = bool(above_ema20 or ema20_cross_bullish or ema20_holding_above)
+    has_structure = bool(hl_hh_sequence or higher_low_from_open or strong_bullish_candle)
+    has_pressure = bool(strong_pressure or moderate_pressure)
+
+    result["triggered"] = bool(strength >= 2.5 and has_ema and has_structure and has_pressure)
+    result["strength"] = round(strength, 3)
+    result["signals"] = signals
+    return result
+
+
 def in_market_hours(ts: datetime) -> bool:
     return MARKET_OPEN <= ts.time() <= FORCE_EXIT_TIME
 

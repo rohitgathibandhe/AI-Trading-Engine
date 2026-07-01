@@ -51,6 +51,8 @@ from .features import (
     sideways_bullish_reclaim_setup,
     put_call_ratio_by_oi,
     compute_daily_trend_features,
+    early_structure_intent_bearish,
+    early_structure_intent_bullish,
 )
 
 
@@ -1668,6 +1670,65 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                 f"historically yields ~18% win for bull-put spreads (need "
                 f"NEUTRAL or OVERHEAD_CALL_PRESSURE)."
             )
+    # ── Early structure intent (9:20–9:55 window) ──────────────────────────────
+    # Fires before trend_15m and execution_5m confirm, using EMA20 position,
+    # LH/LL market structure, candle quality, OR location, and chain pressure.
+    # Allows the agent to enter at the start of a move rather than after it.
+    EARLY_INTENT_START = time(9, 20)
+    EARLY_INTENT_END = time(9, 55)
+    _now_time = snapshot.timestamp.time()
+    _early_window = EARLY_INTENT_START <= _now_time <= EARLY_INTENT_END
+    early_structure_bearish_intent = False
+    early_structure_bullish_intent = False
+    if _early_window and execution_5m != "UP_CONFIRMED":
+        _ei_bear = early_structure_intent_bearish(
+            bars_5m=bars_5m,
+            ema20_5m=ema20_5m_value,
+            vwap=vwap,
+            opening_range_high=opening_range.high if opening_range else None,
+            opening_range_low=opening_range.low if opening_range else None,
+            bearish_chain_pressure=float(option_pressure.get("bearish_pressure") or 0.0),
+        )
+        if _ei_bear["triggered"]:
+            early_structure_bearish_intent = True
+            metadata["bearish_entry_ready"] = True
+            metadata["bearish_setup"] = "EARLY_STRUCTURE_INTENT"
+            metadata["playbook"] = "EARLY_STRUCTURE_BEARISH"
+            metadata["preferred_width_points"] = 75.0
+            metadata["allowed_width_points"] = (75.0, 100.0)
+            metadata["minimum_net_edge_rupees"] = 850.0
+            metadata["early_intent_strength"] = _ei_bear["strength"]
+            metadata["early_intent_signals"] = _ei_bear["signals"]
+            reasons.append(
+                f"Early structure bearish intent detected (strength={_ei_bear['strength']:.2f}): "
+                f"EMA20 position, LH/LL structure, and chain pressure aligned in the "
+                f"opening window before trend labels confirmed."
+            )
+    if _early_window and execution_5m != "DOWN_CONFIRMED" and not early_structure_bearish_intent:
+        _ei_bull = early_structure_intent_bullish(
+            bars_5m=bars_5m,
+            ema20_5m=ema20_5m_value,
+            vwap=vwap,
+            opening_range_high=opening_range.high if opening_range else None,
+            opening_range_low=opening_range.low if opening_range else None,
+            bullish_chain_pressure=float(option_pressure.get("bullish_pressure") or 0.0),
+        )
+        if _ei_bull["triggered"]:
+            early_structure_bullish_intent = True
+            metadata["bullish_entry_ready"] = True
+            metadata["bullish_setup"] = "EARLY_STRUCTURE_INTENT"
+            metadata["playbook"] = "EARLY_STRUCTURE_BULLISH"
+            metadata["preferred_width_points"] = 75.0
+            metadata["allowed_width_points"] = (75.0, 100.0)
+            metadata["minimum_net_edge_rupees"] = 850.0
+            metadata["early_intent_strength"] = _ei_bull["strength"]
+            metadata["early_intent_signals"] = _ei_bull["signals"]
+            reasons.append(
+                f"Early structure bullish intent detected (strength={_ei_bull['strength']:.2f}): "
+                f"EMA20 position, HL/HH structure, and chain pressure aligned in the "
+                f"opening window before trend labels confirmed."
+            )
+
     if bearish_entry_score >= 3.0 and (bearish_pullback or bearish_shallow) and (bearish_planner_alignment or bearish_entry_score >= 4.0):
         metadata["bearish_entry_ready"] = True
         metadata["bearish_setup"] = "PULLBACK_REJECTION" if bearish_pullback else "SHALLOW_CONTINUATION"
@@ -1788,21 +1849,33 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             and bool(metadata.get("bearish_entry_ready"))
             and oi_flow["smart_money_bias"] != "BULLISH"
         )
+        or (
+            # Early structure intent: EMA20 + LH/LL structure + chain pressure aligned
+            # in the opening window before trend_15m and execution_5m confirm.
+            # Lower score threshold because structural signals ARE the confirmation.
+            early_structure_bearish_intent
+            and execution_5m != "UP_CONFIRMED"
+            and bearish_trend_score >= 1.5
+        )
     ):
         regime = RegimeLabel.DOWN_TREND
         metadata["day_archetype"] = (
             "EARLY_BALANCE_TO_BEARISH"
             if metadata.get("playbook") == "EARLY_BALANCE_BEARISH_FAILED_RECLAIM"
             else (
-                "GAP_DOWN_CONTINUATION"
-                if gap_down_bearish_continuation_ready
+                "EARLY_STRUCTURE_BEARISH"
+                if early_structure_bearish_intent
                 else (
-                    "GAP_UP_FAILURE"
-                    if gap_up_bearish_failure_ready
+                    "GAP_DOWN_CONTINUATION"
+                    if gap_down_bearish_continuation_ready
                     else (
-                        "HIGH_CONFLUENCE_BEARISH"
-                        if high_confluence_bearish_ready
-                        else ("OPEN_DRIVE_BEARISH" if open_drive_bearish else ("SIDEWAYS_TO_BEARISH" if (sideways_to_bearish and metadata.get("bearish_setup") == "PULLBACK_REJECTION") else "TREND_BEARISH"))
+                        "GAP_UP_FAILURE"
+                        if gap_up_bearish_failure_ready
+                        else (
+                            "HIGH_CONFLUENCE_BEARISH"
+                            if high_confluence_bearish_ready
+                            else ("OPEN_DRIVE_BEARISH" if open_drive_bearish else ("SIDEWAYS_TO_BEARISH" if (sideways_to_bearish and metadata.get("bearish_setup") == "PULLBACK_REJECTION") else "TREND_BEARISH"))
+                        )
                     )
                 )
             )
@@ -1975,21 +2048,32 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                 or high_confluence_bullish_ready
             )
         )
+        or (
+            # Early structure intent: EMA20 + HL/HH structure + chain pressure aligned
+            # in the opening window before trend_15m and execution_5m confirm.
+            early_structure_bullish_intent
+            and execution_5m != "DOWN_CONFIRMED"
+            and bullish_trend_score >= 1.5
+        )
     ):
         regime = RegimeLabel.UP_TREND
         metadata["day_archetype"] = (
             "EARLY_BALANCE_TO_BULLISH"
             if metadata.get("playbook") == "EARLY_BALANCE_BULLISH_RECLAIM"
             else (
-                "GAP_UP_CONTINUATION"
-                if gap_up_bullish_ready
+                "EARLY_STRUCTURE_BULLISH"
+                if early_structure_bullish_intent
                 else (
-                    "GAP_DOWN_RECOVERY"
-                    if gap_down_bullish_recovery_ready
+                    "GAP_UP_CONTINUATION"
+                    if gap_up_bullish_ready
                     else (
-                        "HIGH_CONFLUENCE_BULLISH"
-                        if high_confluence_bullish_ready
-                        else ("OPEN_DRIVE_BULLISH" if open_drive_bullish else ("SIDEWAYS_TO_BULLISH" if sideways_to_bullish else "TREND_BULLISH"))
+                        "GAP_DOWN_RECOVERY"
+                        if gap_down_bullish_recovery_ready
+                        else (
+                            "HIGH_CONFLUENCE_BULLISH"
+                            if high_confluence_bullish_ready
+                            else ("OPEN_DRIVE_BULLISH" if open_drive_bullish else ("SIDEWAYS_TO_BULLISH" if sideways_to_bullish else "TREND_BULLISH"))
+                        )
                     )
                 )
             )
