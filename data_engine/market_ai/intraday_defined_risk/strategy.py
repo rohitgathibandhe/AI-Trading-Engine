@@ -77,6 +77,20 @@ ENABLE_HIGH_CONFLUENCE_BULLISH_ACTIVE = True
 ENABLE_AFTERNOON_TREND_BULLISH_ACTIVE = False
 ENABLE_RANGE_CONDOR_ACTIVE = True
 
+# Directional strangle: trending day + elevated IV → sell asymmetric strangle
+# instead of a tight credit spread. Fires when avg_chain_iv >= threshold and
+# we are within the confirmed-trend window (10:30–14:00).
+DIRECTIONAL_STRANGLE_IV_FLOOR = 22.0
+DIRECTIONAL_STRANGLE_START = time(10, 30)
+DIRECTIONAL_STRANGLE_END = time(14, 0)
+
+# Short straddle: extreme IV + confirmed range day → sell ATM call + put.
+# Only fires when IV is very elevated and the session is genuinely balanced.
+SHORT_STRADDLE_IV_FLOOR = 28.0
+SHORT_STRADDLE_RANGE_BALANCE_MIN = 3.0
+SHORT_STRADDLE_START = time(11, 30)
+SHORT_STRADDLE_END = time(13, 30)
+
 TIER_A_PLAYBOOKS = {
     # Core bearish spread playbooks — live-validated
     "SIDEWAYS_TO_BEARISH_REJECTION",
@@ -515,6 +529,13 @@ def select_strategy(
             )
             return StrategyType.NO_TRADE, reasons
         if now_time >= required_bear_start:
+            avg_chain_iv = float(metadata.get("avg_chain_iv") or 0.0)
+            if avg_chain_iv >= DIRECTIONAL_STRANGLE_IV_FLOOR and DIRECTIONAL_STRANGLE_START <= now_time <= DIRECTIONAL_STRANGLE_END:
+                reasons.append(
+                    f"Bearish trend + elevated IV ({avg_chain_iv:.1f}%) → directional strangle "
+                    f"(closer OTM call + far OTM put) captures more premium than tight credit spread."
+                )
+                return StrategyType.SHORT_STRANGLE, reasons
             reasons.append(
                 f"15m TrendDown + bearish {(bearish_setup or 'TREND_FOLLOW')} confirmation on {day_archetype} -> Bear Call Credit Spread."
             )
@@ -650,6 +671,13 @@ def select_strategy(
             )
             return StrategyType.NO_TRADE, reasons
         if now_time >= required_bull_start:
+            avg_chain_iv = float(metadata.get("avg_chain_iv") or 0.0)
+            if avg_chain_iv >= DIRECTIONAL_STRANGLE_IV_FLOOR and DIRECTIONAL_STRANGLE_START <= now_time <= DIRECTIONAL_STRANGLE_END:
+                reasons.append(
+                    f"Bullish trend + elevated IV ({avg_chain_iv:.1f}%) → directional strangle "
+                    f"(closer OTM put + far OTM call) captures more premium than tight credit spread."
+                )
+                return StrategyType.SHORT_STRANGLE, reasons
             reasons.append(
                 f"15m TrendUp + bullish {bullish_setup or 'CONTINUATION'} confirmation on {playbook} -> Bull Put Credit Spread."
             )
@@ -695,9 +723,27 @@ def select_strategy(
             # Tuesday expiry day: same-day expiry chain → extreme gamma → no IC or strangle
             reasons.append("Expiry day (Tuesday): Iron Condor / Strangle blocked — same-day expiry gamma risk is unacceptable.")
             return StrategyType.NO_TRADE, reasons
+        # Extreme IV path: rv30 > 0.30 + avg_iv >= straddle floor → sell ATM straddle
+        _straddle_rv30_limit = 0.30
+        avg_chain_iv = float(regime_state.metadata.get("avg_chain_iv") or 0.0)
+        range_balance_score = float(regime_state.metadata.get("range_balance_score") or 0.0)
+        if regime_state.rv30_pct > _straddle_rv30_limit and avg_chain_iv >= SHORT_STRADDLE_IV_FLOOR and range_balance_score >= SHORT_STRADDLE_RANGE_BALANCE_MIN:
+            if is_expiry_day:
+                reasons.append("Expiry day: Short Straddle blocked — same-day ATM gamma risk is unacceptable.")
+                return StrategyType.NO_TRADE, reasons
+            if now_time > SHORT_STRADDLE_END:
+                reasons.append(f"Short Straddle entries avoided after {SHORT_STRADDLE_END.strftime('%H:%M')} IST.")
+                return StrategyType.NO_TRADE, reasons
+            if now_time >= SHORT_STRADDLE_START:
+                reasons.append(
+                    f"Range day with extreme IV (rv30={regime_state.rv30_pct:.3f}, avg_iv={avg_chain_iv:.1f}%): "
+                    "sell ATM straddle to maximise premium capture on balanced session."
+                )
+                return StrategyType.SHORT_STRADDLE, reasons
+            reasons.append(f"Short Straddle allowed only after {SHORT_STRADDLE_START.strftime('%H:%M')} IST.")
+            return StrategyType.NO_TRADE, reasons
         # Elevated IV path: rv30 0.20–0.30 makes condor wings expensive → use short strangle instead
         _strangle_rv30_limit = 0.30
-        avg_chain_iv = float(regime_state.metadata.get("avg_chain_iv") or 0.0)
         if _rv30_limit < regime_state.rv30_pct <= _strangle_rv30_limit and avg_chain_iv >= 18.0:
             if now_time > RANGE_STRANGLE_END:
                 reasons.append(f"Short Strangle entries avoided after {RANGE_STRANGLE_END.strftime('%H:%M')} IST.")

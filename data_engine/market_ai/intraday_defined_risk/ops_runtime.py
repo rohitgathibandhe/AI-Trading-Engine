@@ -51,6 +51,8 @@ V83_LIVE_STRATEGIES = {
     StrategyType.BEAR_CALL_CREDIT_SPREAD.value,
     StrategyType.BULL_PUT_CREDIT_SPREAD.value,
     StrategyType.IRON_CONDOR.value,
+    StrategyType.SHORT_STRANGLE.value,
+    StrategyType.SHORT_STRADDLE.value,
 }
 V83_APPROVED_LIVE_STATES = {"TREND_DOWN", "TREND_UP", "TRANSITION", "DIRECTIONAL_BALANCE", "TRUE_RANGE"}
 # Kept for backward-compat — points to the same set
