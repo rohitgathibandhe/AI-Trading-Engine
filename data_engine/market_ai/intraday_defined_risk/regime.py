@@ -1802,7 +1802,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                     else (
                         "HIGH_CONFLUENCE_BEARISH"
                         if high_confluence_bearish_ready
-                        else ("OPEN_DRIVE_BEARISH" if open_drive_bearish else ("SIDEWAYS_TO_BEARISH" if sideways_to_bearish else "TREND_BEARISH"))
+                        else ("OPEN_DRIVE_BEARISH" if open_drive_bearish else ("SIDEWAYS_TO_BEARISH" if (sideways_to_bearish and metadata.get("bearish_setup") == "PULLBACK_REJECTION") else "TREND_BEARISH"))
                     )
                 )
             )
