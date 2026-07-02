@@ -1746,6 +1746,9 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             metadata["minimum_net_edge_rupees"] = 850.0
             metadata["early_intent_strength"] = _ei_bear["strength"]
             metadata["early_intent_signals"] = _ei_bear["signals"]
+            metadata["early_structure_bearish_intent"] = True
+            # Early structure enters before full score confirmation — lower threshold
+            metadata["bearish_trade_score_threshold"] = 3.0
             reasons.append(
                 f"Early structure bearish intent detected (strength={_ei_bear['strength']:.2f}): "
                 f"EMA20 position, LH/LL structure, and chain pressure aligned in the "
@@ -1770,6 +1773,9 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             metadata["minimum_net_edge_rupees"] = 850.0
             metadata["early_intent_strength"] = _ei_bull["strength"]
             metadata["early_intent_signals"] = _ei_bull["signals"]
+            metadata["early_structure_bullish_intent"] = True
+            # Early structure enters before full score confirmation — lower threshold
+            metadata["bullish_trade_score_threshold"] = 3.0
             reasons.append(
                 f"Early structure bullish intent detected (strength={_ei_bull['strength']:.2f}): "
                 f"EMA20 position, HL/HH structure, and chain pressure aligned in the "
@@ -3191,7 +3197,11 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["trade_score_margin_bearish"] = round(effective_bearish_margin, 4)
     metadata["trade_score_margin_bullish"] = round(effective_bullish_margin, 4)
     metadata["bearish_trade_score_threshold"] = round(effective_bearish_threshold, 4)
-    metadata["bullish_trade_score_threshold"] = round(effective_bullish_threshold, 4)
+    # Preserve early-structure overrides — they set a lower threshold before full confirmation
+    if not metadata.get("early_structure_bullish_intent"):
+        metadata["bullish_trade_score_threshold"] = round(effective_bullish_threshold, 4)
+    if not metadata.get("early_structure_bearish_intent"):
+        metadata["bearish_trade_score_threshold"] = round(effective_bearish_threshold, 4)
     metadata["state_confidence"] = state_confidence_score
     if tradability_class == "TRADABLE":
         reasons.append(tradability_reason)

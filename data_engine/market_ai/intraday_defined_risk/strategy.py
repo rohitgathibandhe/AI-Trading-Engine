@@ -257,6 +257,8 @@ def required_confidence_for_playbook(playbook: str) -> float:
         return AFTERNOON_TREND_BULLISH_MIN_CONFIDENCE
     if playbook == "RANGE_BALANCED_CONDOR":
         return RANGE_CONDOR_MIN_CONFIDENCE
+    if playbook in {"EARLY_STRUCTURE_BEARISH", "EARLY_STRUCTURE_BULLISH"}:
+        return 0.30  # early entry before full confirmation — lower confidence floor
     if playbook in {
         "EARLY_BALANCE_BEARISH_FAILED_RECLAIM",
         "SIDEWAYS_TO_BEARISH_REJECTION",
@@ -554,7 +556,7 @@ def select_strategy(
                 f"Bullish context is too conflicted; failure score is {bullish_failure_score:.2f} with failure type {failure_type}."
             )
             return StrategyType.NO_TRADE, reasons
-        if context_layer_active and open_space_up < 120.0:
+        if context_layer_active and open_space_up < 120.0 and playbook != "EARLY_STRUCTURE_BULLISH":
             reasons.append(
                 f"Bullish open space is too small at {open_space_up:.2f} points."
             )
@@ -586,6 +588,8 @@ def select_strategy(
             required_confidence = EARLY_BALANCE_BULLISH_MIN_CONFIDENCE
         elif playbook == "AFTERNOON_TREND_HOLD_BULLISH":
             required_confidence = AFTERNOON_TREND_BULLISH_MIN_CONFIDENCE
+        elif playbook == "EARLY_STRUCTURE_BULLISH":
+            required_confidence = 0.30
         else:
             required_confidence = SIDEWAYS_BULLISH_RECLAIM_MIN_CONFIDENCE
         required_bull_confidence = required_confidence + (0.05 if now_time >= time(14, 0) else 0.0)
