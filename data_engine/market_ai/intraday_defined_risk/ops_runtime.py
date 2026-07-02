@@ -940,9 +940,13 @@ def evaluate_entry_gate(
         directional_score = bearish_score
     if directional_score <= no_trade_score + score_margin_required:
         reasons.append("DIRECTIONAL_SCORE_MARGIN_FAIL")
+    # Early structure playbooks fire in the 9:20–9:55 window before full confirmation.
+    # They bypass the normal 10:00 bullish start and the 11:00 bearish start.
+    if playbook in {"EARLY_STRUCTURE_BULLISH", "EARLY_STRUCTURE_BEARISH"}:
+        start_t = time(9, 20)
     # Bullish setups use an earlier start time so gap-up continuation plays can
     # be entered from 10:00 AM instead of waiting for the bearish window (11:00).
-    if setup_direction == "BULLISH":
+    elif setup_direction == "BULLISH":
         start_t = _parse_time(config.allowed_bullish_entry_start_hhmm, time(10, 0))
     else:
         start_t = _parse_time(config.allowed_entry_start_hhmm, time(9, 30))

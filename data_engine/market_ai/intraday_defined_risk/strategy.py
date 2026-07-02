@@ -640,6 +640,8 @@ def select_strategy(
             required_bull_start = GAP_DOWN_BULLISH_RECOVERY_START
         elif playbook == "EARLY_BALANCE_BULLISH_RECLAIM":
             required_bull_start = EARLY_BALANCE_BULLISH_START
+        elif playbook == "EARLY_STRUCTURE_BULLISH":
+            required_bull_start = EARLY_STRUCTURE_INTENT_START
         elif playbook == "AFTERNOON_TREND_HOLD_BULLISH":
             required_bull_start = AFTERNOON_TREND_BULLISH_START
         else:
@@ -658,6 +660,8 @@ def select_strategy(
             required_bull_end = GAP_DOWN_BULLISH_RECOVERY_END
         elif playbook == "EARLY_BALANCE_BULLISH_RECLAIM":
             required_bull_end = EARLY_BALANCE_BULLISH_END
+        elif playbook == "EARLY_STRUCTURE_BULLISH":
+            required_bull_end = EARLY_STRUCTURE_INTENT_END
         elif playbook == "AFTERNOON_TREND_HOLD_BULLISH":
             required_bull_end = AFTERNOON_TREND_BULLISH_END
         else:
