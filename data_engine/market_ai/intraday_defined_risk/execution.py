@@ -303,10 +303,20 @@ def evaluate_exit(
     current_capture_pct = max(position.entry_credit_points - current_value_points, 0.0) / max(position.entry_credit_points, 0.01)
     if current_capture_pct >= 0.60 and elapsed_minutes >= 90:
         return ExitDecision(True, "THETA_TARGET_HIT", current_value_points, pnl_rupees)
-    # Afternoon protection: after 13:30, gamma accelerates into close.
-    # If already 40% in profit, lock it in rather than hold through last-hour volatility.
+    # Afternoon protection: graduated thresholds — as the close approaches, a smaller
+    # captured gain is worth locking in because holding through last-hour volatility
+    # risks giving it back. After 14:00 we only need 25% captured; after 13:30 we need 40%.
+    if current_capture_pct >= 0.25 and now.time() >= time(14, 0):
+        return ExitDecision(True, "AFTERNOON_PROFIT_LOCK", current_value_points, pnl_rupees)
     if current_capture_pct >= 0.40 and now.time() >= time(13, 30):
         return ExitDecision(True, "AFTERNOON_PROFIT_LOCK", current_value_points, pnl_rupees)
+    # Delta-decay exit: when the short put/call delta drops to near-zero the spread has
+    # extracted most of its theta. Exit cleanly rather than holding to TIME_EXIT.
+    # Gate: at least 60 min held so entry-day high-delta situations don't trigger this.
+    if elapsed_minutes >= 60 and position.structure.strategy in {StrategyType.BULL_PUT_CREDIT_SPREAD, StrategyType.BEAR_CALL_CREDIT_SPREAD}:
+        short_deltas_decay = [abs(leg.quote.delta) for leg in current_legs if leg.action == "SELL" and leg.quote.delta is not None]
+        if short_deltas_decay and max(short_deltas_decay) <= 0.08:
+            return ExitDecision(True, "DELTA_DECAY_EXIT", current_value_points, pnl_rupees)
 
     # Condor partial close: when one side is threatened, close just that side rather
     # than exiting the full condor. This preserves the safe half which still has
@@ -339,6 +349,8 @@ def evaluate_exit(
         "SIDEWAYS_TO_BULLISH_RECLAIM",
         "GAP_UP_BULLISH_CONTINUATION",
         "GAP_DOWN_BULLISH_RECOVERY",
+        "RANGE_NO_TRADE",
+        "EARLY_STRUCTURE_BULLISH",
     }:
         short_delta_limit = BULLISH_PLAYBOOK_DELTA_SL
     short_deltas = [abs(leg.quote.delta) for leg in current_legs if leg.action == "SELL" and leg.quote.delta is not None]
@@ -357,6 +369,8 @@ def evaluate_exit(
                 "SIDEWAYS_TO_BULLISH_RECLAIM",
                 "GAP_UP_BULLISH_CONTINUATION",
                 "GAP_DOWN_BULLISH_RECOVERY",
+                "RANGE_NO_TRADE",
+                "EARLY_STRUCTURE_BULLISH",
             }
             and pnl_rupees > 0
         ):
