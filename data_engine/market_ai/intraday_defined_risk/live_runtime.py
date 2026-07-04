@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -280,6 +281,7 @@ class DhanLiveMarketDataProvider:
         self._previous_close_cache: tuple[date, float | None] | None = None
         self._daily_bars_cache: tuple[date, list[OhlcvBar]] | None = None
         self._chain_miss_streak: int = 0
+        self._candle_mem_cache: dict[tuple[int, str], list[OhlcvBar]] = {}  # (interval, date_iso) -> bars
 
     def _readiness_diagnostics(
         self,
@@ -334,8 +336,33 @@ class DhanLiveMarketDataProvider:
         )
         raise LiveDataReadinessError("INSUFFICIENT_DATA", reason, diagnostics)
 
+    def _candle_disk_path(self, interval: int, today: date) -> Path:
+        return STATE_ROOT / f"candle_cache_{today.isoformat()}_{interval}m.json"
+
+    def _save_candle_disk(self, interval: int, today: date, bars: list[OhlcvBar]) -> None:
+        try:
+            data = [
+                {"timestamp": b.timestamp.isoformat(), "open": b.open, "high": b.high,
+                 "low": b.low, "close": b.close, "volume": b.volume}
+                for b in bars if b.timestamp is not None
+            ]
+            self._candle_disk_path(interval, today).write_text(json.dumps(data))
+        except Exception:
+            pass
+
+    def _load_candle_disk(self, interval: int, today: date) -> list[OhlcvBar]:
+        try:
+            path = self._candle_disk_path(interval, today)
+            if not path.exists():
+                return []
+            raw = json.loads(path.read_text())
+            return _bars_from_candles(raw)
+        except Exception:
+            return []
+
     def _candles(self, *, interval: int, today: date) -> list[OhlcvBar]:
-        candles = self._dw.get_intraday_candles(
+        cache_key = (interval, today.isoformat())
+        raw = self._dw.get_intraday_candles(
             self.underlying_id,
             self.underlying_seg,
             "INDEX",
@@ -343,7 +370,31 @@ class DhanLiveMarketDataProvider:
             from_date=today.isoformat(),
             to_date=today.isoformat(),
         )
-        return _bars_from_candles(candles or [])
+        bars = _bars_from_candles(raw or [])
+        if bars:
+            # Successful fetch — update both in-memory and disk cache
+            prev = self._candle_mem_cache.get(cache_key, [])
+            if len(bars) >= len(prev):
+                self._candle_mem_cache[cache_key] = bars
+                self._save_candle_disk(interval, today, bars)
+            return bars
+        # Fetch returned empty — try in-memory cache first
+        cached = self._candle_mem_cache.get(cache_key)
+        if cached:
+            logging.getLogger("intraday_defined_risk.v83").warning(
+                "[candles] live fetch returned 0 bars for %dm; using %d cached bars from memory",
+                interval, len(cached),
+            )
+            return cached
+        # Fall back to disk cache (survives restarts)
+        disk = self._load_candle_disk(interval, today)
+        if disk:
+            self._candle_mem_cache[cache_key] = disk  # warm the memory cache
+            logging.getLogger("intraday_defined_risk.v83").warning(
+                "[candles] live fetch failed; loaded %d bars from disk cache for %dm",
+                len(disk), interval,
+            )
+        return disk
 
     def _cached_front_expiry(self, today: date) -> str:
         if self._front_expiry_cache and self._front_expiry_cache[0] == today:
@@ -439,9 +490,9 @@ class DhanLiveMarketDataProvider:
         )
         quotes = [_quote_from_row(dict(row)) for row in chain_rows]
         quotes = [quote for quote in quotes if quote is not None]
+        _log = logging.getLogger("intraday_defined_risk.v83")
         if not quotes:
             self._chain_miss_streak += 1
-            _log = logging.getLogger("intraday_defined_risk.v83")
             if self._chain_miss_streak == 5:
                 _log.warning(
                     "[option_chain] HEALTH ALERT: chain unavailable for %d consecutive polls "
@@ -451,19 +502,15 @@ class DhanLiveMarketDataProvider:
             elif self._chain_miss_streak % 20 == 0:
                 _log.error(
                     "[option_chain] PERSISTENT OUTAGE: chain missing for %d consecutive polls. "
-                    "Entire session is flying blind.",
+                    "Regime signals will be degraded; structure selection is blocked.",
                     self._chain_miss_streak,
                 )
-            self._raise_insufficient(
-                "OPTION_CHAIN_QUOTES_UNAVAILABLE",
-                now=now,
-                bars_5m=bars_5m,
-                bars_15m=bars_15m,
-                spot=spot,
-                quotes=quotes,
-                expiry=expiry,
-            )
-        self._chain_miss_streak = 0
+            # Degraded path: candles + spot are good, so regime classification can still run.
+            # We build a snapshot with no chain quotes — downstream blocks structure selection
+            # via option_chain_available=False but regime + entry gate still evaluate.
+            _log.debug("[option_chain] proceeding in degraded mode (no chain quotes)")
+        else:
+            self._chain_miss_streak = 0
 
         chain = OptionsChainSnapshot(
             timestamp=now,

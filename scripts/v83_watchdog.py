@@ -593,6 +593,68 @@ def _end_of_session_diagnosis(decisions: list[dict], state: dict) -> None:
         _log(f"EOD diagnosis sent: bull={best_bull:.2f} bear={best_bear:.2f} top_block={top_blocks[0][0] if top_blocks else 'none'}")
 
 
+# ─── EoD position guardian ───────────────────────────────────────────────────
+
+_PAPER_STATE = _STATE / "intraday_v83_paper_state.json"
+
+def _guardian_force_close(now: datetime, state: dict, fixes_applied: list[str]) -> None:
+    """
+    After 15:20 IST, if a paper position is still open and the agent has not written
+    a recent decision, force-exit the position directly in paper_state.json.
+
+    This is the last-resort safety net when the agent is down at TIME_EXIT (15:15).
+    Paper mode only — live mode would need a broker call.
+    """
+    hhmm = now.strftime("%H%M")
+    if hhmm < "1520":
+        return
+    today_str = str(now.date())
+    if state.get("eod_guardian_ran") == today_str:
+        return
+    try:
+        ps = json.loads(_PAPER_STATE.read_text()) if _PAPER_STATE.exists() else {}
+    except Exception:
+        return
+    if not ps.get("active_position"):
+        return  # no open position — nothing to do
+
+    # Only act if log is stale (agent not writing decisions)
+    log_age_min = (time.time() - _LOG.stat().st_mtime) / 60.0 if _LOG.exists() else 999
+    if log_age_min < 8:
+        return  # agent is alive and handling it
+
+    # Force-close: clear active position and write a synthetic exit to paper_state
+    pos = ps["active_position"]
+    entry_credit = float((pos.get("structure") or {}).get("credit_points") or 0)
+    entry_time = ps.get("last_exit", {}).get("entry_timestamp") or now.isoformat()
+    ps["last_exit"] = {
+        "event": "PAPER_EXIT",
+        "exit_reason": "TIME_EXIT",
+        "exit_mode": "GUARDIAN_FORCE_CLOSE",
+        "exit_timestamp": now.isoformat(),
+        "entry_timestamp": entry_time,
+        "realized_paper_pnl": 0.0,  # conservative — we don't have live LTP
+        "guardian_note": "Watchdog force-closed at 15:20+ because agent was unresponsive",
+    }
+    ps["active_position"] = None
+    try:
+        _PAPER_STATE.write_text(json.dumps(ps, indent=2, default=str))
+    except Exception as exc:
+        _log(f"EoD guardian: failed to write paper_state: {exc}")
+        return
+
+    state["eod_guardian_ran"] = today_str
+    msg = (
+        f"🛡️ <b>V83 EoD Guardian — FORCE CLOSE</b>\n"
+        f"Open position detected at {now.strftime('%H:%M IST')} with agent unresponsive "
+        f"({log_age_min:.0f} min since last log).\n"
+        f"Cleared position in paper_state.json. Manual review recommended."
+    )
+    _send_telegram(msg)
+    fixes_applied.append(f"EoD guardian: force-closed open position (agent silent {log_age_min:.0f}min)")
+    _log(f"EoD guardian: force-closed open paper position (log stale {log_age_min:.0f}min)")
+
+
 # ─── Main watchdog logic ──────────────────────────────────────────────────────
 
 def _check_pending_gap_report() -> None:
@@ -680,6 +742,13 @@ def run_watchdog() -> None:
     decisions = _todays_decisions(n=600)  # large n: gap detection needs full day window
     age = _last_decision_age_minutes(decisions)
     stale_threshold = STALE_THRESHOLD_EARLY if now.strftime("%H%M") < "0945" else STALE_THRESHOLD_LATE
+
+    # Blind-spot fix: when age is None (no JSON decisions at all today), fall back to
+    # log file mtime. An agent that is completely frozen produces no JSON lines, so
+    # _last_decision_age_minutes returns None and the original check was silently skipped.
+    if age is None and _LOG.exists():
+        age = (time.time() - _LOG.stat().st_mtime) / 60.0
+
     if age is not None and age > stale_threshold:
         _log(f"Log stale {age:.1f} min — restarting")
         ok = _restart_agent()
@@ -687,6 +756,34 @@ def run_watchdog() -> None:
         if age > 20:
             _send_telegram(f"⚠️ <b>V83 Watchdog</b>\nLog stale {age:.1f} min → restarted at {now.strftime('%H:%M IST')}")
         state["restart_grace_until"] = (now + timedelta(minutes=3)).isoformat()
+
+    # ── LAYER 1b: All-day INSUFFICIENT_DATA detection ─────────────────────────
+    # When Dhan API is completely down, every cycle logs INSUFFICIENT_DATA.
+    # This never triggers the stale-log check (log IS being written) so we detect
+    # it separately and alert + restart periodically.
+    if now.strftime("%H%M") >= "0940" and decisions:
+        insuff_count = sum(
+            1 for d in decisions
+            if (d.get("metadata", {}).get("data_readiness") or {}).get("reason") == "MIN_5M_CANDLES_NOT_READY"
+            or (d.get("metadata", {}).get("data_readiness") or {}).get("candle_count", 1) == 0
+        )
+        if insuff_count == len(decisions) and insuff_count >= 3:
+            last_insuff_alert = state.get("insuff_data_alert_hhmm", "")
+            cur_h = now.strftime("%H%M")
+            if not last_insuff_alert or abs(int(cur_h) - int(last_insuff_alert)) >= 30:
+                state["insuff_data_alert_hhmm"] = cur_h
+                _log(f"ALL {insuff_count} decisions today are INSUFFICIENT_DATA — Dhan historical API may be down")
+                _send_telegram(
+                    f"🚨 <b>V83 Watchdog — DATA API DOWN</b>\n"
+                    f"All {insuff_count} decisions today show INSUFFICIENT_DATA.\n"
+                    f"Dhan historical candle API appears to be down.\n"
+                    f"Check API status at {now.strftime('%H:%M IST')}."
+                )
+                ok = _restart_agent()
+                fixes_applied.append(f"All-day INSUFFICIENT_DATA ({insuff_count} cycles) → restarted")
+                state["restart_grace_until"] = (now + timedelta(minutes=3)).isoformat()
+        else:
+            state.pop("insuff_data_alert_hhmm", None)
 
     # ── LAYER 2: Data quality ─────────────────────────────────────────────────
     oc_streak = _consecutive_snap_reason(decisions, "OPTION_CHAIN_QUOTES_UNAVAILABLE")
@@ -732,6 +829,12 @@ def run_watchdog() -> None:
         _send_telegram(
             f"⚠️ <b>V83 Watchdog</b>\nDATA_PIPELINE_HEALTH_BLOCKED {dp_streak}× → restarted at {now.strftime('%H:%M IST')}"
         )
+
+    # ── LAYER 2b: EoD position guardian ──────────────────────────────────────
+    # If a paper position is still open after 15:20 and the agent has not written
+    # a decision in the last 10 minutes, force-exit the position now. This prevents
+    # overnight holds when TIME_EXIT fires at 15:15 but the agent is down.
+    _guardian_force_close(now, state, fixes_applied)
 
     # ── LAYER 3: Strategy gap analysis ───────────────────────────────────────
     strategy_fixes = _analyze_strategy_gaps(decisions)
