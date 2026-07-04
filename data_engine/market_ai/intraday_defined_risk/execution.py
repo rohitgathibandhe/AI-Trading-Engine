@@ -113,6 +113,19 @@ def simulate_entry_credit(structure: TradeStructure, slippage_points: float) -> 
     return max(structure.credit_points - slippage_points, 0.0)
 
 
+def compute_structure_spread_pts(structure, option_chain) -> float:
+    """Sum of half bid-ask spreads across all legs — actual market impact for limit orders.
+
+    Returns 0.0 when bid/ask unavailable (falls back gracefully; caller uses fixed slippage).
+    """
+    total = 0.0
+    for leg in structure.legs:
+        quote = option_chain.find_quote(leg.strike, leg.option_type)
+        if quote is not None and quote.ask > 0 and quote.bid > 0:
+            total += (quote.ask - quote.bid) / 2.0
+    return round(total, 2)
+
+
 def build_open_position(
     structure: TradeStructure,
     lots: int,

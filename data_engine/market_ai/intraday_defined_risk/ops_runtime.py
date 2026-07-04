@@ -22,7 +22,7 @@ from .data_models import (
     TradeStructure,
 )
 from .data_pipeline_health import build_data_freshness_report
-from .execution import build_open_position, evaluate_exit
+from .execution import build_open_position, compute_structure_spread_pts, evaluate_exit
 
 
 STATE_ROOT = Path(__file__).resolve().parents[1] / "state"
@@ -1209,6 +1209,8 @@ def structure_from_decision(decision: DecisionOutput) -> TradeStructure:
 
 def open_position_from_decision(decision: DecisionOutput, snapshot: MarketSnapshot) -> OpenPosition:
     structure = structure_from_decision(decision)
+    extra = dict(decision.metadata or {})
+    extra["spot_at_entry"] = snapshot.option_chain.spot
     return build_open_position(
         structure=structure,
         lots=int(decision.lots or 1),
@@ -1216,7 +1218,7 @@ def open_position_from_decision(decision: DecisionOutput, snapshot: MarketSnapsh
         entry_time=snapshot.timestamp,
         entry_credit_points=float(decision.entry.get("expected_credit_points") or structure.credit_points),
         max_loss_rupees_per_lot=float(decision.max_loss_rupees_per_lot or 0.0),
-        extra_metadata=decision.metadata,
+        extra_metadata=extra,
     )
 
 
@@ -1626,6 +1628,11 @@ def record_paper_entry(
     paths = paths or OpsPaths()
     save_paper_position(position, paths=paths, extra={"last_entry_gate": gate})
     attribution = str(decision.metadata.get("paper_trade_attribution") or "V83_APPROVED")
+    # Phase 7: compute bid-ask spread from live option chain for fill quality attribution
+    _structure = structure_from_decision(decision)
+    _spread_pts = compute_structure_spread_pts(_structure, snapshot.option_chain)
+    _credit_pts = float(decision.entry.get("expected_credit_points") or 0.0)
+    _fill_quality = round(_credit_pts / (_credit_pts + _spread_pts), 3) if (_credit_pts + _spread_pts) > 0 else 1.0
     event = {
         "event": "PAPER_ENTRY",
         "timestamp": snapshot.timestamp.isoformat(),
@@ -1642,6 +1649,11 @@ def record_paper_entry(
         "realized_paper_pnl": None,
         "mfe_rupees": 0.0,
         "mae_rupees": 0.0,
+        "bid_ask_spread_pts": _spread_pts,
+        "fill_quality_score": _fill_quality,
+        "entry_iv_rank": decision.metadata.get("iv_rank_at_entry"),
+        "india_vix_at_entry": decision.metadata.get("india_vix"),
+        "spot_at_entry": snapshot.option_chain.spot,
     }
     _append_jsonl(paths.paper_trades, event)
     record_runtime_trade_entry(decision, snapshot, decision_origin=attribution, paths=paths)
@@ -1675,6 +1687,15 @@ def manage_paper_position(
     save_paper_position(position, paths=paths, extra={"mfe_rupees": mfe, "mae_rupees": mae, "last_mark_pnl_rupees": open_pnl})
     if not exit_decision.should_exit:
         return position
+    # Phase 7: P&L attribution at exit
+    _spot_at_entry = float(position.metadata.get("spot_at_entry") or 0.0)
+    _spot_at_exit = float(snapshot.option_chain.spot)
+    _spot_move_pts = round(_spot_at_exit - _spot_at_entry, 2) if _spot_at_entry > 0 else 0.0
+    _holding_min = round((snapshot.timestamp - position.entry_time).total_seconds() / 60.0, 1)
+    _max_profit_rupees = round(position.entry_credit_points * position.lot_size * position.lots, 2)
+    _theta_capture_pct = round(
+        exit_decision.pnl_rupees / _max_profit_rupees, 3
+    ) if _max_profit_rupees > 0 else 0.0
     event = {
         "event": "PAPER_EXIT",
         "timestamp": snapshot.timestamp.isoformat(),
@@ -1692,6 +1713,13 @@ def manage_paper_position(
         "mfe_rupees": round(mfe, 2),
         "mae_rupees": round(mae, 2),
         "legs": serialize_open_position(position)["structure"]["legs"],
+        "holding_minutes": _holding_min,
+        "spot_at_entry": _spot_at_entry,
+        "spot_at_exit": _spot_at_exit,
+        "spot_move_pts": _spot_move_pts,
+        "theta_capture_pct": _theta_capture_pct,
+        "iv_rank_at_entry": position.metadata.get("iv_rank_at_entry"),
+        "mfe_capture_pct": position.metadata.get("mfe_capture_pct"),
     }
     _append_jsonl(paths.paper_trades, event)
     save_paper_position(None, paths=paths, extra={"last_exit": event, "mfe_rupees": 0.0, "mae_rupees": 0.0})
