@@ -1801,3 +1801,45 @@ def compute_atm_straddle(spot: float, quotes: list[OptionsContractQuote]) -> dic
         "atm_straddle_price": round(straddle, 2),
         "expected_move_pts": round(straddle, 2),
     }
+
+
+def compute_vwap_reclaim(bars: list[OhlcvBar], vwap: float) -> dict[str, bool | float]:
+    """VWAP reclaim: price dipped below VWAP for ≥2 prior bars, now closed above with volume.
+
+    Signals institutional buyers defending the mean — high-quality bullish continuation
+    when paired with positive OI flow.  Returns reclaim=False when VWAP is unknown or bars
+    are insufficient.
+    """
+    if not bars or vwap <= 0 or len(bars) < 3:
+        return {"vwap_reclaim": False, "vwap_reclaim_strength": 0.0}
+    if bars[-1].close <= vwap:
+        return {"vwap_reclaim": False, "vwap_reclaim_strength": 0.0}
+    prior = bars[-4:-1] if len(bars) >= 4 else bars[:-1]
+    below_count = sum(1 for bar in prior if bar.close < vwap)
+    if below_count < min(2, len(prior)):
+        return {"vwap_reclaim": False, "vwap_reclaim_strength": 0.0}
+    avg_prior_vol = sum(b.volume for b in prior) / max(len(prior), 1)
+    vol_ratio = bars[-1].volume / max(avg_prior_vol, 1.0)
+    dist_pct = (bars[-1].close - vwap) / max(vwap, 1.0)
+    strength = round(min(dist_pct * 100 + max(vol_ratio - 1.0, 0.0) * 0.3, 2.0), 3)
+    return {"vwap_reclaim": True, "vwap_reclaim_strength": max(0.0, strength)}
+
+
+def compute_momentum_persistence(bars: list[OhlcvBar], n: int = 6) -> dict[str, float]:
+    """Volume-weighted fraction of last N bars agreeing on direction (green vs red).
+
+    Persistence ≥ 0.70 = institutional trend participation.
+    Persistence ≤ 0.35 = choppy, unreliable candle signals.
+    """
+    if not bars or len(bars) < 2:
+        return {"bullish_persistence": 0.5, "bearish_persistence": 0.5}
+    recent = bars[-min(n, len(bars)):]
+    total_vol = sum(bar.volume for bar in recent)
+    if total_vol <= 0:
+        return {"bullish_persistence": 0.5, "bearish_persistence": 0.5}
+    bull_vol = sum(bar.volume for bar in recent if bar.close >= bar.open)
+    bear_vol = sum(bar.volume for bar in recent if bar.close < bar.open)
+    return {
+        "bullish_persistence": round(bull_vol / total_vol, 3),
+        "bearish_persistence": round(bear_vol / total_vol, 3),
+    }

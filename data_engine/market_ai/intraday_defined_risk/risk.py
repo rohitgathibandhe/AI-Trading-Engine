@@ -1,8 +1,51 @@
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 
 from .data_models import AccountRiskLimits, AccountState, RiskAssessment, StrategyType, TradeStructure
+
+_STATE_ROOT = Path(__file__).resolve().parents[1] / "state"
+
+
+def _compute_kelly_lot_cap(playbook: str, base_lots: int, max_lots: int) -> int:
+    """Scale lot size by Kelly criterion using historical setup performance.
+
+    Kelly fraction: f* = (win_rate * avg_win − loss_rate * avg_loss) / avg_win
+    Normalized: Kelly lots = round(f* × max_lots), clamped to [1, base_lots].
+    Falls back to base_lots when fewer than 5 samples exist for the playbook.
+
+    Effect: high-edge setups (>55% win rate with good MFE) get full sizing;
+    marginal setups get 1–2 lots; negative-edge setups get 1 lot (minimum).
+    """
+    skip = {"NO_TRADE", "UNKNOWN", "RANGE_NO_TRADE", "GAP_NO_TRADE", ""}
+    if playbook in skip:
+        return base_lots
+    perf_path = _STATE_ROOT / "setup_performance.json"
+    if not perf_path.exists():
+        return base_lots
+    try:
+        data = json.loads(perf_path.read_text())
+        stats = data.get("performance", {}).get(playbook)
+        if stats is None or int(stats.get("samples", 0)) < 5:
+            return base_lots
+        win_rate = float(stats.get("win_rate", 0.5))
+        avg_mfe = float(stats.get("avg_mfe", 0.0))
+        if avg_mfe <= 0:
+            return base_lots
+        # Estimate avg loss from last_5_pnls (negative records only)
+        last_pnls = [float(p) for p in stats.get("last_5_pnls", [])]
+        losses = [abs(p) for p in last_pnls if p < 0]
+        avg_loss = sum(losses) / len(losses) if losses else avg_mfe * 0.5
+        if avg_loss <= 0:
+            return base_lots
+        kelly_f = (win_rate * avg_mfe - (1.0 - win_rate) * avg_loss) / avg_mfe
+        if kelly_f <= 0:
+            return 1  # negative Kelly = edge gone, trade minimum
+        return max(1, min(base_lots, round(kelly_f * max_lots)))
+    except Exception:
+        return base_lots
 
 
 def _confidence_lot_cap(
@@ -91,6 +134,7 @@ def assess_trade_risk(
     risk_limits: AccountRiskLimits,
     account_state: AccountState,
     margin_estimate_per_lot: float | None = None,
+    playbook: str = "",
 ) -> RiskAssessment:
     max_loss_per_lot = compute_max_loss_rupees_per_lot(structure, lot_size=lot_size)
     if max_loss_per_lot <= 0:
@@ -126,6 +170,9 @@ def assess_trade_risk(
         max_lots=lots,
     )
     lots = min(lots, confidence_cap)
+    # Kelly criterion: scale lot size by historical win-rate edge for this playbook.
+    # Uses setup_performance.json written by watchdog after 15:30.  No-op if file absent.
+    lots = _compute_kelly_lot_cap(playbook, lots, max_lots=lots)
     projected_margin = account_state.margin_used_rupees + (lots * effective_margin)
     projected_utilisation = projected_margin / risk_limits.max_margin_rupees if risk_limits.max_margin_rupees > 0 else 1.0
 

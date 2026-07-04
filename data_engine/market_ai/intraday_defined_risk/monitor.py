@@ -253,6 +253,7 @@ def _shadow_only_failed_breakout_candidate(
         risk_limits=snapshot.risk_limits,
         account_state=snapshot.account_state,
         margin_estimate_per_lot=structure.margin_estimate_per_lot,
+        playbook=str(regime_state.metadata.get("playbook") or ""),
     )
     if not risk.allowed:
         return None
@@ -536,6 +537,7 @@ def _paper_context_override_candidate(
         risk_limits=snapshot.risk_limits,
         account_state=snapshot.account_state,
         margin_estimate_per_lot=structure.margin_estimate_per_lot,
+        playbook=str(regime_state.metadata.get("playbook") or ""),
     )
     if not risk.allowed:
         info["paper_candidate_reason"] = "RISK_LIMIT"
@@ -677,6 +679,7 @@ def _build_bullish_paper_override(
         risk_limits=snapshot.risk_limits,
         account_state=snapshot.account_state,
         margin_estimate_per_lot=structure.margin_estimate_per_lot,
+        playbook=str(regime_state.metadata.get("playbook") or ""),
     )
     if not risk.allowed:
         info["paper_candidate_reason"] = "RISK_LIMIT"
@@ -1011,6 +1014,7 @@ class IntradayDefinedRiskAgent:
             risk_limits=snapshot.risk_limits,
             account_state=snapshot.account_state,
             margin_estimate_per_lot=structure.margin_estimate_per_lot,
+            playbook=str(regime_state.metadata.get("playbook") or ""),
         )
         if not risk.allowed:
             decision = build_no_trade_decision(

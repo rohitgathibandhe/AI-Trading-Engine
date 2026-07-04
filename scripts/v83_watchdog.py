@@ -797,21 +797,22 @@ def _apply_adaptive_gates(state: dict) -> list[str]:
     if bear_total >= 5:
         bear_wr = bear_wins / bear_total
         if bear_wr < 0.30:
-            cur = float(rt.get("bearish_trade_score_threshold", 5.8))
-            new_val = round(min(cur + 0.3, 8.0), 2)
+            # paper_override_bearish_score_threshold is the hot-loaded paper gate field
+            cur = float(rt.get("paper_override_bearish_score_threshold", 6.5))
+            new_val = round(min(cur + 0.3, 9.0), 2)
             if new_val != cur:
-                rt["bearish_trade_score_threshold"] = new_val
-                fixes.append(f"bearish_threshold {cur:.1f}→{new_val:.1f} (bear wr {bear_wr*100:.0f}%)")
+                rt["paper_override_bearish_score_threshold"] = new_val
+                fixes.append(f"bearish_paper_threshold {cur:.1f}→{new_val:.1f} (bear wr {bear_wr*100:.0f}%)")
                 changed = True
 
     if bull_total >= 5:
         bull_wr = bull_wins / bull_total
         if bull_wr < 0.30:
-            cur = float(rt.get("bullish_trade_score_threshold", 5.8))
-            new_val = round(min(cur + 0.3, 8.0), 2)
+            cur = float(rt.get("paper_override_bullish_score_threshold", rt.get("paper_override_bearish_score_threshold", 6.5)))
+            new_val = round(min(cur + 0.3, 9.0), 2)
             if new_val != cur:
-                rt["bullish_trade_score_threshold"] = new_val
-                fixes.append(f"bullish_threshold {cur:.1f}→{new_val:.1f} (bull wr {bull_wr*100:.0f}%)")
+                rt["paper_override_bullish_score_threshold"] = new_val
+                fixes.append(f"bullish_paper_threshold {cur:.1f}→{new_val:.1f} (bull wr {bull_wr*100:.0f}%)")
                 changed = True
 
     if changed:
@@ -820,6 +821,53 @@ def _apply_adaptive_gates(state: dict) -> list[str]:
         except Exception as exc:
             _log(f"adaptive gates write failed: {exc}")
 
+    return fixes
+
+
+def _update_circuit_breaker(state: dict) -> list[str]:
+    """Detect 2+ consecutive session losses and write circuit_breaker_active to runtime_config.
+
+    Called on every watchdog cycle during market hours.  Clears the flag automatically
+    when the last 2 trades include a winner (i.e. the streak is broken).
+    """
+    fixes: list[str] = []
+    today_str = str(_now().date())
+    trades = _load_exit_trades()
+    today_trades = [t for t in trades if t.get("session_date") == today_str]
+
+    if len(today_trades) >= 2:
+        last_two = today_trades[-2:]
+        consecutive_losses = all(float(t.get("realized_paper_pnl", 1.0)) < 0 for t in last_two)
+    else:
+        consecutive_losses = False
+
+    try:
+        rt = json.loads(_RT_CFG.read_text()) if _RT_CFG.exists() else {}
+    except Exception:
+        return fixes
+
+    current = bool(rt.get("circuit_breaker_active", False))
+    if consecutive_losses == current:
+        return fixes  # no change needed
+
+    rt["circuit_breaker_active"] = consecutive_losses
+    try:
+        _RT_CFG.write_text(json.dumps(rt, indent=2))
+    except Exception as exc:
+        _log(f"circuit_breaker write failed: {exc}")
+        return fixes
+
+    if consecutive_losses:
+        _send_telegram(
+            "🔴 <b>Circuit Breaker ARMED</b>\n"
+            "2 consecutive session losses detected.\n"
+            "Entry score threshold raised +1.0 for rest of session."
+        )
+        _log("Circuit breaker armed: 2 consecutive losses today")
+        fixes.append("circuit_breaker ARMED (2 consecutive session losses)")
+    else:
+        _log("Circuit breaker cleared")
+        fixes.append("circuit_breaker CLEARED")
     return fixes
 
 
@@ -1126,6 +1174,10 @@ def run_watchdog() -> None:
 
     # ── EOD IV history tracking ───────────────────────────────────────────────
     _update_iv_history(decisions, state)
+
+    # ── Intraday circuit breaker: detect consecutive losses, gate entry ────────
+    cb_fixes = _update_circuit_breaker(state)
+    fixes_applied.extend(cb_fixes)
 
     # ── EOD self-learning: setup performance + adaptive gates + time-of-day ──
     _update_setup_performance(state)

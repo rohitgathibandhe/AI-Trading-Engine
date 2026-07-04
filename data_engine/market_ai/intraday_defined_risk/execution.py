@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime, time
+from pathlib import Path
 
 from .data_models import (
     DecisionOutput,
@@ -17,6 +18,32 @@ from .data_models import (
 )
 from .features import compute_vwap, last_n_closes_above, last_n_closes_below, latest_pivot_high, latest_pivot_low, session_bars
 from .features import bullish_reversal_structure, bearish_reversal_structure, closes, ema, ema_value
+
+
+_STATE_ROOT = Path(__file__).resolve().parents[1] / "state"
+
+
+def _read_current_iv_rank() -> float | None:
+    """Read the most recent IV rank percentile from iv_history.csv.
+
+    Format: date,avg_iv,iv_rank  (written daily by watchdog after 15:30).
+    Returns None when file is missing or has fewer than 2 rows (no history yet).
+    """
+    iv_path = _STATE_ROOT / "iv_history.csv"
+    if not iv_path.exists():
+        return None
+    try:
+        rows = [line.strip() for line in iv_path.read_text().splitlines() if line.strip()]
+        for row in reversed(rows):
+            parts = row.split(",")
+            if len(parts) >= 3:
+                try:
+                    return float(parts[2])
+                except ValueError:
+                    continue
+    except Exception:
+        pass
+    return None
 
 
 TIME_EXIT = time(15, 15)
@@ -96,12 +123,21 @@ def build_open_position(
     extra_metadata: dict[str, object] | None = None,
 ) -> OpenPosition:
     tp_capture = DIRECTIONAL_TP_CAPTURE if structure.strategy not in {StrategyType.IRON_CONDOR, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE} else CONDOR_TP_CAPTURE
+    # IV rank-based TP scaling: high IV → hold longer (more premium to decay, wider targets);
+    # compressed IV → exit sooner (less edge available, favour quick capture).
+    _iv_rank = _read_current_iv_rank()
+    if _iv_rank is not None:
+        if _iv_rank > 65:
+            tp_capture = min(tp_capture * 1.15, 0.85)   # e.g. 65% → ~75%
+        elif _iv_rank < 30:
+            tp_capture = max(tp_capture * 0.85, 0.45)   # e.g. 65% → ~55%
     target_value = entry_credit_points * (1.0 - tp_capture)
     stop_value = entry_credit_points * PREMIUM_SL_MULTIPLIER
     metadata = {
         "time_exit": entry_time.replace(hour=15, minute=15, second=0, microsecond=0).isoformat(),
         "session_profit_peak_rupees": 0.0,
         "exit_mode": "STANDARD_TRAIL",
+        "iv_rank_at_entry": _iv_rank,
     }
     if extra_metadata:
         metadata.update(extra_metadata)

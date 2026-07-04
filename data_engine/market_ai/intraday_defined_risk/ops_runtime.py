@@ -135,6 +135,7 @@ class RuntimeConfig:
     health_required_for_paper: bool = True
     health_required_for_micro: bool = True
     allowed_playbook_tiers: tuple[str, ...] = ("A", "B")
+    circuit_breaker_active: bool = False
     risk: RuntimeRiskGovernance = field(default_factory=RuntimeRiskGovernance)
 
     @classmethod
@@ -176,6 +177,7 @@ class RuntimeConfig:
             health_required_for_paper=bool(payload.get("health_required_for_paper", True)),
             health_required_for_micro=bool(payload.get("health_required_for_micro", True)),
             allowed_playbook_tiers=tuple(sorted(set(str(t) for t in payload.get("allowed_playbook_tiers", ["A", "B"])))),
+            circuit_breaker_active=bool(payload.get("circuit_breaker_active", False)),
             risk=RuntimeRiskGovernance.from_payload(payload.get("risk") if isinstance(payload.get("risk"), dict) else payload),
         )
 
@@ -1053,6 +1055,8 @@ def evaluate_paper_context_override_gate(
     no_trade_score = float(metadata.get("no_trade_score") or funnel.get("no_trade_score") or 0.0)
     _active_score = bullish_score if _is_bullish_override else bearish_score
     _score_threshold = float(getattr(config, "paper_override_bullish_score_threshold", config.paper_override_bearish_score_threshold)) if _is_bullish_override else config.paper_override_bearish_score_threshold
+    if config.circuit_breaker_active:
+        _score_threshold += 1.0  # raise bar by 1.0 after 2 consecutive session losses
     if _active_score < _score_threshold:
         reasons.append("PAPER_OVERRIDE_SCORE_TOO_LOW")
     if _active_score <= no_trade_score + config.paper_override_margin:

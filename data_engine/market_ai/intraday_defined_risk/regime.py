@@ -57,6 +57,8 @@ from .features import (
     put_call_ratio_by_oi,
     early_structure_intent_bearish,
     early_structure_intent_bullish,
+    compute_vwap_reclaim,
+    compute_momentum_persistence,
 )
 
 
@@ -1017,6 +1019,11 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "session_move_pts": round(_session_move_pts, 2),
         "expected_move_consumed_pct": round(_move_consumed_pct * 100, 1),
         "expected_move_consumed": _expected_move_consumed,
+        "session_phase": "PRIME",
+        "vwap_reclaim": False,
+        "vwap_reclaim_strength": 0.0,
+        "bullish_momentum_persistence": 0.5,
+        "bearish_momentum_persistence": 0.5,
         "range_compression_score": 0.0,
         "min_short_call_strike": None,
         "max_short_put_strike": None,
@@ -1456,8 +1463,47 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     if _expected_move_consumed and _expected_move_pts_val > 0:
         bullish_entry_score -= 1.0
         bearish_entry_score -= 1.0
+    # VWAP reclaim: dip below VWAP followed by reclaim with volume = strong bullish continuation.
+    # Only meaningful when VWAP is established (after 09:45).
+    _vwap_val = vwap or 0.0
+    _vwap_reclaim = compute_vwap_reclaim(bars_5m, _vwap_val)
+    if _vwap_reclaim["vwap_reclaim"]:
+        bullish_entry_score += 0.5
+        if float(_vwap_reclaim["vwap_reclaim_strength"]) >= 0.5:
+            bullish_entry_score += 0.2  # bonus for distance + volume conviction
+    # Momentum persistence: volume-weighted agreement of last 6 bars on direction.
+    # High persistence = institutional trend participation; low = chop.
+    _momentum = compute_momentum_persistence(bars_5m, n=6)
+    _bull_persist = float(_momentum["bullish_persistence"])
+    _bear_persist = float(_momentum["bearish_persistence"])
+    if _bull_persist >= 0.70 and trend_15m == "TREND_UP":
+        bullish_entry_score += 0.4
+    if _bear_persist >= 0.70 and trend_15m == "TREND_DOWN":
+        bearish_entry_score += 0.4
+    if _bull_persist <= 0.35 and _bear_persist <= 0.35:
+        bullish_entry_score -= 0.2  # genuinely choppy, neither direction has conviction
+        bearish_entry_score -= 0.2
+    # Session-phase score adjustment: entry quality varies predictably by time of day.
+    # OPEN (9:15-10:00): range-setting, wide spreads, wait for OR confirmation → raise bar.
+    # PRIME (10:00-13:30): best theta-decay window, trend established → no adjustment.
+    # LATE (13:30+): less time for theta to accrue, pre-close reversal risk → slight penalty.
+    _now_time = snapshot.timestamp.time()
+    if time(9, 15) <= _now_time < time(10, 0):
+        bullish_entry_score -= 0.5
+        bearish_entry_score -= 0.5
+        metadata["session_phase"] = "OPEN"
+    elif time(10, 0) <= _now_time < time(13, 30):
+        metadata["session_phase"] = "PRIME"
+    else:
+        bullish_entry_score -= 0.3
+        bearish_entry_score -= 0.3
+        metadata["session_phase"] = "LATE"
     metadata["bullish_entry_score"] = bullish_entry_score
     metadata["bearish_entry_score"] = bearish_entry_score
+    metadata["vwap_reclaim"] = bool(_vwap_reclaim["vwap_reclaim"])
+    metadata["vwap_reclaim_strength"] = float(_vwap_reclaim["vwap_reclaim_strength"])
+    metadata["bullish_momentum_persistence"] = _bull_persist
+    metadata["bearish_momentum_persistence"] = _bear_persist
     bullish_planner_alignment = (
         oi_flow["smart_money_bias"] == "BULLISH"
         or wall_migration["wall_migration_bias"] == "BULLISH"
