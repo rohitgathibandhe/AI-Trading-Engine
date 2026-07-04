@@ -961,6 +961,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "call_resistance_strike": oi_flow["call_resistance_strike"],
         "put_support_oi_change": oi_flow["put_support_oi_change"],
         "call_resistance_oi_change": oi_flow["call_resistance_oi_change"],
+        "call_wall_oi_velocity": oi_flow.get("call_wall_oi_velocity", 0.0),
+        "put_wall_oi_velocity": oi_flow.get("put_wall_oi_velocity", 0.0),
         "current_put_wall": wall_migration["current_put_wall"],
         "previous_put_wall": wall_migration["previous_put_wall"],
         "put_wall_shift": wall_migration["put_wall_shift"],
@@ -1278,6 +1280,14 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             bearish_trend_score += 0.3
         elif _pain_dist_pct < -0.3:  # spot meaningfully below max pain → bullish gravity
             bullish_trend_score += 0.3
+    # OI velocity: fast wall buildup = conviction signal from options writers this cycle.
+    # ≥3% OI growth at the dominant wall in a single 30s poll = aggressive positioning.
+    _call_vel = float(oi_flow.get("call_wall_oi_velocity") or 0.0)
+    _put_vel = float(oi_flow.get("put_wall_oi_velocity") or 0.0)
+    if _call_vel >= 3.0:  # fast call writing = resistance hardening, bearish
+        bearish_trend_score += 0.3
+    if _put_vel >= 3.0:   # fast put writing = support flooring, bullish
+        bullish_trend_score += 0.3
     metadata["bullish_trend_score"] = bullish_trend_score
     metadata["bearish_trend_score"] = bearish_trend_score
     metadata["trend_follow_ready_bullish"] = bullish_trend_score >= 3.5

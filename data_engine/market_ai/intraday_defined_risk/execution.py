@@ -287,6 +287,9 @@ def evaluate_exit(
     structure_trail_reason = _structure_profit_trail_reason(position, current_snapshot, current_value_points)
     if structure_trail_reason:
         return ExitDecision(True, structure_trail_reason, current_value_points, pnl_rupees)
+    mfe_trail_reason = _mfe_profit_trail_reason(position, current_value_points, elapsed_minutes)
+    if mfe_trail_reason:
+        return ExitDecision(True, mfe_trail_reason, current_value_points, pnl_rupees)
     effective_target_capture = position.take_profit_capture_pct
     if current_snapshot is not None:
         current_capture_pct = max(position.entry_credit_points - current_value_points, 0.0) / max(position.entry_credit_points, 0.01)
@@ -638,6 +641,31 @@ def _structure_profit_trail_reason(
         )
         if structure_broken:
             return "PROFIT_TRAIL_STRUCTURE"
+    return None
+
+
+def _mfe_profit_trail_reason(
+    position: OpenPosition,
+    current_value_points: float,
+    elapsed_minutes: int,
+) -> str | None:
+    """Proportional MFE trail: once 55%+ of premium is captured, never give back more than 40% of that peak.
+
+    Complements the absolute-point structure trail: a 100-pt credit and a 40-pt credit both
+    get protected proportionally rather than by a single fixed giveback.  Gate: 20 min minimum
+    hold so the trade can breathe past initial noise.
+    """
+    if position.entry_credit_points <= 0 or elapsed_minutes < 20:
+        return None
+    current_capture = max(0.0, position.entry_credit_points - current_value_points)
+    current_capture_pct = current_capture / position.entry_credit_points
+    best_pct = float(position.metadata.get("mfe_capture_pct", 0.0))
+    best_pct = max(best_pct, current_capture_pct)
+    position.metadata["mfe_capture_pct"] = round(best_pct, 4)
+    if best_pct < 0.55:
+        return None
+    if current_capture_pct < best_pct * 0.60:
+        return "MFE_TRAIL_EXIT"
     return None
 
 

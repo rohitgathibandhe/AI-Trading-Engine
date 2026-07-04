@@ -678,10 +678,205 @@ def _update_iv_history(decisions: list[dict], state: dict) -> None:
         )
 
 
+# ─── Self-learning engine ─────────────────────────────────────────────────────
+
+def _load_exit_trades() -> list[dict]:
+    """Load all PAPER_EXIT records from the blotter (all sessions)."""
+    trades: list[dict] = []
+    if not _PAPER_TRADES.exists():
+        return trades
+    try:
+        with _PAPER_TRADES.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    t = json.loads(line)
+                    if t.get("event") == "PAPER_EXIT" and t.get("realized_paper_pnl") is not None:
+                        trades.append(t)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return trades
+
+
+def _update_setup_performance(state: dict) -> None:
+    """After 15:30 IST: compute win rates and avg PnL per playbook subtype."""
+    now = _now()
+    if now.strftime("%H%M") < "1530":
+        return
+    today_str = str(now.date())
+    if state.get("setup_perf_written") == today_str:
+        return
+
+    trades = _load_exit_trades()
+    if not trades:
+        return
+
+    by_playbook: dict[str, list[dict]] = defaultdict(list)
+    for t in trades:
+        playbook = str(t.get("playbook") or "UNKNOWN")
+        by_playbook[playbook].append({
+            "pnl": float(t["realized_paper_pnl"]),
+            "mfe": float(t.get("mfe_rupees") or 0.0),
+            "exit_reason": str(t.get("exit_reason") or ""),
+        })
+
+    performance: dict[str, dict] = {}
+    for playbook, records in by_playbook.items():
+        wins = [r for r in records if r["pnl"] > 0]
+        avg_pnl = sum(r["pnl"] for r in records) / len(records)
+        total_mfe = sum(r["mfe"] for r in records if r["mfe"] > 0)
+        total_pnl_on_mfe = sum(r["pnl"] for r in records if r["mfe"] > 0)
+        mfe_capture = total_pnl_on_mfe / total_mfe if total_mfe > 0 else 0.0
+        performance[playbook] = {
+            "samples": len(records),
+            "wins": len(wins),
+            "win_rate": round(len(wins) / len(records), 3),
+            "avg_pnl": round(avg_pnl, 2),
+            "avg_mfe": round(sum(r["mfe"] for r in records) / len(records), 2),
+            "mfe_capture_rate": round(mfe_capture, 3),
+            "last_5_pnls": [r["pnl"] for r in records[-5:]],
+        }
+
+    _SETUP_PERF.write_text(json.dumps({"updated_at": today_str, "performance": performance}, indent=2))
+    state["setup_perf_written"] = today_str
+    _log(f"Setup performance updated: {len(performance)} playbooks across {len(trades)} exits")
+
+    # Alert on underperforming setups (real trading setups only)
+    skip = {"NO_TRADE", "UNKNOWN", "RANGE_NO_TRADE", "GAP_NO_TRADE"}
+    underperformers = [
+        (p, d) for p, d in performance.items()
+        if p not in skip and d["samples"] >= 5 and d["win_rate"] < 0.35
+    ]
+    if underperformers:
+        lines = "\n".join(
+            f"• {p}: {d['win_rate']*100:.0f}% win, {d['samples']} trades, avg {d['avg_pnl']:.0f}₹"
+            for p, d in underperformers
+        )
+        _send_telegram(
+            f"⚠️ <b>V83 Learning — Underperforming Setups</b>\n\n"
+            f"{lines}\n\n"
+            f"<i>Auto-raising entry threshold for these directions.</i>"
+        )
+
+
+def _apply_adaptive_gates(state: dict) -> list[str]:
+    """Read setup performance and raise entry score thresholds for consistently losing directions."""
+    fixes: list[str] = []
+    if not _SETUP_PERF.exists():
+        return fixes
+    try:
+        perf_data = json.loads(_SETUP_PERF.read_text())
+    except Exception:
+        return fixes
+
+    performance = perf_data.get("performance", {})
+    skip = {"NO_TRADE", "UNKNOWN", "RANGE_NO_TRADE", "GAP_NO_TRADE"}
+
+    # Aggregate wins/samples per direction
+    bear_wins = bear_total = bull_wins = bull_total = 0
+    for p, d in performance.items():
+        if p in skip:
+            continue
+        if any(kw in p for kw in ("BEARISH", "BEAR", "SHORT", "REJECTION", "CONTINUATION_DOWN")):
+            bear_wins += d["wins"]
+            bear_total += d["samples"]
+        elif any(kw in p for kw in ("BULLISH", "BULL", "RECLAIM", "CONTINUATION_UP")):
+            bull_wins += d["wins"]
+            bull_total += d["samples"]
+
+    try:
+        rt = json.loads(_RT_CFG.read_text()) if _RT_CFG.exists() else {}
+    except Exception:
+        return fixes
+
+    changed = False
+    if bear_total >= 5:
+        bear_wr = bear_wins / bear_total
+        if bear_wr < 0.30:
+            cur = float(rt.get("bearish_trade_score_threshold", 5.8))
+            new_val = round(min(cur + 0.3, 8.0), 2)
+            if new_val != cur:
+                rt["bearish_trade_score_threshold"] = new_val
+                fixes.append(f"bearish_threshold {cur:.1f}→{new_val:.1f} (bear wr {bear_wr*100:.0f}%)")
+                changed = True
+
+    if bull_total >= 5:
+        bull_wr = bull_wins / bull_total
+        if bull_wr < 0.30:
+            cur = float(rt.get("bullish_trade_score_threshold", 5.8))
+            new_val = round(min(cur + 0.3, 8.0), 2)
+            if new_val != cur:
+                rt["bullish_trade_score_threshold"] = new_val
+                fixes.append(f"bullish_threshold {cur:.1f}→{new_val:.1f} (bull wr {bull_wr*100:.0f}%)")
+                changed = True
+
+    if changed:
+        try:
+            _RT_CFG.write_text(json.dumps(rt, indent=2))
+        except Exception as exc:
+            _log(f"adaptive gates write failed: {exc}")
+
+    return fixes
+
+
+def _update_time_of_day_performance(state: dict) -> None:
+    """After 15:30 IST: compute win rate and avg PnL grouped by entry hour."""
+    now = _now()
+    if now.strftime("%H%M") < "1530":
+        return
+    today_str = str(now.date())
+    if state.get("tod_perf_written") == today_str:
+        return
+
+    trades = _load_exit_trades()
+    if len(trades) < 3:
+        return
+
+    by_hour: dict[int, list[float]] = defaultdict(list)
+    for t in trades:
+        ts = t.get("entry_timestamp") or ""
+        try:
+            hour = int(ts[11:13])
+        except (ValueError, IndexError):
+            continue
+        by_hour[hour].append(float(t["realized_paper_pnl"]))
+
+    tod_perf: dict[str, dict] = {}
+    for hour, pnls in sorted(by_hour.items()):
+        wins = [p for p in pnls if p > 0]
+        tod_perf[f"{hour:02d}:00"] = {
+            "samples": len(pnls),
+            "win_rate": round(len(wins) / len(pnls), 3),
+            "avg_pnl": round(sum(pnls) / len(pnls), 2),
+            "total_pnl": round(sum(pnls), 2),
+        }
+
+    _TIME_PERF.write_text(json.dumps({"updated_at": today_str, "by_hour": tod_perf}, indent=2))
+    state["tod_perf_written"] = today_str
+    _log(f"Time-of-day performance updated: {len(tod_perf)} hours from {len(trades)} exits")
+
+    # Alert on consistently negative hours (≥3 samples, avg pnl < -500)
+    bad_hours = [(h, d) for h, d in tod_perf.items() if d["samples"] >= 3 and d["avg_pnl"] < -500]
+    if bad_hours:
+        lines = "\n".join(f"• {h}: avg {d['avg_pnl']:.0f}₹ ({d['samples']} trades)" for h, d in bad_hours)
+        _send_telegram(
+            f"⏰ <b>V83 Learning — Weak Time Slots</b>\n\n"
+            f"{lines}\n\n"
+            f"<i>Consider raising entry thresholds in these hours.</i>"
+        )
+
+
 # ─── EoD position guardian ───────────────────────────────────────────────────
 
 _PAPER_STATE  = _STATE / "intraday_v83_paper_state.json"
 _IV_HISTORY   = _STATE / "iv_history.csv"
+_PAPER_TRADES = _STATE / "intraday_v83_paper_live_trades.jsonl"
+_SETUP_PERF   = _STATE / "setup_performance.json"
+_TIME_PERF    = _STATE / "time_of_day_performance.json"
 
 def _guardian_force_close(now: datetime, state: dict, fixes_applied: list[str]) -> None:
     """
@@ -931,6 +1126,12 @@ def run_watchdog() -> None:
 
     # ── EOD IV history tracking ───────────────────────────────────────────────
     _update_iv_history(decisions, state)
+
+    # ── EOD self-learning: setup performance + adaptive gates + time-of-day ──
+    _update_setup_performance(state)
+    adaptive_fixes = _apply_adaptive_gates(state)
+    fixes_applied.extend(adaptive_fixes)
+    _update_time_of_day_performance(state)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     if fixes_applied:

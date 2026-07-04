@@ -1464,6 +1464,20 @@ def option_chain_oi_flow(
     else:
         smart_money_bias = "NEUTRAL"
 
+    # OI velocity: rate of buildup at dominant wall strikes (pct of prior OI per poll cycle).
+    # High velocity at call wall = resistance hardening fast → reinforces bearish bias.
+    # High velocity at put wall = support flooring fast → reinforces bullish bias.
+    call_wall_prev_oi = next(
+        (float(prev.oi or 0) for cur, prev in nearby_calls if cur.strike == call_wall_strike),
+        0.0,
+    )
+    put_wall_prev_oi = next(
+        (float(prev.oi or 0) for cur, prev in nearby_puts if cur.strike == put_wall_strike),
+        0.0,
+    )
+    call_wall_velocity = round(call_wall_change / max(call_wall_prev_oi, 1.0) * 100, 2)
+    put_wall_velocity = round(put_wall_change / max(put_wall_prev_oi, 1.0) * 100, 2)
+
     return {
         "bullish_flow_score": bullish_score,
         "bearish_flow_score": bearish_score,
@@ -1472,6 +1486,8 @@ def option_chain_oi_flow(
         "put_support_oi_change": put_wall_change,
         "call_resistance_oi_change": call_wall_change,
         "smart_money_bias": smart_money_bias,
+        "call_wall_oi_velocity": call_wall_velocity,
+        "put_wall_oi_velocity": put_wall_velocity,
     }
 
 
