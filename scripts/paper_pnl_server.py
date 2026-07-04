@@ -347,7 +347,7 @@ def load_positions(blotter_path: Path, mode: str = "paper") -> Dict[str, Any]:
 
     chain_map: Dict[str, Any] = {}
     spot_val: Optional[float] = None
-    if latest_expiry:
+    if latest_expiry and mode != "paper":
         cm = _build_chain_map(latest_expiry)
         chain_map = cm.get("map") or {}
         spot_val = cm.get("spot")
@@ -366,7 +366,7 @@ def load_positions(blotter_path: Path, mode: str = "paper") -> Dict[str, Any]:
             continue
         if sid:
             pairs.setdefault(seg, []).append(sid)
-    if pairs:
+    if pairs and mode != "paper":
         # dedupe sec_ids per segment to avoid API 400 on duplicates
         for seg, ids in pairs.items():
             pairs[seg] = sorted(list({int(i) for i in ids}))
