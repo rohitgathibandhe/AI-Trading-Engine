@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 from datetime import time
 
 from .data_models import AdaptiveParameters, MarketSnapshot, OhlcvBar, RegimeLabel, RegimeState, ValidationError
@@ -59,6 +60,7 @@ from .features import (
     early_structure_intent_bullish,
     compute_vwap_reclaim,
     compute_momentum_persistence,
+    read_market_context,
 )
 
 
@@ -1024,6 +1026,9 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "vwap_reclaim_strength": 0.0,
         "bullish_momentum_persistence": 0.5,
         "bearish_momentum_persistence": 0.5,
+        "india_vix": 0.0,
+        "banknifty_divergence": 0.0,
+        "days_to_monthly_expiry": 99,
         "range_compression_score": 0.0,
         "min_short_call_strike": None,
         "max_short_put_strike": None,
@@ -1498,6 +1503,53 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         bullish_entry_score -= 0.3
         bearish_entry_score -= 0.3
         metadata["session_phase"] = "LATE"
+    # Phase 6A: India VIX — fear/premium gauge.
+    # VIX > 22: gap risk, wide spreads → raise bar both sides.
+    # VIX 16-22: elevated premium, good theta capture → slight bonus.
+    # VIX < 12: crushed vol, premium barely covers slippage → raise bar.
+    _mkt_ctx = read_market_context()
+    _india_vix = float(_mkt_ctx.get("india_vix") or 0.0)
+    if _india_vix > 22:
+        bullish_entry_score -= 0.4
+        bearish_entry_score -= 0.4
+    elif _india_vix > 16:
+        bullish_entry_score += 0.2
+        bearish_entry_score += 0.2
+    elif 0 < _india_vix < 12:
+        bullish_entry_score -= 0.2
+        bearish_entry_score -= 0.2
+    metadata["india_vix"] = _india_vix
+
+    # Phase 6B: BankNifty divergence — if BankNifty and Nifty moving opposite, reduce conviction.
+    # Significant bank-sector divergence signals sector rotation that undercuts index trend reliability.
+    _bank_now = float(_mkt_ctx.get("banknifty_spot") or 0.0)
+    _bank_prev = float(_mkt_ctx.get("banknifty_spot_prev") or 0.0)
+    _nifty_prev = float(_mkt_ctx.get("nifty_spot_prev") or 0.0)
+    _bank_divergence = 0.0
+    if _bank_now > 0 and _bank_prev > 0 and _nifty_prev > 0:
+        _bank_chg = (_bank_now - _bank_prev) / _bank_prev * 100
+        _nifty_chg = (spot - _nifty_prev) / _nifty_prev * 100
+        if _bank_chg * _nifty_chg < 0 and abs(_bank_chg - _nifty_chg) > 0.5:
+            _bank_divergence = round(min(abs(_bank_chg - _nifty_chg), 2.0) * 0.2, 3)
+            if _bank_chg < 0 <= _nifty_chg:
+                bullish_entry_score -= _bank_divergence
+            elif _bank_chg > 0 >= _nifty_chg:
+                bearish_entry_score -= _bank_divergence
+    metadata["banknifty_divergence"] = _bank_divergence
+
+    # Phase 6C: Monthly expiry gate — last Thursday of month carries extreme gamma risk.
+    _today = snapshot.timestamp.date()
+    _month_weeks = calendar.monthcalendar(_today.year, _today.month)
+    _last_thu = max(w[calendar.THURSDAY] for w in _month_weeks if w[calendar.THURSDAY])
+    _days_to_monthly = _last_thu - _today.day
+    if _days_to_monthly == 0:
+        bullish_entry_score -= 0.8
+        bearish_entry_score -= 0.8
+    elif _days_to_monthly == 1:
+        bullish_entry_score -= 0.4
+        bearish_entry_score -= 0.4
+    metadata["days_to_monthly_expiry"] = _days_to_monthly
+
     metadata["bullish_entry_score"] = bullish_entry_score
     metadata["bearish_entry_score"] = bearish_entry_score
     metadata["vwap_reclaim"] = bool(_vwap_reclaim["vwap_reclaim"])

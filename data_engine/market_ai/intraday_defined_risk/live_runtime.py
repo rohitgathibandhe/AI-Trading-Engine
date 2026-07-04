@@ -538,6 +538,43 @@ class DhanLiveMarketDataProvider:
         )
         snapshot.validate()
         self._previous_chain = chain
+
+        # Phase 6: Fetch auxiliary market context (India VIX + BankNifty) best-effort.
+        # Written to state/market_context.json for regime.py to read each cycle.
+        # security_ids: India VIX=1, BankNifty=25 (both IDX_I segment on Dhan).
+        _VIX_ID = 1
+        _BANK_ID = 25
+        try:
+            _ltp_map = self._dw.get_ltp_bulk([
+                (self.underlying_seg, _VIX_ID),
+                (self.underlying_seg, _BANK_ID),
+            ])
+            _vix_ltp = _ltp_map.get((self.underlying_seg, _VIX_ID))
+            _bank_ltp = _ltp_map.get((self.underlying_seg, _BANK_ID))
+            _ctx_path = STATE_ROOT / "market_context.json"
+            _ctx: dict = {}
+            if _ctx_path.exists():
+                try:
+                    _ctx = json.loads(_ctx_path.read_text())
+                except Exception:
+                    _ctx = {}
+            # Shift current → prev before overwriting so regime.py can compute % change
+            if "nifty_spot" in _ctx:
+                _ctx["nifty_spot_prev"] = _ctx["nifty_spot"]
+            if "banknifty_spot" in _ctx:
+                _ctx["banknifty_spot_prev"] = _ctx["banknifty_spot"]
+            _ctx["nifty_spot"] = spot
+            if _vix_ltp:
+                _ctx["india_vix"] = float(_vix_ltp)
+            if _bank_ltp:
+                _ctx["banknifty_spot"] = float(_bank_ltp)
+                if "banknifty_spot_prev" not in _ctx:
+                    _ctx["banknifty_spot_prev"] = float(_bank_ltp)
+            _ctx["updated_at"] = now.isoformat()
+            _ctx_path.write_text(json.dumps(_ctx))
+        except Exception:
+            pass
+
         return snapshot
 
     def current_structure_quotes(self, position: OpenPosition) -> MarketSnapshot:

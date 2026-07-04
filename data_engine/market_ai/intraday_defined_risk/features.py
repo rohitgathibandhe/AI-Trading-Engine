@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, time
+from pathlib import Path
 from statistics import fmean
 from typing import Iterable
 
 from .data_models import OhlcvBar, OhlcvSeries, ORLevels, OptionType, OptionsContractQuote
+
+_MARKET_CONTEXT_PATH = Path(__file__).resolve().parents[1] / "state" / "market_context.json"
 
 
 MARKET_OPEN = time(9, 15)
@@ -1843,3 +1847,16 @@ def compute_momentum_persistence(bars: list[OhlcvBar], n: int = 6) -> dict[str, 
         "bullish_persistence": round(bull_vol / total_vol, 3),
         "bearish_persistence": round(bear_vol / total_vol, 3),
     }
+
+
+def read_market_context() -> dict:
+    """Read auxiliary market context (VIX, BankNifty) written by DhanLiveMarketDataProvider.
+
+    Returns an empty dict when the file is absent or unreadable — callers must handle missing keys.
+    """
+    try:
+        if _MARKET_CONTEXT_PATH.exists():
+            return json.loads(_MARKET_CONTEXT_PATH.read_text())
+    except Exception:
+        pass
+    return {}
