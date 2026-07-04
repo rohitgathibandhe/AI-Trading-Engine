@@ -246,6 +246,15 @@ class IntradayDecisionAgent:
         use_delta = any(self._delta_for(row, side) is not None for row in liquid_rows)
         distance_points = max(spot * rv30_pct / 100.0, atr_5m)
 
+        # Widen minimum distance using the ATM straddle price as the market's own
+        # implied expected-move forecast. Short strikes inside 55% of the straddle
+        # are inside the market's 1-sigma range — a high-risk sell zone on trend days.
+        atm_candidates = [row for row in strikes if row.ce_ltp > 0 and row.pe_ltp > 0]
+        if atm_candidates:
+            atm_row = min(atm_candidates, key=lambda r: abs(r.k - spot))
+            expected_move_pts = atm_row.ce_ltp + atm_row.pe_ltp
+            distance_points = max(distance_points, expected_move_pts * 0.55)
+
         for short_row in liquid_rows:
             short_strike = short_row.k
             if side == OptionType.CALL and short_strike <= spot:

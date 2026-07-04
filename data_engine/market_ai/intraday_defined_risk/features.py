@@ -1663,3 +1663,125 @@ def compute_daily_trend_features(daily_series: OhlcvSeries | None) -> dict[str, 
         "price_vs_ema50_pct": round(price_vs_ema50_pct, 3) if price_vs_ema50_pct is not None else None,
         "higher_tf_available": True,
     }
+
+
+def compute_vwap_bands(bars: list[OhlcvBar]) -> dict[str, float | None]:
+    """VWAP with 1-sigma and 2-sigma volume-weighted standard deviation bands.
+
+    High-volume bars receive more influence on band width — mirroring how
+    institutional activity defines the expected intraday price envelope.
+    band_compression_pct < 1.0% signals a coiling market; > 2.5% = expansion.
+    """
+    denom = sum(bar.volume for bar in bars)
+    if denom <= 0:
+        return {
+            "vwap": None, "upper_1": None, "lower_1": None,
+            "upper_2": None, "lower_2": None,
+            "band_width": None, "band_compression_pct": None,
+        }
+    typicals = [(bar.high + bar.low + bar.close) / 3.0 for bar in bars]
+    vwap = sum(t * bar.volume for t, bar in zip(typicals, bars)) / denom
+    variance = sum(bar.volume * (t - vwap) ** 2 for t, bar in zip(typicals, bars)) / denom
+    std = variance ** 0.5
+    band_width = 4.0 * std  # full envelope: upper_2 to lower_2
+    band_compression_pct = round(band_width / vwap * 100, 3) if vwap > 0 else None
+    return {
+        "vwap": round(vwap, 2),
+        "upper_1": round(vwap + std, 2),
+        "lower_1": round(vwap - std, 2),
+        "upper_2": round(vwap + 2 * std, 2),
+        "lower_2": round(vwap - 2 * std, 2),
+        "band_width": round(band_width, 2),
+        "band_compression_pct": band_compression_pct,
+    }
+
+
+def compute_volume_spike(bars: list[OhlcvBar], window: int = 20) -> dict[str, float | bool]:
+    """Volume anomaly: compares the latest bar to the rolling mean of prior N bars.
+
+    ratio >= 1.5 → volume spike (institutional or news-driven surge, often precedes a move).
+    ratio < 0.5 → volume drought (watch for range-bound chop or liquidity thin-out).
+    """
+    if not bars:
+        return {"volume_ratio": 1.0, "is_spike": False}
+    lookback = bars[-min(window + 1, len(bars)):-1]
+    if not lookback:
+        return {"volume_ratio": 1.0, "is_spike": False}
+    avg_vol = sum(bar.volume for bar in lookback) / len(lookback)
+    if avg_vol <= 0:
+        return {"volume_ratio": 1.0, "is_spike": False}
+    ratio = bars[-1].volume / avg_vol
+    return {"volume_ratio": round(ratio, 2), "is_spike": ratio >= 1.5}
+
+
+def compute_max_pain(quotes: list[OptionsContractQuote]) -> dict[str, float | None]:
+    """Strike where total option-buyer notional pain is minimised.
+
+    For each candidate settlement S:
+      call_pain = Σ max(0, S - strike) × call_OI
+      put_pain  = Σ max(0, strike - S) × put_OI
+    max_pain_strike = argmin(call_pain + put_pain).
+
+    Market makers are net-short options so they tend to pin expiry near this level.
+    Use as a gravitational reference for where the chain may settle, not a hard gate.
+    """
+    if not quotes:
+        return {"max_pain_strike": None}
+    oi_by_strike: dict[int, dict[str, int]] = {}
+    for q in quotes:
+        k = int(q.strike)
+        if k not in oi_by_strike:
+            oi_by_strike[k] = {"ce": 0, "pe": 0}
+        if q.option_type == OptionType.CALL and q.oi:
+            oi_by_strike[k]["ce"] += int(q.oi)
+        elif q.option_type == OptionType.PUT and q.oi:
+            oi_by_strike[k]["pe"] += int(q.oi)
+    strikes = sorted(oi_by_strike)
+    if not strikes:
+        return {"max_pain_strike": None}
+    min_pain = float("inf")
+    max_pain_strike = strikes[len(strikes) // 2]
+    for candidate in strikes:
+        call_pain = sum(max(0, candidate - k) * oi_by_strike[k]["ce"] for k in strikes)
+        put_pain = sum(max(0, k - candidate) * oi_by_strike[k]["pe"] for k in strikes)
+        total = call_pain + put_pain
+        if total < min_pain:
+            min_pain = total
+            max_pain_strike = candidate
+    return {"max_pain_strike": float(max_pain_strike)}
+
+
+def compute_atm_straddle(spot: float, quotes: list[OptionsContractQuote]) -> dict[str, float | None]:
+    """ATM straddle price = CE_ltp + PE_ltp at the nearest-to-spot strike.
+
+    For 0-1 DTE Nifty weekly options the straddle price directly equals the
+    market's consensus 1-sigma expected daily range — no scaling needed.
+    Short strikes inside this range are inside the market's own forecast,
+    dramatically increasing assignment risk on trending days.
+    """
+    by_strike: dict[int, dict[str, float]] = {}
+    for q in quotes:
+        k = int(q.strike)
+        if k not in by_strike:
+            by_strike[k] = {}
+        if q.option_type == OptionType.CALL and q.ltp > 0:
+            by_strike[k]["ce"] = q.ltp
+        elif q.option_type == OptionType.PUT and q.ltp > 0:
+            by_strike[k]["pe"] = q.ltp
+    atm_strike = None
+    atm_dist = float("inf")
+    for k, sides in by_strike.items():
+        if "ce" in sides and "pe" in sides:
+            d = abs(k - spot)
+            if d < atm_dist:
+                atm_dist = d
+                atm_strike = k
+    if atm_strike is None:
+        return {"atm_strike": None, "atm_straddle_price": None, "expected_move_pts": None}
+    sides = by_strike[atm_strike]
+    straddle = sides["ce"] + sides["pe"]
+    return {
+        "atm_strike": float(atm_strike),
+        "atm_straddle_price": round(straddle, 2),
+        "expected_move_pts": round(straddle, 2),
+    }

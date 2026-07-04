@@ -593,9 +593,95 @@ def _end_of_session_diagnosis(decisions: list[dict], state: dict) -> None:
         _log(f"EOD diagnosis sent: bull={best_bull:.2f} bear={best_bear:.2f} top_block={top_blocks[0][0] if top_blocks else 'none'}")
 
 
+# ─── IV history tracker ──────────────────────────────────────────────────────
+
+def _update_iv_history(decisions: list[dict], state: dict) -> None:
+    """After 15:30 IST, persist today's avg_chain_iv and compute rolling IV rank.
+
+    iv_history.csv stores up to 60 sessions (≈ 3 months) of avg_chain_iv.
+    Rolling 20-day IV rank: 0 = historically low IV, 100 = historically high IV.
+    High IV rank (>70) means premium selling edge is elevated.
+    Low IV rank (<30) means IV is compressed — widen wings or be more selective.
+    """
+    import csv as _csv
+    now = _now()
+    if now.strftime("%H%M") < "1530":
+        return
+    today_str = str(now.date())
+    if state.get("iv_history_written") == today_str:
+        return
+
+    # Extract last non-None avg_chain_iv from today's decisions
+    avg_iv: float | None = None
+    for d in reversed(decisions):
+        v = (d.get("metadata") or {}).get("avg_chain_iv")
+        if v is not None:
+            try:
+                avg_iv = float(v)
+                break
+            except (TypeError, ValueError):
+                pass
+    if avg_iv is None:
+        return  # no IV data today (API down all day)
+
+    # Load, update, and trim history
+    rows: list[dict] = []
+    if _IV_HISTORY.exists():
+        try:
+            with _IV_HISTORY.open() as f:
+                rows = list(_csv.DictReader(f))
+        except Exception:
+            rows = []
+    rows = [r for r in rows if r.get("date") != today_str]
+    rows.append({"date": today_str, "avg_chain_iv": f"{avg_iv:.4f}"})
+    rows = rows[-60:]
+    try:
+        with _IV_HISTORY.open("w", newline="") as f:
+            writer = _csv.DictWriter(f, fieldnames=["date", "avg_chain_iv"])
+            writer.writeheader()
+            writer.writerows(rows)
+    except Exception as exc:
+        _log(f"IV history write failed: {exc}")
+        return
+
+    # Compute 20-day rolling IV rank
+    recent_ivs: list[float] = []
+    for r in rows[-20:]:
+        try:
+            recent_ivs.append(float(r["avg_chain_iv"]))
+        except (ValueError, KeyError):
+            pass
+    iv_rank: float | None = None
+    if len(recent_ivs) >= 5:
+        low, high = min(recent_ivs), max(recent_ivs)
+        iv_rank = round((avg_iv - low) / (high - low) * 100, 1) if high > low else 50.0
+
+    state["iv_history_written"] = today_str
+    state["last_iv_rank"] = iv_rank
+    _log(f"IV history: avg_chain_iv={avg_iv:.2f} iv_rank={iv_rank} sessions={len(rows)}")
+
+    if iv_rank is not None:
+        rank_emoji = "🔥" if iv_rank > 70 else ("❄️" if iv_rank < 30 else "📊")
+        context = (
+            "Premium selling edge elevated — favour tighter spreads for higher credit."
+            if iv_rank > 70 else (
+                "IV compressed — widen wings or skip low-credit setups."
+                if iv_rank < 30 else
+                "IV in normal range — standard strike selection applies."
+            )
+        )
+        _send_telegram(
+            f"{rank_emoji} <b>V83 IV Rank — EOD Update ({today_str})</b>\n"
+            f"Avg chain IV: <b>{avg_iv:.1f}%</b> | "
+            f"20-day IV Rank: <b>{iv_rank:.0f}/100</b>\n"
+            f"<i>{context}</i>"
+        )
+
+
 # ─── EoD position guardian ───────────────────────────────────────────────────
 
-_PAPER_STATE = _STATE / "intraday_v83_paper_state.json"
+_PAPER_STATE  = _STATE / "intraday_v83_paper_state.json"
+_IV_HISTORY   = _STATE / "iv_history.csv"
 
 def _guardian_force_close(now: datetime, state: dict, fixes_applied: list[str]) -> None:
     """
@@ -842,6 +928,9 @@ def run_watchdog() -> None:
 
     # ── EOD diagnosis (no-trade day) ──────────────────────────────────────────
     _end_of_session_diagnosis(decisions, state)
+
+    # ── EOD IV history tracking ───────────────────────────────────────────────
+    _update_iv_history(decisions, state)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     if fixes_applied:

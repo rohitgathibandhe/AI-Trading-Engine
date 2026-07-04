@@ -18,9 +18,14 @@ from .features import (
     bullish_vwap_hold_higher_low_setup,
     closes,
     close_location_value,
+    compute_atm_straddle,
+    compute_daily_trend_features,
+    compute_max_pain,
     compute_pcr_trend,
     compute_opening_range,
     compute_vwap,
+    compute_vwap_bands,
+    compute_volume_spike,
     ema,
     ema_distance_pct,
     ema_value,
@@ -50,7 +55,6 @@ from .features import (
     session_bars,
     sideways_bullish_reclaim_setup,
     put_call_ratio_by_oi,
-    compute_daily_trend_features,
     early_structure_intent_bearish,
     early_structure_intent_bullish,
 )
@@ -870,6 +874,10 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     previous_pcr = put_call_ratio_by_oi(previous_quotes or [])
     pcr_trend = compute_pcr_trend(snapshot.option_chain.quotes, previous_quotes)
     daily_tf = compute_daily_trend_features(snapshot.nifty_daily)
+    vwap_bands = compute_vwap_bands(bars_5m)
+    vol_spike = compute_volume_spike(bars_5m)
+    max_pain_data = compute_max_pain(snapshot.option_chain.quotes)
+    atm_straddle = compute_atm_straddle(spot, snapshot.option_chain.quotes)
     support_ref = support_5m[0] if support_5m else (support_15m[0] if support_15m else None)
     resistance_ref = resistance_5m[0] if resistance_5m else (resistance_15m[0] if resistance_15m else None)
     session_open = bars_5m[0].open if bars_5m else None
@@ -983,6 +991,19 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "condor_shape_bias": None,
         "condor_short_delta_band_bias": None,
         "avg_chain_iv": None,
+        # ── Market intelligence signals ────────────────────────────────────────
+        "vwap_upper_1": vwap_bands["upper_1"],
+        "vwap_lower_1": vwap_bands["lower_1"],
+        "vwap_upper_2": vwap_bands["upper_2"],
+        "vwap_lower_2": vwap_bands["lower_2"],
+        "vwap_band_width": vwap_bands["band_width"],
+        "vwap_band_compression_pct": vwap_bands["band_compression_pct"],
+        "volume_ratio": vol_spike["volume_ratio"],
+        "volume_spike": vol_spike["is_spike"],
+        "max_pain_strike": max_pain_data["max_pain_strike"],
+        "atm_strike": atm_straddle["atm_strike"],
+        "atm_straddle_price": atm_straddle["atm_straddle_price"],
+        "expected_move_pts": atm_straddle["expected_move_pts"],
         "range_compression_score": 0.0,
         "min_short_call_strike": None,
         "max_short_put_strike": None,
