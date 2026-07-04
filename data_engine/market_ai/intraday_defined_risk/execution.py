@@ -259,6 +259,24 @@ def evaluate_exit(
         pnl_rupees = (position.entry_credit_points - liability) * position.lot_size * position.lots
         return ExitDecision(True, invalidation_reason, liability, pnl_rupees)
 
+    # IV expansion exit: a ≥20% jump in average chain IV after entry signals a regime shift —
+    # the market is repricing uncertainty, which works against short-premium positions because
+    # vega losses accelerate faster than theta accrues. Gate: wait 15 min to avoid early noise.
+    if elapsed_minutes >= 15 and current_snapshot is not None:
+        entry_avg_iv = position.metadata.get("avg_chain_iv")
+        if entry_avg_iv is not None:
+            current_ivs = [
+                float(q.iv)
+                for q in current_snapshot.option_chain.quotes
+                if q.iv is not None and q.ltp > 0
+            ]
+            if current_ivs:
+                current_avg_iv = sum(current_ivs) / len(current_ivs)
+                if current_avg_iv >= float(entry_avg_iv) * 1.20:
+                    liability = current_value_points if current_value_points is not None else position.stop_value_points
+                    pnl_rupees = (position.entry_credit_points - liability) * position.lot_size * position.lots
+                    return ExitDecision(True, "IV_EXPANSION_EXIT", liability, pnl_rupees)
+
     if current_value_points is None:
         return ExitDecision(False, "MISSING_QUOTES", 0.0, 0.0)
 

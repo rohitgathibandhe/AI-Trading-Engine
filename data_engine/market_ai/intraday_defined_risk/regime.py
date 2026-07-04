@@ -883,6 +883,14 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     session_open = bars_5m[0].open if bars_5m else None
     gap_pct = opening_gap_pct(snapshot.previous_session_close, session_open)
 
+    # Expected-move consumed: fraction of the ATM straddle price already covered by spot's move.
+    # When ≥70% of the market's own 1σ forecast is consumed, entering new premium sales is risky
+    # — the edge is largely gone and continuation risk is high.
+    _session_move_pts = abs(spot - session_open) if session_open is not None else 0.0
+    _expected_move_pts_val = float(atm_straddle.get("expected_move_pts") or 0)
+    _move_consumed_pct = _session_move_pts / _expected_move_pts_val if _expected_move_pts_val > 0 else 0.0
+    _expected_move_consumed = _move_consumed_pct >= 0.70
+
     # ── Pre-market regime bias ──────────────────────────────────────────────────
     # Computed before any bar-based analysis using signals that are available from
     # the moment the chain loads: gap size, IV level, PCR, and OI flow direction.
@@ -1004,6 +1012,9 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "atm_strike": atm_straddle["atm_strike"],
         "atm_straddle_price": atm_straddle["atm_straddle_price"],
         "expected_move_pts": atm_straddle["expected_move_pts"],
+        "session_move_pts": round(_session_move_pts, 2),
+        "expected_move_consumed_pct": round(_move_consumed_pct * 100, 1),
+        "expected_move_consumed": _expected_move_consumed,
         "range_compression_score": 0.0,
         "min_short_call_strike": None,
         "max_short_put_strike": None,
@@ -1258,6 +1269,15 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         bearish_trend_score -= 0.50
     elif oi_flow["smart_money_bias"] == "BEARISH":
         bullish_trend_score -= 0.50
+    # Max pain gravitational bias: market makers are net short options so they pin toward
+    # max pain near expiry. Spot above max pain = latent bearish pull; below = bullish pull.
+    _max_pain_strike = max_pain_data.get("max_pain_strike")
+    if _max_pain_strike is not None:
+        _pain_dist_pct = (spot - float(_max_pain_strike)) / max(spot, 1.0) * 100
+        if _pain_dist_pct > 0.3:     # spot meaningfully above max pain → bearish gravity
+            bearish_trend_score += 0.3
+        elif _pain_dist_pct < -0.3:  # spot meaningfully below max pain → bullish gravity
+            bullish_trend_score += 0.3
     metadata["bullish_trend_score"] = bullish_trend_score
     metadata["bearish_trend_score"] = bearish_trend_score
     metadata["trend_follow_ready_bullish"] = bullish_trend_score >= 3.5
@@ -1313,6 +1333,15 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             bullish_location_score += 0.35
         if spot < opening_range.low:
             bearish_location_score += 0.35
+    # VWAP band positioning: spot at or beyond the 1σ band signals overextension.
+    # Overextended to the upside → bearish location quality; to the downside → bullish.
+    # Also flows into confluence_score, so it influences the full entry decision chain.
+    _vwap_upper_1 = vwap_bands.get("upper_1")
+    _vwap_lower_1 = vwap_bands.get("lower_1")
+    if _vwap_upper_1 is not None and spot >= _vwap_upper_1:
+        bearish_location_score += 0.5  # overextended above 1σ band → fade zone
+    if _vwap_lower_1 is not None and spot <= _vwap_lower_1:
+        bullish_location_score += 0.5  # overextended below 1σ band → bounce zone
     metadata["bullish_location_score"] = round(bullish_location_score, 4)
     metadata["bearish_location_score"] = round(bearish_location_score, 4)
     bullish_confluence_score = (
@@ -1402,6 +1431,21 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         bearish_entry_score -= 0.50
     if resistance_ref is not None and (resistance_ref - spot) / max(spot, 1.0) <= 0.004:
         bearish_entry_score += 0.5
+    # Volume confirmation: a direction-aligned volume spike shows institutional conviction;
+    # thin volume on a candle pattern is a false signal and should be suppressed.
+    _vol_ratio = float(vol_spike.get("volume_ratio") or 1.0)
+    if _vol_ratio >= 1.2 and trend_15m == "TREND_UP":
+        bullish_entry_score += 0.4
+    if _vol_ratio >= 1.2 and trend_15m == "TREND_DOWN":
+        bearish_entry_score += 0.4
+    if _vol_ratio < 0.7:
+        bullish_entry_score -= 0.3   # thin volume = unreliable candle pattern
+        bearish_entry_score -= 0.3
+    # Expected-move consumed: if spot has already covered ≥70% of the ATM straddle price
+    # from the session open, premium has largely decayed and new entries face high risk.
+    if _expected_move_consumed and _expected_move_pts_val > 0:
+        bullish_entry_score -= 1.0
+        bearish_entry_score -= 1.0
     metadata["bullish_entry_score"] = bullish_entry_score
     metadata["bearish_entry_score"] = bearish_entry_score
     bullish_planner_alignment = (
