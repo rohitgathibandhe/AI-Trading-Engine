@@ -3562,6 +3562,39 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["plan_target_level"] = trade_plan["target_level"]
     metadata["plan_thesis"] = trade_plan["thesis"]
 
+    # ── Trade Synthesis Engine — market-first override ──────────────────────
+    # If the rule-based path produced NO_TRADE, score all market signals from
+    # first principles. Strong consensus (score >= 0.50) overrides NO_TRADE
+    # and injects the best strategy playbook directly into regime metadata.
+    # The synthesis playbook bypasses score-threshold gates in strategy.py.
+    if regime == RegimeLabel.NO_TRADE and str(metadata.get("session_phase") or "") == "PRIME":
+        from market_ai.intraday_defined_risk.synthesis import synthesize_trade  # noqa: PLC0415
+        _syn = synthesize_trade(metadata, spot)
+        if _syn.override_eligible and _syn.recommended_playbook:
+            _pb = _syn.recommended_playbook
+            if _pb == "SYNTHESIS_BULL_PUT":
+                regime = RegimeLabel.UP_TREND
+                metadata["bullish_entry_ready"] = True
+                metadata["bullish_setup"] = "SYNTHESIS_OVERRIDE"
+                metadata["day_archetype"] = "SYNTHESIS_BULL_PUT"
+            elif _pb == "SYNTHESIS_BEAR_CALL":
+                regime = RegimeLabel.DOWN_TREND
+                metadata["bearish_entry_ready"] = True
+                metadata["bearish_setup"] = "SYNTHESIS_OVERRIDE"
+                metadata["day_archetype"] = "SYNTHESIS_BEAR_CALL"
+            else:
+                regime = RegimeLabel.RANGE
+                metadata["range_entry_ready"] = True
+                metadata["day_archetype"] = "OI_WALL_BOUNDED_RANGE"
+            metadata["playbook"] = _pb
+            metadata["synthesis_override"] = True
+            metadata["synthesis_score"] = _syn.synthesis_score
+            metadata["synthesis_all_scores"] = str(_syn.all_scores)
+            for k, v in _syn.strike_guidance.items():
+                metadata.setdefault(k, v)
+            reasons.extend(_syn.rationale)
+            confidence += 0.10
+
     return RegimeState(
         regime=regime,
         trend_15m=trend_15m,

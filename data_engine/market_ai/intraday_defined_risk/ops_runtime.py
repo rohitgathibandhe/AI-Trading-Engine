@@ -49,6 +49,9 @@ V83_LIVE_PLAYBOOKS = {
     # Range / neutral playbooks
     "RANGE_BALANCED_CONDOR",
     "OI_WALL_CONDOR",
+    # Synthesis-override playbooks — market-first intelligence
+    "SYNTHESIS_BULL_PUT",
+    "SYNTHESIS_BEAR_CALL",
 }
 V83_LIVE_STRATEGIES = {
     StrategyType.BEAR_CALL_CREDIT_SPREAD.value,

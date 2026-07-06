@@ -105,6 +105,9 @@ TIER_A_PLAYBOOKS = {
     "HIGH_CONFLUENCE_BULLISH_CONTINUATION",
     "AFTERNOON_TREND_HOLD_BULLISH",
     "EARLY_STRUCTURE_BULLISH",
+    # Synthesis-override playbooks — market-first intelligence bypasses score gates
+    "SYNTHESIS_BULL_PUT",
+    "SYNTHESIS_BEAR_CALL",
 }
 
 TIER_B_PLAYBOOKS = {
@@ -381,11 +384,11 @@ def select_strategy(
     if (
         bool(metadata.get("enable_market_state_gating"))
         and market_state == "TRUE_RANGE"
-        and str(metadata.get("playbook") or "UNKNOWN") not in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR"}
+        and str(metadata.get("playbook") or "UNKNOWN") not in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR", "SYNTHESIS_BULL_PUT", "SYNTHESIS_BEAR_CALL"}
     ):
         reasons.append("Market state engine classifies the session as TRUE_RANGE; directional deployment is blocked outside strict condor criteria.")
         return StrategyType.NO_TRADE, reasons
-    if context_layer_active and tradability == REGIME_TRADABILITY_NOT_TRADABLE and str(metadata.get("playbook") or "UNKNOWN") not in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR"}:
+    if context_layer_active and tradability == REGIME_TRADABILITY_NOT_TRADABLE and str(metadata.get("playbook") or "UNKNOWN") not in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR", "SYNTHESIS_BULL_PUT", "SYNTHESIS_BEAR_CALL"}:
         reasons.append(tradability_reason)
         return StrategyType.NO_TRADE, reasons
 
@@ -407,6 +410,16 @@ def select_strategy(
         bearish_setup = metadata.get("bearish_setup")
         bearish_ready = bool(metadata.get("bearish_entry_ready"))
         playbook = str(metadata.get("playbook") or "UNKNOWN")
+        if playbook == "SYNTHESIS_BEAR_CALL" and bool(metadata.get("synthesis_override")):
+            if now_time < time(10, 0) or now_time > time(14, 0):
+                reasons.append("SYNTHESIS_BEAR_CALL outside allowed window (10:00–14:00 IST).")
+                return StrategyType.NO_TRADE, reasons
+            synth_score = float(metadata.get("synthesis_score") or 0)
+            reasons.append(
+                f"Synthesis override: bear_call consensus score {synth_score:.3f} >= 0.50 — "
+                "multi-signal agreement bypasses score-threshold gates."
+            )
+            return StrategyType.BEAR_CALL_CREDIT_SPREAD, reasons
         if not bearish_ready:
             reasons.append(
                 "Bearish downtrend detected, but price has not yet printed a valid bearish pullback rejection, failed reclaim, or shallow continuation setup."
@@ -544,6 +557,16 @@ def select_strategy(
     if regime_state.regime == RegimeLabel.UP_TREND:
         bullish_setup = regime_state.metadata.get("bullish_setup")
         playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
+        if playbook == "SYNTHESIS_BULL_PUT" and bool(metadata.get("synthesis_override")):
+            if now_time < time(10, 0) or now_time > time(14, 0):
+                reasons.append("SYNTHESIS_BULL_PUT outside allowed window (10:00–14:00 IST).")
+                return StrategyType.NO_TRADE, reasons
+            synth_score = float(metadata.get("synthesis_score") or 0)
+            reasons.append(
+                f"Synthesis override: bull_put consensus score {synth_score:.3f} >= 0.50 — "
+                "multi-signal agreement bypasses score-threshold gates."
+            )
+            return StrategyType.BULL_PUT_CREDIT_SPREAD, reasons
         if not regime_state.metadata.get("bullish_entry_ready"):
             reasons.append(
                 "Bullish uptrend detected, but price has not yet printed a valid pullback reclaim or shallow continuation setup."
