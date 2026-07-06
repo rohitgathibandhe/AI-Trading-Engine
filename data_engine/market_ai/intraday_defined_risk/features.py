@@ -1622,10 +1622,33 @@ def compute_daily_trend_features(daily_series: OhlcvSeries | None) -> dict[str, 
     ema50 = _ema(closes, 50)
     ema200 = _ema(closes, 200)
 
-    # Weekly levels: last 5 trading days
+    # Weekly levels: last 5 completed trading days
     recent = bars[-5:] if len(bars) >= 5 else bars
     weekly_high = max(b.high for b in recent)
     weekly_low = min(b.low for b in recent)
+
+    # Monthly swing structure: last 20 trading days (~1 month).
+    # Swing highs = bars whose high exceeds both neighbours (simple 3-bar pivot).
+    # Nearest swing high ABOVE last_close = structural resistance.
+    # Nearest swing low BELOW last_close = structural support.
+    monthly_bars = bars[-20:] if len(bars) >= 20 else bars
+    monthly_high = max(b.high for b in monthly_bars)
+    monthly_low = min(b.low for b in monthly_bars)
+
+    swing_highs: list[float] = []
+    swing_lows: list[float] = []
+    for i in range(1, len(monthly_bars) - 1):
+        if monthly_bars[i].high > monthly_bars[i - 1].high and monthly_bars[i].high > monthly_bars[i + 1].high:
+            swing_highs.append(monthly_bars[i].high)
+        if monthly_bars[i].low < monthly_bars[i - 1].low and monthly_bars[i].low < monthly_bars[i + 1].low:
+            swing_lows.append(monthly_bars[i].low)
+
+    # Nearest swing high strictly above last_close = resistance; nearest swing low below = support
+    daily_swing_resistance = min((h for h in swing_highs if h > last_close), default=None)
+    daily_swing_support = max((l for l in swing_lows if l < last_close), default=None)
+    # If no pivot found above, use the monthly_high as the ceiling
+    if daily_swing_resistance is None and monthly_high > last_close:
+        daily_swing_resistance = monthly_high
 
     # ATR (14-day)
     atr: float | None = None
@@ -1681,6 +1704,10 @@ def compute_daily_trend_features(daily_series: OhlcvSeries | None) -> dict[str, 
         "daily_ema200": round(ema200, 2) if ema200 else None,
         "weekly_high": round(weekly_high, 2),
         "weekly_low": round(weekly_low, 2),
+        "monthly_high": round(monthly_high, 2),
+        "monthly_low": round(monthly_low, 2),
+        "daily_swing_resistance": round(daily_swing_resistance, 2) if daily_swing_resistance is not None else None,
+        "daily_swing_support": round(daily_swing_support, 2) if daily_swing_support is not None else None,
         "daily_atr": round(atr, 2) if atr else None,
         "price_vs_ema20_pct": round(price_vs_ema20_pct, 3) if price_vs_ema20_pct is not None else None,
         "price_vs_ema50_pct": round(price_vs_ema50_pct, 3) if price_vs_ema50_pct is not None else None,

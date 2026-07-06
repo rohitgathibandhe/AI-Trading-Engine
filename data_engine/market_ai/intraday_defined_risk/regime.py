@@ -992,6 +992,10 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "daily_ema200": daily_tf["daily_ema200"],
         "weekly_high": daily_tf["weekly_high"],
         "weekly_low": daily_tf["weekly_low"],
+        "monthly_high": daily_tf.get("monthly_high"),
+        "monthly_low": daily_tf.get("monthly_low"),
+        "daily_swing_resistance": daily_tf.get("daily_swing_resistance"),
+        "daily_swing_support": daily_tf.get("daily_swing_support"),
         "daily_atr": daily_tf["daily_atr"],
         "price_vs_ema50_pct": daily_tf["price_vs_ema50_pct"],
         "higher_tf_available": daily_tf["higher_tf_available"],
@@ -3044,6 +3048,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         for level in [
             resistance_ref,
             option_context.get("nearest_call_wall"),
+            daily_tf.get("daily_swing_resistance"),  # nearest monthly pivot high above spot
+            daily_tf.get("weekly_high"),              # max of last 5 completed trading days
         ]
         if isinstance(level, (int, float))
     ]
@@ -3052,6 +3058,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         for level in [
             support_ref,
             option_context.get("nearest_put_wall"),
+            daily_tf.get("daily_swing_support"),  # nearest monthly pivot low below spot
+            daily_tf.get("weekly_low"),            # min of last 5 completed trading days
         ]
         if isinstance(level, (int, float))
     ]
@@ -3064,6 +3072,38 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["open_space_up"] = round(min(distance_to_resistance, float(option_context.get("distance_to_call_wall") or distance_to_resistance)), 2)
     metadata["open_space_down"] = round(min(distance_to_support, float(option_context.get("distance_to_put_wall") or distance_to_support)), 2)
     metadata["inside_balance_zone"] = bool(metadata["inside_opening_range"] and abs(float(metadata.get("price_vs_vwap") or 0.0)) <= 20.0)
+
+    # HTF cap: when price is close to a daily/weekly resistance wall and the session
+    # is not in a confirmed uptrend, the correct play is range (theta), not direction.
+    # A bullish spread needs 120+ pts of clear upside; less than that means we're
+    # trading INTO resistance — a losing edge. Pivot to RANGE/CONDOR instead.
+    htf_resistance_cap = bool(
+        regime in {RegimeLabel.UP_TREND, RegimeLabel.NO_TRADE}
+        and float(metadata["open_space_up"]) < 90.0
+        and float(metadata["open_space_down"]) > 40.0      # floor below for condor safety
+        and trend_15m != "TREND_UP"                        # not a confirmed daily trend day
+        and market_state in {"DIRECTIONAL_BALANCE", "TRANSITION", "TRUE_RANGE"}
+        and atm_straddle is not None and float(atm_straddle) >= 60.0  # enough premium
+        and session in {"PRIME", "MIDDAY"}
+        and snapshot.timestamp.time() >= time(10, 0)
+        and not bool(metadata.get("pin_risk_active"))
+    )
+    metadata["htf_resistance_cap"] = htf_resistance_cap
+    if htf_resistance_cap:
+        regime = RegimeLabel.RANGE
+        metadata["range_entry_ready"] = True
+        metadata["playbook"] = "RANGE_BALANCED_CONDOR"
+        metadata["day_archetype"] = "HTF_CAP_RANGE"
+        # Anchor the condor strikes to the detected resistance/support walls
+        htf_short_call = round((nearest_resistance_level - 25.0) / 50.0) * 50.0 if nearest_resistance_level else spot + 75.0
+        htf_short_put = round((nearest_support_level + 25.0) / 50.0) * 50.0 if nearest_support_level else spot - 75.0
+        metadata.setdefault("condor_short_call_anchor", htf_short_call)
+        metadata.setdefault("condor_short_put_anchor", htf_short_put)
+        reasons.append(
+            f"HTF resistance cap: open_space_up={float(metadata['open_space_up']):.0f}pts "
+            f"(daily/weekly resistance at {nearest_resistance_level:.0f}), "
+            f"trend_15m=NEUTRAL — deploying range CONDOR instead of directional spread."
+        )
 
     failed_breakout = bool(
         opening_range_break_state == "FAILED_UP"
