@@ -48,6 +48,7 @@ V83_LIVE_PLAYBOOKS = {
     "EARLY_STRUCTURE_BULLISH",
     # Range / neutral playbooks
     "RANGE_BALANCED_CONDOR",
+    "OI_WALL_CONDOR",
 }
 V83_LIVE_STRATEGIES = {
     StrategyType.BEAR_CALL_CREDIT_SPREAD.value,

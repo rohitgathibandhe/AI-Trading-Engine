@@ -2495,6 +2495,45 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             reasons.append("Range playbook confirmed: price is balanced around VWAP, opening range is intact, and option-chain pressure is neutral.")
         else:
             metadata["playbook"] = "RANGE_NO_TRADE"
+    elif (
+        # OI-wall condor: spot sandwiched between major institutional OI walls, no confirmed
+        # directional trend. Uses accumulated OI positioning rather than price-action RANGE_CONFIRMED.
+        # Fires only when execution_5m is ambiguous (UNCONFIRMED) — not during confirmed trends.
+        float(metadata.get("multi_session_call_wall") or 0) > 0
+        and float(metadata.get("multi_session_put_wall") or 0) > 0
+        and (
+            float(metadata.get("multi_session_call_wall") or 0)
+            - float(metadata.get("multi_session_put_wall") or 0)
+        ) >= 75.0
+        and (float(metadata.get("multi_session_call_wall") or 0) - spot) >= 40.0
+        and (spot - float(metadata.get("multi_session_put_wall") or 0)) >= 40.0
+        and abs(float(metadata.get("order_flow_imbalance") or 0.0)) < 0.45
+        and float(metadata.get("range_balance_score") or 0.0) >= 2.0
+        and float(metadata.get("atm_straddle_price") or 0.0) >= 80.0
+        and not bool(metadata.get("pin_risk_active"))
+        and metadata.get("session_phase") == "PRIME"
+        and snapshot.timestamp.time() >= RANGE_GATE_TIME
+        and not _is_expiry_day
+    ):
+        _oi_call_wall = float(metadata.get("multi_session_call_wall"))
+        _oi_put_wall = float(metadata.get("multi_session_put_wall"))
+        _wall_spread = _oi_call_wall - _oi_put_wall
+        regime = RegimeLabel.RANGE
+        confidence += 0.12
+        metadata["day_archetype"] = "OI_WALL_BOUNDED_RANGE"
+        metadata["playbook"] = "OI_WALL_CONDOR"
+        metadata["range_entry_ready"] = True
+        metadata["condor_short_call_anchor"] = _oi_call_wall + 25.0
+        metadata["condor_short_put_anchor"] = _oi_put_wall - 25.0
+        metadata["condor_wall_spread"] = _wall_spread
+        metadata["preferred_width_points"] = 75.0
+        metadata["allowed_width_points"] = (75.0, 100.0)
+        metadata["minimum_net_edge_rupees"] = 700.0
+        reasons.append(
+            f"OI wall sandwich: call wall {_oi_call_wall:.0f}, put wall {_oi_put_wall:.0f}; "
+            f"spot ({spot:.0f}) is {(spot - _oi_put_wall):.0f}/{(_oi_call_wall - spot):.0f} pts "
+            "from put/call walls. Institutional OI bounds define a tradeable range — OI-anchored condor."
+        )
     else:
         reasons.append("Multi-timeframe regime remains unclear; defaulting to NO TRADE.")
         if any("event risk" in reason.lower() for reason in reasons):
@@ -2819,7 +2858,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     if snapshot.timestamp.time() >= time(14, 0):
         confidence = max(0.0, confidence - 0.05)
 
-    if metadata.get("playbook") == "RANGE_BALANCED_CONDOR":
+    if metadata.get("playbook") in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR"}:
         if avg_chain_iv is not None and avg_chain_iv >= 22.0 and range_compression_score >= 0.75:
             metadata["condor_profile"] = "COMPRESSED_HIGH_IV"
             metadata["condor_short_delta_band_bias"] = "10_16"

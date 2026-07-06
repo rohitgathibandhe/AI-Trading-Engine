@@ -92,6 +92,7 @@ TIER_A_PLAYBOOKS = {
     "GAP_DOWN_BEARISH_CONTINUATION",
     "GAP_UP_BEARISH_FAILURE",
     "RANGE_BALANCED_CONDOR",
+    "OI_WALL_CONDOR",
     "EARLY_BALANCE_BEARISH_FAILED_RECLAIM",
     "HIGH_CONFLUENCE_BEARISH_CONTINUATION",
     "BEARISH_FAILED_RECLAIM",
@@ -380,11 +381,11 @@ def select_strategy(
     if (
         bool(metadata.get("enable_market_state_gating"))
         and market_state == "TRUE_RANGE"
-        and str(metadata.get("playbook") or "UNKNOWN") != "RANGE_BALANCED_CONDOR"
+        and str(metadata.get("playbook") or "UNKNOWN") not in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR"}
     ):
         reasons.append("Market state engine classifies the session as TRUE_RANGE; directional deployment is blocked outside strict condor criteria.")
         return StrategyType.NO_TRADE, reasons
-    if context_layer_active and tradability == REGIME_TRADABILITY_NOT_TRADABLE and str(metadata.get("playbook") or "UNKNOWN") != "RANGE_BALANCED_CONDOR":
+    if context_layer_active and tradability == REGIME_TRADABILITY_NOT_TRADABLE and str(metadata.get("playbook") or "UNKNOWN") not in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR"}:
         reasons.append(tradability_reason)
         return StrategyType.NO_TRADE, reasons
 
@@ -698,7 +699,7 @@ def select_strategy(
                 "Range/condor deployment is suppressed — wait for the directional play to resolve first."
             )
             return StrategyType.NO_TRADE, reasons
-        if playbook != "RANGE_BALANCED_CONDOR" or not range_ready:
+        if playbook not in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR"} or not range_ready:
             reasons.append("Range regime detected, but the session is not balanced enough for the dedicated condor playbook.")
             return StrategyType.NO_TRADE, reasons
         required_range_confidence = RANGE_CONDOR_MIN_CONFIDENCE + (0.05 if now_time >= time(14, 0) else 0.0)
