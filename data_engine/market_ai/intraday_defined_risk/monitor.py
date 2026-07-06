@@ -615,6 +615,16 @@ def _paper_context_override_candidate(
             "paper_override_source_failure_type": failure_type,
             "paper_override_source_market_state": market_state,
             "structure_report": structure_report,
+            "ml_bearish_entry_score": regime_metadata.get("bearish_entry_score"),
+            "ml_bullish_entry_score": regime_metadata.get("bullish_entry_score"),
+            "ml_india_vix": regime_metadata.get("india_vix"),
+            "ml_session_phase": regime_metadata.get("session_phase"),
+            "ml_vwap_reclaim": regime_metadata.get("vwap_reclaim"),
+            "ml_banknifty_divergence": regime_metadata.get("banknifty_divergence"),
+            "ml_days_to_monthly_expiry": regime_metadata.get("days_to_monthly_expiry"),
+            "ml_bullish_momentum": regime_metadata.get("bullish_momentum_persistence"),
+            "ml_bearish_momentum": regime_metadata.get("bearish_momentum_persistence"),
+            "ml_rv30_pct": regime_state.rv30_pct,
         },
     ), info
 
@@ -742,6 +752,16 @@ def _build_bullish_paper_override(
             "v83_rejection_reason": v83_reason,
             "paper_override_source_market_state": market_state,
             "structure_report": structure_report,
+            "ml_bearish_entry_score": regime_metadata.get("bearish_entry_score"),
+            "ml_bullish_entry_score": regime_metadata.get("bullish_entry_score"),
+            "ml_india_vix": regime_metadata.get("india_vix"),
+            "ml_session_phase": regime_metadata.get("session_phase"),
+            "ml_vwap_reclaim": regime_metadata.get("vwap_reclaim"),
+            "ml_banknifty_divergence": regime_metadata.get("banknifty_divergence"),
+            "ml_days_to_monthly_expiry": regime_metadata.get("days_to_monthly_expiry"),
+            "ml_bullish_momentum": regime_metadata.get("bullish_momentum_persistence"),
+            "ml_bearish_momentum": regime_metadata.get("bearish_momentum_persistence"),
+            "ml_rv30_pct": regime_state.rv30_pct,
         },
     ), info
 
@@ -1108,6 +1128,17 @@ class IntradayDefinedRiskAgent:
                 "regime_tradability": regime_tradability,
                 "experimental_policy_name": self.experimental_policy.get("name"),
                 "trade_funnel": trade_funnel,
+                # Phase 8: ML feature snapshot stored at entry for win-probability training
+                "ml_bearish_entry_score": regime_state.metadata.get("bearish_entry_score"),
+                "ml_bullish_entry_score": regime_state.metadata.get("bullish_entry_score"),
+                "ml_india_vix": regime_state.metadata.get("india_vix"),
+                "ml_session_phase": regime_state.metadata.get("session_phase"),
+                "ml_vwap_reclaim": regime_state.metadata.get("vwap_reclaim"),
+                "ml_banknifty_divergence": regime_state.metadata.get("banknifty_divergence"),
+                "ml_days_to_monthly_expiry": regime_state.metadata.get("days_to_monthly_expiry"),
+                "ml_bullish_momentum": regime_state.metadata.get("bullish_momentum_persistence"),
+                "ml_bearish_momentum": regime_state.metadata.get("bearish_momentum_persistence"),
+                "ml_rv30_pct": regime_state.rv30_pct,
             },
         )
         self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())

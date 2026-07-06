@@ -922,9 +922,112 @@ def _update_time_of_day_performance(state: dict) -> None:
 
 _PAPER_STATE  = _STATE / "intraday_v83_paper_state.json"
 _IV_HISTORY   = _STATE / "iv_history.csv"
-_PAPER_TRADES = _STATE / "intraday_v83_paper_live_trades.jsonl"
-_SETUP_PERF   = _STATE / "setup_performance.json"
-_TIME_PERF    = _STATE / "time_of_day_performance.json"
+_PAPER_TRADES   = _STATE / "intraday_v83_paper_live_trades.jsonl"
+_SETUP_PERF     = _STATE / "setup_performance.json"
+_TIME_PERF      = _STATE / "time_of_day_performance.json"
+_WIN_PROB_MODEL = _STATE / "win_prob_model.json"
+
+# Features used for ML training — must match _ML_FEATURE_NAMES in features.py
+_ML_FEAT_NAMES = [
+    "ml_bearish_entry_score", "ml_bullish_entry_score", "ml_india_vix",
+    "ml_vwap_reclaim", "ml_banknifty_divergence", "ml_days_to_monthly_expiry",
+    "ml_bullish_momentum", "ml_bearish_momentum", "ml_rv30_pct",
+]
+
+
+def _train_win_probability_model(state: dict) -> None:
+    """EOD: train a logistic regression on completed paper trades with ML features.
+
+    Pairs ENTRY + EXIT records by entry_timestamp; requires at least 15 labeled
+    samples.  Saves coefficient sets for BEARISH and BULLISH directions separately
+    to state/win_prob_model.json.  Silently skips if sklearn unavailable or data
+    is insufficient.
+    """
+    if not _PAPER_TRADES.exists():
+        return
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.preprocessing import StandardScaler
+        import numpy as np
+    except ImportError:
+        return
+
+    # Load all records
+    entries, exits_by_entry = {}, {}
+    try:
+        with _PAPER_TRADES.open() as f:
+            for line in f:
+                row = json.loads(line.strip())
+                if row.get("event") == "PAPER_ENTRY" and row.get("entry_timestamp"):
+                    entries[row["entry_timestamp"]] = row
+                elif row.get("event") == "PAPER_EXIT" and row.get("entry_timestamp"):
+                    exits_by_entry[row["entry_timestamp"]] = row
+    except Exception:
+        return
+
+    # Build labelled samples: require all ML features present + known PnL
+    samples_bear, samples_bull = [], []
+    for ts, entry in entries.items():
+        exit_rec = exits_by_entry.get(ts)
+        if exit_rec is None or exit_rec.get("realized_paper_pnl") is None:
+            continue
+        # Check if all ML features are recorded in the entry
+        if not any(f in entry for f in _ML_FEAT_NAMES):
+            continue
+        feat_vec = []
+        for f in _ML_FEAT_NAMES:
+            raw = entry.get(f)
+            if raw is None:
+                feat_vec.append(0.0)
+            else:
+                feat_vec.append(1.0 if raw is True else (0.0 if raw is False else float(raw)))
+        label = 1 if float(exit_rec["realized_paper_pnl"]) > 0 else 0
+        direction = str(entry.get("setup_direction") or entry.get("ml_setup_direction") or "").upper()
+        if direction == "BULLISH":
+            samples_bull.append((feat_vec, label))
+        else:
+            samples_bear.append((feat_vec, label))
+
+    def _fit_direction(samples):
+        if len(samples) < 15:
+            return None
+        X = np.array([s[0] for s in samples])
+        y = np.array([s[1] for s in samples])
+        if len(set(y)) < 2:
+            return None
+        scaler = StandardScaler()
+        X_s = scaler.fit_transform(X)
+        clf = LogisticRegression(max_iter=500, C=1.0)
+        clf.fit(X_s, y)
+        # Store weights in original (unscaled) space: w_raw = w_scaled / std, b adjusted
+        std = scaler.scale_
+        mean = scaler.mean_
+        weights = {f: round(float(clf.coef_[0][i] / std[i]), 6) for i, f in enumerate(_ML_FEAT_NAMES)}
+        intercept = float(clf.intercept_[0]) - sum(
+            clf.coef_[0][i] / std[i] * mean[i] for i in range(len(_ML_FEAT_NAMES))
+        )
+        return {"weights": weights, "intercept": round(intercept, 6)}
+
+    result_bear = _fit_direction(samples_bear)
+    result_bull = _fit_direction(samples_bull)
+    total_samples = len(samples_bear) + len(samples_bull)
+
+    if result_bear is None and result_bull is None:
+        return
+
+    model = {
+        "samples": total_samples,
+        "bearish_samples": len(samples_bear),
+        "bullish_samples": len(samples_bull),
+        "bearish": result_bear,
+        "bullish": result_bull,
+    }
+    try:
+        _WIN_PROB_MODEL.write_text(json.dumps(model, indent=2))
+        _log(f"win_prob_model trained: {total_samples} samples (bear={len(samples_bear)}, bull={len(samples_bull)})")
+    except Exception as exc:
+        _log(f"win_prob_model write failed: {exc}")
+
 
 def _guardian_force_close(now: datetime, state: dict, fixes_applied: list[str]) -> None:
     """
@@ -1184,6 +1287,7 @@ def run_watchdog() -> None:
     adaptive_fixes = _apply_adaptive_gates(state)
     fixes_applied.extend(adaptive_fixes)
     _update_time_of_day_performance(state)
+    _train_win_probability_model(state)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     if fixes_applied:

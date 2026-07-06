@@ -1860,3 +1860,42 @@ def read_market_context() -> dict:
     except Exception:
         pass
     return {}
+
+
+_WIN_PROB_MODEL_PATH = Path(__file__).resolve().parents[1] / "state" / "win_prob_model.json"
+
+# Feature names expected by the ML model — must match what watchdog writes
+_ML_FEATURE_NAMES = [
+    "ml_bearish_entry_score", "ml_bullish_entry_score", "ml_india_vix",
+    "ml_vwap_reclaim", "ml_banknifty_divergence", "ml_days_to_monthly_expiry",
+    "ml_bullish_momentum", "ml_bearish_momentum", "ml_rv30_pct",
+]
+
+
+def compute_win_probability(features: dict, direction: str = "BEARISH") -> float:
+    """Apply trained logistic regression to score a setup's win probability.
+
+    Returns 0.5 (neutral — no opinion) when the model is absent or undertrained.
+    direction: 'BEARISH' or 'BULLISH' — selects the appropriate coefficient set.
+    """
+    try:
+        if not _WIN_PROB_MODEL_PATH.exists():
+            return 0.5
+        model = json.loads(_WIN_PROB_MODEL_PATH.read_text())
+        key = "bearish" if direction != "BULLISH" else "bullish"
+        coeffs = model.get(key)
+        if not coeffs or int(model.get("samples", 0)) < 15:
+            return 0.5
+        intercept = float(coeffs.get("intercept", 0.0))
+        weights = coeffs.get("weights", {})
+        dot = intercept
+        for feat in _ML_FEATURE_NAMES:
+            raw = features.get(feat)
+            if raw is None:
+                continue
+            val = 1.0 if raw is True else (0.0 if raw is False else float(raw))
+            dot += val * float(weights.get(feat, 0.0))
+        prob = 1.0 / (1.0 + (2.71828 ** (-dot)))
+        return round(prob, 3)
+    except Exception:
+        return 0.5

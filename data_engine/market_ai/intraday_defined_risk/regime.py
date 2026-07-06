@@ -60,6 +60,7 @@ from .features import (
     early_structure_intent_bullish,
     compute_vwap_reclaim,
     compute_momentum_persistence,
+    compute_win_probability,
     read_market_context,
 )
 
@@ -1029,6 +1030,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "india_vix": 0.0,
         "banknifty_divergence": 0.0,
         "days_to_monthly_expiry": 99,
+        "win_probability_bearish": 0.5,
+        "win_probability_bullish": 0.5,
         "range_compression_score": 0.0,
         "min_short_call_strike": None,
         "max_short_put_strike": None,
@@ -1549,6 +1552,35 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         bullish_entry_score -= 0.4
         bearish_entry_score -= 0.4
     metadata["days_to_monthly_expiry"] = _days_to_monthly
+
+    # Phase 8: ML win probability gate.
+    # Scores the current feature vector against a logistic regression trained EOD by the watchdog.
+    # Model absent or under 15 samples → returns 0.5 (neutral, no adjustment).
+    # Low P(win) < 0.42 → raise bar by 0.5 (below-chance setup, skip it).
+    # High P(win) > 0.68 → bonus 0.2 (ML confirms strong edge).
+    _ml_features = {
+        "ml_bearish_entry_score": bearish_entry_score,
+        "ml_bullish_entry_score": bullish_entry_score,
+        "ml_india_vix": _india_vix,
+        "ml_vwap_reclaim": bool(_vwap_reclaim["vwap_reclaim"]),
+        "ml_banknifty_divergence": _bank_divergence,
+        "ml_days_to_monthly_expiry": _days_to_monthly,
+        "ml_bullish_momentum": _bull_persist,
+        "ml_bearish_momentum": _bear_persist,
+        "ml_rv30_pct": rv30_pct,
+    }
+    _wp_bear = compute_win_probability(_ml_features, direction="BEARISH")
+    _wp_bull = compute_win_probability(_ml_features, direction="BULLISH")
+    if _wp_bear < 0.42:
+        bearish_entry_score -= 0.5
+    elif _wp_bear > 0.68:
+        bearish_entry_score += 0.2
+    if _wp_bull < 0.42:
+        bullish_entry_score -= 0.5
+    elif _wp_bull > 0.68:
+        bullish_entry_score += 0.2
+    metadata["win_probability_bearish"] = _wp_bear
+    metadata["win_probability_bullish"] = _wp_bull
 
     metadata["bullish_entry_score"] = bullish_entry_score
     metadata["bearish_entry_score"] = bearish_entry_score
