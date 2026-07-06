@@ -559,9 +559,10 @@ def select_strategy(
                 f"Bullish context is too conflicted; failure score is {bullish_failure_score:.2f} with failure type {failure_type}."
             )
             return StrategyType.NO_TRADE, reasons
-        if context_layer_active and open_space_up < 120.0 and playbook != "EARLY_STRUCTURE_BULLISH":
+        _open_space_min = 60.0 if playbook == "SCORE_DRIVEN_BULL" else 120.0
+        if context_layer_active and open_space_up < _open_space_min and playbook != "EARLY_STRUCTURE_BULLISH":
             reasons.append(
-                f"Bullish open space is too small at {open_space_up:.2f} points."
+                f"Bullish open space is too small at {open_space_up:.2f} points (min {_open_space_min:.0f} for {playbook})."
             )
             return StrategyType.NO_TRADE, reasons
         if context_layer_active and overhead_call_pressure_score >= 1.5:

@@ -3069,8 +3069,17 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     distance_to_support = max((spot - nearest_support_level), 0.0) if nearest_support_level is not None else 999.0
     metadata["distance_to_resistance"] = round(distance_to_resistance, 2)
     metadata["distance_to_support"] = round(distance_to_support, 2)
-    metadata["open_space_up"] = round(min(distance_to_resistance, float(option_context.get("distance_to_call_wall") or distance_to_resistance)), 2)
-    metadata["open_space_down"] = round(min(distance_to_support, float(option_context.get("distance_to_put_wall") or distance_to_support)), 2)
+    # open_space uses structural levels only (≥30 pts away) so intraday micro-highs
+    # (just 5-15 pts above spot in an uptrend) don't mask the real HTF resistance wall.
+    _MICRO_RESISTANCE_THRESHOLD = 30.0
+    structural_resistance = [l for l in resistance_candidates if float(l) - spot >= _MICRO_RESISTANCE_THRESHOLD]
+    structural_support = [l for l in support_candidates if spot - float(l) >= _MICRO_RESISTANCE_THRESHOLD]
+    structural_nearest_res = min((float(l) for l in structural_resistance if float(l) > spot), default=nearest_resistance_level)
+    structural_nearest_sup = max((float(l) for l in structural_support if float(l) < spot), default=nearest_support_level)
+    structural_dist_up = max((structural_nearest_res - spot), 0.0) if structural_nearest_res is not None else 999.0
+    structural_dist_dn = max((spot - structural_nearest_sup), 0.0) if structural_nearest_sup is not None else 999.0
+    metadata["open_space_up"] = round(min(structural_dist_up, float(option_context.get("distance_to_call_wall") or structural_dist_up)), 2)
+    metadata["open_space_down"] = round(min(structural_dist_dn, float(option_context.get("distance_to_put_wall") or structural_dist_dn)), 2)
     metadata["inside_balance_zone"] = bool(metadata["inside_opening_range"] and abs(float(metadata.get("price_vs_vwap") or 0.0)) <= 20.0)
 
     # HTF cap: when price is close to a daily/weekly resistance wall and the session
