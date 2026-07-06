@@ -655,7 +655,7 @@ def select_strategy(
         elif playbook == "AFTERNOON_TREND_HOLD_BULLISH":
             required_bull_start = AFTERNOON_TREND_BULLISH_START
         elif playbook == "SCORE_DRIVEN_BULL":
-            required_bull_start = time(10, 0)
+            required_bull_start = time(9, 45)
         else:
             required_bull_start = (
                 time(10, 30)

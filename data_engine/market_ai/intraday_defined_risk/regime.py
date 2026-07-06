@@ -2883,8 +2883,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     if or_breakout_bullish_ready:
         regime = RegimeLabel.UP_TREND
         metadata["bullish_entry_ready"] = True
-        metadata["bullish_setup"] = "OR_BREAKOUT"
-        metadata["playbook"] = "EARLY_BALANCE_BULLISH_RECLAIM"
+        metadata["bullish_setup"] = "SCORE_DRIVEN"
+        metadata["playbook"] = "SCORE_DRIVEN_BULL"
         metadata["day_archetype"] = "OR_BREAKOUT_BULLISH"
         metadata["preferred_width_points"] = 100.0
         metadata["allowed_width_points"] = (100.0,)
@@ -2894,6 +2894,22 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             "OR breakout bullish: price cleared opening range high with bullish bias, "
             "spot above VWAP, trend and support scores confirmed."
         )
+        # OR_BREAKOUT fires after the main UP_TREND routing block (because
+        # opening_range_break_state is computed at line ~2706). It misses the
+        # confidence bonuses from that block. Add them here explicitly so the
+        # 0.65 confidence gate in strategy.py can be cleared.
+        confidence += 0.15  # UP_TREND routing bonus
+        confidence += 0.08  # SCORE_DRIVEN_BULL path bonus
+        if metadata.get("trend_follow_ready_bullish"):
+            confidence += 0.10
+            reasons.append("Bullish trend-follow confirmed on the OR breakout path: continuation into primary trend.")
+        if oi_flow["smart_money_bias"] == "BULLISH":
+            confidence += 0.05
+            reasons.append(f"Smart money flow supports the OR breakout: put support building near {oi_flow['put_support_strike']}.")
+        if bullish_planner_alignment:
+            confidence += 0.04
+        if bullish_support_quality >= 3.5:
+            confidence += 0.04
 
     if snapshot.timestamp.time() >= time(14, 0):
         confidence = max(0.0, confidence - 0.05)
