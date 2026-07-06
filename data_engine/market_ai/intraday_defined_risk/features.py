@@ -1869,6 +1869,7 @@ _ML_FEATURE_NAMES = [
     "ml_bearish_entry_score", "ml_bullish_entry_score", "ml_india_vix",
     "ml_vwap_reclaim", "ml_banknifty_divergence", "ml_days_to_monthly_expiry",
     "ml_bullish_momentum", "ml_bearish_momentum", "ml_rv30_pct",
+    "ml_order_flow_imbalance",
 ]
 
 
@@ -1899,3 +1900,57 @@ def compute_win_probability(features: dict, direction: str = "BEARISH") -> float
         return round(prob, 3)
     except Exception:
         return 0.5
+
+
+def compute_order_flow_imbalance(
+    quotes: list[OptionsContractQuote],
+    spot: float,
+    atm_width: float = 150.0,
+) -> float:
+    """Snapshot-based order flow imbalance: LTP vs mid for near-ATM options.
+
+    Measures whether call options or put options are being bought more aggressively
+    (LTP close to ask = aggressor buying; LTP close to bid = aggressor selling).
+
+    Returns float in [-1, +1]:
+      +1  = aggressive call buying (bullish institutional demand)
+      -1  = aggressive put buying  (bearish institutional demand)
+       0  = balanced / insufficient data
+    """
+    call_aggression = 0.0
+    put_aggression = 0.0
+    call_count = 0
+    put_count = 0
+
+    for quote in quotes:
+        if quote.ask <= 0 or quote.bid <= 0 or quote.ltp < 0:
+            continue
+        if quote.ask <= quote.bid:
+            continue
+        if abs(quote.strike - spot) > atm_width:
+            continue
+
+        half_spread = (quote.ask - quote.bid) / 2.0
+        if half_spread <= 0:
+            continue
+        mid = (quote.bid + quote.ask) / 2.0
+        # Clamp to [-1, +1]: +1 = LTP at ask (aggressive buy), -1 = LTP at bid (aggressive sell)
+        aggression = max(-1.0, min(1.0, (quote.ltp - mid) / half_spread))
+
+        if quote.option_type == OptionType.CALL:
+            call_aggression += aggression
+            call_count += 1
+        elif quote.option_type == OptionType.PUT:
+            put_aggression += aggression
+            put_count += 1
+
+    if call_count == 0 and put_count == 0:
+        return 0.0
+
+    # Normalize by count so we compare per-strike pressure, not volume
+    avg_call = call_aggression / max(call_count, 1)
+    avg_put = put_aggression / max(put_count, 1)
+
+    # Net: call buying is bullish (+), put buying is bearish (-)
+    net = avg_call - avg_put
+    return round(max(-1.0, min(1.0, net / 2.0)), 3)

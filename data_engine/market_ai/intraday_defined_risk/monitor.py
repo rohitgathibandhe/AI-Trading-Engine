@@ -625,6 +625,7 @@ def _paper_context_override_candidate(
             "ml_bullish_momentum": regime_metadata.get("bullish_momentum_persistence"),
             "ml_bearish_momentum": regime_metadata.get("bearish_momentum_persistence"),
             "ml_rv30_pct": regime_state.rv30_pct,
+            "ml_order_flow_imbalance": regime_metadata.get("order_flow_imbalance"),
         },
     ), info
 
@@ -762,6 +763,7 @@ def _build_bullish_paper_override(
             "ml_bullish_momentum": regime_metadata.get("bullish_momentum_persistence"),
             "ml_bearish_momentum": regime_metadata.get("bearish_momentum_persistence"),
             "ml_rv30_pct": regime_state.rv30_pct,
+            "ml_order_flow_imbalance": regime_metadata.get("order_flow_imbalance"),
         },
     ), info
 
@@ -1139,6 +1141,7 @@ class IntradayDefinedRiskAgent:
                 "ml_bullish_momentum": regime_state.metadata.get("bullish_momentum_persistence"),
                 "ml_bearish_momentum": regime_state.metadata.get("bearish_momentum_persistence"),
                 "ml_rv30_pct": regime_state.rv30_pct,
+                "ml_order_flow_imbalance": regime_state.metadata.get("order_flow_imbalance"),
             },
         )
         self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())

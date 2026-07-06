@@ -61,6 +61,7 @@ from .features import (
     compute_vwap_reclaim,
     compute_momentum_persistence,
     compute_win_probability,
+    compute_order_flow_imbalance,
     read_market_context,
 )
 
@@ -1032,6 +1033,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "days_to_monthly_expiry": 99,
         "win_probability_bearish": 0.5,
         "win_probability_bullish": 0.5,
+        "order_flow_imbalance": 0.0,
         "range_compression_score": 0.0,
         "min_short_call_strike": None,
         "max_short_put_strike": None,
@@ -1581,6 +1583,22 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         bullish_entry_score += 0.2
     metadata["win_probability_bearish"] = _wp_bear
     metadata["win_probability_bullish"] = _wp_bull
+
+    # Phase 9: Order flow imbalance — LTP-vs-midpoint aggression for near-ATM options.
+    # Call buying (LTP near ask) is bullish demand; put buying is bearish demand.
+    # This is the real-time "smart money" tape signal within each 30-second snapshot.
+    _ofi = compute_order_flow_imbalance(snapshot.option_chain.quotes, spot)
+    if _ofi > 0.5:
+        bullish_entry_score += 0.5
+        bearish_entry_score -= 0.2
+    elif _ofi > 0.3:
+        bullish_entry_score += 0.3
+    elif _ofi < -0.5:
+        bearish_entry_score += 0.5
+        bullish_entry_score -= 0.2
+    elif _ofi < -0.3:
+        bearish_entry_score += 0.3
+    metadata["order_flow_imbalance"] = _ofi
 
     metadata["bullish_entry_score"] = bullish_entry_score
     metadata["bearish_entry_score"] = bearish_entry_score

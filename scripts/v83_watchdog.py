@@ -932,6 +932,7 @@ _ML_FEAT_NAMES = [
     "ml_bearish_entry_score", "ml_bullish_entry_score", "ml_india_vix",
     "ml_vwap_reclaim", "ml_banknifty_divergence", "ml_days_to_monthly_expiry",
     "ml_bullish_momentum", "ml_bearish_momentum", "ml_rv30_pct",
+    "ml_order_flow_imbalance",
 ]
 
 
