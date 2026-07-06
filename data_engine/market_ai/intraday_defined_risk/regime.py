@@ -64,6 +64,7 @@ from .features import (
     compute_order_flow_imbalance,
     compute_gamma_concentration,
     compute_multi_session_oi_walls,
+    read_fii_bias,
     read_market_context,
 )
 
@@ -1043,6 +1044,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "multi_session_call_wall": None,
         "multi_session_put_wall": None,
         "multi_session_oi_days": 0,
+        "fii_bias": "UNKNOWN",
+        "fii_net_crores": 0.0,
         "range_compression_score": 0.0,
         "min_short_call_strike": None,
         "max_short_put_strike": None,
@@ -1650,6 +1653,24 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["multi_session_call_wall"] = _ms_call_wall
     metadata["multi_session_put_wall"] = _ms_put_wall
     metadata["multi_session_oi_days"] = _ms_oi.get("multi_session_days", 0)
+
+    # Phase 14: FII/DII institutional flow overlay — T-1 net buy/sell from NSE.
+    # FIIs are the dominant price-setters in Nifty; their direction from yesterday
+    # provides a credible next-session bias overlay.  Modest scoring — T-1 lag limits precision.
+    _fii = read_fii_bias()
+    _fii_bias = str(_fii.get("bias", ""))
+    if _fii_bias == "STRONG_BULLISH":
+        bullish_entry_score += 0.3
+        bearish_entry_score -= 0.2
+    elif _fii_bias == "BULLISH":
+        bullish_entry_score += 0.2
+    elif _fii_bias == "STRONG_BEARISH":
+        bearish_entry_score += 0.3
+        bullish_entry_score -= 0.2
+    elif _fii_bias == "BEARISH":
+        bearish_entry_score += 0.2
+    metadata["fii_bias"] = _fii_bias or "UNKNOWN"
+    metadata["fii_net_crores"] = float(_fii.get("fii_net_crores") or 0.0)
 
     metadata["bullish_entry_score"] = bullish_entry_score
     metadata["bearish_entry_score"] = bearish_entry_score

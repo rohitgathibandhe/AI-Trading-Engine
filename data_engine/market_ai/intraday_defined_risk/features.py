@@ -11,6 +11,7 @@ from .data_models import OhlcvBar, OhlcvSeries, ORLevels, OptionType, OptionsCon
 _MARKET_CONTEXT_PATH = Path(__file__).resolve().parents[1] / "state" / "market_context.json"
 _OI_SNAPSHOTS_PATH = Path(__file__).resolve().parents[1] / "state" / "oi_snapshots.json"
 _OI_TODAY_PATH = Path(__file__).resolve().parents[1] / "state" / "oi_today.json"
+_FII_BIAS_PATH = Path(__file__).resolve().parents[1] / "state" / "fii_bias.json"
 
 
 MARKET_OPEN = time(9, 15)
@@ -1962,6 +1963,20 @@ def read_market_context() -> dict:
     try:
         if _MARKET_CONTEXT_PATH.exists():
             return json.loads(_MARKET_CONTEXT_PATH.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def read_fii_bias() -> dict:
+    """Read latest FII/DII directional bias from NSE data fetched by the EOD watchdog.
+
+    Returns an empty dict when absent — callers must handle missing keys gracefully.
+    Keys: date, fii_net_crores, dii_net_crores, bias (STRONG_BULLISH/BULLISH/NEUTRAL/BEARISH/STRONG_BEARISH).
+    """
+    try:
+        if _FII_BIAS_PATH.exists():
+            return json.loads(_FII_BIAS_PATH.read_text())
     except Exception:
         pass
     return {}

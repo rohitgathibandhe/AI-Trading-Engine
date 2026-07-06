@@ -928,6 +928,7 @@ _TIME_PERF      = _STATE / "time_of_day_performance.json"
 _WIN_PROB_MODEL = _STATE / "win_prob_model.json"
 _OI_TODAY     = _STATE / "oi_today.json"
 _OI_SNAPSHOTS = _STATE / "oi_snapshots.json"
+_FII_BIAS     = _STATE / "fii_bias.json"
 
 # Features used for ML training — must match _ML_FEATURE_NAMES in features.py
 _ML_FEAT_NAMES = [
@@ -936,6 +937,56 @@ _ML_FEAT_NAMES = [
     "ml_bullish_momentum", "ml_bearish_momentum", "ml_rv30_pct",
     "ml_order_flow_imbalance",
 ]
+
+
+def _fetch_fii_bias() -> None:
+    """EOD: fetch NSE FII/DII cash-market net positions and save as next-session directional bias.
+
+    Published by NSE after close for the current trading day.  The watchdog runs after
+    15:35 IST so the file written here is read by the agent in the NEXT session.
+    Saved to state/fii_bias.json.
+    """
+    try:
+        resp = requests.get(
+            "https://www.nseindia.com/api/fiidiiTradeReact?type=fii",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                "Accept": "application/json",
+                "Referer": "https://www.nseindia.com",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        fii_row = next((r for r in rows if "FII" in str(r.get("category", "")).upper()), None)
+        dii_row = next((r for r in rows if "DII" in str(r.get("category", "")).upper()), None)
+        if fii_row is None:
+            _log("FII bias: no FII row in NSE response")
+            return
+        fii_net = float(str(fii_row.get("netValue", "0")).replace(",", ""))
+        dii_net = float(str(dii_row.get("netValue", "0")).replace(",", "")) if dii_row else 0.0
+        # Bias: combined FII+DII net — FII is the stronger institutional signal
+        if fii_net > 2000:
+            bias = "STRONG_BULLISH"
+        elif fii_net > 800:
+            bias = "BULLISH"
+        elif fii_net < -2000:
+            bias = "STRONG_BEARISH"
+        elif fii_net < -800:
+            bias = "BEARISH"
+        else:
+            bias = "NEUTRAL"
+        payload = {
+            "date": fii_row.get("date", ""),
+            "fii_net_crores": fii_net,
+            "dii_net_crores": dii_net,
+            "bias": bias,
+            "updated_at": datetime.now(IST).isoformat(),
+        }
+        _FII_BIAS.write_text(json.dumps(payload, indent=2))
+        _log(f"FII bias: {bias} (FII net={fii_net:.0f} cr, DII net={dii_net:.0f} cr, date={payload['date']})")
+    except Exception as exc:
+        _log(f"FII bias fetch error: {exc}")
 
 
 def _archive_oi_snapshot() -> None:
@@ -1317,6 +1368,7 @@ def run_watchdog() -> None:
     fixes_applied.extend(adaptive_fixes)
     _update_time_of_day_performance(state)
     _archive_oi_snapshot()
+    _fetch_fii_bias()
     _train_win_probability_model(state)
 
     # ── Summary ───────────────────────────────────────────────────────────────
