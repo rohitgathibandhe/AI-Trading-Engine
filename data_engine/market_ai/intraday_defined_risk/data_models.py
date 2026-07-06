@@ -41,7 +41,7 @@ class AdaptiveParameters:
     relaxed_directional_credit_width_ratio: float = 0.22
     strict_directional_credit_width_ratio: float = 0.30
     condor_credit_width_ratio: float = 0.30
-    candidate_widths: tuple[float, ...] = (50.0, 75.0, 100.0, 150.0)
+    candidate_widths: tuple[float, ...] = (100.0, 150.0)
     liquidity_spread_ratio_cap: float = 0.15
     minimum_anchor_distance_points: float = 0.0
     strong_setup_quality_threshold: float = 10.5
@@ -69,7 +69,7 @@ class AdaptiveParameters:
             relaxed_directional_credit_width_ratio=min(max(self.relaxed_directional_credit_width_ratio, 0.15), 0.40),
             strict_directional_credit_width_ratio=min(max(self.strict_directional_credit_width_ratio, 0.15), 0.45),
             condor_credit_width_ratio=min(max(self.condor_credit_width_ratio, 0.15), 0.40),
-            candidate_widths=tuple(sorted({float(width) for width in self.candidate_widths if width > 0} or {50.0, 75.0, 100.0, 150.0})),
+            candidate_widths=tuple(sorted({float(width) for width in self.candidate_widths if width >= 100.0} or {100.0, 150.0})),
             liquidity_spread_ratio_cap=min(max(self.liquidity_spread_ratio_cap, 0.05), 0.30),
             minimum_anchor_distance_points=max(0.0, self.minimum_anchor_distance_points),
             strong_setup_quality_threshold=max(1.0, self.strong_setup_quality_threshold),

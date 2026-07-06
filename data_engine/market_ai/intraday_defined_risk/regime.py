@@ -2140,18 +2140,12 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["is_post_expiry_day"] = _is_post_expiry_day
     metadata["weekly_series_day"] = _weekday
     # Post-expiry Wednesday: relax balance requirement — fresh series, clean slate, full premium
-    _range_balance_min = 3.0 if _is_post_expiry_day else 3.5
+    _range_balance_min = 3.0
     metadata["range_entry_ready"] = bool(
         execution_5m == "RANGE_CONFIRMED"
         and snapshot.timestamp.time() >= RANGE_GATE_TIME
         and range_balance_score >= _range_balance_min
         and abs(gap_pct) <= 0.15
-        and balanced_range_condor_setup(
-            bars_5m,
-            opening_range,
-            vwap,
-            rv30_pct=rv30_pct,
-        )
     )
     # Post-expiry Wednesday: more generous credit ratio — 7DTE options are premium-rich
     metadata["range_condor_credit_ratio"] = 0.13 if _is_post_expiry_day else 0.16
@@ -3088,7 +3082,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     # A bullish spread needs 120+ pts of clear upside; less than that means we're
     # trading INTO resistance — a losing edge. Pivot to RANGE/CONDOR instead.
     htf_resistance_cap = bool(
-        regime in {RegimeLabel.UP_TREND, RegimeLabel.NO_TRADE}
+        (regime in {RegimeLabel.UP_TREND, RegimeLabel.NO_TRADE}
+         or (regime == RegimeLabel.RANGE and metadata.get("playbook") == "RANGE_NO_TRADE"))
         and float(metadata["open_space_up"]) < 90.0
         and float(metadata["open_space_down"]) > 40.0      # floor below for condor safety
         and trend_15m != "TREND_UP"                        # not a confirmed daily trend day
