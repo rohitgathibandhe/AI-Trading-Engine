@@ -4,6 +4,7 @@ import calendar
 from datetime import time
 
 from .data_models import AdaptiveParameters, MarketSnapshot, OhlcvBar, RegimeLabel, RegimeState, ValidationError
+from .day_thesis import get_or_form_day_thesis
 from .features import (
     RANGE_GATE_TIME,
     adaptive_or_length_minutes,
@@ -3112,6 +3113,59 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             f"HTF resistance cap: open_space_up={float(metadata['open_space_up']):.0f}pts "
             f"(daily/weekly resistance at {nearest_resistance_level:.0f}), "
             f"trend_15m=NEUTRAL — deploying range CONDOR instead of directional spread."
+        )
+
+    # ── Day Thesis Engine ────────────────────────────────────────────────────
+    # Forms ONE clear market view per session (10:00-10:45 AM).
+    # A professional trader reads the market once, then trades from that view.
+    # The thesis anchors regime routing — if it says RANGE_PREMIUM when the
+    # scoring path classified UP_TREND, override to RANGE.
+    _atm_straddle_pts = float(atm_straddle.get("atm_straddle") or 0.0) if isinstance(atm_straddle, dict) else float(atm_straddle or 0.0)
+    _oi_flow_smbias = oi_flow.get("smart_money_bias", "NEUTRAL") if isinstance(oi_flow, dict) else "NEUTRAL"
+    day_thesis = get_or_form_day_thesis(
+        spot=spot,
+        trend_15m=trend_15m,
+        execution_5m=execution_5m,
+        daily_tf=daily_tf,
+        option_context=option_context,
+        atm_straddle_pts=_atm_straddle_pts,
+        premarket_bias=str(metadata.get("premarket_bias") or "NEUTRAL"),
+        smart_money_bias=_oi_flow_smbias,
+        open_space_up=float(metadata["open_space_up"]),
+        open_space_down=float(metadata["open_space_down"]),
+        now=snapshot.timestamp,
+    )
+    metadata["day_thesis_type"] = day_thesis.get("day_type", "UNFORMED")
+    metadata["day_thesis_conviction"] = day_thesis.get("conviction", 0.0)
+    metadata["day_thesis_preferred_strategy"] = day_thesis.get("preferred_strategy", "")
+    metadata["day_thesis_reasoning"] = day_thesis.get("reasoning", "")
+    metadata["day_thesis_invalidated"] = day_thesis.get("invalidated", False)
+
+    # Thesis-driven routing override:
+    # If the thesis says RANGE_PREMIUM (price near HTF wall, IV elevated) but
+    # the scoring path landed on UP_TREND without htf_resistance_cap, pivot to RANGE.
+    # Conviction threshold: 0.65 — thesis must be convincing before overriding scoring.
+    _thesis_type = day_thesis.get("day_type", "UNFORMED")
+    _thesis_conv = float(day_thesis.get("conviction", 0.0))
+    _thesis_valid = not bool(day_thesis.get("invalidated", False))
+    if (
+        _thesis_type == "RANGE_PREMIUM"
+        and _thesis_valid
+        and _thesis_conv >= 0.65
+        and regime in {RegimeLabel.UP_TREND, RegimeLabel.NO_TRADE}
+        and not metadata.get("htf_resistance_cap")
+        and session in {"PRIME", "MIDDAY"}
+        and snapshot.timestamp.time() >= time(10, 0)
+        and not bool(metadata.get("pin_risk_active"))
+        and _atm_straddle_pts >= 60.0
+    ):
+        regime = RegimeLabel.RANGE
+        metadata["range_entry_ready"] = True
+        metadata["playbook"] = "RANGE_BALANCED_CONDOR"
+        metadata["day_archetype"] = "THESIS_RANGE"
+        reasons.append(
+            f"Day thesis RANGE_PREMIUM (conviction={_thesis_conv:.2f}): "
+            f"{day_thesis.get('reasoning', '')} — routing to range strategy."
         )
 
     failed_breakout = bool(
