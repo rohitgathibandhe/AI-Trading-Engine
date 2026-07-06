@@ -2403,31 +2403,71 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             and execution_5m != "DOWN_CONFIRMED"
             and bullish_trend_score >= 1.5
         )
+        or (
+            # Score-driven bypass: mirrors the DOWN_TREND bypass at line 2184.
+            # Fires when execution confirmed UP and scores show directional
+            # consensus, WITHOUT requiring trend_15m flip or specific patterns.
+            # Sets its own entry_ready + playbook in the block below.
+            execution_5m == "UP_CONFIRMED"
+            and bullish_entry_score >= 2.5
+            and bullish_trend_score >= 3.0
+            and not (bearish_entry_score >= 3.0 and bearish_trend_score > bullish_trend_score)
+        )
     ):
         regime = RegimeLabel.UP_TREND
+        # Score bypass: no specific pattern matched but entry/trend scores show
+        # directional consensus. Set a first-class SCORE_DRIVEN_BULL playbook so
+        # no downstream gate blocks it with setup-mismatch or adaptive threshold.
+        if (
+            not metadata.get("bullish_entry_ready")
+            and execution_5m == "UP_CONFIRMED"
+            and bullish_entry_score >= 2.5
+            and bullish_trend_score >= 3.0
+        ):
+            metadata["bullish_entry_ready"] = True
+            metadata["bullish_setup"] = "SCORE_DRIVEN"
+            metadata["playbook"] = "SCORE_DRIVEN_BULL"
+            metadata.setdefault("preferred_width_points", 100.0)
+            metadata.setdefault("allowed_width_points", (100.0,))
+            metadata.setdefault("target_short_put_buffer_points", 30.0)
+            metadata.setdefault("minimum_net_edge_rupees", 900.0)
+            reasons.append(
+                f"Score-driven bullish entry: entry_score={bullish_entry_score:.1f}, "
+                f"trend_score={bullish_trend_score:.1f}, execution UP_CONFIRMED "
+                "— directional consensus without specific pattern requirement."
+            )
         metadata["day_archetype"] = (
-            "EARLY_BALANCE_TO_BULLISH"
-            if metadata.get("playbook") == "EARLY_BALANCE_BULLISH_RECLAIM"
+            "SCORE_DRIVEN_BULL"
+            if metadata.get("playbook") == "SCORE_DRIVEN_BULL"
             else (
-                "EARLY_STRUCTURE_BULLISH"
-                if early_structure_bullish_intent
+                "EARLY_BALANCE_TO_BULLISH"
+                if metadata.get("playbook") == "EARLY_BALANCE_BULLISH_RECLAIM"
                 else (
-                    "GAP_UP_CONTINUATION"
-                    if gap_up_bullish_ready
+                    "EARLY_STRUCTURE_BULLISH"
+                    if early_structure_bullish_intent
                     else (
-                        "GAP_DOWN_RECOVERY"
-                        if gap_down_bullish_recovery_ready
+                        "GAP_UP_CONTINUATION"
+                        if gap_up_bullish_ready
                         else (
-                            "HIGH_CONFLUENCE_BULLISH"
-                            if high_confluence_bullish_ready
-                            else ("OPEN_DRIVE_BULLISH" if open_drive_bullish else ("SIDEWAYS_TO_BULLISH" if sideways_to_bullish else "TREND_BULLISH"))
+                            "GAP_DOWN_RECOVERY"
+                            if gap_down_bullish_recovery_ready
+                            else (
+                                "HIGH_CONFLUENCE_BULLISH"
+                                if high_confluence_bullish_ready
+                                else ("OPEN_DRIVE_BULLISH" if open_drive_bullish else ("SIDEWAYS_TO_BULLISH" if sideways_to_bullish else "TREND_BULLISH"))
+                            )
                         )
                     )
                 )
             )
         )
         confidence += 0.15
-        if metadata["playbook"] == "GAP_UP_BULLISH_CONTINUATION":
+        if metadata["playbook"] == "SCORE_DRIVEN_BULL":
+            confidence += 0.08
+            reasons.append(
+                "Score-driven bullish routing confirmed: entry and trend scores show directional consensus without requiring a specific candle pattern."
+            )
+        elif metadata["playbook"] == "GAP_UP_BULLISH_CONTINUATION":
             confidence += 0.12
             reasons.append("Gap-up continuation playbook confirmed: the gap held above VWAP / OR-high support, pullback demand stayed firm, and smart-money flow remained supportive.")
         elif metadata["playbook"] == "GAP_DOWN_BULLISH_RECOVERY":
@@ -3561,39 +3601,6 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["plan_invalidation_level"] = trade_plan["invalidation_level"]
     metadata["plan_target_level"] = trade_plan["target_level"]
     metadata["plan_thesis"] = trade_plan["thesis"]
-
-    # ── Trade Synthesis Engine — market-first override ──────────────────────
-    # If the rule-based path produced NO_TRADE, score all market signals from
-    # first principles. Strong consensus (score >= 0.50) overrides NO_TRADE
-    # and injects the best strategy playbook directly into regime metadata.
-    # The synthesis playbook bypasses score-threshold gates in strategy.py.
-    if regime == RegimeLabel.NO_TRADE and str(metadata.get("session_phase") or "") == "PRIME":
-        from market_ai.intraday_defined_risk.synthesis import synthesize_trade  # noqa: PLC0415
-        _syn = synthesize_trade(metadata, spot)
-        if _syn.override_eligible and _syn.recommended_playbook:
-            _pb = _syn.recommended_playbook
-            if _pb == "SYNTHESIS_BULL_PUT":
-                regime = RegimeLabel.UP_TREND
-                metadata["bullish_entry_ready"] = True
-                metadata["bullish_setup"] = "SYNTHESIS_OVERRIDE"
-                metadata["day_archetype"] = "SYNTHESIS_BULL_PUT"
-            elif _pb == "SYNTHESIS_BEAR_CALL":
-                regime = RegimeLabel.DOWN_TREND
-                metadata["bearish_entry_ready"] = True
-                metadata["bearish_setup"] = "SYNTHESIS_OVERRIDE"
-                metadata["day_archetype"] = "SYNTHESIS_BEAR_CALL"
-            else:
-                regime = RegimeLabel.RANGE
-                metadata["range_entry_ready"] = True
-                metadata["day_archetype"] = "OI_WALL_BOUNDED_RANGE"
-            metadata["playbook"] = _pb
-            metadata["synthesis_override"] = True
-            metadata["synthesis_score"] = _syn.synthesis_score
-            metadata["synthesis_all_scores"] = str(_syn.all_scores)
-            for k, v in _syn.strike_guidance.items():
-                metadata.setdefault(k, v)
-            reasons.extend(_syn.rationale)
-            confidence += 0.10
 
     return RegimeState(
         regime=regime,

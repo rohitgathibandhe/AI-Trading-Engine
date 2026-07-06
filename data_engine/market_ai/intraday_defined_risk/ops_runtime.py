@@ -46,12 +46,10 @@ V83_LIVE_PLAYBOOKS = {
     "EARLY_BALANCE_BULLISH_RECLAIM",
     "AFTERNOON_TREND_HOLD_BULLISH",
     "EARLY_STRUCTURE_BULLISH",
+    "SCORE_DRIVEN_BULL",
     # Range / neutral playbooks
     "RANGE_BALANCED_CONDOR",
     "OI_WALL_CONDOR",
-    # Synthesis-override playbooks — market-first intelligence
-    "SYNTHESIS_BULL_PUT",
-    "SYNTHESIS_BEAR_CALL",
 }
 V83_LIVE_STRATEGIES = {
     StrategyType.BEAR_CALL_CREDIT_SPREAD.value,
@@ -726,6 +724,7 @@ def _is_bullish_context(metadata: dict[str, Any], funnel: dict[str, Any]) -> boo
         or playbook.startswith("HIGH_CONFLUENCE_BULLISH")
         or playbook.startswith("LATE_SESSION_BULLISH")
         or playbook.startswith("SIDEWAYS_TO_BULLISH")
+        or playbook == "SCORE_DRIVEN_BULL"
     )
 
 

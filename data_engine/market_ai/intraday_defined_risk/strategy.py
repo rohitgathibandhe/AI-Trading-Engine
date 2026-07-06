@@ -105,9 +105,8 @@ TIER_A_PLAYBOOKS = {
     "HIGH_CONFLUENCE_BULLISH_CONTINUATION",
     "AFTERNOON_TREND_HOLD_BULLISH",
     "EARLY_STRUCTURE_BULLISH",
-    # Synthesis-override playbooks — market-first intelligence bypasses score gates
-    "SYNTHESIS_BULL_PUT",
-    "SYNTHESIS_BEAR_CALL",
+    # Score-driven: fires when entry+trend scores show consensus without a specific pattern
+    "SCORE_DRIVEN_BULL",
 }
 
 TIER_B_PLAYBOOKS = {
@@ -384,11 +383,11 @@ def select_strategy(
     if (
         bool(metadata.get("enable_market_state_gating"))
         and market_state == "TRUE_RANGE"
-        and str(metadata.get("playbook") or "UNKNOWN") not in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR", "SYNTHESIS_BULL_PUT", "SYNTHESIS_BEAR_CALL"}
+        and str(metadata.get("playbook") or "UNKNOWN") not in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR"}
     ):
         reasons.append("Market state engine classifies the session as TRUE_RANGE; directional deployment is blocked outside strict condor criteria.")
         return StrategyType.NO_TRADE, reasons
-    if context_layer_active and tradability == REGIME_TRADABILITY_NOT_TRADABLE and str(metadata.get("playbook") or "UNKNOWN") not in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR", "SYNTHESIS_BULL_PUT", "SYNTHESIS_BEAR_CALL"}:
+    if context_layer_active and tradability == REGIME_TRADABILITY_NOT_TRADABLE and str(metadata.get("playbook") or "UNKNOWN") not in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR"}:
         reasons.append(tradability_reason)
         return StrategyType.NO_TRADE, reasons
 
@@ -410,16 +409,6 @@ def select_strategy(
         bearish_setup = metadata.get("bearish_setup")
         bearish_ready = bool(metadata.get("bearish_entry_ready"))
         playbook = str(metadata.get("playbook") or "UNKNOWN")
-        if playbook == "SYNTHESIS_BEAR_CALL" and bool(metadata.get("synthesis_override")):
-            if now_time < time(10, 0) or now_time > time(14, 0):
-                reasons.append("SYNTHESIS_BEAR_CALL outside allowed window (10:00–14:00 IST).")
-                return StrategyType.NO_TRADE, reasons
-            synth_score = float(metadata.get("synthesis_score") or 0)
-            reasons.append(
-                f"Synthesis override: bear_call consensus score {synth_score:.3f} >= 0.50 — "
-                "multi-signal agreement bypasses score-threshold gates."
-            )
-            return StrategyType.BEAR_CALL_CREDIT_SPREAD, reasons
         if not bearish_ready:
             reasons.append(
                 "Bearish downtrend detected, but price has not yet printed a valid bearish pullback rejection, failed reclaim, or shallow continuation setup."
@@ -557,16 +546,6 @@ def select_strategy(
     if regime_state.regime == RegimeLabel.UP_TREND:
         bullish_setup = regime_state.metadata.get("bullish_setup")
         playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
-        if playbook == "SYNTHESIS_BULL_PUT" and bool(metadata.get("synthesis_override")):
-            if now_time < time(10, 0) or now_time > time(14, 0):
-                reasons.append("SYNTHESIS_BULL_PUT outside allowed window (10:00–14:00 IST).")
-                return StrategyType.NO_TRADE, reasons
-            synth_score = float(metadata.get("synthesis_score") or 0)
-            reasons.append(
-                f"Synthesis override: bull_put consensus score {synth_score:.3f} >= 0.50 — "
-                "multi-signal agreement bypasses score-threshold gates."
-            )
-            return StrategyType.BULL_PUT_CREDIT_SPREAD, reasons
         if not regime_state.metadata.get("bullish_entry_ready"):
             reasons.append(
                 "Bullish uptrend detected, but price has not yet printed a valid pullback reclaim or shallow continuation setup."
@@ -590,9 +569,14 @@ def select_strategy(
                 f"Overhead call-wall pressure {overhead_call_pressure_score:.2f} is too high for bullish deployment."
             )
             return StrategyType.NO_TRADE, reasons
-        if context_layer_active and bullish_trade_score < bullish_threshold:
+        effective_bull_threshold = (
+            min(bullish_threshold, 4.5)
+            if playbook == "SCORE_DRIVEN_BULL"
+            else bullish_threshold
+        )
+        if context_layer_active and bullish_trade_score < effective_bull_threshold:
             reasons.append(
-                f"Bullish trade score {bullish_trade_score:.2f} is below the required {bullish_threshold:.2f}."
+                f"Bullish trade score {bullish_trade_score:.2f} is below the required {effective_bull_threshold:.2f}."
             )
             return StrategyType.NO_TRADE, reasons
         if context_layer_active and bullish_trade_score <= no_trade_score + bullish_margin:
@@ -614,6 +598,8 @@ def select_strategy(
             required_confidence = AFTERNOON_TREND_BULLISH_MIN_CONFIDENCE
         elif playbook == "EARLY_STRUCTURE_BULLISH":
             required_confidence = 0.30
+        elif playbook == "SCORE_DRIVEN_BULL":
+            required_confidence = 0.65
         else:
             required_confidence = SIDEWAYS_BULLISH_RECLAIM_MIN_CONFIDENCE
         required_bull_confidence = required_confidence + (0.05 if now_time >= time(14, 0) else 0.0)
@@ -622,7 +608,7 @@ def select_strategy(
                 f"Bullish setup detected, but conviction {regime_state.confidence:.2f} is below the required {required_bull_confidence:.2f}."
             )
             return StrategyType.NO_TRADE, reasons
-        if playbook not in {"OPEN_DRIVE_BULLISH", "HIGH_CONFLUENCE_BULLISH_CONTINUATION", "SIDEWAYS_TO_BULLISH_RECLAIM", "EARLY_BALANCE_BULLISH_RECLAIM", "GAP_UP_BULLISH_CONTINUATION", "GAP_DOWN_BULLISH_RECOVERY", "AFTERNOON_TREND_HOLD_BULLISH", "EARLY_STRUCTURE_BULLISH"}:
+        if playbook not in {"OPEN_DRIVE_BULLISH", "HIGH_CONFLUENCE_BULLISH_CONTINUATION", "SIDEWAYS_TO_BULLISH_RECLAIM", "EARLY_BALANCE_BULLISH_RECLAIM", "GAP_UP_BULLISH_CONTINUATION", "GAP_DOWN_BULLISH_RECOVERY", "AFTERNOON_TREND_HOLD_BULLISH", "EARLY_STRUCTURE_BULLISH", "SCORE_DRIVEN_BULL"}:
             reasons.append(
                 f"Bullish regime is generic {day_archetype} with playbook {playbook}; only dedicated gap/open-drive/sideways bullish playbooks are eligible for upside deployment."
             )
@@ -668,6 +654,8 @@ def select_strategy(
             required_bull_start = EARLY_STRUCTURE_INTENT_START
         elif playbook == "AFTERNOON_TREND_HOLD_BULLISH":
             required_bull_start = AFTERNOON_TREND_BULLISH_START
+        elif playbook == "SCORE_DRIVEN_BULL":
+            required_bull_start = time(10, 0)
         else:
             required_bull_start = (
                 time(10, 30)
@@ -688,6 +676,8 @@ def select_strategy(
             required_bull_end = EARLY_STRUCTURE_INTENT_END
         elif playbook == "AFTERNOON_TREND_HOLD_BULLISH":
             required_bull_end = AFTERNOON_TREND_BULLISH_END
+        elif playbook == "SCORE_DRIVEN_BULL":
+            required_bull_end = time(14, 0)
         else:
             required_bull_end = SIDEWAYS_BULLISH_RECLAIM_END
         if now_time > required_bull_end:
