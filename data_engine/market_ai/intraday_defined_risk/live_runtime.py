@@ -566,6 +566,20 @@ class DhanLiveMarketDataProvider:
             _ctx["nifty_spot"] = spot
             if _vix_ltp:
                 _ctx["india_vix"] = float(_vix_ltp)
+                _ctx["india_vix_source"] = "dhan_api"
+            elif quotes:
+                # Dhan API for VIX returns None — derive proxy from option chain ATM IV.
+                # ATM ± 200pts = near-money options that dominate VIX calculation.
+                _atm_ivs = [
+                    float(q.iv)
+                    for q in quotes
+                    if q.iv is not None and q.ltp > 0
+                    and abs(q.strike - spot) <= 200.0
+                ]
+                if _atm_ivs:
+                    _vix_proxy = round(sum(_atm_ivs) / len(_atm_ivs), 2)
+                    _ctx["india_vix"] = _vix_proxy
+                    _ctx["india_vix_source"] = "chain_iv_proxy"
             if _bank_ltp:
                 _ctx["banknifty_spot"] = float(_bank_ltp)
                 if "banknifty_spot_prev" not in _ctx:

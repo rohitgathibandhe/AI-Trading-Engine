@@ -64,8 +64,8 @@ def select_best_structure(
             snapshot=snapshot,
             regime_state=regime_state,
             option_type=OptionType.CALL,
-            short_delta_band=(0.18, 0.38),
-            long_delta_band=(0.05, 0.22),
+            short_delta_band=(0.18, 0.25),
+            long_delta_band=(0.05, 0.15),
             params=params,
             setup_quality_score=setup_quality,
             playbook_tier=playbook_tier,
@@ -946,8 +946,8 @@ def _select_strangle_candidates(
     avg_chain_iv = float(regime_state.metadata.get("avg_chain_iv") or 0.0)
     call_quotes = _liquid_otm_quotes(snapshot.option_chain.quotes, OptionType.CALL, spot)
     put_quotes = _liquid_otm_quotes(snapshot.option_chain.quotes, OptionType.PUT, spot)
-    call_delta_band = (0.15, 0.28)   # symmetric OTM bands — range day, no directional bias
-    put_delta_band = (0.15, 0.28)
+    call_delta_band = (0.15, 0.25)   # target 0.20-0.25 OTM — professional standard
+    put_delta_band = (0.15, 0.25)
 
     _empty_report: dict[str, object] = {
         "strategy": StrategyType.SHORT_STRANGLE.value,

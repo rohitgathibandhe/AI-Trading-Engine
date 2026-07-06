@@ -3114,6 +3114,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             f"(daily/weekly resistance at {nearest_resistance_level:.0f}), "
             f"trend_15m=NEUTRAL — deploying range CONDOR instead of directional spread."
         )
+        confidence = max(confidence, 0.60)
 
     # ── Day Thesis Engine ────────────────────────────────────────────────────
     # Forms ONE clear market view per session (10:00-10:45 AM).
@@ -3167,6 +3168,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             f"Day thesis RANGE_PREMIUM (conviction={_thesis_conv:.2f}): "
             f"{day_thesis.get('reasoning', '')} — routing to range strategy."
         )
+        confidence = max(confidence, 0.60)
 
     failed_breakout = bool(
         opening_range_break_state == "FAILED_UP"
