@@ -62,6 +62,8 @@ from .features import (
     compute_momentum_persistence,
     compute_win_probability,
     compute_order_flow_imbalance,
+    compute_gamma_concentration,
+    compute_multi_session_oi_walls,
     read_market_context,
 )
 
@@ -1034,6 +1036,13 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "win_probability_bearish": 0.5,
         "win_probability_bullish": 0.5,
         "order_flow_imbalance": 0.0,
+        "max_gamma_strike": None,
+        "gamma_concentration": 0.0,
+        "spot_to_pin_pts": None,
+        "pin_risk_active": False,
+        "multi_session_call_wall": None,
+        "multi_session_put_wall": None,
+        "multi_session_oi_days": 0,
         "range_compression_score": 0.0,
         "min_short_call_strike": None,
         "max_short_put_strike": None,
@@ -1599,6 +1608,48 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     elif _ofi < -0.3:
         bearish_entry_score += 0.3
     metadata["order_flow_imbalance"] = _ofi
+
+    # Phase 13: Gamma/pin risk — penalise entries when spot is near the max-OI strike.
+    # On expiry day (Tuesday), market makers delta-hedge aggressively near this strike,
+    # creating unpredictable whip.  Pre-expiry (Monday) gets a softer penalty.
+    _gamma = compute_gamma_concentration(snapshot.option_chain.quotes, spot)
+    _pin_pts = _gamma.get("spot_to_pin_pts")
+    _pin_risk_active = False
+    if _pin_pts is not None:
+        _weekday_pin = snapshot.timestamp.weekday()
+        _is_expiry_day_pin = (_weekday_pin == 1)   # Tuesday
+        _is_pre_expiry_pin = (_weekday_pin == 0)   # Monday
+        _abs_pin = abs(_pin_pts)
+        if _is_expiry_day_pin and _abs_pin < 30:
+            bullish_entry_score -= 0.5
+            bearish_entry_score -= 0.5
+            _pin_risk_active = True
+        elif _is_expiry_day_pin and _abs_pin < 60:
+            bullish_entry_score -= 0.3
+            bearish_entry_score -= 0.3
+            _pin_risk_active = True
+        elif _is_pre_expiry_pin and _abs_pin < 30:
+            bullish_entry_score -= 0.2
+            bearish_entry_score -= 0.2
+    metadata["max_gamma_strike"] = _gamma.get("max_gamma_strike")
+    metadata["gamma_concentration"] = _gamma.get("gamma_concentration")
+    metadata["spot_to_pin_pts"] = _pin_pts
+    metadata["pin_risk_active"] = _pin_risk_active
+
+    # Phase 12: Multi-session OI walls — 3-day accumulated CE/PE walls are institutional.
+    # A wall that persists across sessions carries more weight than a single-day build-up.
+    _ms_oi = compute_multi_session_oi_walls(spot)
+    _ms_call_wall = _ms_oi.get("multi_session_call_wall")
+    _ms_put_wall = _ms_oi.get("multi_session_put_wall")
+    if _ms_call_wall is not None and spot >= _ms_call_wall - 30:
+        # Approaching multi-session call wall from below → confirmed bearish resistance
+        bearish_entry_score += 0.4
+    if _ms_put_wall is not None and spot <= _ms_put_wall + 30:
+        # Holding above multi-session put wall → confirmed bullish support
+        bullish_entry_score += 0.4
+    metadata["multi_session_call_wall"] = _ms_call_wall
+    metadata["multi_session_put_wall"] = _ms_put_wall
+    metadata["multi_session_oi_days"] = _ms_oi.get("multi_session_days", 0)
 
     metadata["bullish_entry_score"] = bullish_entry_score
     metadata["bearish_entry_score"] = bearish_entry_score

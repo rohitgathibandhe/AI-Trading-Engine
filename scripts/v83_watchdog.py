@@ -926,6 +926,8 @@ _PAPER_TRADES   = _STATE / "intraday_v83_paper_live_trades.jsonl"
 _SETUP_PERF     = _STATE / "setup_performance.json"
 _TIME_PERF      = _STATE / "time_of_day_performance.json"
 _WIN_PROB_MODEL = _STATE / "win_prob_model.json"
+_OI_TODAY     = _STATE / "oi_today.json"
+_OI_SNAPSHOTS = _STATE / "oi_snapshots.json"
 
 # Features used for ML training — must match _ML_FEATURE_NAMES in features.py
 _ML_FEAT_NAMES = [
@@ -934,6 +936,32 @@ _ML_FEAT_NAMES = [
     "ml_bullish_momentum", "ml_bearish_momentum", "ml_rv30_pct",
     "ml_order_flow_imbalance",
 ]
+
+
+def _archive_oi_snapshot() -> None:
+    """EOD: append today's OI snapshot (written live by the agent) to the rolling archive.
+
+    Keeps last 5 days of OI data so multi-session wall detection has enough history.
+    """
+    if not _OI_TODAY.exists():
+        return
+    try:
+        today_snap = json.loads(_OI_TODAY.read_text())
+        today_date = today_snap.get("date", "")
+        if not today_date:
+            return
+        archive: list[dict] = []
+        if _OI_SNAPSHOTS.exists():
+            archive = json.loads(_OI_SNAPSHOTS.read_text())
+        # Remove stale entry for today if already present (idempotent)
+        archive = [s for s in archive if s.get("date") != today_date]
+        archive.append(today_snap)
+        # Keep rolling 5 days
+        archive = archive[-5:]
+        _OI_SNAPSHOTS.write_text(json.dumps(archive, indent=2))
+        _log(f"OI snapshot archived: {today_date} ({len(today_snap.get('strikes', {}))} strikes)")
+    except Exception as exc:
+        _log(f"OI archive error: {exc}")
 
 
 def _train_win_probability_model(state: dict) -> None:
@@ -1288,6 +1316,7 @@ def run_watchdog() -> None:
     adaptive_fixes = _apply_adaptive_gates(state)
     fixes_applied.extend(adaptive_fixes)
     _update_time_of_day_performance(state)
+    _archive_oi_snapshot()
     _train_win_probability_model(state)
 
     # ── Summary ───────────────────────────────────────────────────────────────

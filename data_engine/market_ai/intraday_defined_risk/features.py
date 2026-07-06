@@ -9,6 +9,8 @@ from typing import Iterable
 from .data_models import OhlcvBar, OhlcvSeries, ORLevels, OptionType, OptionsContractQuote
 
 _MARKET_CONTEXT_PATH = Path(__file__).resolve().parents[1] / "state" / "market_context.json"
+_OI_SNAPSHOTS_PATH = Path(__file__).resolve().parents[1] / "state" / "oi_snapshots.json"
+_OI_TODAY_PATH = Path(__file__).resolve().parents[1] / "state" / "oi_today.json"
 
 
 MARKET_OPEN = time(9, 15)
@@ -1769,6 +1771,109 @@ def compute_max_pain(quotes: list[OptionsContractQuote]) -> dict[str, float | No
             min_pain = total
             max_pain_strike = candidate
     return {"max_pain_strike": float(max_pain_strike)}
+
+
+def compute_gamma_concentration(
+    quotes: list[OptionsContractQuote],
+    spot: float,
+) -> dict[str, float | None]:
+    """Find the max-gamma strike (highest combined call+put OI) and distance from spot.
+
+    On expiry day, market makers are net-short a massive notional of options at the
+    max-OI strike.  They must delta-hedge with futures, creating a gravitational pin
+    as spot approaches that strike.  Trading through the pin on expiry is low-edge.
+
+    Returns:
+      max_gamma_strike      — the strike with highest CE+PE open interest
+      gamma_concentration   — total OI at that strike as fraction of total chain OI
+      spot_to_pin_pts       — signed distance: spot - max_gamma_strike (+ = above pin)
+      spot_to_pin_pct       — same, as % of spot
+    """
+    if not quotes:
+        return {
+            "max_gamma_strike": None,
+            "gamma_concentration": 0.0,
+            "spot_to_pin_pts": None,
+            "spot_to_pin_pct": None,
+        }
+    oi_by_strike: dict[float, int] = {}
+    total_oi = 0
+    for q in quotes:
+        if q.oi:
+            oi_by_strike[q.strike] = oi_by_strike.get(q.strike, 0) + int(q.oi)
+            total_oi += int(q.oi)
+    if not oi_by_strike or total_oi == 0:
+        return {
+            "max_gamma_strike": None,
+            "gamma_concentration": 0.0,
+            "spot_to_pin_pts": None,
+            "spot_to_pin_pct": None,
+        }
+    max_gamma_strike = max(oi_by_strike, key=lambda k: oi_by_strike[k])
+    pin_oi = oi_by_strike[max_gamma_strike]
+    return {
+        "max_gamma_strike": float(max_gamma_strike),
+        "gamma_concentration": round(pin_oi / total_oi, 4),
+        "spot_to_pin_pts": round(spot - max_gamma_strike, 1),
+        "spot_to_pin_pct": round((spot - max_gamma_strike) / max(spot, 1.0) * 100, 3),
+    }
+
+
+def compute_multi_session_oi_walls(
+    spot: float,
+    lookback_days: int = 3,
+) -> dict[str, float | None]:
+    """Load rolling N-day OI snapshots and find accumulated call/put walls.
+
+    Intraday OI walls shift and grow throughout a single session.  A wall that
+    appears across 3 consecutive sessions is institutional conviction, not noise.
+    Call wall = strike with highest total CE OI over N days.
+    Put wall  = strike with highest total PE OI over N days.
+
+    Reads:
+      state/oi_snapshots.json  — rolling archive written by EOD watchdog
+      state/oi_today.json      — today's live OI (overwritten each poll)
+
+    Returns None values if insufficient data (< 2 days with OI).
+    """
+    try:
+        # Load archived days + today's live snapshot
+        snapshots: list[dict] = []
+        if _OI_SNAPSHOTS_PATH.exists():
+            archived = json.loads(_OI_SNAPSHOTS_PATH.read_text())
+            if isinstance(archived, list):
+                snapshots = archived[-(lookback_days - 1):]  # last N-1 archived days
+        if _OI_TODAY_PATH.exists():
+            today_snap = json.loads(_OI_TODAY_PATH.read_text())
+            snapshots.append(today_snap)
+
+        if len(snapshots) < 2:
+            return {"multi_session_call_wall": None, "multi_session_put_wall": None,
+                    "multi_session_days": len(snapshots)}
+
+        # Accumulate OI by strike across all sessions
+        total_ce: dict[float, int] = {}
+        total_pe: dict[float, int] = {}
+        for snap in snapshots:
+            for k_str, ois in (snap.get("strikes") or {}).items():
+                k = float(k_str)
+                total_ce[k] = total_ce.get(k, 0) + int(ois.get("ce_oi", 0))
+                total_pe[k] = total_pe.get(k, 0) + int(ois.get("pe_oi", 0))
+
+        if not total_ce and not total_pe:
+            return {"multi_session_call_wall": None, "multi_session_put_wall": None,
+                    "multi_session_days": len(snapshots)}
+
+        call_wall = float(max(total_ce, key=lambda k: total_ce[k])) if total_ce else None
+        put_wall = float(max(total_pe, key=lambda k: total_pe[k])) if total_pe else None
+        return {
+            "multi_session_call_wall": call_wall,
+            "multi_session_put_wall": put_wall,
+            "multi_session_days": len(snapshots),
+        }
+    except Exception:
+        return {"multi_session_call_wall": None, "multi_session_put_wall": None,
+                "multi_session_days": 0}
 
 
 def compute_atm_straddle(spot: float, quotes: list[OptionsContractQuote]) -> dict[str, float | None]:

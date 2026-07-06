@@ -575,6 +575,30 @@ class DhanLiveMarketDataProvider:
         except Exception:
             pass
 
+        # Phase 12: Persist today's OI snapshot so EOD watchdog can archive it.
+        # Written every poll — overwrites with latest intraday values (EOD = final).
+        try:
+            if quotes:
+                _oi_by_strike: dict[str, dict[str, int]] = {}
+                for _q in quotes:
+                    if _q.oi:
+                        _k = str(int(_q.strike))
+                        if _k not in _oi_by_strike:
+                            _oi_by_strike[_k] = {"ce_oi": 0, "pe_oi": 0}
+                        if _q.option_type == OptionType.CALL:
+                            _oi_by_strike[_k]["ce_oi"] += int(_q.oi)
+                        else:
+                            _oi_by_strike[_k]["pe_oi"] += int(_q.oi)
+                _oi_path = STATE_ROOT / "oi_today.json"
+                _oi_path.write_text(json.dumps({
+                    "date": today.isoformat(),
+                    "spot": spot,
+                    "expiry": expiry,
+                    "strikes": _oi_by_strike,
+                }))
+        except Exception:
+            pass
+
         return snapshot
 
     def current_structure_quotes(self, position: OpenPosition) -> MarketSnapshot:
