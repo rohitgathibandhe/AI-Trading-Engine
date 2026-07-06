@@ -33,9 +33,9 @@ GAP_BEARISH_START = time(9, 45)
 GAP_BEARISH_END = time(13, 0)
 GAP_DOWN_BEARISH_CONTINUATION_END = time(12, 0)
 GAP_UP_BEARISH_FAILURE_END = time(11, 15)
-RANGE_CONDOR_START = time(11, 30)
+RANGE_CONDOR_START = time(10, 30)
 RANGE_CONDOR_END = time(13, 30)
-RANGE_STRANGLE_START = time(11, 30)
+RANGE_STRANGLE_START = time(10, 30)
 RANGE_STRANGLE_END = time(13, 30)
 # Wednesday = Day 1 of new weekly series (post-Tuesday expiry).
 # IC can start earlier on Wednesday — morning range is well-defined after the
@@ -81,10 +81,11 @@ ENABLE_RANGE_CONDOR_ACTIVE = True
 
 # Short straddle: extreme IV + confirmed range day → sell ATM call + put.
 # Only fires when IV is very elevated and the session is genuinely balanced.
-SHORT_STRADDLE_IV_FLOOR = 28.0
-SHORT_STRADDLE_RANGE_BALANCE_MIN = 3.0
-SHORT_STRADDLE_START = time(11, 30)
+SHORT_STRADDLE_IV_FLOOR = 40.0
+SHORT_STRADDLE_OPEN_SPACE_MIN = 80.0
+SHORT_STRADDLE_START = time(10, 30)
 SHORT_STRADDLE_END = time(13, 30)
+SHORT_STRANGLE_IV_FLOOR = 30.0
 
 TIER_A_PLAYBOOKS = {
     # Core bearish spread playbooks — live-validated
@@ -735,60 +736,68 @@ def select_strategy(
         # Start 45 min earlier than normal, same RV30 limit.
         is_post_expiry_day = bool(regime_state.metadata.get("is_post_expiry_day"))
         is_expiry_day = bool(regime_state.metadata.get("is_expiry_day"))
-        _rv30_limit = 0.20
-        _condor_start = RANGE_CONDOR_POST_EXPIRY_START if is_post_expiry_day else RANGE_CONDOR_START
-        _condor_end = RANGE_CONDOR_POST_EXPIRY_END if is_post_expiry_day else RANGE_CONDOR_END
-        if is_expiry_day:
-            # Tuesday expiry day: same-day expiry chain → extreme gamma → no IC or strangle
-            reasons.append("Expiry day (Tuesday): Iron Condor / Strangle blocked — same-day expiry gamma risk is unacceptable.")
-            return StrategyType.NO_TRADE, reasons
-        # Extreme IV path: rv30 > 0.30 + avg_iv >= straddle floor → sell ATM straddle
-        _straddle_rv30_limit = 0.30
         avg_chain_iv = float(regime_state.metadata.get("avg_chain_iv") or 0.0)
-        range_balance_score = float(regime_state.metadata.get("range_balance_score") or 0.0)
-        if regime_state.rv30_pct > _straddle_rv30_limit and avg_chain_iv >= SHORT_STRADDLE_IV_FLOOR and range_balance_score >= SHORT_STRADDLE_RANGE_BALANCE_MIN:
-            if is_expiry_day:
-                reasons.append("Expiry day: Short Straddle blocked — same-day ATM gamma risk is unacceptable.")
+        atm_straddle_price = float(regime_state.metadata.get("atm_straddle_price") or 0.0)
+        open_space_up = float(regime_state.metadata.get("open_space_up") or 0.0)
+        open_space_down = float(regime_state.metadata.get("open_space_down") or 0.0)
+
+        # Expiry day (Tuesday): gamma risk is extreme near ATM — straddle forbidden.
+        # Short strangle OTM is still valid: theta is maximum, and OTM position has buffer.
+        # Only deploy if IV >= 25% (enough premium), straddle >= 50pts, after 11:00 AM.
+        if is_expiry_day:
+            if avg_chain_iv >= 25.0 and atm_straddle_price >= 50.0 and now_time >= time(11, 0):
+                if now_time <= time(13, 30):
+                    reasons.append(
+                        f"Expiry day: IV={avg_chain_iv:.0f}%, straddle={atm_straddle_price:.0f}pts — "
+                        "maximum theta decay, selling OTM strangle (not straddle)."
+                    )
+                    return StrategyType.SHORT_STRANGLE, reasons
+                reasons.append("Expiry day: entry window closed (after 13:30).")
                 return StrategyType.NO_TRADE, reasons
-            if now_time > SHORT_STRADDLE_END:
-                reasons.append(f"Short Straddle entries avoided after {SHORT_STRADDLE_END.strftime('%H:%M')} IST.")
-                return StrategyType.NO_TRADE, reasons
-            if now_time >= SHORT_STRADDLE_START:
-                reasons.append(
-                    f"Range day with extreme IV (rv30={regime_state.rv30_pct:.3f}, avg_iv={avg_chain_iv:.1f}%): "
-                    "sell ATM straddle to maximise premium capture on balanced session."
-                )
-                return StrategyType.SHORT_STRADDLE, reasons
-            reasons.append(f"Short Straddle allowed only after {SHORT_STRADDLE_START.strftime('%H:%M')} IST.")
-            return StrategyType.NO_TRADE, reasons
-        # Elevated IV path: rv30 0.20–0.30 makes condor wings expensive → use short strangle instead
-        _strangle_rv30_limit = 0.30
-        if _rv30_limit < regime_state.rv30_pct <= _strangle_rv30_limit and avg_chain_iv >= 18.0:
-            if now_time > RANGE_STRANGLE_END:
-                reasons.append(f"Short Strangle entries avoided after {RANGE_STRANGLE_END.strftime('%H:%M')} IST.")
-                return StrategyType.NO_TRADE, reasons
-            if now_time >= RANGE_STRANGLE_START:
-                reasons.append(
-                    f"Range day with elevated IV (rv30={regime_state.rv30_pct:.3f}, avg_iv={avg_chain_iv:.1f}%): "
-                    "condor wings too expensive → Short Strangle."
-                )
-                return StrategyType.SHORT_STRANGLE, reasons
-            reasons.append(f"Short Strangle allowed only after {RANGE_STRANGLE_START.strftime('%H:%M')} IST.")
-            return StrategyType.NO_TRADE, reasons
-        if regime_state.rv30_pct > _rv30_limit:
-            reasons.append(f"Iron Condor requires low-volatility range (rv30={regime_state.rv30_pct:.3f} > {_rv30_limit}).")
-            return StrategyType.NO_TRADE, reasons
-        if now_time > _condor_end:
-            reasons.append(f"Iron Condor entries are avoided after {_condor_end.strftime('%H:%M')} IST.")
-            return StrategyType.NO_TRADE, reasons
-        if now_time >= _condor_start:
-            weekly_note = (
-                f" [Day-1 weekly series: 7DTE, wider strikes, credit_ratio={regime_state.metadata.get('range_condor_credit_ratio', 0.16):.2f}]"
-                if is_post_expiry_day else ""
+            reasons.append(
+                f"Expiry day: conditions insufficient (IV={avg_chain_iv:.0f}%, "
+                f"straddle={atm_straddle_price:.0f}pts) or time before 11:00."
             )
-            reasons.append(f"Neutral 15m regime + balanced range playbook ({range_balance_score:.2f}) -> Iron Condor{weekly_note}.")
+            return StrategyType.NO_TRADE, reasons
+
+        _entry_start = RANGE_CONDOR_POST_EXPIRY_START if is_post_expiry_day else RANGE_CONDOR_START
+        _entry_end = RANGE_CONDOR_END
+
+        if now_time > _entry_end:
+            reasons.append(f"Range strategies avoided after {_entry_end.strftime('%H:%M')} IST.")
+            return StrategyType.NO_TRADE, reasons
+        if now_time < _entry_start:
+            reasons.append(f"Range strategy allowed only after {_entry_start.strftime('%H:%M')} IST.")
+            return StrategyType.NO_TRADE, reasons
+
+        # Strategy selection — IV is the primary signal for premium-selling quality.
+        # Straddle (ATM): very high IV + confirmed range with buffer both sides.
+        # Strangle (OTM): elevated IV — wider protection than straddle.
+        # Iron Condor: moderate/normal IV — defined risk, can be sized up.
+        if avg_chain_iv >= SHORT_STRADDLE_IV_FLOOR and atm_straddle_price >= 100.0 and open_space_up >= SHORT_STRADDLE_OPEN_SPACE_MIN and open_space_down >= SHORT_STRADDLE_OPEN_SPACE_MIN:
+            reasons.append(
+                f"HIGH IV={avg_chain_iv:.0f}%, straddle={atm_straddle_price:.0f}pts, "
+                f"space up={open_space_up:.0f}/down={open_space_down:.0f} → SHORT_STRADDLE."
+            )
+            return StrategyType.SHORT_STRADDLE, reasons
+
+        if avg_chain_iv >= SHORT_STRANGLE_IV_FLOOR and atm_straddle_price >= 70.0:
+            reasons.append(
+                f"Elevated IV={avg_chain_iv:.0f}%, straddle={atm_straddle_price:.0f}pts — "
+                "rich premium for OTM strangle."
+            )
+            return StrategyType.SHORT_STRANGLE, reasons
+
+        if now_time >= _entry_start:
+            weekly_note = (
+                f" [Day-1 weekly: 7DTE, wider strikes]" if is_post_expiry_day else ""
+            )
+            reasons.append(
+                f"Range playbook, IV={avg_chain_iv:.0f}% → IRON_CONDOR{weekly_note}."
+            )
             return StrategyType.IRON_CONDOR, reasons
-        reasons.append(f"Iron Condor is allowed only after {_condor_start.strftime('%H:%M')} IST.")
+
+        reasons.append(f"Iron Condor is allowed only after {_entry_start.strftime('%H:%M')} IST.")
         return StrategyType.NO_TRADE, reasons
 
     reasons.append("No aligned regime/trigger pair available.")

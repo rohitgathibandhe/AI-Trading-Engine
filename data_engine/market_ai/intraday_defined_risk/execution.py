@@ -425,11 +425,16 @@ def evaluate_exit(
         short_delta_limit = BULLISH_PLAYBOOK_DELTA_SL
     short_deltas = [abs(leg.quote.delta) for leg in current_legs if leg.action == "SELL" and leg.quote.delta is not None]
     if short_deltas and max(short_deltas) >= short_delta_limit:
-        # Skip DELTA_STOP in the first 3 minutes — short leg may have entered near
-        # the threshold (pre-existing condition at entry), causing a spurious exit
-        # on the very first poll before the position has had any time to develop.
-        if elapsed_minutes < 3:
-            pass  # hold — let the position breathe before applying delta stop
+        # Minimum hold time before DELTA_STOP:
+        # - Directional spreads: 3 min (entered near threshold = spurious, not a signal)
+        # - Theta strategies (condor, strangle, straddle): 20 min — position must breathe
+        #   before delta noise from the first few candles triggers an exit
+        _is_theta_strategy = position.structure.strategy in {
+            StrategyType.IRON_CONDOR, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE
+        }
+        _min_hold = 20 if _is_theta_strategy else 3
+        if elapsed_minutes < _min_hold:
+            pass  # hold
         elif (
             position.structure.strategy == StrategyType.BULL_PUT_CREDIT_SPREAD
             and position.metadata.get("playbook") in {
@@ -441,6 +446,7 @@ def evaluate_exit(
                 "GAP_DOWN_BULLISH_RECOVERY",
                 "RANGE_NO_TRADE",
                 "EARLY_STRUCTURE_BULLISH",
+                "SCORE_DRIVEN_BULL",
             }
             and pnl_rupees > 0
         ):
