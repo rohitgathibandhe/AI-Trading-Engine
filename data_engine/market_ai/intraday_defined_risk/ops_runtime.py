@@ -961,6 +961,19 @@ def evaluate_entry_gate(
     )
     if not (start_t <= snapshot.timestamp.time() <= end_t):
         reasons.append("ENTRY_WINDOW_CLOSED")
+    # PH 21: Early-session confirmation gate.
+    # Directional spreads before 10:15 require both 5m execution confirmation AND
+    # meaningful OFI (|ofi| >= 0.35) to avoid entering into first-candle noise.
+    # EARLY_STRUCTURE_* playbooks are designed for early entries and are exempt.
+    if (
+        snapshot.timestamp.time() < time(10, 15)
+        and strategy in {"BEAR_CALL_CREDIT_SPREAD", "BULL_PUT_CREDIT_SPREAD"}
+        and playbook not in {"EARLY_STRUCTURE_BULLISH", "EARLY_STRUCTURE_BEARISH"}
+    ):
+        _exec_5m = str(metadata.get("execution_5m") or "")
+        _ofi = abs(float(metadata.get("order_flow_imbalance") or 0.0))
+        if _exec_5m not in ("UP_CONFIRMED", "DOWN_CONFIRMED") or _ofi < 0.35:
+            reasons.append("EARLY_SESSION_UNCONFIRMED")
     daily_lock = state.get("daily_lock") if isinstance(state.get("daily_lock"), dict) else {}
     if bool(daily_lock.get("active")):
         reasons.append(str(daily_lock.get("reason") or "DAILY_LOCK_ACTIVE"))
@@ -1071,6 +1084,18 @@ def evaluate_paper_context_override_gate(
     inside_window = start_t <= snapshot.timestamp.time() <= end_t
     if not inside_window:
         reasons.append("PAPER_EXPERIMENT_WINDOW_CLOSED")
+    # PH 21: Early-session confirmation gate — same rule as evaluate_entry_gate.
+    if (
+        snapshot.timestamp.time() < time(10, 15)
+        and strategy in {"BEAR_CALL_CREDIT_SPREAD", "BULL_PUT_CREDIT_SPREAD"}
+        and str(metadata.get("playbook") or funnel.get("playbook") or "") not in {
+            "EARLY_STRUCTURE_BULLISH", "EARLY_STRUCTURE_BEARISH"
+        }
+    ):
+        _exec_5m = str(metadata.get("execution_5m") or funnel.get("execution_5m") or "")
+        _ofi = abs(float(metadata.get("order_flow_imbalance") or funnel.get("order_flow_imbalance") or 0.0))
+        if _exec_5m not in ("UP_CONFIRMED", "DOWN_CONFIRMED") or _ofi < 0.35:
+            reasons.append("EARLY_SESSION_UNCONFIRMED")
 
     daily_lock = state.get("daily_lock") if isinstance(state.get("daily_lock"), dict) else {}
     if bool(daily_lock.get("active")):

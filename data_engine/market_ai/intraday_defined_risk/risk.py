@@ -99,6 +99,31 @@ def _confidence_lot_cap(
     return max(1, cap)
 
 
+def _apply_vix_lot_scale(lots: int) -> int:
+    """PH 23: Scale lot count by current India VIX regime.
+
+    Extreme-low VIX (< 12): options are cheap but spot moves are wide and unpredictable.
+    Normal range 12–25: no change.
+    Extreme-high VIX (> 25): gamma risk rises sharply, reduce exposure.
+    Reads market_context.json written each cycle by live_runtime.py.
+    """
+    ctx_path = _STATE_ROOT / "market_context.json"
+    if not ctx_path.exists():
+        return lots
+    try:
+        ctx = json.loads(ctx_path.read_text())
+        vix = float(ctx.get("india_vix") or 0.0)
+        if vix <= 0:
+            return lots
+        if vix < 12.0:
+            return max(1, math.floor(lots * 0.5))
+        if vix > 25.0:
+            return max(1, math.floor(lots * 0.75))
+        return lots
+    except Exception:
+        return lots
+
+
 def kill_switch_triggered(account_state: AccountState, risk_limits: AccountRiskLimits) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     if account_state.realised_pnl_rupees <= -risk_limits.max_daily_loss_rupees:
@@ -173,6 +198,8 @@ def assess_trade_risk(
     # Kelly criterion: scale lot size by historical win-rate edge for this playbook.
     # Uses setup_performance.json written by watchdog after 15:30.  No-op if file absent.
     lots = _compute_kelly_lot_cap(playbook, lots, max_lots=lots)
+    # PH 23: VIX-regime lot cap — reduce exposure in extreme vol environments.
+    lots = _apply_vix_lot_scale(lots)
     projected_margin = account_state.margin_used_rupees + (lots * effective_margin)
     projected_utilisation = projected_margin / risk_limits.max_margin_rupees if risk_limits.max_margin_rupees > 0 else 1.0
 
