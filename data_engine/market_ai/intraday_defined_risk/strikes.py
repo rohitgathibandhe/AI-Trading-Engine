@@ -94,6 +94,7 @@ def select_best_structure(
             params=params,
             setup_quality_score=setup_quality,
             playbook_tier=playbook_tier,
+            allow_distance_fallback_when_deltas_present=False,
             max_short_strike=regime_state.metadata.get("max_short_put_strike"),
         )
     if strategy == StrategyType.IRON_CONDOR:
