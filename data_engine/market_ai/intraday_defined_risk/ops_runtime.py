@@ -1659,6 +1659,18 @@ def record_paper_entry(
         "entry_iv_rank": decision.metadata.get("iv_rank_at_entry"),
         "india_vix_at_entry": decision.metadata.get("india_vix"),
         "spot_at_entry": snapshot.option_chain.spot,
+        # Phase 8: ML features — needed by watchdog._train_win_probability_model()
+        "ml_bearish_entry_score":    decision.metadata.get("ml_bearish_entry_score"),
+        "ml_bullish_entry_score":    decision.metadata.get("ml_bullish_entry_score"),
+        "ml_india_vix":              decision.metadata.get("ml_india_vix"),
+        "ml_vwap_reclaim":           decision.metadata.get("ml_vwap_reclaim"),
+        "ml_banknifty_divergence":   decision.metadata.get("ml_banknifty_divergence"),
+        "ml_days_to_monthly_expiry": decision.metadata.get("ml_days_to_monthly_expiry"),
+        "ml_bullish_momentum":       decision.metadata.get("ml_bullish_momentum"),
+        "ml_bearish_momentum":       decision.metadata.get("ml_bearish_momentum"),
+        "ml_rv30_pct":               decision.metadata.get("ml_rv30_pct"),
+        "ml_order_flow_imbalance":   decision.metadata.get("ml_order_flow_imbalance"),
+        "setup_direction":           decision.metadata.get("setup_direction"),
     }
     _append_jsonl(paths.paper_trades, event)
     record_runtime_trade_entry(decision, snapshot, decision_origin=attribution, paths=paths)

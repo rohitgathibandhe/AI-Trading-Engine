@@ -274,6 +274,10 @@ def save_day_thesis(thesis: dict[str, Any], *, path: Path | None = None) -> None
         logger.warning("Failed to save day_thesis: %s", exc)
 
 
+_SOFT_CONVICTION_DECAY = 0.15   # per-cycle decay when 15m flips against thesis
+_HARD_INVALIDATION_CONVICTION = 0.30  # below this conviction → full invalidation
+
+
 def check_invalidation(
     thesis: dict[str, Any],
     spot: float,
@@ -282,16 +286,19 @@ def check_invalidation(
 ) -> dict[str, Any]:
     """
     Check whether the session thesis is still valid.
-    Invalidation means the market has moved decisively AGAINST the thesis.
+    Two-stage model:
+      1. Soft decay: 15m flipped but 5m not yet confirmed — conviction erodes each cycle.
+      2. Hard invalidation: both 15m AND 5m confirmed opposite direction, OR conviction < 0.30.
     """
     if thesis.get("invalidated"):
         return thesis
 
     day_type = thesis.get("day_type", "UNCERTAIN")
     key_resistance = thesis.get("key_resistance")
+    conviction = float(thesis.get("conviction") or 0.5)
 
     if day_type == "RANGE_PREMIUM":
-        # Invalidate if price broke cleanly above resistance (trend emerging)
+        # Hard invalidation: price broke resistance with confirmed 15m trend
         if (
             key_resistance
             and spot > key_resistance + _RANGE_THESIS_INVALIDATION_PTS
@@ -305,21 +312,63 @@ def check_invalidation(
                 f"{spot - key_resistance:.0f}pts with 15m TREND_UP — thesis shifted to TREND_UP."
             )
             logger.info("Day thesis invalidated: %s", thesis["invalidation_reason"])
+        # Soft decay: market is running directionally, range is no longer neutral
+        elif execution_5m in ("UP_CONFIRMED", "DOWN_CONFIRMED"):
+            thesis = dict(thesis)
+            thesis["conviction"] = max(0.20, conviction - _SOFT_CONVICTION_DECAY)
+            thesis["soft_warning"] = (
+                f"execution_5m={execution_5m} on RANGE_PREMIUM — conviction decayed "
+                f"{conviction:.2f}→{thesis['conviction']:.2f}"
+            )
+            logger.debug("Day thesis soft decay: %s", thesis["soft_warning"])
 
     elif day_type == "TREND_UP":
-        # Invalidate if 15m trend reversed
+        # Hard invalidation: both timeframes confirmed reversal
         if trend_15m == "TREND_DOWN" and execution_5m == "DOWN_CONFIRMED":
             thesis = dict(thesis)
             thesis["invalidated"] = True
-            thesis["invalidation_reason"] = "15m turned TREND_DOWN — bullish thesis invalidated."
+            thesis["invalidation_reason"] = "15m turned TREND_DOWN + 5m DOWN_CONFIRMED — bullish thesis invalidated."
             logger.info("Day thesis invalidated: %s", thesis["invalidation_reason"])
+        # Soft decay: 15m flipped but 5m not yet confirmed
+        elif trend_15m == "TREND_DOWN":
+            thesis = dict(thesis)
+            new_conv = max(0.20, conviction - _SOFT_CONVICTION_DECAY)
+            thesis["conviction"] = new_conv
+            thesis["soft_warning"] = (
+                f"15m TREND_DOWN on TREND_UP day — conviction decayed "
+                f"{conviction:.2f}→{new_conv:.2f}"
+            )
+            logger.debug("Day thesis soft decay: %s", thesis["soft_warning"])
+            if new_conv < _HARD_INVALIDATION_CONVICTION:
+                thesis["invalidated"] = True
+                thesis["invalidation_reason"] = (
+                    f"TREND_UP conviction decayed to {new_conv:.2f} — 15m persistent TREND_DOWN."
+                )
+                logger.info("Day thesis invalidated via conviction decay: %s", thesis["invalidation_reason"])
 
     elif day_type == "TREND_DOWN":
+        # Hard invalidation: both timeframes confirmed reversal
         if trend_15m == "TREND_UP" and execution_5m == "UP_CONFIRMED":
             thesis = dict(thesis)
             thesis["invalidated"] = True
-            thesis["invalidation_reason"] = "15m turned TREND_UP — bearish thesis invalidated."
+            thesis["invalidation_reason"] = "15m turned TREND_UP + 5m UP_CONFIRMED — bearish thesis invalidated."
             logger.info("Day thesis invalidated: %s", thesis["invalidation_reason"])
+        # Soft decay: 15m flipped but 5m not yet confirmed
+        elif trend_15m == "TREND_UP":
+            thesis = dict(thesis)
+            new_conv = max(0.20, conviction - _SOFT_CONVICTION_DECAY)
+            thesis["conviction"] = new_conv
+            thesis["soft_warning"] = (
+                f"15m TREND_UP on TREND_DOWN day — conviction decayed "
+                f"{conviction:.2f}→{new_conv:.2f}"
+            )
+            logger.debug("Day thesis soft decay: %s", thesis["soft_warning"])
+            if new_conv < _HARD_INVALIDATION_CONVICTION:
+                thesis["invalidated"] = True
+                thesis["invalidation_reason"] = (
+                    f"TREND_DOWN conviction decayed to {new_conv:.2f} — 15m persistent TREND_UP."
+                )
+                logger.info("Day thesis invalidated via conviction decay: %s", thesis["invalidation_reason"])
 
     return thesis
 
@@ -451,8 +500,9 @@ def get_or_form_day_thesis(
             )
 
     # Check if still valid
+    _pre_check_conviction = thesis.get("conviction")
     thesis = check_invalidation(thesis, spot, trend_15m, execution_5m)
-    if thesis.get("invalidated"):
-        save_day_thesis(thesis, path=path)  # persist the invalidation flag
+    if thesis.get("invalidated") or thesis.get("conviction") != _pre_check_conviction:
+        save_day_thesis(thesis, path=path)  # persist invalidation or conviction decay
 
     return thesis

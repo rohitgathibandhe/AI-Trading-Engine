@@ -221,6 +221,7 @@ def _parse_completed_trades(session_date: str) -> list[dict]:
             "spot_move_pts": float(ex.get("spot_move_pts") or 0.0),
             "theta_capture_pct": float(ex.get("theta_capture_pct") or 0.0),
             "iv_rank_at_entry": ex.get("iv_rank_at_entry") or en.get("entry_iv_rank"),
+            "rv30_pct": float(en.get("ml_rv30_pct") or 0.0),
         })
     return trades
 
@@ -428,7 +429,7 @@ def _feed_outcomes_to_learning_store(trades: list[dict], session_date: str) -> i
                     "mfe_rupees":            t.get("mfe_rupees", 0.0),
                     "iv_rank_at_entry":      t.get("iv_rank_at_entry"),
                     "attribution":           t.get("attribution"),
-                    "rv30_pct":              0.0,
+                    "rv30_pct":              t.get("rv30_pct", 0.0),
                 },
             )
             logged += 1

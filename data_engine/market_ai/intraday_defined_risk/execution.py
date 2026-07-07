@@ -426,13 +426,14 @@ def evaluate_exit(
     short_deltas = [abs(leg.quote.delta) for leg in current_legs if leg.action == "SELL" and leg.quote.delta is not None]
     if short_deltas and max(short_deltas) >= short_delta_limit:
         # Minimum hold time before DELTA_STOP:
-        # - Directional spreads: 3 min (entered near threshold = spurious, not a signal)
+        # - Directional spreads: 10 min (was 3 — delta noise in first few candles is not a signal)
         # - Theta strategies (condor, strangle, straddle): 20 min — position must breathe
         #   before delta noise from the first few candles triggers an exit
         _is_theta_strategy = position.structure.strategy in {
             StrategyType.IRON_CONDOR, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE
         }
-        _min_hold = 20 if _is_theta_strategy else 3
+        _max_profit_r = position.entry_credit_points * position.lot_size * position.lots
+        _min_hold = 20 if _is_theta_strategy else 10
         if elapsed_minutes < _min_hold:
             pass  # hold
         elif (
@@ -448,7 +449,7 @@ def evaluate_exit(
                 "EARLY_STRUCTURE_BULLISH",
                 "SCORE_DRIVEN_BULL",
             }
-            and pnl_rupees > 0
+            and pnl_rupees > -(_max_profit_r * 0.25)  # hold unless lost >25% of max credit
         ):
             return ExitDecision(False, "HOLD", current_value_points, pnl_rupees)
         else:

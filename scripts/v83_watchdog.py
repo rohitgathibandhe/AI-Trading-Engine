@@ -1069,7 +1069,7 @@ def _train_win_probability_model(state: dict) -> None:
             samples_bear.append((feat_vec, label))
 
     def _fit_direction(samples):
-        if len(samples) < 15:
+        if len(samples) < 8:
             return None
         X = np.array([s[0] for s in samples])
         y = np.array([s[1] for s in samples])
