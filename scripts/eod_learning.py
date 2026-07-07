@@ -160,20 +160,67 @@ def _parse_completed_trades(session_date: str) -> list[dict]:
         en = entries.get(entry_ts, {})
         gate = en.get("gate") or {}
         pnl = float(ex.get("realized_paper_pnl") or 0.0)
+        strategy = str(ex.get("strategy") or gate.get("strategy") or "UNKNOWN")
+
+        # Compute credit_width_ratio from entry legs
+        credit_width_ratio = 0.0
+        entry_legs = en.get("legs") or []
+        if len(entry_legs) == 2:
+            try:
+                sell_leg = next((l for l in entry_legs if l.get("action") == "SELL"), None)
+                buy_leg = next((l for l in entry_legs if l.get("action") == "BUY"), None)
+                if sell_leg and buy_leg:
+                    credit = float(sell_leg.get("ltp") or sell_leg.get("bid") or 0) - float(buy_leg.get("ltp") or buy_leg.get("ask") or 0)
+                    width = abs(float(sell_leg.get("strike") or 0) - float(buy_leg.get("strike") or 0))
+                    if width > 0 and credit > 0:
+                        credit_width_ratio = round(credit / width, 4)
+            except Exception:
+                pass
+
+        # Use entry_price_assumptions credit if legs computation failed
+        if credit_width_ratio == 0.0:
+            ep = en.get("entry_price_assumptions") or {}
+            credit_pts = float(ep.get("expected_credit_points") or 0.0)
+            if credit_pts > 0 and len(entry_legs) == 2:
+                try:
+                    s0 = float((entry_legs[0].get("strike") or 0))
+                    s1 = float((entry_legs[1].get("strike") or 0))
+                    w = abs(s0 - s1)
+                    if w > 0:
+                        credit_width_ratio = round(credit_pts / w, 4)
+                except Exception:
+                    pass
+
+        # For bullish strategies, use bullish_trade_score as the directional score
+        bearish_score = float(gate.get("bearish_trade_score") or 0.0)
+        bullish_score = float(gate.get("bullish_trade_score") or 0.0)
+        is_bullish = "BULL" in strategy.upper() or "BULLISH" in strategy.upper()
+        directional_score = bullish_score if is_bullish else bearish_score
+
         trades.append({
             "session_date": session_date,
             "entry_timestamp": entry_ts,
             "exit_timestamp": ex.get("exit_timestamp"),
             "playbook": ex.get("playbook") or gate.get("playbook") or "UNKNOWN",
-            "strategy": ex.get("strategy") or gate.get("strategy") or "UNKNOWN",
+            "strategy": strategy,
             "pnl_rupees": pnl,
             "exit_reason": ex.get("exit_reason"),
             "mae_rupees": float(ex.get("mae_rupees") or 0.0),
             "mfe_rupees": float(ex.get("mfe_rupees") or 0.0),
+            "mfe_capture_pct": float(ex.get("mfe_capture_pct") or 0.0),
             "attribution": ex.get("paper_trade_attribution") or ex.get("paper_candidate_reason"),
             "market_state": gate.get("market_state"),
-            "bearish_trade_score": float(gate.get("bearish_trade_score") or 0.0),
+            "bearish_trade_score": bearish_score,
+            "bullish_trade_score": bullish_score,
+            "directional_score": directional_score,
             "tradability_class": gate.get("tradability_class"),
+            "credit_width_ratio": credit_width_ratio,
+            "holding_minutes": float(ex.get("holding_minutes") or 0.0),
+            "spot_at_entry": float(ex.get("spot_at_entry") or en.get("spot_at_entry") or 0.0),
+            "spot_at_exit": float(ex.get("spot_at_exit") or 0.0),
+            "spot_move_pts": float(ex.get("spot_move_pts") or 0.0),
+            "theta_capture_pct": float(ex.get("theta_capture_pct") or 0.0),
+            "iv_rank_at_entry": ex.get("iv_rank_at_entry") or en.get("entry_iv_rank"),
         })
     return trades
 
@@ -365,12 +412,23 @@ def _feed_outcomes_to_learning_store(trades: list[dict], session_date: str) -> i
                 max_drawdown_rupees=abs(float(t.get("mae_rupees") or 0.0)),
                 margin_utilisation=0.05,  # approximate — refine when margin data is available
                 features={
-                    "playbook":           t.get("playbook"),
-                    "market_state":       t.get("market_state"),
-                    "bearish_trade_score": t.get("bearish_trade_score"),
-                    "exit_reason":        t.get("exit_reason"),
-                    "rv30_pct":           0.0,   # populated when feature history available
-                    "credit_width_ratio": 0.0,
+                    "playbook":              t.get("playbook"),
+                    "market_state":          t.get("market_state"),
+                    "bearish_trade_score":   t.get("bearish_trade_score"),
+                    "bullish_trade_score":   t.get("bullish_trade_score"),
+                    "directional_score":     t.get("directional_score"),
+                    "exit_reason":           t.get("exit_reason"),
+                    "credit_width_ratio":    t.get("credit_width_ratio", 0.0),
+                    "holding_minutes":       t.get("holding_minutes", 0.0),
+                    "spot_at_entry":         t.get("spot_at_entry", 0.0),
+                    "spot_at_exit":          t.get("spot_at_exit", 0.0),
+                    "spot_move_pts":         t.get("spot_move_pts", 0.0),
+                    "theta_capture_pct":     t.get("theta_capture_pct", 0.0),
+                    "mfe_capture_pct":       t.get("mfe_capture_pct", 0.0),
+                    "mfe_rupees":            t.get("mfe_rupees", 0.0),
+                    "iv_rank_at_entry":      t.get("iv_rank_at_entry"),
+                    "attribution":           t.get("attribution"),
+                    "rv30_pct":              0.0,
                 },
             )
             logged += 1

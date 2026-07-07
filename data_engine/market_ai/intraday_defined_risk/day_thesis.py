@@ -357,48 +357,98 @@ def get_or_form_day_thesis(
 
     if thesis is None:
         # No thesis yet for today
-        if not (_THESIS_FORM_TIME <= now.time() <= _THESIS_FORM_END):
-            # Too early or too late to form — return empty
+        if now.time() < _THESIS_FORM_TIME:
+            # Too early — market hasn't opened its first full hour yet
             return {
                 "session_date": session_date,
                 "day_type": "UNFORMED",
                 "preferred_strategy": "UNKNOWN",
                 "conviction": 0.0,
-                "reasoning": f"Thesis not formed yet (time={now.time().strftime('%H:%M')}, window=10:00-10:45).",
+                "reasoning": f"Pre-formation window (time={now.time().strftime('%H:%M')}, opens at 10:00).",
                 "invalidated": False,
             }
-        # Form fresh
-        if execution_5m == "UNCONFIRMED" and trend_15m == "NEUTRAL":
-            # Market hasn't established direction yet — too early to commit
-            return {
-                "session_date": session_date,
-                "day_type": "UNFORMED",
-                "preferred_strategy": "UNKNOWN",
-                "conviction": 0.0,
-                "reasoning": "Market direction unestablished at thesis formation time — waiting.",
-                "invalidated": False,
-            }
-        thesis = compute_day_thesis(
-            spot=spot,
-            trend_15m=trend_15m,
-            execution_5m=execution_5m,
-            daily_tf=daily_tf,
-            option_context=option_context,
-            atm_straddle_pts=atm_straddle_pts,
-            premarket_bias=premarket_bias,
-            smart_money_bias=smart_money_bias,
-            open_space_up=open_space_up,
-            open_space_down=open_space_down,
-            now=now,
-        )
-        save_day_thesis(thesis, path=path)
-        logger.info(
-            "Day thesis formed at %s: type=%s conviction=%.2f — %s",
-            now.strftime("%H:%M"),
-            thesis["day_type"],
-            thesis["conviction"],
-            thesis["reasoning"],
-        )
+
+        if now.time() > _THESIS_FORM_END:
+            # Missed the regular window (agent started late). Attempt a late fallback
+            # if the market has established direction. Cap conviction at 0.55 to stay
+            # conservative about decisions taken without the opening-range context.
+            has_direction = (
+                trend_15m in {"TREND_UP", "TREND_DOWN"}
+                or execution_5m in {"UP_CONFIRMED", "DOWN_CONFIRMED", "RANGE_CONFIRMED"}
+            )
+            if not has_direction:
+                return {
+                    "session_date": session_date,
+                    "day_type": "UNFORMED",
+                    "preferred_strategy": "UNKNOWN",
+                    "conviction": 0.0,
+                    "reasoning": (
+                        f"Late start at {now.time().strftime('%H:%M')} and no clear direction "
+                        f"(trend_15m={trend_15m}, execution_5m={execution_5m}) — skipping fallback."
+                    ),
+                    "invalidated": False,
+                }
+            fallback = compute_day_thesis(
+                spot=spot,
+                trend_15m=trend_15m,
+                execution_5m=execution_5m,
+                daily_tf=daily_tf,
+                option_context=option_context,
+                atm_straddle_pts=atm_straddle_pts,
+                premarket_bias=premarket_bias,
+                smart_money_bias=smart_money_bias,
+                open_space_up=open_space_up,
+                open_space_down=open_space_down,
+                now=now,
+            )
+            # Conservative cap: formed without opening-range context
+            fallback["conviction"] = min(fallback["conviction"], 0.55)
+            fallback["source"] = "LATE_FALLBACK"
+            fallback["reasoning"] = (
+                f"[LATE_FALLBACK @ {now.time().strftime('%H:%M')}] " + fallback.get("reasoning", "")
+            )
+            save_day_thesis(fallback, path=path)
+            logger.info(
+                "Day thesis late-fallback formed at %s: type=%s conviction=%.2f — %s",
+                now.strftime("%H:%M"),
+                fallback["day_type"],
+                fallback["conviction"],
+                fallback["reasoning"],
+            )
+            thesis = fallback
+        else:
+            # Regular formation window (10:00–10:45)
+            if execution_5m == "UNCONFIRMED" and trend_15m == "NEUTRAL":
+                # Market hasn't established direction yet — too early to commit
+                return {
+                    "session_date": session_date,
+                    "day_type": "UNFORMED",
+                    "preferred_strategy": "UNKNOWN",
+                    "conviction": 0.0,
+                    "reasoning": "Market direction unestablished at thesis formation time — waiting.",
+                    "invalidated": False,
+                }
+            thesis = compute_day_thesis(
+                spot=spot,
+                trend_15m=trend_15m,
+                execution_5m=execution_5m,
+                daily_tf=daily_tf,
+                option_context=option_context,
+                atm_straddle_pts=atm_straddle_pts,
+                premarket_bias=premarket_bias,
+                smart_money_bias=smart_money_bias,
+                open_space_up=open_space_up,
+                open_space_down=open_space_down,
+                now=now,
+            )
+            save_day_thesis(thesis, path=path)
+            logger.info(
+                "Day thesis formed at %s: type=%s conviction=%.2f — %s",
+                now.strftime("%H:%M"),
+                thesis["day_type"],
+                thesis["conviction"],
+                thesis["reasoning"],
+            )
 
     # Check if still valid
     thesis = check_invalidation(thesis, spot, trend_15m, execution_5m)

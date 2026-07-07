@@ -1017,6 +1017,7 @@ def evaluate_entry_gate(
         "market_state": market_state,
         "tradability_class": metadata.get("tradability_class") or funnel.get("tradability_class"),
         "bearish_trade_score": round(bearish_score, 4),
+        "bullish_trade_score": round(bullish_score, 4),
         "no_trade_score": round(no_trade_score, 4),
         "score_margin_required": score_margin_required,
     }
@@ -1151,6 +1152,7 @@ def evaluate_paper_context_override_gate(
         "tradability_class": metadata.get("tradability_class") or funnel.get("tradability_class"),
         "failure_type": metadata.get("failure_type") or funnel.get("failure_type"),
         "bearish_trade_score": round(bearish_score, 4),
+        "bullish_trade_score": round(bullish_score, 4),
         "no_trade_score": round(no_trade_score, 4),
         "score_threshold_required": config.paper_override_bearish_score_threshold,
         "score_margin_required": config.paper_override_margin,

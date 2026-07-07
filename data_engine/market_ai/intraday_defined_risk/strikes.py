@@ -58,14 +58,22 @@ def select_best_structure(
         if setup_quality_score is not None
         else regime_state.metadata.get("setup_quality_score") or 0.0
     )
+    is_expiry_day = bool(regime_state.metadata.get("is_expiry_day"))
     if strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD:
+        # Tighter delta band on expiry day — gamma spikes make 0.18-0.25 deltas dangerous
+        if is_expiry_day:
+            bc_short_band = (0.08, 0.15)
+            bc_long_band = (0.03, 0.08)
+        else:
+            bc_short_band = (0.18, 0.25)
+            bc_long_band = (0.05, 0.15)
         return _evaluate_vertical_candidates(
             strategy=strategy,
             snapshot=snapshot,
             regime_state=regime_state,
             option_type=OptionType.CALL,
-            short_delta_band=(0.18, 0.25),
-            long_delta_band=(0.05, 0.15),
+            short_delta_band=bc_short_band,
+            long_delta_band=bc_long_band,
             params=params,
             setup_quality_score=setup_quality,
             playbook_tier=playbook_tier,
@@ -74,9 +82,11 @@ def select_best_structure(
         )
     if strategy == StrategyType.BULL_PUT_CREDIT_SPREAD:
         playbook = regime_state.metadata.get("playbook")
-        short_delta_band = (0.18, 0.25)
-        long_delta_band = (0.05, 0.10)
-        if (
+        # Tighter delta band on expiry day — gamma spikes make 0.18-0.25 deltas dangerous
+        if is_expiry_day:
+            short_delta_band = (0.08, 0.15)
+            long_delta_band = (0.03, 0.08)
+        elif (
             playbook == "SIDEWAYS_TO_BULLISH_RECLAIM"
             and regime_state.metadata.get("bullish_setup") == "VWAP_HOLD_HIGHER_LOW"
             and bool(regime_state.metadata.get("early_sideways_bullish_ready"))
@@ -84,6 +94,9 @@ def select_best_structure(
         ):
             short_delta_band = (0.10, 0.25)
             long_delta_band = (0.0, 0.10)
+        else:
+            short_delta_band = (0.18, 0.25)
+            long_delta_band = (0.05, 0.10)
         return _evaluate_vertical_candidates(
             strategy=strategy,
             snapshot=snapshot,

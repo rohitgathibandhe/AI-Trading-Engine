@@ -542,15 +542,13 @@ class DhanLiveMarketDataProvider:
         # Phase 6: Fetch auxiliary market context (India VIX + BankNifty) best-effort.
         # Written to state/market_context.json for regime.py to read each cycle.
         # security_ids: India VIX=1, BankNifty=25 (both IDX_I segment on Dhan).
+        # Use get_ltp_once per symbol (ticker + quote fallback) rather than bulk
+        # call — the bulk API returns status=failure for non-subscribed sec IDs.
         _VIX_ID = 1
         _BANK_ID = 25
         try:
-            _ltp_map = self._dw.get_ltp_bulk([
-                (self.underlying_seg, _VIX_ID),
-                (self.underlying_seg, _BANK_ID),
-            ])
-            _vix_ltp = _ltp_map.get((self.underlying_seg, _VIX_ID))
-            _bank_ltp = _ltp_map.get((self.underlying_seg, _BANK_ID))
+            _vix_ltp = self._dw.get_ltp_once(self.underlying_seg, _VIX_ID)
+            _bank_ltp = self._dw.get_ltp_once(self.underlying_seg, _BANK_ID)
             _ctx_path = STATE_ROOT / "market_context.json"
             _ctx: dict = {}
             if _ctx_path.exists():
