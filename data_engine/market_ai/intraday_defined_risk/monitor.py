@@ -1014,21 +1014,32 @@ class IntradayDefinedRiskAgent:
             "BULL_PUT_CREDIT_SPREAD": StrategyType.BULL_PUT_CREDIT_SPREAD,
             "IRON_CONDOR": StrategyType.IRON_CONDOR,
             "SHORT_STRANGLE": StrategyType.SHORT_STRANGLE,
+            "CALL_DEBIT_SPREAD": StrategyType.CALL_DEBIT_SPREAD,
+            "PUT_DEBIT_SPREAD": StrategyType.PUT_DEBIT_SPREAD,
         }
         strategy = _strat_map.get(choice.structures[0])
         if strategy is None:
             return None  # fall back to legacy
 
-        direction = "BEARISH" if strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD else (
-            "BULLISH" if strategy == StrategyType.BULL_PUT_CREDIT_SPREAD else "RANGE")
+        _dir_map = {
+            StrategyType.BEAR_CALL_CREDIT_SPREAD: "BEARISH",
+            StrategyType.PUT_DEBIT_SPREAD: "BEARISH",
+            StrategyType.BULL_PUT_CREDIT_SPREAD: "BULLISH",
+            StrategyType.CALL_DEBIT_SPREAD: "BULLISH",
+        }
+        direction = _dir_map.get(strategy, "RANGE")
+        _is_debit = strategy in (StrategyType.CALL_DEBIT_SPREAD, StrategyType.PUT_DEBIT_SPREAD)
         playbook = f"SEL_{choice.condition}"
         meta["playbook"] = playbook
         meta["setup_direction"] = direction
         meta["setup_quality_score"] = max(float(meta.get("setup_quality_score") or 0.0), choice.conviction * 20.0)
-        if direction == "BEARISH" and choice.read and choice.read.resistance:
-            meta["min_short_call_strike"] = float(choice.read.resistance)
-        elif direction == "BULLISH" and choice.read and choice.read.support:
-            meta["max_short_put_strike"] = float(choice.read.support)
+        # Credit spreads take a wall/level floor for strike selection; debit spreads
+        # use their own delta-band selection, so no strike guidance is imposed.
+        if not _is_debit:
+            if direction == "BEARISH" and choice.read and choice.read.resistance:
+                meta["min_short_call_strike"] = float(choice.read.resistance)
+            elif direction == "BULLISH" and choice.read and choice.read.support:
+                meta["max_short_put_strike"] = float(choice.read.support)
 
         entry_allowed, entry_reason = validate_entry_time(strategy, snapshot.timestamp)
         if not entry_allowed:

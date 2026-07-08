@@ -56,8 +56,9 @@ IV_RICH = "RICH"     # sell premium is favoured
 IV_CHEAP = "CHEAP"   # buy premium is favoured
 IV_NORMAL = "NORMAL"
 
-# Executable today vs needs-build (so the build order is explicit and honest)
-_EXECUTABLE = {"BEAR_CALL_CREDIT_SPREAD", "BULL_PUT_CREDIT_SPREAD", "IRON_CONDOR", "SHORT_STRANGLE", "SHORT_STRADDLE"}
+# Executable today (Stage 2 added the directional debit spreads).
+_EXECUTABLE = {"BEAR_CALL_CREDIT_SPREAD", "BULL_PUT_CREDIT_SPREAD", "IRON_CONDOR",
+               "SHORT_STRANGLE", "SHORT_STRADDLE", "CALL_DEBIT_SPREAD", "PUT_DEBIT_SPREAD"}
 
 
 @dataclass
@@ -128,20 +129,17 @@ def select_strategy(metadata: dict[str, Any], spot: float) -> StrategyChoice:
     choice = StrategyChoice(condition=condition, iv_regime=iv, read=read, conviction=read.conviction)
 
     if condition in (STRONG_TREND_UP, BREAKOUT_UP):
-        # Trend up: buy a call debit (positive skew) in cheap IV, or sell a bull-put
-        # (with-trend theta) when premium is rich.
-        if iv == IV_CHEAP:
-            choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["CALL_DEBIT_SPREAD"]
-        else:
-            choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
-        choice.rationale = f"{condition} / IV {iv}: trade WITH the up-move; {'buy call debit (cheap premium, +skew)' if iv==IV_CHEAP else 'sell bull-put below support (rich premium, theta)'}."
+        # Nifty UP-moves grind and chop — a call-debit needs a clean continued rally
+        # and gets whipsawed (7mo: CALL_DEBIT -Rs30.9k). A with-trend BULL-PUT profits
+        # on up OR sideways via theta, which fits the grindy character far better.
+        choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
+        choice.rationale = f"{condition}: with-trend bull-put (Nifty up-moves grind — theta fits better than a debit needing a clean rally)."
 
     elif condition in (STRONG_TREND_DOWN, BREAKOUT_DOWN):
-        if iv == IV_CHEAP:
-            choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
-        else:
-            choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BEAR_CALL_CREDIT_SPREAD"]
-        choice.rationale = f"{condition} / IV {iv}: trade WITH the down-move; {'buy put debit (cheap premium, +skew)' if iv==IV_CHEAP else 'sell bear-call above resistance (rich premium, theta)'}."
+        # Nifty DOWN-moves are sharp — a PUT-DEBIT's positive skew captures them
+        # (7mo: PUT_DEBIT +Rs40.3k). This is the core edge.
+        choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
+        choice.rationale = f"{condition}: buy PUT DEBIT with the down-move (Nifty falls sharply — +skew capped-loss captures it)."
 
     elif condition == RANGE_WIDE:
         # Sell premium into a defined range only when it's rich.

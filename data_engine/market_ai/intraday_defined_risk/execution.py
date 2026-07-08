@@ -129,6 +129,10 @@ def validate_entry_context(
 
 
 def simulate_entry_credit(structure: TradeStructure, slippage_points: float) -> float:
+    if structure.metadata.get("is_debit"):
+        # Debit spread: credit_points is stored NEGATIVE (=-debit). Slippage worsens
+        # the fill (pay more), so the effective entry stays negative. No 0-clamp.
+        return structure.credit_points - slippage_points
     return max(structure.credit_points - slippage_points, 0.0)
 
 
@@ -305,6 +309,81 @@ def mark_to_market_value_points(position: OpenPosition, quotes_by_leg: list[Stra
     return max(liability, 0.0)
 
 
+# ── Debit-spread exit engine (mirror of the credit logic) ───────────────────
+DEBIT_TP_CAPTURE = 0.60       # take profit at 60% of max profit
+DEBIT_STOP_FRAC = 0.50        # stop when 50% of the debit is lost
+DEBIT_MIN_HOLD = 10           # min minutes before the stop can fire (noise guard)
+DEBIT_TRAIL_ARM = 0.40        # once 40% of max profit is captured, trail
+DEBIT_TRAIL_GIVEBACK = 0.35   # exit if the trade gives back 35% of its peak profit
+
+
+def _current_debit_value(
+    position: OpenPosition,
+    current_snapshot: MarketSnapshot | None,
+    current_structure: TradeStructure | None,
+) -> float | None:
+    """Current sellable value of a debit spread in points = long_mark - short_mark."""
+    if current_snapshot is None:
+        return None
+    long_mark = short_mark = None
+    for leg in position.structure.legs:
+        quote = current_snapshot.option_chain.find_quote(leg.strike, leg.option_type)
+        if quote is None:
+            return None
+        mark = max(float(quote.mid_price or quote.ltp or 0.0), 0.0)
+        if leg.action == "BUY":
+            long_mark = mark
+        else:
+            short_mark = mark
+    if long_mark is None or short_mark is None:
+        return None
+    return max(long_mark - short_mark, 0.0)
+
+
+def _evaluate_debit_exit(
+    position: OpenPosition,
+    current_snapshot: MarketSnapshot | None,
+    current_structure: TradeStructure | None,
+    now: datetime,
+) -> ExitDecision:
+    """Debit spread P&L is the mirror of a credit spread: you pay a debit and profit
+    when the spread's value RISES. pnl = (current_value - entry_debit) * size.
+    Exits: profit target (% of max profit), hard stop (% of debit lost), profit
+    trail once armed, and the 15:15 flatten."""
+    entry_debit = abs(position.entry_credit_points)  # stored negative
+    width = position.structure.width_points
+    max_profit = max(width - entry_debit, 0.0)
+    value = _current_debit_value(position, current_snapshot, current_structure)
+    if value is None:
+        value = entry_debit  # no data → mark at breakeven
+    pnl = (value - entry_debit) * position.lot_size * position.lots
+    profit_captured = value - entry_debit
+
+    if now.time() >= TIME_EXIT:
+        return ExitDecision(True, "TIME_EXIT", value, pnl)
+
+    elapsed_minutes = _elapsed_minutes(now, position.entry_time)
+
+    # Profit target: captured >= 60% of max profit
+    if max_profit > 0 and profit_captured >= DEBIT_TP_CAPTURE * max_profit:
+        return ExitDecision(True, "DEBIT_TARGET", value, pnl)
+
+    # Hard stop: lost >= 50% of the debit (after a short breathe)
+    if elapsed_minutes >= DEBIT_MIN_HOLD and value <= entry_debit * (1.0 - DEBIT_STOP_FRAC):
+        return ExitDecision(True, "DEBIT_STOP", value, pnl)
+
+    # Profit trail: once armed at 40% of max profit, exit on a 35% giveback of peak
+    peak = max(float(position.metadata.get("debit_peak_value") or entry_debit), value)
+    position.metadata["debit_peak_value"] = peak
+    peak_profit = peak - entry_debit
+    if max_profit > 0 and peak_profit >= DEBIT_TRAIL_ARM * max_profit:
+        floor_profit = peak_profit * (1.0 - DEBIT_TRAIL_GIVEBACK)
+        if profit_captured <= floor_profit:
+            return ExitDecision(True, "DEBIT_PROFIT_TRAIL", value, pnl)
+
+    return ExitDecision(False, "HOLD", value, pnl)
+
+
 def evaluate_exit(
     position: OpenPosition,
     current_structure: TradeStructure | None = None,
@@ -313,6 +392,8 @@ def evaluate_exit(
     current_regime: RegimeState | None = None,
     now: datetime,
 ) -> ExitDecision:
+    if position.structure.strategy in {StrategyType.CALL_DEBIT_SPREAD, StrategyType.PUT_DEBIT_SPREAD}:
+        return _evaluate_debit_exit(position, current_snapshot, current_structure, now)
     current_value_points, current_legs = _current_position_mark(position, current_snapshot, current_structure)
     if now.time() >= TIME_EXIT:
         liability = current_value_points if current_value_points is not None else position.stop_value_points
