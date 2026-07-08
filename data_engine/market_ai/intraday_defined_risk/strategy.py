@@ -31,7 +31,7 @@ SIDEWAYS_BEARISH_REJECTION_START = time(11, 30)
 SIDEWAYS_BEARISH_REJECTION_END = time(14, 30)
 GAP_BEARISH_START = time(9, 45)
 GAP_BEARISH_END = time(13, 0)
-GAP_DOWN_BEARISH_CONTINUATION_END = time(12, 0)
+GAP_DOWN_BEARISH_CONTINUATION_END = time(14, 0)  # was 12:00 — blocked strong midday down-trend continuations; aligned with OPEN_DRIVE_BEARISH 14:00 end and the 14:30 directional cutoff
 GAP_UP_BEARISH_FAILURE_END = time(11, 15)
 RANGE_CONDOR_START = time(10, 30)
 RANGE_CONDOR_END = time(13, 30)
@@ -478,8 +478,10 @@ def select_strategy(
                 f"Bearish regime is generic {day_archetype}; only gap/open-drive/sideways/trend-bearish archetypes are eligible for downside deployment."
             )
             return StrategyType.NO_TRADE, reasons
-        if day_archetype == "OPEN_DRIVE_BEARISH" and bearish_setup != "TIGHT_BREAKDOWN":
-            reasons.append("Open-drive bearish sessions require a tight breakdown setup, not a generic continuation.")
+        if day_archetype == "OPEN_DRIVE_BEARISH" and bearish_setup not in {"TIGHT_BREAKDOWN", "FAILED_RECLAIM"}:
+            # A FAILED_RECLAIM on a down-driving day (price tried to reclaim a level and
+            # failed) is a valid short into the failed bounce — not a "generic continuation".
+            reasons.append("Open-drive bearish sessions require a tight breakdown or failed-reclaim setup, not a generic continuation.")
             return StrategyType.NO_TRADE, reasons
         if day_archetype == "EARLY_BALANCE_TO_BEARISH" and (bearish_setup != "FAILED_RECLAIM" or playbook != "EARLY_BALANCE_BEARISH_FAILED_RECLAIM"):
             reasons.append("Early-balance bearish sessions require the dedicated failed-reclaim playbook before deployment.")

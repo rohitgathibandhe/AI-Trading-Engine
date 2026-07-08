@@ -65,7 +65,11 @@ def select_best_structure(
             bc_short_band = (0.08, 0.15)
             bc_long_band = (0.03, 0.08)
         else:
-            bc_short_band = (0.18, 0.25)
+            # Upper bound 0.30 (was 0.25): when the OI-wall/anchor floor pushes the
+            # short strike toward a still-0.26-0.30-delta level, a 0.25 cap rejected
+            # every candidate with DELTA_TOO_HIGH and built no spread. 0.30 short is
+            # still a defensible OTM credit-spread strike for a directional bear view.
+            bc_short_band = (0.18, 0.30)
             bc_long_band = (0.05, 0.15)
         return _evaluate_vertical_candidates(
             strategy=strategy,
