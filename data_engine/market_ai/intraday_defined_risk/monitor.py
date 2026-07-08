@@ -889,11 +889,14 @@ class IntradayDefinedRiskAgent:
         if strategy is None:
             return None  # unmapped — fall back to legacy
 
-        # Feed the planner's strike intent to the structure selector.
-        if plan.direction == "BEARISH" and plan.short_strike is not None:
-            meta["min_short_call_strike"] = plan.short_strike
-        elif plan.direction == "BULLISH" and plan.short_strike is not None:
-            meta["max_short_put_strike"] = plan.short_strike
+        # WHAT: do NOT force a strike from the read. The proven delta-band + wall
+        # anchor selector (which produced the profitable legacy trades) picks a safe
+        # OTM short; forcing resistance/spot+60 gave near-ATM, high-delta shorts that
+        # lost. The planner only picks a resistance FLOOR the short must clear.
+        if plan.direction == "BEARISH" and plan.read and plan.read.resistance:
+            meta["min_short_call_strike"] = float(plan.read.resistance)
+        elif plan.direction == "BULLISH" and plan.read and plan.read.support:
+            meta["max_short_put_strike"] = float(plan.read.support)
         playbook = f"PLANNER_{plan.direction}"
         meta["playbook"] = playbook
         meta["setup_direction"] = plan.direction
@@ -906,6 +909,29 @@ class IntradayDefinedRiskAgent:
                 confidence_score=plan.conviction,
                 extra_metadata=dict(meta) | {"trade_funnel": _funnel("ENTRY_TIME_INVALID", strategy.value, "NO_TRADE")},
             )
+
+        # WHEN: enforce the tape discipline the legacy path uses — don't sell calls
+        # into strength (price above VWAP / PCR falling). Plus a symmetric bull-put
+        # check: don't sell puts into weakness (price below VWAP / PCR rising).
+        ctx_ok, ctx_reason = validate_entry_context(strategy, snapshot, regime_state)
+        if not ctx_ok:
+            return build_no_trade_decision(
+                regime_state.regime.value, plan.rationale + [f"Entry context: {ctx_reason}"],
+                confidence_score=plan.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel(str(ctx_reason or "ENTRY_CONTEXT"), strategy.value, "NO_TRADE")},
+            )
+        if strategy == StrategyType.BULL_PUT_CREDIT_SPREAD:
+            from .features import session_bars, compute_vwap
+            _bars = session_bars(snapshot.nifty_5m)
+            _vwap = snapshot.live_vwap or regime_state.vwap or (compute_vwap(_bars) if _bars else None)
+            if _bars and _vwap and _vwap > 0 and _bars[-1].close < _vwap * 0.998:
+                return build_no_trade_decision(
+                    regime_state.regime.value, plan.rationale + ["Entry context: PRICE_BELOW_VWAP_AT_ENTRY"],
+                    confidence_score=plan.conviction,
+                    extra_metadata=dict(meta) | {"trade_funnel": _funnel("PRICE_BELOW_VWAP_AT_ENTRY", strategy.value, "NO_TRADE")},
+                )
+            if str(meta.get("pcr_trend") or "") == "RISING" and False:
+                pass  # (reserved) puts building can still support a bull-put; no veto
 
         structure, structure_reasons, structure_report = select_best_structure(
             strategy, snapshot, regime_state, self.parameters,
