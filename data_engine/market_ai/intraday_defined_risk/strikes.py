@@ -59,6 +59,11 @@ def select_best_structure(
         else regime_state.metadata.get("setup_quality_score") or 0.0
     )
     is_expiry_day = bool(regime_state.metadata.get("is_expiry_day"))
+    if strategy in (StrategyType.CALL_DEBIT_SPREAD, StrategyType.PUT_DEBIT_SPREAD):
+        return _select_debit_spread(
+            strategy, snapshot, regime_state, params,
+            setup_quality_score=setup_quality, playbook_tier=playbook_tier,
+        )
     if strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD:
         # Tighter delta band on expiry day — gamma spikes make 0.18-0.25 deltas dangerous
         if is_expiry_day:
@@ -298,6 +303,115 @@ def _score_candidate(
         + min(0.6, credit_points / max(width_points, 1.0))
     )
     return round(score, 4)
+
+
+def _select_debit_spread(
+    strategy: StrategyType,
+    snapshot: MarketSnapshot,
+    regime_state: RegimeState,
+    params: AdaptiveParameters,
+    *,
+    setup_quality_score: float,
+    playbook_tier: str,
+) -> tuple[TradeStructure | None, list[str], dict[str, object]]:
+    """Directional debit spread: BUY near-ATM (~0.45 delta), SELL further-OTM
+    (~0.25 delta), same option type. Net DEBIT paid = max loss; max profit =
+    width - debit. Positive skew (small capped loss, larger win) for trend days
+    where selling premium has poor risk/reward. credit_points is stored NEGATIVE
+    to signal a debit to the downstream engine."""
+    option_type = OptionType.CALL if strategy == StrategyType.CALL_DEBIT_SPREAD else OptionType.PUT
+    spot = snapshot.option_chain.spot
+    quotes = _liquid_otm_quotes(snapshot.option_chain.quotes, option_type=option_type, spot=spot)
+    report: dict[str, object] = {
+        "strategy": strategy.value,
+        "setup_quality_score": round(setup_quality_score, 4),
+        "passed_spread_construction": False,
+        "passed_delta_band": False,
+        "passed_liquidity": bool(quotes),
+        "canonical_rejection_reason": "LIQUIDITY_BAD",
+        "candidate_evaluations": [],
+        "best_candidate": None,
+    }
+    if len(quotes) < 2:
+        return None, ["Debit spread: fewer than 2 liquid quotes."], report
+
+    long_band = (0.40, 0.55)    # near-ATM long leg (the directional engine)
+    short_band = (0.20, 0.32)   # further-OTM short leg (finances the long, caps profit)
+    widths = regime_state.metadata.get("allowed_width_points") or (100.0, 150.0)
+    widths = {float(w) for w in widths}
+
+    best = None
+    best_score = -inf
+    for long_q in quotes:
+        if long_q.delta is None or long_q.mid_price is None:
+            continue
+        if not (long_band[0] <= abs(long_q.delta) <= long_band[1]):
+            continue
+        for short_q in quotes:
+            if short_q.delta is None or short_q.mid_price is None:
+                continue
+            if not (short_band[0] <= abs(short_q.delta) <= short_band[1]):
+                continue
+            # Long is the closer-to-money strike; short is further OTM.
+            if option_type == OptionType.CALL and short_q.strike <= long_q.strike:
+                continue
+            if option_type == OptionType.PUT and short_q.strike >= long_q.strike:
+                continue
+            width = abs(short_q.strike - long_q.strike)
+            if width not in widths:
+                continue
+            debit = long_q.mid_price - short_q.mid_price
+            if debit <= 0:
+                continue                       # must be a net debit
+            if debit >= width * 0.70:
+                continue                       # poor R:R — paying too much of the width
+            max_profit = width - debit
+            rr = max_profit / debit
+            score = rr - long_q.spread_ratio - short_q.spread_ratio
+            if score > best_score:
+                best_score = score
+                best = (long_q, short_q, width, debit, max_profit, rr)
+
+    if best is None:
+        report["canonical_rejection_reason"] = "NO_DEBIT_STRUCTURE"
+        return None, ["Debit spread: no long/short pair met delta/width/RR rules."], report
+
+    long_q, short_q, width, debit, max_profit, rr = best
+    legs = [
+        StrategyLeg(action="BUY", option_type=option_type, strike=long_q.strike, quote=long_q),
+        StrategyLeg(action="SELL", option_type=option_type, strike=short_q.strike, quote=short_q),
+    ]
+    structure = TradeStructure(
+        strategy=strategy,
+        legs=legs,
+        credit_points=-round(debit, 4),  # NEGATIVE = debit paid
+        width_points=round(width, 2),
+        margin_estimate_per_lot=round(debit * snapshot.lot_size, 2),  # debit paid = max loss = margin
+        rationale=[
+            f"Directional {option_type.value} debit: buy {long_q.strike:.0f} (~{abs(long_q.delta):.2f}d) / "
+            f"sell {short_q.strike:.0f} (~{abs(short_q.delta):.2f}d).",
+            f"Debit {debit:.1f}pts, width {width:.0f}, max profit {max_profit:.1f}pts, R:R {rr:.2f}.",
+        ],
+        metadata={
+            "debit_points": round(debit, 4),
+            "max_profit_points": round(max_profit, 4),
+            "risk_reward": round(rr, 2),
+            "structure_credit_points": -round(debit, 4),
+            "is_debit": True,
+        },
+    )
+    report.update({
+        "passed_spread_construction": True,
+        "passed_delta_band": True,
+        "passed_credit_width": True,
+        "passed_anchor_distance": True,
+        "canonical_rejection_reason": "NONE",
+        "monetization_score": round(rr, 4),
+        "final_trade_score": round(setup_quality_score + rr, 4),
+        "best_candidate": {"long_strike": long_q.strike, "short_strike": short_q.strike,
+                           "debit_points": round(debit, 4), "risk_reward": round(rr, 2)},
+    })
+    return structure, list(structure.rationale), report
 
 
 def _evaluate_vertical_candidates(

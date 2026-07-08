@@ -258,6 +258,9 @@ def main(argv: list[str] | None = None) -> int:
             output_path = Path(args.output_json)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(summary_json + "\n")
+            # Also dump per-trade detail for forensic analysis (sibling _trades.json).
+            trades_path = output_path.with_name(output_path.stem + "_trades.json")
+            trades_path.write_text(json.dumps(result.get("trades", []), indent=2, default=str) + "\n")
         print(summary_json)
         return 0
     if args.command == "inspect_dataset":
