@@ -3136,9 +3136,10 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         htf_short_put = round((nearest_support_level + 25.0) / 50.0) * 50.0 if nearest_support_level else spot - 75.0
         metadata.setdefault("condor_short_call_anchor", htf_short_call)
         metadata.setdefault("condor_short_put_anchor", htf_short_put)
+        _res_lvl_str = f"{nearest_resistance_level:.0f}" if nearest_resistance_level is not None else "n/a"
         reasons.append(
             f"HTF resistance cap: open_space_up={float(metadata['open_space_up']):.0f}pts "
-            f"(daily/weekly resistance at {nearest_resistance_level:.0f}), "
+            f"(daily/weekly resistance at {_res_lvl_str}), "
             f"trend_15m=NEUTRAL — deploying range CONDOR instead of directional spread."
         )
         confidence = max(confidence, 0.60)
