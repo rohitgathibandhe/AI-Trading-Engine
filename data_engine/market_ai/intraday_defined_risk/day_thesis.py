@@ -123,10 +123,10 @@ def compute_day_thesis(
 
     if dist_to_sup < 100.0:
         range_score += 2.0
-        signals.append(f"HTF support {key_support:.0f} only {dist_to_sup:.0f}pts away (+2 range)")
+        signals.append(f"HTF support {sup_str} only {dist_to_sup:.0f}pts away (+2 range)")
     elif dist_to_sup >= 200.0 and trend_15m == "TREND_DOWN":
         trend_dn_score += 0.5
-        signals.append(f"HTF support {key_support:.0f} far — downtrend has room (+0.5 trend-dn)")
+        signals.append(f"HTF support {sup_str} far — downtrend has room (+0.5 trend-dn)")
 
     # IV / premium environment: elevated IV = premium selling opportunity
     iv_regime = "NORMAL"
