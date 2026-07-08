@@ -994,6 +994,20 @@ class IntradayDefinedRiskAgent:
         meta["selector_condition"] = choice.condition
         meta["selector_family"] = choice.family
         meta["selector_iv"] = choice.iv_regime
+        # Attach the full multi-dimensional reasoning (option chain + chart + levels
+        # + confluence) so every decision is auditable — "why did the agent do this?".
+        try:
+            from .decision_justification import build_thesis
+            _thesis = build_thesis(
+                meta, spot,
+                strategy=(choice.structures[0] if choice.structures else "STAND_ASIDE"),
+                strategy_why=choice.rationale,
+            )
+            meta["trade_thesis"] = _thesis.to_text()
+            meta["thesis_confluence"] = _thesis.confluence
+            meta["thesis_net_bias"] = _thesis.net_bias
+        except Exception:  # noqa: BLE001 — reasoning log must never break trading
+            pass
 
         def _funnel(reason: str, strat: str, result: str) -> dict:
             return {"canonical_rejection_reason": reason, "selected_strategy": strat,
