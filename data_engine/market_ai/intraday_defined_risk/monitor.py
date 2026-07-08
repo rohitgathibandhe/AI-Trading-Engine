@@ -835,6 +835,9 @@ class IntradayDefinedRiskAgent:
             if allow_naked is None
             else bool(allow_naked)
         )
+        # Condition-first strategy selector (reads condition -> picks strategy family).
+        # Off unless USE_SELECTOR env set, so it can be A/B-validated on the backtest.
+        self.use_selector = bool(os.environ.get("USE_SELECTOR"))
         self.open_position: OpenPosition | None = None
         self._current_features: dict[str, object] = {}
         self._session_date = None
@@ -978,6 +981,108 @@ class IntradayDefinedRiskAgent:
             },
         )
 
+    def _evaluate_via_selector(self, snapshot: MarketSnapshot, regime_state) -> DecisionOutput | None:
+        """Condition-first: classify the market condition, pick the strategy family,
+        stand aside in chop. Only trades structures that are executable today
+        (credit spreads / condor / strangle); debit-family selections stand aside
+        until Stage 2 builds them."""
+        from .strategy_selector import select_strategy as _select
+        from .strategy_selector import FAM_STAND_ASIDE
+        spot = float(snapshot.option_chain.spot)
+        meta = regime_state.metadata
+        choice = _select(meta, spot)
+        meta["selector_condition"] = choice.condition
+        meta["selector_family"] = choice.family
+        meta["selector_iv"] = choice.iv_regime
+
+        def _funnel(reason: str, strat: str, result: str) -> dict:
+            return {"canonical_rejection_reason": reason, "selected_strategy": strat,
+                    "final_result": result, "playbook": f"SEL_{choice.condition}",
+                    "selector_condition": choice.condition, "selector_family": choice.family}
+
+        # Stand aside: chop / high-vol-undirected / not-yet-executable structure
+        if choice.family == FAM_STAND_ASIDE or not choice.executable_today or not choice.structures:
+            self._current_features = {"playbook": f"SEL_{choice.condition}", "selector_family": choice.family}
+            return build_no_trade_decision(
+                regime_state.regime.value, [choice.rationale],
+                confidence_score=choice.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel("SELECTOR_STAND_ASIDE", "NO_TRADE", "NO_TRADE")},
+            )
+
+        _strat_map = {
+            "BEAR_CALL_CREDIT_SPREAD": StrategyType.BEAR_CALL_CREDIT_SPREAD,
+            "BULL_PUT_CREDIT_SPREAD": StrategyType.BULL_PUT_CREDIT_SPREAD,
+            "IRON_CONDOR": StrategyType.IRON_CONDOR,
+            "SHORT_STRANGLE": StrategyType.SHORT_STRANGLE,
+        }
+        strategy = _strat_map.get(choice.structures[0])
+        if strategy is None:
+            return None  # fall back to legacy
+
+        direction = "BEARISH" if strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD else (
+            "BULLISH" if strategy == StrategyType.BULL_PUT_CREDIT_SPREAD else "RANGE")
+        playbook = f"SEL_{choice.condition}"
+        meta["playbook"] = playbook
+        meta["setup_direction"] = direction
+        meta["setup_quality_score"] = max(float(meta.get("setup_quality_score") or 0.0), choice.conviction * 20.0)
+        if direction == "BEARISH" and choice.read and choice.read.resistance:
+            meta["min_short_call_strike"] = float(choice.read.resistance)
+        elif direction == "BULLISH" and choice.read and choice.read.support:
+            meta["max_short_put_strike"] = float(choice.read.support)
+
+        entry_allowed, entry_reason = validate_entry_time(strategy, snapshot.timestamp)
+        if not entry_allowed:
+            return build_no_trade_decision(
+                regime_state.regime.value, [choice.rationale] + ([entry_reason] if entry_reason else []),
+                confidence_score=choice.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel("ENTRY_TIME_INVALID", strategy.value, "NO_TRADE")},
+            )
+        ctx_ok, ctx_reason = validate_entry_context(strategy, snapshot, regime_state)
+        if not ctx_ok:
+            return build_no_trade_decision(
+                regime_state.regime.value, [choice.rationale, f"Entry context: {ctx_reason}"],
+                confidence_score=choice.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel(str(ctx_reason or "ENTRY_CONTEXT"), strategy.value, "NO_TRADE")},
+            )
+
+        structure, structure_reasons, structure_report = select_best_structure(
+            strategy, snapshot, regime_state, self.parameters,
+            setup_quality_score=float(meta.get("setup_quality_score") or 0.0), playbook_tier="A",
+        )
+        if not structure:
+            return build_no_trade_decision(
+                regime_state.regime.value, [choice.rationale] + structure_reasons,
+                confidence_score=choice.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel(
+                    str(structure_report.get("canonical_rejection_reason") or "SPREAD_CONSTRUCTION_FAILED"),
+                    strategy.value, "NO_TRADE")},
+            )
+        risk = assess_trade_risk(
+            structure=structure, lot_size=snapshot.lot_size,
+            risk_limits=snapshot.risk_limits, account_state=snapshot.account_state,
+            margin_estimate_per_lot=structure.margin_estimate_per_lot, playbook=playbook,
+        )
+        if not risk.allowed:
+            return build_no_trade_decision(
+                regime_state.regime.value, [choice.rationale] + risk.reasons,
+                confidence_score=choice.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel("RISK_LIMIT", strategy.value, "NO_TRADE")},
+            )
+        self._current_features = {"playbook": playbook, "setup_direction": direction,
+                                  "selector_condition": choice.condition, "selector_family": choice.family}
+        return build_trade_decision(
+            structure=structure, regime=regime_state.regime,
+            rationale=[choice.rationale] + structure_reasons,
+            confidence_score=min(1.0, choice.conviction + 0.10),
+            entry_time=snapshot.timestamp, lots=risk.lots, lot_size=snapshot.lot_size,
+            max_loss_rupees_per_lot=risk.max_loss_rupees_per_lot, slippage_points=snapshot.slippage_points,
+            extra_metadata=dict(meta) | {
+                "playbook": playbook, "setup_direction": direction,
+                "selector_condition": choice.condition, "selector_family": choice.family,
+                "trade_funnel": _funnel("NONE", strategy.value, "EXECUTED"),
+            },
+        )
+
     def evaluate(self, snapshot: MarketSnapshot) -> DecisionOutput:
         self._reset_session(snapshot.timestamp)
         regime_state = classify_regime(snapshot, self.parameters)
@@ -991,6 +1096,15 @@ class IntradayDefinedRiskAgent:
                     return planned
             except Exception as exc:  # noqa: BLE001 — never let the planner crash the loop
                 logger.warning("trade_planner path failed, falling back to legacy: %s", exc)
+        # Condition-first selector path: classify the condition, pick the strategy
+        # family, stand aside in chop. Uses only executable structures for now.
+        if self.use_selector:
+            try:
+                selected = self._evaluate_via_selector(snapshot, regime_state)
+                if selected is not None:
+                    return selected
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("strategy_selector path failed, falling back to legacy: %s", exc)
         rationale = list(regime_state.reasons)
         playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
         regime_tradability, tradability_reason = classify_regime_tradability(regime_state)
