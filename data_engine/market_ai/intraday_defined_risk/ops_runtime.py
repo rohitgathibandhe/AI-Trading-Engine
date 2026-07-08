@@ -962,17 +962,29 @@ def evaluate_entry_gate(
     if not (start_t <= snapshot.timestamp.time() <= end_t):
         reasons.append("ENTRY_WINDOW_CLOSED")
     # PH 21: Early-session confirmation gate.
-    # Directional spreads before 10:15 require both 5m execution confirmation AND
-    # meaningful OFI (|ofi| >= 0.35) to avoid entering into first-candle noise.
+    # Directional spreads before 10:15 require 5m execution confirmation IN THE
+    # TRADE DIRECTION, and must not face strongly opposing order flow. This avoids
+    # entering into first-candle noise without blocking genuinely confirmed setups.
     # EARLY_STRUCTURE_* playbooks are designed for early entries and are exempt.
     if (
         snapshot.timestamp.time() < time(10, 15)
         and strategy in {"BEAR_CALL_CREDIT_SPREAD", "BULL_PUT_CREDIT_SPREAD"}
         and playbook not in {"EARLY_STRUCTURE_BULLISH", "EARLY_STRUCTURE_BEARISH"}
     ):
-        _exec_5m = str(metadata.get("execution_5m") or "")
-        _ofi = abs(float(metadata.get("order_flow_imbalance") or 0.0))
-        if _exec_5m not in ("UP_CONFIRMED", "DOWN_CONFIRMED") or _ofi < 0.35:
+        _exec_5m = str(metadata.get("execution_5m") or funnel.get("execution_5m") or "")
+        _ofi = float(
+            metadata.get("order_flow_imbalance")
+            or metadata.get("ml_order_flow_imbalance")
+            or funnel.get("order_flow_imbalance")
+            or 0.0
+        )
+        _is_bull = strategy == "BULL_PUT_CREDIT_SPREAD"
+        _confirmed = (
+            (_is_bull and _exec_5m == "UP_CONFIRMED")
+            or (not _is_bull and _exec_5m == "DOWN_CONFIRMED")
+        )
+        _ofi_opposes = (_is_bull and _ofi < -0.30) or (not _is_bull and _ofi > 0.30)
+        if not _confirmed or _ofi_opposes:
             reasons.append("EARLY_SESSION_UNCONFIRMED")
     daily_lock = state.get("daily_lock") if isinstance(state.get("daily_lock"), dict) else {}
     if bool(daily_lock.get("active")):
@@ -1000,22 +1012,29 @@ def evaluate_entry_gate(
             reasons.append("EXPIRY_DAY_BLOCKED")
     except Exception:
         pass
-    if str(health.get("status") or "") == HealthStatus.BLOCKED.value:
-        reasons.append("HEALTH_BLOCKED")
-    components = health.get("components") if isinstance(health.get("components"), dict) else {}
-    required = [
-        "broker_auth_health",
-        "market_feed_health",
-        "option_chain_health",
-        "broker_position_sync_health",
-        "state_store_health",
-        "strategy_engine_health",
-        "data_pipeline_health",
-    ]
-    for name in required:
-        component = components.get(name) if isinstance(components, dict) else None
-        if not isinstance(component, dict) or str(component.get("status") or "") == HealthStatus.BLOCKED.value:
-            reasons.append(f"{name.upper()}_BLOCKED")
+    # Health enforcement: real-money (MICRO_LIVE) always enforces; PAPER_LIVE only
+    # when the operator opts in via health_required_for_paper. Paper trades place no
+    # broker orders, so broker-auth/position-sync flicker (e.g. a Dhan 429 burst)
+    # must not block them. Missing market data is already caught by snapshot
+    # validation upstream, so skipping here cannot trade on absent data.
+    _enforce_health = config.health_required_for_paper or mode == RuntimeMode.MICRO_LIVE
+    if _enforce_health:
+        if str(health.get("status") or "") == HealthStatus.BLOCKED.value:
+            reasons.append("HEALTH_BLOCKED")
+        components = health.get("components") if isinstance(health.get("components"), dict) else {}
+        required = [
+            "broker_auth_health",
+            "market_feed_health",
+            "option_chain_health",
+            "broker_position_sync_health",
+            "state_store_health",
+            "strategy_engine_health",
+            "data_pipeline_health",
+        ]
+        for name in required:
+            component = components.get(name) if isinstance(components, dict) else None
+            if not isinstance(component, dict) or str(component.get("status") or "") == HealthStatus.BLOCKED.value:
+                reasons.append(f"{name.upper()}_BLOCKED")
     recovery_blocked, recovery_reason = _has_recovery_block(paths)
     if recovery_blocked:
         reasons.append(f"RECOVERY_BLOCK:{recovery_reason}")
@@ -1093,8 +1112,19 @@ def evaluate_paper_context_override_gate(
         }
     ):
         _exec_5m = str(metadata.get("execution_5m") or funnel.get("execution_5m") or "")
-        _ofi = abs(float(metadata.get("order_flow_imbalance") or funnel.get("order_flow_imbalance") or 0.0))
-        if _exec_5m not in ("UP_CONFIRMED", "DOWN_CONFIRMED") or _ofi < 0.35:
+        _ofi = float(
+            metadata.get("order_flow_imbalance")
+            or metadata.get("ml_order_flow_imbalance")
+            or funnel.get("order_flow_imbalance")
+            or 0.0
+        )
+        _is_bull = strategy == "BULL_PUT_CREDIT_SPREAD"
+        _confirmed = (
+            (_is_bull and _exec_5m == "UP_CONFIRMED")
+            or (not _is_bull and _exec_5m == "DOWN_CONFIRMED")
+        )
+        _ofi_opposes = (_is_bull and _ofi < -0.30) or (not _is_bull and _ofi > 0.30)
+        if not _confirmed or _ofi_opposes:
             reasons.append("EARLY_SESSION_UNCONFIRMED")
 
     daily_lock = state.get("daily_lock") if isinstance(state.get("daily_lock"), dict) else {}

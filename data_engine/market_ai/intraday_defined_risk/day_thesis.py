@@ -105,16 +105,21 @@ def compute_day_thesis(
 
     dist_to_res = (key_resistance - spot) if key_resistance else 999.0
     dist_to_sup = (spot - key_support) if key_support else 999.0
+    # None-safe display strings — key_resistance/key_support are None when no
+    # HTF level exists above/below spot (e.g. an all-time-high breakout has no
+    # resistance overhead). Formatting None with :.0f raises TypeError.
+    res_str = f"{key_resistance:.0f}" if key_resistance else "N/A"
+    sup_str = f"{key_support:.0f}" if key_support else "N/A"
 
     if dist_to_res < 100.0:
         range_score += 2.0
-        signals.append(f"HTF resistance {key_resistance:.0f} only {dist_to_res:.0f}pts away (+2 range)")
+        signals.append(f"HTF resistance {res_str} only {dist_to_res:.0f}pts away (+2 range)")
     elif dist_to_res < 200.0:
         range_score += 0.8
-        signals.append(f"HTF resistance {key_resistance:.0f} is {dist_to_res:.0f}pts away (+0.8 range)")
+        signals.append(f"HTF resistance {res_str} is {dist_to_res:.0f}pts away (+0.8 range)")
     elif dist_to_res >= 200.0 and trend_15m == "TREND_UP":
         trend_up_score += 0.5
-        signals.append(f"HTF resistance {key_resistance:.0f} far ({dist_to_res:.0f}pts) — trend has room (+0.5 trend-up)")
+        signals.append(f"HTF resistance {res_str} far ({dist_to_res:.0f}pts) — trend has room (+0.5 trend-up)")
 
     if dist_to_sup < 100.0:
         range_score += 2.0
@@ -202,14 +207,14 @@ def compute_day_thesis(
         if atm_straddle_pts >= 100.0 and open_space_up >= 80.0 and open_space_down >= 80.0:
             preferred_strategy = "SHORT_STRADDLE"
             reasoning = (
-                f"Range: spot {dist_to_res:.0f}pts from HTF resistance {key_resistance:.0f}, "
+                f"Range: spot {dist_to_res:.0f}pts from HTF resistance {res_str}, "
                 f"ATM straddle {atm_straddle_pts:.0f}pts (rich premium), 15m neutral — "
                 f"sell ATM straddle."
             )
         elif atm_straddle_pts >= 70.0:
             preferred_strategy = "SHORT_STRANGLE"
             reasoning = (
-                f"Range: spot {dist_to_res:.0f}pts from resistance {key_resistance:.0f if key_resistance else 'N/A'}, "
+                f"Range: spot {dist_to_res:.0f}pts from resistance {res_str}, "
                 f"ATM straddle {atm_straddle_pts:.0f}pts — sell OTM strangle."
             )
         else:

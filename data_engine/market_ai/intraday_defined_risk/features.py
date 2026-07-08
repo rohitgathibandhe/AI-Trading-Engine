@@ -2032,7 +2032,10 @@ def compute_win_probability(features: dict, direction: str = "BEARISH") -> float
         model = json.loads(_WIN_PROB_MODEL_PATH.read_text())
         key = "bearish" if direction != "BULLISH" else "bullish"
         coeffs = model.get(key)
-        if not coeffs or int(model.get("samples", 0)) < 15:
+        # Threshold must match the watchdog's per-direction training floor (8).
+        # `coeffs` is already None for a direction that did not train, so this
+        # only guards against a model written with too few total samples.
+        if not coeffs or int(model.get("samples", 0)) < 8:
             return 0.5
         intercept = float(coeffs.get("intercept", 0.0))
         weights = coeffs.get("weights", {})

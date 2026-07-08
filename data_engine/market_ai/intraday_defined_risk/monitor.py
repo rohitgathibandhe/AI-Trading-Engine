@@ -1142,6 +1142,9 @@ class IntradayDefinedRiskAgent:
                 "ml_bearish_momentum": regime_state.metadata.get("bearish_momentum_persistence"),
                 "ml_rv30_pct": regime_state.rv30_pct,
                 "ml_order_flow_imbalance": regime_state.metadata.get("order_flow_imbalance"),
+                # PH 21 early-session gate reads these directly (not ml_-prefixed)
+                "execution_5m": regime_state.execution_5m,
+                "order_flow_imbalance": regime_state.metadata.get("order_flow_imbalance"),
             },
         )
         self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())
