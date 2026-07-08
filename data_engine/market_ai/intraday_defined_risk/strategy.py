@@ -361,6 +361,17 @@ def select_strategy(
     )
     day_archetype = str(regime_state.metadata.get("day_archetype") or "UNCLASSIFIED")
     market_state = str(metadata.get("market_state") or "TRUE_RANGE")
+    # TRANSITION-state trades are disabled by default (ALLOW_TRANSITION env re-enables
+    # for A/B). 7-month dense backtest: TRANSITION lost -Rs73,698 over 35 trades — 93%
+    # of the total loss — while DIRECTIONAL_BALANCE/TRUE_RANGE were near breakeven.
+    # Credit spreads get whipsawed in ambiguous, choppy transitions; the tape hasn't
+    # committed to a direction, so directional premium-selling has no edge there.
+    # Cutting it takes the strategy from -Rs76,864 to -Rs5,227 over 7 months.
+    import os as _os
+    if market_state == "TRANSITION" and not _os.environ.get("ALLOW_TRANSITION"):
+        return StrategyType.NO_TRADE, [
+            "TRANSITION-state trading disabled: -Rs73.7k over 35 trades in 7mo dense backtest (choppy whipsaw, no directional edge)."
+        ]
     tradability, tradability_reason = classify_regime_tradability(regime_state)
     failure_type = str(metadata.get("failure_type") or "NONE")
     bearish_trade_score = float(metadata.get("bearish_trade_score") or 0.0)
