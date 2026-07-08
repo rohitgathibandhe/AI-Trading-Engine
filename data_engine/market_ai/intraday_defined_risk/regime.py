@@ -888,6 +888,15 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     vol_spike = compute_volume_spike(bars_5m)
     max_pain_data = compute_max_pain(snapshot.option_chain.quotes)
     atm_straddle = compute_atm_straddle(spot, snapshot.option_chain.quotes)
+    # Scalar ATM straddle premium in points, computed once. compute_atm_straddle
+    # returns a dict keyed "atm_straddle_price" — several gates below previously
+    # either crashed (float(dict)) or read a non-existent "atm_straddle" key and
+    # silently got 0.0, killing the condor/HTF-cap premium checks.
+    _atm_straddle_pts = (
+        float(atm_straddle.get("atm_straddle_price") or 0.0)
+        if isinstance(atm_straddle, dict)
+        else float(atm_straddle or 0.0)
+    )
     support_ref = support_5m[0] if support_5m else (support_15m[0] if support_15m else None)
     resistance_ref = resistance_5m[0] if resistance_5m else (resistance_15m[0] if resistance_15m else None)
     session_open = bars_5m[0].open if bars_5m else None
@@ -3111,8 +3120,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         and float(metadata["open_space_down"]) > 40.0      # floor below for condor safety
         and trend_15m != "TREND_UP"                        # not a confirmed daily trend day
         and market_state in {"DIRECTIONAL_BALANCE", "TRANSITION", "TRUE_RANGE"}
-        and atm_straddle is not None and float(atm_straddle) >= 60.0  # enough premium
-        and session in {"PRIME", "MIDDAY"}
+        and _atm_straddle_pts >= 60.0  # enough premium
+        and metadata.get("session_phase") in {"PRIME", "MIDDAY"}
         and snapshot.timestamp.time() >= time(10, 0)
         and not bool(metadata.get("pin_risk_active"))
     )
@@ -3139,7 +3148,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     # A professional trader reads the market once, then trades from that view.
     # The thesis anchors regime routing — if it says RANGE_PREMIUM when the
     # scoring path classified UP_TREND, override to RANGE.
-    _atm_straddle_pts = float(atm_straddle.get("atm_straddle") or 0.0) if isinstance(atm_straddle, dict) else float(atm_straddle or 0.0)
+    # _atm_straddle_pts computed once near the top (correct "atm_straddle_price" key).
     _oi_flow_smbias = oi_flow.get("smart_money_bias", "NEUTRAL") if isinstance(oi_flow, dict) else "NEUTRAL"
     day_thesis = get_or_form_day_thesis(
         spot=spot,
@@ -3173,7 +3182,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         and _thesis_conv >= 0.65
         and regime in {RegimeLabel.UP_TREND, RegimeLabel.NO_TRADE}
         and not metadata.get("htf_resistance_cap")
-        and session in {"PRIME", "MIDDAY"}
+        and metadata.get("session_phase") in {"PRIME", "MIDDAY"}
         and snapshot.timestamp.time() >= time(10, 0)
         and not bool(metadata.get("pin_risk_active"))
         and _atm_straddle_pts >= 60.0
