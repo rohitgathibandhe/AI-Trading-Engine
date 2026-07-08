@@ -1033,6 +1033,15 @@ class IntradayDefinedRiskAgent:
         meta["playbook"] = playbook
         meta["setup_direction"] = direction
         meta["setup_quality_score"] = max(float(meta.get("setup_quality_score") or 0.0), choice.conviction * 20.0)
+        # The selector IS the decision brain — express its conviction as the directional
+        # trade score so the live entry gate (which re-checks score vs no_trade + margin)
+        # passes selector trades. ~2-10 scale; above the ~5 threshold at high conviction.
+        _sel_score = round(2.0 + choice.conviction * 8.0, 4)
+        meta["no_trade_score"] = min(float(meta.get("no_trade_score") or 0.0), 0.0)
+        if direction == "BEARISH":
+            meta["bearish_trade_score"] = max(float(meta.get("bearish_trade_score") or 0.0), _sel_score)
+        elif direction == "BULLISH":
+            meta["bullish_trade_score"] = max(float(meta.get("bullish_trade_score") or 0.0), _sel_score)
         # Credit spreads take a wall/level floor for strike selection; debit spreads
         # use their own delta-band selection, so no strike guidance is imposed.
         if not _is_debit:
