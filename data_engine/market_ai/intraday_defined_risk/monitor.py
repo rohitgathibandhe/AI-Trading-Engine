@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections import Counter
 from datetime import datetime, time as dtime, timedelta, timezone
@@ -794,6 +795,9 @@ def _broker_positions_from_executor(executor: object) -> list[dict[str, object]]
     return None
 
 
+logger = logging.getLogger("market_ai.intraday_defined_risk.monitor")
+
+
 class IntradayDefinedRiskAgent:
     def __init__(
         self,
@@ -806,6 +810,8 @@ class IntradayDefinedRiskAgent:
         experimental_policy: dict[str, object] | None = None,
         use_regime_tradability_layer: bool = True,
         use_market_state_engine: bool = False,
+        use_trade_planner: bool | None = None,
+        allow_naked: bool | None = None,
     ) -> None:
         self.learning_store = learning_store or LearningStore()
         self.parameters = (parameters or self.learning_store.active_parameters()).clamped()
@@ -814,15 +820,151 @@ class IntradayDefinedRiskAgent:
         self.experimental_policy = dict(experimental_policy or {})
         self.use_regime_tradability_layer = use_regime_tradability_layer
         self.use_market_state_engine = use_market_state_engine
+        # Market-first trade planner (read -> plan). Off unless explicitly enabled
+        # (arg or USE_TRADE_PLANNER env) so it can be A/B-validated on the backtest
+        # before it ever drives live. allow_naked lets the planner choose naked
+        # selling when conviction is very high (defined-risk otherwise).
+        import os
+        self.use_trade_planner = (
+            bool(os.environ.get("USE_TRADE_PLANNER"))
+            if use_trade_planner is None
+            else bool(use_trade_planner)
+        )
+        self.allow_naked = (
+            bool(os.environ.get("ALLOW_NAKED"))
+            if allow_naked is None
+            else bool(allow_naked)
+        )
         self.open_position: OpenPosition | None = None
         self._current_features: dict[str, object] = {}
         self._session_date = None
         self._session_trade_counts: Counter[str] = Counter()
 
+    def _evaluate_via_planner(self, snapshot: MarketSnapshot, regime_state) -> DecisionOutput | None:
+        """Market-first decision: read the signals, form a plan, execute it.
+
+        Reuses the proven execution machinery (select_best_structure ->
+        assess_trade_risk -> build_trade_decision) but replaces the archetype/
+        playbook cascade with the planner's read-then-decide. Returns None to
+        fall back to the legacy path (e.g. unmapped structure).
+        """
+        from .trade_planner import (
+            plan_trade, BEAR_CALL_SPREAD, BULL_PUT_SPREAD, IRON_CONDOR,
+            SHORT_STRANGLE, NAKED_CALL, NAKED_PUT,
+        )
+        spot = float(snapshot.option_chain.spot)
+        meta = regime_state.metadata
+        plan = plan_trade(meta, spot, allow_naked=self.allow_naked)
+        meta["planner_read"] = plan.read.reasoning if plan.read else ""
+        meta["planner_structure"] = plan.structure
+        meta["planner_conviction"] = plan.conviction
+        self._current_features = {
+            "playbook": f"PLANNER_{plan.direction}",
+            "setup_direction": plan.direction,
+            "planner_conviction": plan.conviction,
+            "planner_structure": plan.structure,
+        }
+
+        def _funnel(reason: str, strat: str, result: str) -> dict:
+            return {"canonical_rejection_reason": reason, "selected_strategy": strat,
+                    "final_result": result, "playbook": f"PLANNER_{plan.direction}",
+                    "planner_read": meta.get("planner_read")}
+
+        if not plan.should_trade:
+            return build_no_trade_decision(
+                regime_state.regime.value, plan.rationale,
+                confidence_score=plan.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel("PLANNER_NO_EDGE", "NO_TRADE", "NO_TRADE")},
+            )
+
+        strat_map = {
+            BEAR_CALL_SPREAD: StrategyType.BEAR_CALL_CREDIT_SPREAD,
+            NAKED_CALL: StrategyType.BEAR_CALL_CREDIT_SPREAD,   # execute defined-risk; naked exec is a follow-up
+            BULL_PUT_SPREAD: StrategyType.BULL_PUT_CREDIT_SPREAD,
+            NAKED_PUT: StrategyType.BULL_PUT_CREDIT_SPREAD,
+            IRON_CONDOR: StrategyType.IRON_CONDOR,
+            SHORT_STRANGLE: StrategyType.SHORT_STRANGLE,
+        }
+        strategy = strat_map.get(plan.structure)
+        if strategy is None:
+            return None  # unmapped — fall back to legacy
+
+        # Feed the planner's strike intent to the structure selector.
+        if plan.direction == "BEARISH" and plan.short_strike is not None:
+            meta["min_short_call_strike"] = plan.short_strike
+        elif plan.direction == "BULLISH" and plan.short_strike is not None:
+            meta["max_short_put_strike"] = plan.short_strike
+        playbook = f"PLANNER_{plan.direction}"
+        meta["playbook"] = playbook
+        meta["setup_direction"] = plan.direction
+        meta["setup_quality_score"] = max(float(meta.get("setup_quality_score") or 0.0), plan.conviction * 20.0)
+
+        entry_allowed, entry_reason = validate_entry_time(strategy, snapshot.timestamp)
+        if not entry_allowed:
+            return build_no_trade_decision(
+                regime_state.regime.value, plan.rationale + ([entry_reason] if entry_reason else []),
+                confidence_score=plan.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel("ENTRY_TIME_INVALID", strategy.value, "NO_TRADE")},
+            )
+
+        structure, structure_reasons, structure_report = select_best_structure(
+            strategy, snapshot, regime_state, self.parameters,
+            setup_quality_score=float(meta.get("setup_quality_score") or 0.0),
+            playbook_tier="A",
+        )
+        if not structure:
+            return build_no_trade_decision(
+                regime_state.regime.value, plan.rationale + structure_reasons,
+                confidence_score=plan.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel(
+                    str(structure_report.get("canonical_rejection_reason") or "SPREAD_CONSTRUCTION_FAILED"),
+                    strategy.value, "NO_TRADE")},
+            )
+
+        risk = assess_trade_risk(
+            structure=structure, lot_size=snapshot.lot_size,
+            risk_limits=snapshot.risk_limits, account_state=snapshot.account_state,
+            margin_estimate_per_lot=structure.margin_estimate_per_lot, playbook=playbook,
+        )
+        if not risk.allowed:
+            return build_no_trade_decision(
+                regime_state.regime.value, plan.rationale + risk.reasons,
+                confidence_score=plan.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel("RISK_LIMIT", strategy.value, "NO_TRADE")},
+            )
+
+        return build_trade_decision(
+            structure=structure,
+            regime=regime_state.regime,
+            rationale=plan.rationale + structure_reasons,
+            confidence_score=min(1.0, plan.conviction + 0.10),
+            entry_time=snapshot.timestamp,
+            lots=risk.lots,
+            lot_size=snapshot.lot_size,
+            max_loss_rupees_per_lot=risk.max_loss_rupees_per_lot,
+            slippage_points=snapshot.slippage_points,
+            extra_metadata=dict(meta) | {
+                "playbook": playbook,
+                "setup_direction": plan.direction,
+                "planner_read": meta.get("planner_read"),
+                "planner_naked_intent": plan.is_naked,
+                "trade_funnel": _funnel("NONE", strategy.value, "EXECUTED"),
+            },
+        )
+
     def evaluate(self, snapshot: MarketSnapshot) -> DecisionOutput:
         self._reset_session(snapshot.timestamp)
         regime_state = classify_regime(snapshot, self.parameters)
         regime_state.metadata["enable_market_state_gating"] = self.use_market_state_engine
+        # Market-first path: the planner reads the fully-computed signal set and
+        # decides the trade directly, bypassing the archetype/playbook cascade.
+        if self.use_trade_planner:
+            try:
+                planned = self._evaluate_via_planner(snapshot, regime_state)
+                if planned is not None:
+                    return planned
+            except Exception as exc:  # noqa: BLE001 — never let the planner crash the loop
+                logger.warning("trade_planner path failed, falling back to legacy: %s", exc)
         rationale = list(regime_state.reasons)
         playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
         regime_tradability, tradability_reason = classify_regime_tradability(regime_state)

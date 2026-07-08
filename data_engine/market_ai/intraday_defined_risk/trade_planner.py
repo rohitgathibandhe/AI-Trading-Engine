@@ -49,10 +49,33 @@ NAKED_PUT = "NAKED_PUT"
 NO_STRUCTURE = "NONE"
 
 # Conviction thresholds
-_MIN_DIRECTIONAL_CONVICTION = 0.55   # below this, no directional trade
-_MIN_RANGE_CONVICTION = 0.55
+_MIN_DIRECTIONAL_CONVICTION = 0.62   # below this, no directional trade
+_MIN_RANGE_CONVICTION = 0.60
 _NAKED_CONVICTION = 0.80             # naked selling requires very strong read
 _MIN_SIGNAL_CONSENSUS = 4            # at least N aligned signals (robustness)
+
+
+def _has_bear_trigger(m: dict) -> bool:
+    """A professional shorts on a TRIGGER, not just a bearish lean: a failed
+    reclaim, a confirmed breakdown, a rejection at resistance, or an OR breakdown."""
+    return bool(
+        m.get("failed_reclaim")
+        or m.get("accepted_breakdown")
+        or m.get("bearish_rejection_transition")
+        or m.get("lower_high_confirmed")
+        or str(m.get("opening_range_break_state") or "") in {"DOWN", "FAILED_UP"}
+    )
+
+
+def _has_bull_trigger(m: dict) -> bool:
+    """Go long premium-selling on a trigger: confirmed breakout, higher-low
+    reclaim, failed breakdown, or an OR breakout up."""
+    return bool(
+        m.get("accepted_breakout")
+        or m.get("higher_low_confirmed")
+        or m.get("failed_breakdown")
+        or str(m.get("opening_range_break_state") or "") in {"UP", "FAILED_DOWN"}
+    )
 
 
 @dataclass
@@ -257,7 +280,12 @@ def form_trade_plan(
     consensus = max(read.bull_signals, read.bear_signals, read.range_signals)
 
     # ── BEARISH: sell call premium above resistance ─────────────────────────
-    if read.bias == BEARISH and read.conviction >= _MIN_DIRECTIONAL_CONVICTION and read.bear_signals >= _MIN_SIGNAL_CONSENSUS:
+    if (
+        read.bias == BEARISH
+        and read.conviction >= _MIN_DIRECTIONAL_CONVICTION
+        and read.bear_signals >= _MIN_SIGNAL_CONSENSUS
+        and _has_bear_trigger(metadata)
+    ):
         anchor = read.resistance or read.call_wall or (spot + 100)
         short = max(anchor, spot + 60)
         naked = allow_naked and read.conviction >= _NAKED_CONVICTION and read.call_wall is not None
@@ -279,7 +307,12 @@ def form_trade_plan(
         return plan
 
     # ── BULLISH: sell put premium below support ─────────────────────────────
-    if read.bias == BULLISH and read.conviction >= _MIN_DIRECTIONAL_CONVICTION and read.bull_signals >= _MIN_SIGNAL_CONSENSUS:
+    if (
+        read.bias == BULLISH
+        and read.conviction >= _MIN_DIRECTIONAL_CONVICTION
+        and read.bull_signals >= _MIN_SIGNAL_CONSENSUS
+        and _has_bull_trigger(metadata)
+    ):
         anchor = read.support or read.put_wall or (spot - 100)
         short = min(anchor, spot - 60)
         naked = allow_naked and read.conviction >= _NAKED_CONVICTION and read.put_wall is not None
