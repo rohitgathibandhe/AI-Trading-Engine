@@ -990,7 +990,7 @@ class IntradayDefinedRiskAgent:
         from .strategy_selector import FAM_STAND_ASIDE
         spot = float(snapshot.option_chain.spot)
         meta = regime_state.metadata
-        choice = _select(meta, spot)
+        choice = _select(meta, spot, now_time=snapshot.timestamp.time())
         meta["selector_condition"] = choice.condition
         meta["selector_family"] = choice.family
         meta["selector_iv"] = choice.iv_regime

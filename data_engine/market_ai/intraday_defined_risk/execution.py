@@ -325,12 +325,19 @@ def _current_debit_value(
     """Current sellable value of a debit spread in points = long_mark - short_mark."""
     if current_snapshot is None:
         return None
+    # If EITHER leg is missing from the chain window, return None (caller marks at
+    # breakeven) rather than guessing. An intrinsic-value fallback was tried and
+    # REJECTED — it mismatched a real-priced leg (with time value) against an
+    # intrinsic-only leg, blowing up P&L by ~-Rs420k on the narrow backtest chain.
     long_mark = short_mark = None
     for leg in position.structure.legs:
         quote = current_snapshot.option_chain.find_quote(leg.strike, leg.option_type)
         if quote is None:
             return None
-        mark = max(float(quote.mid_price or quote.ltp or 0.0), 0.0)
+        mark = quote.mid_price or quote.ltp
+        if mark is None or mark <= 0:
+            return None
+        mark = max(float(mark), 0.0)
         if leg.action == "BUY":
             long_mark = mark
         else:

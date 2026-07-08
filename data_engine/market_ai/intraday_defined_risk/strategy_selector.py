@@ -29,6 +29,7 @@ order is explicit. Credit spreads / condor / strangle ARE executable today.
 
 from __future__ import annotations
 
+from datetime import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -121,8 +122,11 @@ def classify_condition(read: MarketRead, metadata: dict[str, Any]) -> str:
     return CHOP
 
 
-def select_strategy(metadata: dict[str, Any], spot: float) -> StrategyChoice:
-    """Read the market, name the condition, and choose the strategy family + structures."""
+def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> StrategyChoice:
+    """Read the market, name the condition, and choose the strategy family + structures.
+
+    now_time (datetime.time, optional): used for time-of-day rules learned from the
+    retrospective — e.g. condors only after the range forms (mid-day)."""
     read = assess_market(metadata, spot)
     condition = classify_condition(read, metadata)
     iv = _iv_regime(metadata)
@@ -142,11 +146,17 @@ def select_strategy(metadata: dict[str, Any], spot: float) -> StrategyChoice:
         choice.rationale = f"{condition}: buy PUT DEBIT with the down-move (Nifty falls sharply — +skew capped-loss captures it)."
 
     elif condition == RANGE_WIDE:
-        # Sell premium into a defined range only when it's rich.
-        if iv in (IV_RICH, IV_NORMAL):
+        # Retrospective lesson: morning condors LOSE (-Rs1,151/24tr @10-12) because the
+        # day's range hasn't formed yet; mid-day condors win (+Rs7.6k @70%). Only sell
+        # the range once it's established (>= 11:30).
+        _too_early = now_time is not None and now_time < time(11, 30)
+        if _too_early:
+            choice.family, choice.structures = FAM_STAND_ASIDE, []
+            choice.rationale = "RANGE_WIDE but before 11:30 — range not yet formed (morning condors lose); wait."
+        elif iv in (IV_RICH, IV_NORMAL):
             choice.family = FAM_PREMIUM_SELL
             choice.structures = ["IRON_CONDOR", "SHORT_STRANGLE"]
-            choice.rationale = f"RANGE_WIDE / IV {iv}: two-sided walls, balanced tape — sell premium inside the range."
+            choice.rationale = f"RANGE_WIDE / IV {iv} / mid-day: two-sided walls, balanced tape — sell premium inside the formed range."
         else:
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = "RANGE_WIDE but IV CHEAP: premium too thin to sell; stand aside."
