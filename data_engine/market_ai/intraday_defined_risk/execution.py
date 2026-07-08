@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import datetime, time
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
 from .data_models import (
@@ -61,6 +61,25 @@ BULLISH_PLAYBOOK_PROFIT_TRAIL_ARM_RUPEES = 6500.0
 BULLISH_PLAYBOOK_PROFIT_TRAIL_GIVEBACK_RUPEES = 2000.0
 PROFIT_TRAIL_CAPTURE_ARM = 0.35
 PROFIT_TRAIL_GIVEBACK_POINTS = 6.0
+
+_IST = timezone(timedelta(hours=5, minutes=30))  # India has no DST — fixed offset is exact
+
+
+def _to_ist_naive(dt: datetime) -> datetime:
+    """Normalize a datetime to IST wall-clock, tz-naive.
+
+    Aware datetimes are CONVERTED to IST (astimezone) before stripping tzinfo, not
+    relabeled — so a UTC-aware value (e.g. a position restored from JSON after a
+    restart) does not skew elapsed-time math by 5.5h and bypass/suppress the
+    min-hold stops. Naive datetimes are assumed to already be IST wall-clock.
+    """
+    if dt.tzinfo is not None:
+        return dt.astimezone(_IST).replace(tzinfo=None)
+    return dt
+
+
+def _elapsed_minutes(now: datetime, entry_time: datetime) -> int:
+    return max(int((_to_ist_naive(now) - _to_ist_naive(entry_time)).total_seconds() // 60), 0)
 
 
 def validate_entry_time(strategy: StrategyType, now: datetime) -> tuple[bool, str | None]:
@@ -263,11 +282,22 @@ def build_no_trade_decision(
 
 
 def mark_to_market_value_points(position: OpenPosition, quotes_by_leg: list[StrategyLeg]) -> float:
+    # Fallback entry prices by (strike, option_type). When a live quote is stale/
+    # absent (mid_price None and ltp<=0), we fall back to the entry price for that
+    # leg instead of DROPPING it. Dropping a long (BUY) hedge leg overstated the
+    # liability by the hedge's worth and fired premature PREMIUM_STOPs (e.g. a
+    # deep-OTM long put quoting 0 near expiry made a 14pt spread mark at 16pt).
+    entry_price_by_key: dict[tuple[float, object], float] = {}
+    for leg in position.structure.legs:
+        entry_price_by_key[(leg.strike, leg.option_type)] = float(
+            leg.quote.mid_price or leg.quote.ltp or 0.0
+        )
     liability = 0.0
     for leg in quotes_by_leg:
-        mark = leg.quote.mid_price or leg.quote.ltp
+        mark = leg.quote.mid_price or leg.quote.ltp or 0.0
         if mark <= 0:
-            continue
+            mark = entry_price_by_key.get((leg.strike, leg.option_type), 0.0)
+        mark = max(float(mark), 0.0)
         if leg.action == "SELL":
             liability += mark
         else:
@@ -289,12 +319,7 @@ def evaluate_exit(
         pnl_rupees = (position.entry_credit_points - liability) * position.lot_size * position.lots
         return ExitDecision(True, "TIME_EXIT", liability, pnl_rupees)
 
-    entry_time = position.entry_time
-    if entry_time.tzinfo is None and now.tzinfo is not None:
-        entry_time = entry_time.replace(tzinfo=now.tzinfo)
-    elif entry_time.tzinfo is not None and now.tzinfo is None:
-        entry_time = entry_time.replace(tzinfo=None)
-    elapsed_minutes = max(int((now - entry_time).total_seconds() // 60), 0)
+    elapsed_minutes = _elapsed_minutes(now, position.entry_time)
 
     quick_invalidation_reason = _intrabar_regime_invalidation_reason(position, current_snapshot, now=now)
     if quick_invalidation_reason:
@@ -390,9 +415,17 @@ def evaluate_exit(
 
     # Condor partial close: when one side is threatened, close just that side rather
     # than exiting the full condor. This preserves the safe half which still has
-    # theta working in its favour. Trigger is 0.25 delta (before full DELTA_STOP at 0.25).
+    # theta working in its favour. Trigger is 0.23 delta, just below the 0.25
+    # CONDOR_DELTA_SL. Gated by the same 20-min min-hold as the theta-strategy
+    # DELTA_STOP below — otherwise first-candle delta noise (0.20→0.23 in a minute)
+    # closed a side before the position had any time to breathe.
     CONDOR_PARTIAL_CLOSE_DELTA = 0.23
-    if position.structure.strategy == StrategyType.IRON_CONDOR and current_legs:
+    CONDOR_PARTIAL_CLOSE_MIN_HOLD = 20
+    if (
+        position.structure.strategy == StrategyType.IRON_CONDOR
+        and current_legs
+        and elapsed_minutes >= CONDOR_PARTIAL_CLOSE_MIN_HOLD
+    ):
         call_short_deltas = [
             abs(leg.quote.delta)
             for leg in current_legs
@@ -754,12 +787,7 @@ def evaluate_hedge_opportunity(
         return result
 
     # Must be in position long enough to have a clear picture
-    entry_time = position.entry_time
-    if entry_time.tzinfo is None and now.tzinfo is not None:
-        entry_time = entry_time.replace(tzinfo=now.tzinfo)
-    elif entry_time.tzinfo is not None and now.tzinfo is None:
-        entry_time = entry_time.replace(tzinfo=None)
-    elapsed_minutes = max(int((now - entry_time).total_seconds() // 60), 0)
+    elapsed_minutes = _elapsed_minutes(now, position.entry_time)
     if elapsed_minutes < 20:
         return result
 

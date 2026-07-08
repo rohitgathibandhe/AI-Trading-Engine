@@ -847,11 +847,21 @@ def _score_margin_required(
     config: RuntimeConfig,
     market_state: str,
     no_trade_score: float,
+    setup_direction: str = "BEARISH",
 ) -> float:
     configured = float(config.bearish_score_margin)
+    # Direction-aware: a bullish setup must be gated with the bullish margin the
+    # regime layer computed for it (trade_score_margin_bullish), not the bearish
+    # one. Reading only the bearish key gated bull-put trades against the wrong
+    # (often stricter) margin and silently blocked valid bullish setups.
+    margin_key = (
+        "trade_score_margin_bullish"
+        if str(setup_direction).upper() == "BULLISH"
+        else "trade_score_margin_bearish"
+    )
     dynamic = float(
-        metadata.get("trade_score_margin_bearish")
-        or funnel.get("trade_score_margin_bearish")
+        metadata.get(margin_key)
+        or funnel.get(margin_key)
         or configured
     )
     required = dynamic if dynamic > 0 else configured
@@ -935,6 +945,7 @@ def evaluate_entry_gate(
         config=config,
         market_state=market_state,
         no_trade_score=no_trade_score,
+        setup_direction=setup_direction,
     )
     # Use directional score: bullish strategies use bullish_trade_score, others use bearish_trade_score
     if setup_direction == "BULLISH":

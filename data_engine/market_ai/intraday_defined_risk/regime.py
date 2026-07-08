@@ -1137,8 +1137,31 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     vwap = snapshot.live_vwap if snapshot.live_vwap is not None else compute_vwap(bars_5m)
     metadata["bars_above_vwap"] = sum(1 for bar in bars_5m[-10:] if vwap is not None and bar.close > vwap)
     metadata["bars_below_vwap"] = sum(1 for bar in bars_5m[-10:] if vwap is not None and bar.close < vwap)
-    # Pre-initialize; overwritten at the canonical assignment below (~line 2175).
-    opening_range_break_state = "NONE"
+    # Compute OR-break state and option-chain pressure context EARLY. Several gates
+    # below read these before the old canonical assignment points (~2705 / ~3002),
+    # so they previously saw "NONE"/empty and were dead code: the bullish veto (~2006,
+    # incl. its OR-breakout exemption), the OR-rejection bearish bypass (~2193), and
+    # the VWAP-rejection bearish path (~2850, ~67% historical win rate). All inputs
+    # (bars_5m, opening_range, vwap, walls, option_pressure, oi_flow, wall_migration)
+    # are final by this point, so the later recomputations produce identical values.
+    opening_range_break_state = _opening_range_break_state(
+        bars_5m,
+        opening_range.high if opening_range else None,
+        opening_range.low if opening_range else None,
+        vwap,
+    )
+    metadata["opening_range_break_state"] = opening_range_break_state
+    metadata.update(
+        _option_chain_context(
+            spot=spot,
+            support_ref=support_ref,
+            resistance_ref=resistance_ref,
+            metadata=metadata,
+            option_pressure=option_pressure,
+            oi_flow=oi_flow,
+            wall_migration=wall_migration,
+        )
+    )
     execution_5m = "UNCONFIRMED"
 
     if opening_range and vwap:

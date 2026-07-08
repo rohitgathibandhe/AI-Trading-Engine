@@ -1367,6 +1367,22 @@ def _shortlist_condor_quotes(
     quotes = _liquid_otm_quotes(snapshot.option_chain.quotes, option_type=option_type, spot=snapshot.option_chain.spot)
     if not quotes:
         return []
+    # OI-wall anchors: regime sets condor_short_call_anchor = call_wall+25 and
+    # condor_short_put_anchor = put_wall-25. Prefer short strikes OUTSIDE the walls
+    # so the condor doesn't sell into the dominant institutional OI. Soft filter —
+    # fall back to all quotes if the anchor leaves nothing tradable (no deadlock).
+    if option_type == OptionType.CALL:
+        _call_anchor = regime_state.metadata.get("condor_short_call_anchor")
+        if _call_anchor is not None:
+            _respecting = [q for q in quotes if q.strike >= float(_call_anchor)]
+            if _respecting:
+                quotes = _respecting
+    else:
+        _put_anchor = regime_state.metadata.get("condor_short_put_anchor")
+        if _put_anchor is not None:
+            _respecting = [q for q in quotes if q.strike <= float(_put_anchor)]
+            if _respecting:
+                quotes = _respecting
     target_delta = sum(short_delta_band) / 2.0
     rv_points = snapshot.option_chain.spot * regime_state.rv30_pct / 100.0
     target_distance = max(40.0, min(120.0, rv_points * 1.2))
