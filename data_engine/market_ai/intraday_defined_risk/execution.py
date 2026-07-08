@@ -55,8 +55,8 @@ DIRECTIONAL_DELTA_SL = 0.40
 BULLISH_PLAYBOOK_DELTA_SL = 0.50
 CONDOR_DELTA_SL = 0.25
 PREMIUM_SL_MULTIPLIER = 2.0
-DAILY_PROFIT_TRAIL_ARM_RUPEES = 5000.0
-DAILY_PROFIT_TRAIL_GIVEBACK_RUPEES = 1500.0
+DAILY_PROFIT_TRAIL_ARM_RUPEES = 1200.0   # was 5000 — modest paper-lot winners (Rs800-1200)
+DAILY_PROFIT_TRAIL_GIVEBACK_RUPEES = 500.0  # never armed, so winners gave everything back
 BULLISH_PLAYBOOK_PROFIT_TRAIL_ARM_RUPEES = 6500.0
 BULLISH_PLAYBOOK_PROFIT_TRAIL_GIVEBACK_RUPEES = 2000.0
 PROFIT_TRAIL_CAPTURE_ARM = 0.35
@@ -751,9 +751,12 @@ def _mfe_profit_trail_reason(
     best_pct = float(position.metadata.get("mfe_capture_pct", 0.0))
     best_pct = max(best_pct, current_capture_pct)
     position.metadata["mfe_capture_pct"] = round(best_pct, 4)
-    if best_pct < 0.55:
+    # Arm at 40% capture (was 55%): a credit spread up 40% that reverses used to
+    # give it all back into a loss. Once armed, exit if capture falls below 55%
+    # of the peak — "don't let a green trade go red".
+    if best_pct < 0.40:
         return None
-    if current_capture_pct < best_pct * 0.60:
+    if current_capture_pct < best_pct * 0.55:
         return "MFE_TRAIL_EXIT"
     return None
 

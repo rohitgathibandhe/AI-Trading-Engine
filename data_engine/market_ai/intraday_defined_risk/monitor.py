@@ -1623,6 +1623,13 @@ def run_live(config: dict[str, object]) -> None:
                         _state = {}
                     _mfe = float(_state.get("mfe_rupees") or 0.0)
                     _mae = float(_state.get("mae_rupees") or 0.0)
+                    # Book the LAST KNOWN mark-to-market PnL rather than None/0.
+                    # Two live trades reached +Rs1,921 / +Rs1,141 MFE and were booked
+                    # at 0 here because the chain feed died before close — erasing
+                    # real profit. last_mark_pnl_rupees is the position's value at the
+                    # last cycle data was available: the best available estimate.
+                    _last_mark = _state.get("last_mark_pnl_rupees")
+                    _booked_pnl = round(float(_last_mark), 2) if _last_mark is not None else None
                     _exit_event = {
                         "event": "PAPER_EXIT",
                         "timestamp": _now_ist.isoformat(),
@@ -1634,10 +1641,10 @@ def run_live(config: dict[str, object]) -> None:
                         "paper_trade_attribution": _stuck_position.metadata.get("paper_trade_attribution"),
                         "paper_candidate_reason": _stuck_position.metadata.get("paper_candidate_reason"),
                         "strategy": _stuck_position.structure.strategy.value,
-                        "realized_paper_pnl": None,
+                        "realized_paper_pnl": _booked_pnl,
                         "mfe_rupees": round(_mfe, 2),
                         "mae_rupees": round(_mae, 2),
-                        "note": "Force-closed at EOD: option chain data unavailable, PnL unknown.",
+                        "note": "Force-closed at EOD on data loss; PnL booked at last-known mark.",
                     }
                     try:
                         with open(_paths.paper_trades, "a") as _f:
