@@ -48,6 +48,19 @@ _NO_CONDOR = os.environ.get("SEL_NO_CONDOR") == "1"
 #   CALL_DEBIT — buy a call-debit with the up-move (symmetric to the put-debit engine)
 #   ASIDE      — stand aside on up-moves entirely
 _UP_STRUCT = os.environ.get("SEL_UP_STRUCT", "BULL_PUT").upper()
+
+# Research toggle: blackout window for the PUT_DEBIT engine. Leak analysis showed
+# down-trend debit entries in 10:00-10:29 bleed -Rs36.7k over 20 trades / 12 distinct
+# days (open-drive exhaustion → entries buy the bottom right before the bounce), while
+# 9:30 and 10:30+ are net positive. Format "HH:MM-HH:MM"; empty = no blackout.
+def _parse_window(s: str):
+    try:
+        a, b = s.split("-")
+        ah, am = map(int, a.split(":")); bh, bm = map(int, b.split(":"))
+        return time(ah, am), time(bh, bm)
+    except Exception:
+        return None
+_DEBIT_BLACKOUT = _parse_window(os.environ.get("SEL_DEBIT_BLACKOUT", ""))
 from .volatility_engine import assess_vol, RICH_SELL, CHEAP_BUY
 
 # ── Condition labels ────────────────────────────────────────────────────────
@@ -173,8 +186,14 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     elif condition in (STRONG_TREND_DOWN, BREAKOUT_DOWN):
         # Nifty DOWN-moves are sharp — a PUT-DEBIT's positive skew captures them
         # (7mo: PUT_DEBIT +Rs40.3k). This is the core edge.
-        choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
-        choice.rationale = f"{condition}: buy PUT DEBIT with the down-move (Nifty falls sharply — +skew capped-loss captures it)."
+        _in_blackout = (_DEBIT_BLACKOUT is not None and now_time is not None
+                        and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1])
+        if _in_blackout:
+            choice.family, choice.structures = FAM_STAND_ASIDE, []
+            choice.rationale = f"{condition} but in the {_DEBIT_BLACKOUT[0].strftime('%H:%M')}-{_DEBIT_BLACKOUT[1].strftime('%H:%M')} blackout — post-open-drive exhaustion zone (debit entries here leak); wait for a fresh leg."
+        else:
+            choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
+            choice.rationale = f"{condition}: buy PUT DEBIT with the down-move (Nifty falls sharply — +skew capped-loss captures it)."
 
     elif condition == RANGE_WIDE:
         # Retrospective lesson: morning condors LOSE (-Rs1,151/24tr @10-12) because the
