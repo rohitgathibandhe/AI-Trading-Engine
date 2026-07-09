@@ -994,6 +994,8 @@ class IntradayDefinedRiskAgent:
         meta["selector_condition"] = choice.condition
         meta["selector_family"] = choice.family
         meta["selector_iv"] = choice.iv_regime
+        meta["vol_regime"] = choice.vol_regime          # volatility engine read (advisory)
+        meta["vol_notes"] = "; ".join(choice.vol_notes or [])
         # Attach the full multi-dimensional reasoning (option chain + chart + levels
         # + confluence) so every decision is auditable — "why did the agent do this?".
         try:

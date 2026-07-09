@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .trade_planner import assess_market, MarketRead, _f
+from .volatility_engine import assess_vol, RICH_SELL, CHEAP_BUY
 
 # ── Condition labels ────────────────────────────────────────────────────────
 STRONG_TREND_UP = "STRONG_TREND_UP"
@@ -72,6 +73,8 @@ class StrategyChoice:
     conviction: float = 0.0
     rationale: str = ""
     read: MarketRead | None = None
+    vol_regime: str = "NEUTRAL"          # RICH_SELL / CHEAP_BUY / NEUTRAL (volatility engine)
+    vol_notes: list[str] = field(default_factory=list)
 
 
 def _iv_regime(metadata: dict[str, Any]) -> str:
@@ -130,7 +133,12 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     read = assess_market(metadata, spot)
     condition = classify_condition(read, metadata)
     iv = _iv_regime(metadata)
+    # Volatility engine FIRST — trade vol, not just direction. This tells us whether
+    # premium is rich (sell) or cheap (buy), which the pros decide before direction.
+    vol = assess_vol(metadata)
     choice = StrategyChoice(condition=condition, iv_regime=iv, read=read, conviction=read.conviction)
+    choice.vol_regime = vol.regime
+    choice.vol_notes = vol.notes
 
     if condition in (STRONG_TREND_UP, BREAKOUT_UP):
         # Nifty UP-moves grind and chop — a call-debit needs a clean continued rally
@@ -154,9 +162,15 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = "RANGE_WIDE but before 11:30 — range not yet formed (morning condors lose); wait."
         elif iv in (IV_RICH, IV_NORMAL):
+            # NOTE: the volatility engine is ADVISORY here for now — its rich/cheap read
+            # is attached to the decision (choice.vol_regime/vol_notes) but does NOT yet
+            # gate the trade. A "stand aside when vol cheap" rule was tested and REJECTED
+            # (7mo: +104,858 -> +84,945) — the VRP thresholds need calibration for Nifty
+            # before vol drives trades. Kept computing so it can be calibrated on real data.
             choice.family = FAM_PREMIUM_SELL
             choice.structures = ["IRON_CONDOR", "SHORT_STRANGLE"]
-            choice.rationale = f"RANGE_WIDE / IV {iv} / mid-day: two-sided walls, balanced tape — sell premium inside the formed range."
+            _rich = " (vol RICH)" if vol.regime == RICH_SELL else (" (vol CHEAP — watch)" if vol.regime == CHEAP_BUY else "")
+            choice.rationale = f"RANGE_WIDE / mid-day{_rich}: two-sided walls, balanced tape — sell premium inside the formed range."
         else:
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = "RANGE_WIDE but IV CHEAP: premium too thin to sell; stand aside."
