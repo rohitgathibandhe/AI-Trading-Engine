@@ -659,6 +659,8 @@ def run_backtest(
         trade_counts[current_strategy] += 1
         pnl_by_strategy[current_strategy] += pnl_fragment
         equity_curve.append(total_realized_pnl_rupees)
+        from .volatility_engine import assess_vol as _assess_vol
+        _vs = _assess_vol(position.metadata)
         trades.append(
             {
                 "entry_timestamp": position.entry_time.isoformat(),
@@ -692,6 +694,13 @@ def run_backtest(
                 "gross_pnl_rupees": gross_pnl_fragment,
                 "transaction_cost_rupees": trade_cost_rupees,
                 "pnl_rupees": pnl_fragment,
+                # Volatility state at entry — for calibrating whether vol predicts P&L
+                "avg_chain_iv": position.metadata.get("avg_chain_iv"),
+                "daily_atr": position.metadata.get("daily_atr"),
+                "vrp": _vs.vrp,
+                "vol_implied": _vs.implied_vol,
+                "vol_realized": _vs.realized_vol,
+                "vol_regime": _vs.regime,
             }
         )
 

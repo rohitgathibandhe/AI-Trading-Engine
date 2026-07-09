@@ -189,5 +189,10 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         choice.family, choice.structures = FAM_STAND_ASIDE, []
         choice.rationale = f"CHOP: uncommitted tape (bias {read.bias}, conviction {read.conviction:.2f}) — stand aside. This condition was the -Rs73k killer."
 
+    # NOTE: a vol rule "skip debit when IV 12-16" was calibrated from post-hoc buckets
+    # (that bucket showed -Rs18,807/25% win) and REJECTED on validation: applying it made
+    # 7mo WORSE (+84,945 -> +8,877). Reason = PATH DEPENDENCE — in a one-position system,
+    # cutting trades frees the slot for other (worse) trades, so bucket edges don't
+    # transfer. Lesson recorded; vol stays advisory until a rule survives full re-sim.
     choice.executable_today = bool(choice.structures) and all(s in _EXECUTABLE for s in choice.structures)
     return choice
