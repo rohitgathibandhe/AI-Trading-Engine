@@ -1737,6 +1737,13 @@ def record_paper_entry(
         "ml_rv30_pct":               decision.metadata.get("ml_rv30_pct"),
         "ml_order_flow_imbalance":   decision.metadata.get("ml_order_flow_imbalance"),
         "setup_direction":           decision.metadata.get("setup_direction"),
+        # The agent's full reasoning for this trade (option chain + chart + levels +
+        # confluence), so every trade is auditable after the fact — "why did it do this?".
+        "trade_thesis":              decision.metadata.get("trade_thesis"),
+        "thesis_confluence":         decision.metadata.get("thesis_confluence"),
+        "thesis_net_bias":           decision.metadata.get("thesis_net_bias"),
+        "selector_condition":        decision.metadata.get("selector_condition"),
+        "selector_family":           decision.metadata.get("selector_family"),
     }
     _append_jsonl(paths.paper_trades, event)
     record_runtime_trade_entry(decision, snapshot, decision_origin=attribution, paths=paths)

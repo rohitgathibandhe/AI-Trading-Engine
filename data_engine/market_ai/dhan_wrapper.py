@@ -26,6 +26,29 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 _SHARED_WRAPPER: Optional["DhanWrapper"] = None
 _SHARED_WRAPPER_LOCK = threading.Lock()
 
+# Hard-timeout wrapper for Dhan SDK calls that expose no timeout of their own.
+# The Dhan historical-candle / option-chain SDK helpers make blocking HTTP calls
+# with no timeout; when Dhan's API hangs (as on 2026-07-09) the single-threaded
+# live loop froze for ~5 hours. We run each such call in a daemon pool and abandon
+# it after `timeout_s` — the hung thread lingers harmlessly but the LIVE LOOP NEVER
+# BLOCKS, so it keeps polling and auto-resumes the instant Dhan recovers (no restart).
+import concurrent.futures as _futures
+_DHAN_TIMEOUT_POOL = _futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="dhan_to")
+
+
+def _call_with_timeout(fn: Callable[[], Any], timeout_s: float, default: Any, log=None, label: str = "") -> Any:
+    fut = _DHAN_TIMEOUT_POOL.submit(fn)
+    try:
+        return fut.result(timeout=timeout_s)
+    except _futures.TimeoutError:
+        if log:
+            log.error("[timeout] %s exceeded %.0fs — returning default; live loop stays alive", label, timeout_s)
+        return default
+    except Exception as exc:  # noqa: BLE001
+        if log:
+            log.exception("[timeout] %s failed: %s", label, exc)
+        return default
+
 try:
     from zoneinfo import ZoneInfo  # py3.9+
 except Exception:  # pragma: no cover
@@ -718,10 +741,11 @@ class DhanWrapper:
         seen = set()
 
         def _try_fetch(seg: str) -> Optional[Dict[str, Any]]:
-            try:
-                resp = oc.option_chain(underlying_security_id, seg, expiry_str)
-            except Exception as exc:
-                self.log.warning(f"[option_chain] fetch failed seg={seg}: {exc}")
+            resp = _call_with_timeout(
+                lambda: oc.option_chain(underlying_security_id, seg, expiry_str),
+                timeout_s=15.0, default=None, log=self.log, label=f"option_chain seg={seg}",
+            )
+            if resp is None:
                 return None
             if isinstance(resp, dict):
                 status = resp.get("status")
@@ -789,17 +813,23 @@ class DhanWrapper:
         self._refresh_token_if_stale()
         from_str = (from_date or dt_date.today().isoformat()).strip()
         to_str = (to_date or from_str).strip()
-        try:
-            resp = self._historical.intraday_minute_data(
+        resp = _call_with_timeout(
+            lambda: self._historical.intraday_minute_data(
                 security_id=security_id,
                 exchange_segment=exchange_segment,
                 instrument_type=instrument_type,
                 from_date=from_str,
                 to_date=to_str,
                 interval=interval,
-            )
-        except Exception as exc:
-            self.log.exception("[historical] intraday fetch failed: %s", exc)
+            ),
+            timeout_s=15.0,
+            default=None,
+            log=self.log,
+            label="intraday_minute_data",
+        )
+        if resp is None:
+            # timeout or error — return empty so the loop logs INSUFFICIENT_DATA and
+            # retries next cycle instead of freezing. Auto-recovers when Dhan is back.
             return []
 
         data: Any = resp
@@ -889,17 +919,21 @@ class DhanWrapper:
         Fetch daily OHLCV from /charts/historical via the HistoricalData helper.
         Returns a list of dicts sorted by timestamp with keys: timestamp, open, high, low, close, volume.
         """
-        try:
-            resp = self._historical.historical_daily_data(
+        resp = _call_with_timeout(
+            lambda: self._historical.historical_daily_data(
                 security_id=security_id,
                 exchange_segment=exchange_segment,
                 instrument_type=instrument_type,
                 from_date=from_date,
                 to_date=to_date,
                 expiry_code=0,
-            )
-        except Exception as exc:
-            self.log.exception("[historical] daily fetch failed: %s", exc)
+            ),
+            timeout_s=15.0,
+            default=None,
+            log=self.log,
+            label="historical_daily_data",
+        )
+        if resp is None:
             return []
 
         data: Any = resp
