@@ -45,6 +45,64 @@ LEARNING_DB          = STATE / "intraday_v83_paper_live_learning.sqlite3"
 CREDS_FILE           = STATE / "creds.json"
 EOD_REPORT_FILE      = STATE / "eod_learning_report.json"
 PLAYBOOK_STATS_FILE  = STATE / "playbook_performance_stats.json"
+IV_HISTORY_FILE      = STATE / "iv_history.csv"
+DAILY_STUDY_FILE     = STATE / "daily_market_study.jsonl"
+
+
+def _run_daily_market_study(session_date: str) -> dict | None:
+    """Study the day's market so the brain trains EVERY day, not just on trades taken.
+    Derives OHLC from the day's decision spots, prior close + prior move from the study
+    journal, and IV from iv_history, then records a structured DayStudy + seller notes."""
+    import sys as _sys, csv as _csv
+    from dataclasses import asdict
+    _sys.path.insert(0, str(DATA_ENGINE))
+    try:
+        from market_ai.intraday_defined_risk.daily_market_study import study_day
+    except Exception as e:  # noqa: BLE001
+        _log(f"[daily-study] import failed: {e}"); return None
+
+    # spot series from today's decisions -> OHLC
+    spots = []
+    for rec in _load_jsonl(DECISIONS_JSONL):
+        if str(rec.get("session_date") or rec.get("timestamp") or "")[:10] != session_date:
+            continue
+        m = rec.get("metadata", {}) or {}
+        s = m.get("nifty_spot") or (m.get("data_readiness") or {}).get("spot_price") or m.get("atm_strike")
+        if s:
+            try: spots.append(float(s))
+            except (TypeError, ValueError): pass
+    if len(spots) < 3:
+        _log(f"[daily-study] not enough spot data for {session_date} ({len(spots)}) — skipping"); return None
+    o, c, h, l = spots[0], spots[-1], max(spots), min(spots)
+
+    # prior close + prior move from the last journal entry
+    prev_close = None; prev_move = None
+    prior = _load_jsonl(DAILY_STUDY_FILE)
+    if prior:
+        last = prior[-1]
+        if last.get("date") != session_date:
+            prev_close = last.get("close"); prev_move = last.get("day_move_pct")
+
+    # IV from iv_history (day value; open/close IV snapshots are the next enhancement)
+    iv_close = None
+    try:
+        rows = list(_csv.DictReader(open(IV_HISTORY_FILE))) if IV_HISTORY_FILE.exists() else []
+        for r in rows:
+            if r.get("date") == session_date:
+                iv_close = float(r.get("avg_chain_iv") or 0) or None
+    except Exception:  # noqa: BLE001
+        pass
+
+    study = study_day(session_date, prev_close or o, o, h, l, c,
+                      prev_day_move_pct=prev_move, iv_close=iv_close)
+    d = asdict(study)
+    try:
+        with open(DAILY_STUDY_FILE, "a") as f:
+            f.write(__import__("json").dumps(d, default=str) + "\n")
+        _log(f"[daily-study] {session_date}: gap {study.gap_pct:+.1f}% move {study.day_move_pct:+.1f}% [{study.day_type}] — {len(study.seller_notes)} seller notes")
+    except Exception as e:  # noqa: BLE001
+        _log(f"[daily-study] write failed: {e}")
+    return d
 LOG_FILE             = ROOT / "logs" / "eod_learning.log"
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -660,6 +718,10 @@ def main() -> None:
         _log(f"Outcomes logged to SQLite: {logged}")
     elif trades and dry_run:
         _log(f"DRY-RUN: would log {len(trades)} outcomes to SQLite")
+
+    # 3b. Daily market study — the brain trains from the MARKET every day (even no-trade days)
+    if not dry_run:
+        _run_daily_market_study(session_date)
 
     # 4. Rolling playbook stats
     playbook_stats = _compute_rolling_playbook_stats()
