@@ -29,11 +29,25 @@ order is explicit. Credit spreads / condor / strangle ARE executable today.
 
 from __future__ import annotations
 
+import os
 from datetime import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from .trade_planner import assess_market, MarketRead, _f
+
+# Research toggle: stand aside from RANGE_WIDE condors. The ordering-robustness
+# test showed condor P&L is noise (~0 median, sign-flips across orderings) while
+# PUT_DEBIT is the robust edge. This flag lets us validate whether cutting the
+# noisy condor (and freeing the slot for the robust edge) helps across orderings.
+_NO_CONDOR = os.environ.get("SEL_NO_CONDOR") == "1"
+
+# Research toggle: which structure to deploy on STRONG_TREND_UP / BREAKOUT_UP.
+# Baseline "BULL_PUT" earns ~0 across orderings (no up-side edge). Values:
+#   BULL_PUT   — with-trend credit spread (current default)
+#   CALL_DEBIT — buy a call-debit with the up-move (symmetric to the put-debit engine)
+#   ASIDE      — stand aside on up-moves entirely
+_UP_STRUCT = os.environ.get("SEL_UP_STRUCT", "BULL_PUT").upper()
 from .volatility_engine import assess_vol, RICH_SELL, CHEAP_BUY
 
 # ── Condition labels ────────────────────────────────────────────────────────
@@ -144,8 +158,17 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         # Nifty UP-moves grind and chop — a call-debit needs a clean continued rally
         # and gets whipsawed (7mo: CALL_DEBIT -Rs30.9k). A with-trend BULL-PUT profits
         # on up OR sideways via theta, which fits the grindy character far better.
-        choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
-        choice.rationale = f"{condition}: with-trend bull-put (Nifty up-moves grind — theta fits better than a debit needing a clean rally)."
+        # NOTE: ordering-robust test shows BULL_PUT earns ~0 here — no up-side edge yet.
+        # _UP_STRUCT lets us test alternatives under the same robust harness.
+        if _UP_STRUCT == "CALL_DEBIT":
+            choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["CALL_DEBIT_SPREAD"]
+            choice.rationale = f"{condition}: buy CALL DEBIT with the up-move (testing a symmetric up-side engine)."
+        elif _UP_STRUCT == "ASIDE":
+            choice.family, choice.structures = FAM_STAND_ASIDE, []
+            choice.rationale = f"{condition}: stand aside on up-moves (no validated up-side edge)."
+        else:
+            choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
+            choice.rationale = f"{condition}: with-trend bull-put (Nifty up-moves grind — theta fits better than a debit needing a clean rally)."
 
     elif condition in (STRONG_TREND_DOWN, BREAKOUT_DOWN):
         # Nifty DOWN-moves are sharp — a PUT-DEBIT's positive skew captures them
@@ -158,7 +181,10 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         # day's range hasn't formed yet; mid-day condors win (+Rs7.6k @70%). Only sell
         # the range once it's established (>= 11:30).
         _too_early = now_time is not None and now_time < time(11, 30)
-        if _too_early:
+        if _NO_CONDOR:
+            choice.family, choice.structures = FAM_STAND_ASIDE, []
+            choice.rationale = "RANGE_WIDE but condor disabled (SEL_NO_CONDOR) — condor P&L is order-noise; stand aside, keep the slot for the robust directional edge."
+        elif _too_early:
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = "RANGE_WIDE but before 11:30 — range not yet formed (morning condors lose); wait."
         elif iv in (IV_RICH, IV_NORMAL):
