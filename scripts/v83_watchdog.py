@@ -60,7 +60,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 BLOCK_THRESHOLD      = 3     # consecutive same-reason blocks before acting
 OC_ALERT_MINUTES     = 15    # minutes OC unavailable before Telegram
 WINDOW_CLOSED_CYCLES = 5     # cycles with ENTRY_WINDOW_CLOSED + good signal before widening window
-STALE_THRESHOLD_LATE = 10    # minutes (after 09:45 AM)
+STALE_THRESHOLD_LATE = 15    # minutes (after 09:45 AM) — tolerate slow cycles/warmup; a true freeze still trips it
 STALE_THRESHOLD_EARLY = 20   # minutes (before 09:45 AM, accumulating candles)
 BULLISH_SIGNAL_MIN   = 3.3   # minimum bullish_entry_score we consider "signal present"
 BEARISH_SIGNAL_MIN   = 3.3   # minimum bearish_entry_score we consider "signal present"
@@ -1271,7 +1271,10 @@ def run_watchdog() -> None:
         fixes_applied.append(f"Log stale ({log_age_min:.1f} min) → restarted")
         if log_age_min > 20:
             _send_telegram(f"⚠️ <b>V83 Watchdog</b>\nLog stale {log_age_min:.1f} min → restarted at {now.strftime('%H:%M IST')}")
-        state["restart_grace_until"] = (now + timedelta(minutes=3)).isoformat()
+        # 15-min grace: a freshly-restarted agent needs time to warm up (fetch history,
+        # accumulate candles) before it writes steadily. A 3-min grace rechecked mid-warmup
+        # and restarted again -> the loop that never let the agent stabilize.
+        state["restart_grace_until"] = (now + timedelta(minutes=15)).isoformat()
 
     # ── LAYER 1b: All-day INSUFFICIENT_DATA detection ─────────────────────────
     # When Dhan API is completely down, every cycle logs INSUFFICIENT_DATA.
