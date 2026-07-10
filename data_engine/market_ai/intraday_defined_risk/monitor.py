@@ -1732,6 +1732,23 @@ def load_object(path_spec: str):
     return getattr(module, symbol_name)
 
 
+def _emit_decision(decision) -> None:
+    """Print a per-cycle decision to stdout (the runner log) stamped with the emit time.
+
+    The success path's Decision.to_dict() carries no timestamp — only the INSUFFICIENT_DATA
+    path did (data_readiness.timestamp) — so the watchdog could not date healthy decisions
+    and misjudged a working agent as stale / API-down (the restart-loop + false Telegram
+    alerts). Stamping 'emitted_at' at this single source lets the watchdog see healthy
+    activity and judge liveness/recency correctly.
+    """
+    try:
+        payload = decision.to_dict()
+        payload["emitted_at"] = datetime.now(_IST).isoformat()
+        print(json.dumps(payload, default=str))
+    except Exception:
+        print(decision.to_json())
+
+
 def run_live(config: dict[str, object]) -> None:
     provider_cls = load_object(str(config["provider_class"]))
     executor_cls = load_object(str(config["executor_class"]))
@@ -1852,7 +1869,7 @@ def run_live(config: dict[str, object]) -> None:
                 block_reason=reason_code,
                 data_status=data_status,
             )
-            print(decision.to_json())
+            _emit_decision(decision)
             if _should_report:
                 build_operator_status_report()
             sleep(poll_seconds)
@@ -1868,7 +1885,7 @@ def run_live(config: dict[str, object]) -> None:
             )
             log_validation_decision(decision, snapshot=snapshot, block_reason="LIVE_DISABLED")
             _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="LIVE_DISABLED")
-            print(decision.to_json())
+            _emit_decision(decision)
             if _should_report:
                 build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
             sleep(poll_seconds)
@@ -1877,7 +1894,7 @@ def run_live(config: dict[str, object]) -> None:
             decision = agent.evaluate(snapshot)
             log_validation_decision(decision, snapshot=snapshot, block_reason="RESEARCH_MODE")
             _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="RESEARCH_MODE")
-            print(decision.to_json())
+            _emit_decision(decision)
             if _should_report:
                 build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
             sleep(poll_seconds)
@@ -1931,7 +1948,7 @@ def run_live(config: dict[str, object]) -> None:
                         event_type="HEDGE_ENTRY",
                     )
                     _update_runtime_decision_state(position_decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="NONE")
-                    print(position_decision.to_json())
+                    _emit_decision(position_decision)
                 else:
                     # Normal exit decision
                     exit_decision = position_decision
@@ -1946,7 +1963,7 @@ def run_live(config: dict[str, object]) -> None:
                         )
                     log_validation_decision(exit_decision, snapshot=snapshot, block_reason="EXIT_DECISION", event_type="EXIT")
                     _update_runtime_decision_state(exit_decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="EXIT_DECISION")
-                    print(exit_decision.to_json())
+                    _emit_decision(exit_decision)
         else:
             decision = agent.evaluate(snapshot)
             # Clamp lots to the operator cap *before* any gate check so that
@@ -1956,7 +1973,7 @@ def run_live(config: dict[str, object]) -> None:
                 ops_max = int(getattr(getattr(runtime_config, "risk", None), "max_lots_per_trade", None) or 6)
                 if decision.lots > ops_max:
                     decision.lots = ops_max
-            print(decision.to_json())
+            _emit_decision(decision)
             if decision.action == "TRADE":
                 if runtime_config.mode == RuntimeMode.SHADOW_LIVE:
                     log_shadow_decision(decision, snapshot=snapshot)

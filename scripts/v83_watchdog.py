@@ -206,10 +206,13 @@ def _todays_decisions(n: int = 60) -> list[dict]:
         except Exception:
             continue
         m = d.get("metadata", {}) or {}
-        # Check both data_readiness.timestamp (error path) and trade_funnel.timestamp (success path)
+        # Prefer the top-level emitted_at (stamped on EVERY decision by the agent), then
+        # fall back to data_readiness.timestamp (error path) / trade_funnel.timestamp
+        # (older success path). emitted_at is what lets us see HEALTHY decisions at all.
+        em_ts = d.get("emitted_at", "")
         dr_ts = (m.get("data_readiness") or {}).get("timestamp", "")
         tf_ts = (m.get("trade_funnel") or {}).get("timestamp", "")
-        ts = dr_ts or tf_ts
+        ts = em_ts or dr_ts or tf_ts
         if not ts.startswith(today_str):
             continue
         results.append(d)
@@ -221,7 +224,14 @@ def _todays_decisions(n: int = 60) -> list[dict]:
 def _last_decision_age_minutes(decisions: list[dict]) -> float | None:
     if not decisions:
         return None
-    ts_str = (decisions[-1].get("metadata", {}).get("data_readiness", {}) or {}).get("timestamp", "")
+    last = decisions[-1]
+    # Prefer emitted_at (present on EVERY decision the agent writes); fall back to the
+    # error/success-path timestamps for older log lines that predate emitted_at.
+    ts_str = (
+        last.get("emitted_at", "")
+        or (last.get("metadata", {}).get("data_readiness", {}) or {}).get("timestamp", "")
+        or (last.get("metadata", {}).get("trade_funnel", {}) or {}).get("timestamp", "")
+    )
     if not ts_str:
         return None
     try:
