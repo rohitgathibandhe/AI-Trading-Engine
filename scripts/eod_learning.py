@@ -62,19 +62,82 @@ def _run_daily_market_study(session_date: str) -> dict | None:
     except Exception as e:  # noqa: BLE001
         _log(f"[daily-study] import failed: {e}"); return None
 
-    # spot series from today's decisions -> OHLC
-    spots = []
-    for rec in _load_jsonl(DECISIONS_JSONL):
-        if str(rec.get("session_date") or rec.get("timestamp") or "")[:10] != session_date:
-            continue
-        m = rec.get("metadata", {}) or {}
-        s = m.get("nifty_spot") or (m.get("data_readiness") or {}).get("spot_price") or m.get("atm_strike")
-        if s:
-            try: spots.append(float(s))
-            except (TypeError, ValueError): pass
-    if len(spots) < 3:
-        _log(f"[daily-study] not enough spot data for {session_date} ({len(spots)}) — skipping"); return None
-    o, c, h, l = spots[0], spots[-1], max(spots), min(spots)
+    # ── Session OHLC — RELIABLE source so the brain trains EVERY day ──────────
+    # Primary: authoritative Dhan intraday candles (always available post-session).
+    # Fallbacks: IV-snapshot open/close spots, then decision-spots. The old code used
+    # ONLY decision-spots and SILENTLY SKIPPED on a chaotic day (today: 0 spots) — the
+    # single biggest hole in "train on the market every day". Never skip on data again.
+    o = h = l = c = None
+    source = None
+    try:
+        _sys.path.insert(0, str(DATA_ENGINE))
+        from market_ai.dhan_wrapper import DhanWrapper  # type: ignore
+        import os as _os
+        _creds = {}
+        _cf = STATE / "creds.json"
+        if _cf.exists():
+            _creds = __import__("json").load(open(_cf))
+        _cid = str(_creds.get("client_id") or "").strip()
+        _tok = str(_creds.get("access_token") or "").strip()
+        if _cid and _tok:
+            _os.environ["DHAN_CLIENT_ID"] = _cid
+            _os.environ["DHAN_ACCESS_TOKEN"] = _tok
+        _dw = DhanWrapper(logger=None)
+        _candles = _dw.get_intraday_candles(13, "IDX_I", interval=5) or []
+        _o = _hi = _lo = _cl = None
+        for _cd in _candles:
+            _ts = str(_cd.get("timestamp") or _cd.get("start_time") or _cd.get("time") or "")
+            if _ts and session_date not in _ts:
+                continue
+            oo, hh, ll, cc = _cd.get("open"), _cd.get("high"), _cd.get("low"), _cd.get("close")
+            if None in (oo, hh, ll, cc):
+                continue
+            oo, hh, ll, cc = float(oo), float(hh), float(ll), float(cc)
+            if _o is None:
+                _o = oo
+            _hi = hh if _hi is None else max(_hi, hh)
+            _lo = ll if _lo is None else min(_lo, ll)
+            _cl = cc
+        if _o is not None and _cl is not None:
+            o, h, l, c, source = _o, _hi, _lo, _cl, "dhan_candles"
+    except Exception as e:  # noqa: BLE001
+        _log(f"[daily-study] candle OHLC failed ({e}) — trying fallbacks")
+
+    if o is None:  # fallback 1: IV-snapshot open/close spot (real, captured at 09:20/15:25)
+        try:
+            _snap_o = _snap_c = _snap_hi = _snap_lo = None
+            for r in (list(_csv.DictReader(open(IV_SNAPSHOTS_FILE))) if IV_SNAPSHOTS_FILE.exists() else []):
+                if r.get("date") != session_date:
+                    continue
+                sp = r.get("spot")
+                try: sp = float(sp)
+                except (TypeError, ValueError): continue
+                if (r.get("phase") or "").upper() == "OPEN": _snap_o = sp
+                elif (r.get("phase") or "").upper() == "CLOSE": _snap_c = sp
+                _snap_hi = sp if _snap_hi is None else max(_snap_hi, sp)
+                _snap_lo = sp if _snap_lo is None else min(_snap_lo, sp)
+            if _snap_o is not None and _snap_c is not None:
+                o, h, l, c, source = _snap_o, _snap_hi, _snap_lo, _snap_c, "iv_snapshots"
+        except Exception:  # noqa: BLE001
+            pass
+
+    if o is None:  # fallback 2: decision-spots (legacy)
+        spots = []
+        for rec in _load_jsonl(DECISIONS_JSONL):
+            if str(rec.get("session_date") or rec.get("timestamp") or "")[:10] != session_date:
+                continue
+            m = rec.get("metadata", {}) or {}
+            s = m.get("nifty_spot") or (m.get("data_readiness") or {}).get("spot_price") or m.get("atm_strike")
+            if s:
+                try: spots.append(float(s))
+                except (TypeError, ValueError): pass
+        if len(spots) >= 3:
+            o, h, l, c, source = spots[0], max(spots), min(spots), spots[-1], "decision_spots"
+
+    if o is None or c is None:
+        _log(f"[daily-study] no OHLC from any source for {session_date} — skipping (investigate: candles+iv_snapshots+decisions all empty)")
+        return None
+    _log(f"[daily-study] OHLC for {session_date} from {source}: O={o:.0f} H={h:.0f} L={l:.0f} C={c:.0f}")
 
     # prior close + prior move from the last journal entry
     prev_close = None; prev_move = None
