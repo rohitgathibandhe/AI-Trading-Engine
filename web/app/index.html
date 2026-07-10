@@ -2304,6 +2304,50 @@
       }
     }
 
+    // Fast (~3s) refresh of JUST the open position's live legs + total — hits the light
+    // /api/open_position_live endpoint so live P&L updates far more often than the 15s loop.
+    async function refreshLivePosition() {
+      try {
+        const d = await fetchJSON("/api/open_position_live");
+        const op = d.v83_open_position || {};
+        const legs = op.legs || [];
+        const mtm = Number(op.open_mtm || 0);
+        const pnlEl = document.getElementById("total-pnl");
+        if (pnlEl) {
+          pnlEl.textContent = fmtMoney(mtm);
+          pnlEl.classList.toggle("pos", mtm > 0);
+          pnlEl.classList.toggle("neg", mtm < 0);
+        }
+        let openTotal = 0.0;
+        upsertRows(
+          "#legs-table tbody",
+          legs,
+          (leg) => `${leg.strike}-${leg.option_type}-${leg.side}`,
+          (leg, tr) => {
+            const pnlClass = (leg.pnl || 0) > 0 ? "pos" : ((leg.pnl || 0) < 0 ? "neg" : "");
+            openTotal += leg.pnl || 0;
+            const change = leg.entry && leg.ltp ? ((leg.ltp - leg.entry) / leg.entry * 100) : null;
+            tr.innerHTML = `
+              <td>${leg.side === "SELL" ? "S" : "B"}</td>
+              <td>${leg.option_type || ""}</td>
+              <td>${leg.strike}</td>
+              <td>${leg.expiry || "—"}</td>
+              <td>${leg.qty}</td>
+              <td>${fmtMoney(leg.entry)}</td>
+              <td>${fmtMoney(leg.ltp)}</td>
+              <td class="${pnlClass}">${fmtMoney(leg.pnl)}</td>
+              <td class="${pnlClass}">${change !== null ? change.toFixed(2) + '%' : '—'}</td>
+            `;
+          }
+        );
+        const totEl = document.getElementById("paper-positions-pnl");
+        if (totEl) totEl.textContent = `Total P&L: ${fmtMoney(openTotal)}`;
+        const cellEl = document.getElementById("paper-open-totalcell");
+        if (cellEl) cellEl.textContent = fmtMoney(openTotal);
+        document.getElementById("last-refresh").textContent = "Updated: " + new Date().toLocaleTimeString();
+      } catch (e) { /* keep last values on transient errors */ }
+    }
+
     async function loadPreflight() {
       const grid = document.getElementById("preflight-grid");
       const badge = document.getElementById("preflight-badge");
@@ -2426,6 +2470,14 @@
       else if (activeTab === "state") loadState().catch(() => {});
       else if (activeTab === "logs") loadLogs().catch(() => {});
     }, 15000);
+
+    // Fast loop: while viewing Paper P&L, refresh JUST the open position's live legs +
+    // total every 3s (light endpoint) so live P&L tracks close to real time, without
+    // re-running the heavy full payload.
+    setInterval(() => {
+      if (!pageVisible()) return;
+      if (activeTab === "pnl") refreshLivePosition().catch(() => {});
+    }, 3000);
 
     document.addEventListener("visibilitychange", () => {
       if (!pageVisible()) return;

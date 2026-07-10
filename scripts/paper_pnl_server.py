@@ -2146,7 +2146,7 @@ def _load_intraday_trade_history(limit: Optional[int] = None) -> List[Dict[str, 
 
 _open_leg_ltp_cache: Dict[float, Dict[str, Any]] = {}
 _open_leg_ltp_cache_ts: float = 0.0
-_OPEN_LEG_LTP_TTL = 6.0
+_OPEN_LEG_LTP_TTL = 3.0   # Dhan chain is ~1 req/3s; 3s is the floor for the fast poller
 
 
 def _live_leg_ltps() -> Dict[float, Dict[str, Any]]:
@@ -4425,6 +4425,15 @@ class PaperHandler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/preflight"):
             try:
                 self._send_json(_preflight_status())
+            except Exception as exc:  # pragma: no cover - defensive
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/open_position_live"):
+            # Lightweight endpoint for FAST (~3s) polling of just the open position's live
+            # legs + total — avoids the heavy /api/paper_positions payload so the UI can
+            # refresh the live P&L far more often than the 15s full loop.
+            try:
+                self._send_json({"v83_open_position": _build_v83_open_position_payload()})
             except Exception as exc:  # pragma: no cover - defensive
                 self._send_json({"error": str(exc)}, status=500)
             return
