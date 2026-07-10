@@ -138,3 +138,50 @@ def mine_patterns(studies: list[DayStudy]) -> dict[str, Any]:
     out["day_type_mix"] = dict(Counter(d.day_type for d in studies))
     out["premium_behavior_mix"] = dict(Counter(d.premium_behavior for d in studies))
     return out
+
+
+def load_prev_day_context(jsonl_path, today: str | None = None) -> dict:
+    """Read the most recent completed DayStudy (before `today`) so the NEXT session's
+    decisions can SEE yesterday's character. Advisory context — attaches to metadata,
+    does NOT gate (the premium-crush lesson has too few sharp-down samples to gate on;
+    it accumulates here for forward validation). Returns {} when unavailable.
+    """
+    import json
+    import os
+
+    try:
+        if not os.path.exists(jsonl_path):
+            return {}
+        rows = []
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
+        if today is not None:
+            rows = [r for r in rows if str(r.get("date") or "") < str(today)]
+        if not rows:
+            return {}
+        last = rows[-1]
+        mv = last.get("day_move_pct")
+        ctx = {
+            "prev_day_date": last.get("date"),
+            "prev_day_move_pct": mv,
+            "prev_day_type": last.get("day_type"),
+            "prev_day_gap_type": last.get("gap_type"),
+            "prev_day_premium_behavior": last.get("premium_behavior"),
+        }
+        if isinstance(mv, (int, float)) and mv <= -1.5:
+            ctx["prev_day_lesson"] = (
+                "after a sharp down day: next-open premium tends rich and CRUSHES — "
+                "favour selling / do not overpay to buy debits at the open"
+            )
+        elif isinstance(mv, (int, float)) and mv >= 1.5:
+            ctx["prev_day_lesson"] = "after a sharp up day: watch for gap-and-fade / mean reversion"
+        return ctx
+    except Exception:
+        return {}

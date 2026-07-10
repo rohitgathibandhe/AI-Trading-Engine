@@ -495,6 +495,26 @@ def _compute_chain_gex(snapshot: MarketSnapshot):
     return compute_gex(rows, chain.spot, t_years)
 
 
+_PREV_DAY_CTX_CACHE: dict[str, dict] = {}
+
+
+def _load_prev_day_context_cached(session_date: str) -> dict:
+    """Yesterday's market character for today's decisions (advisory). Cached per date so
+    the daily_market_study.jsonl is read at most once a session, not every cycle."""
+    if session_date in _PREV_DAY_CTX_CACHE:
+        return _PREV_DAY_CTX_CACHE[session_date]
+    ctx: dict = {}
+    try:
+        from pathlib import Path
+        from .daily_market_study import load_prev_day_context
+        study_path = Path(__file__).resolve().parent.parent / "state" / "daily_market_study.jsonl"
+        ctx = load_prev_day_context(str(study_path), today=session_date) or {}
+    except Exception:
+        ctx = {}
+    _PREV_DAY_CTX_CACHE[session_date] = ctx
+    return ctx
+
+
 def _bullish_shadow_subtype(
     *,
     playbook: str,
@@ -2649,6 +2669,15 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         metadata["gex_dist_to_flip_pct"] = _gex.distance_to_flip_pct
     except Exception:
         metadata["gex_regime"] = None
+
+    # Yesterday's character from the daily-study loop (advisory context, not a gate) —
+    # closes the write-only silo: the premium-crush lesson now reaches each decision.
+    try:
+        _pdc = _load_prev_day_context_cached(snapshot.timestamp.date().isoformat())
+        for _k, _v in _pdc.items():
+            metadata[_k] = _v
+    except Exception:
+        pass
 
     bullish_shadow_subtype = _bullish_shadow_subtype(
         playbook=str(metadata.get("playbook") or "NO_TRADE"),
