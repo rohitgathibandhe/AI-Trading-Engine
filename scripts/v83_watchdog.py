@@ -181,6 +181,69 @@ def _restart_agent() -> bool:
         return False
 
 
+# ── Self-heal circuit breaker ────────────────────────────────────────────────
+# A real self-healer must know when its fix ISN'T working. Restarting only cures a
+# crashed/frozen process; if the agent has been restarted repeatedly and is STILL
+# unhealthy, the fault is not restart-fixable (code/data/config) — blindly retrying
+# gives today's 36-restart storm. So cap restarts per rolling window, then OPEN the
+# circuit: stop restarting, escalate ONCE with a diagnosis, and pause auto-heal to cool.
+RESTART_STORM_WINDOW_MIN = 30
+RESTART_STORM_MAX = 3
+CIRCUIT_COOLDOWN_MIN = 30
+
+
+def _guarded_restart(state: dict, now: datetime, reason: str) -> bool:
+    """Restart the agent ONLY while auto-healing is plausibly working; otherwise open the
+    circuit and escalate. This is the difference between a self-healer and a restart loop."""
+    cutoff = now - timedelta(minutes=RESTART_STORM_WINDOW_MIN)
+    pruned: list[str] = []
+    for t in (state.get("restart_history") or []):
+        try:
+            if datetime.fromisoformat(t) >= cutoff:
+                pruned.append(t)
+        except Exception:
+            continue
+
+    open_until = state.get("heal_circuit_open_until")
+    if open_until:
+        try:
+            still_open = now < datetime.fromisoformat(open_until)
+        except Exception:
+            still_open = False
+        if still_open:
+            _log(f"Self-heal circuit OPEN — NOT restarting (trigger: {reason})")
+            state["restart_history"] = pruned
+            _save_wdog_state(state)
+            return False
+        state.pop("heal_circuit_open_until", None)   # cooldown elapsed → fresh budget
+        state.pop("heal_escalated_hour", None)
+        pruned = []
+
+    if len(pruned) >= RESTART_STORM_MAX:
+        state["heal_circuit_open_until"] = (now + timedelta(minutes=CIRCUIT_COOLDOWN_MIN)).isoformat()
+        state["restart_history"] = pruned
+        hour_key = now.strftime("%Y-%m-%d %H")
+        if state.get("heal_escalated_hour") != hour_key:
+            state["heal_escalated_hour"] = hour_key
+            _log(f"CIRCUIT OPEN: {len(pruned)} restarts in {RESTART_STORM_WINDOW_MIN}min, still unhealthy — PAUSED, escalating")
+            _send_telegram(
+                f"🛑 <b>V83 Self-Heal PAUSED — needs you</b>\n"
+                f"Agent restarted {len(pruned)}x in {RESTART_STORM_WINDOW_MIN} min and is STILL unhealthy "
+                f"(trigger: {reason}).\n"
+                f"Restarting is NOT fixing it — likely a code/data/config issue, not a crash. "
+                f"Auto-heal paused {CIRCUIT_COOLDOWN_MIN} min. Please check the agent now."
+            )
+        _save_wdog_state(state)
+        return False
+
+    ok = _restart_agent()   # the actual restart (this is the guarded path itself)
+    if ok:
+        pruned.append(now.isoformat())
+    state["restart_history"] = pruned
+    _save_wdog_state(state)
+    return ok
+
+
 def _kill_pid(pid: int) -> None:
     try:
         os.kill(pid, signal.SIGTERM)
@@ -1240,7 +1303,7 @@ def run_watchdog() -> None:
     pids = _find_agent_pids()
     if not pids:
         _log("Agent not running — kickstart")
-        ok = _restart_agent()
+        ok = _guarded_restart(state, now, "watchdog auto-heal")
         fix = "Agent dead → kickstart" if ok else "Agent dead + kickstart FAILED"
         fixes_applied.append(fix)
         _send_telegram(f"⚠️ <b>V83 Watchdog</b>\n{fix} at {now.strftime('%H:%M IST')}")
@@ -1263,6 +1326,18 @@ def run_watchdog() -> None:
     # ── LAYER 1: Stale log ────────────────────────────────────────────────────
     decisions = _todays_decisions(n=600)  # still needed by layer 1b (INSUFFICIENT_DATA) below
 
+    # RECOVERY: if the agent is producing FRESH decisions (emitted_at within the stale
+    # window), any prior heal attempt worked — reset the circuit breaker so a future
+    # genuine fault gets its full restart budget instead of inheriting an old storm count.
+    _fresh_age = _last_decision_age_minutes(decisions)
+    if _fresh_age is not None and _fresh_age <= STALE_THRESHOLD_LATE:
+        if state.get("restart_history") or state.get("heal_circuit_open_until"):
+            _log(f"Agent healthy (newest decision {_fresh_age:.1f}min old) — resetting self-heal circuit")
+            state.pop("restart_history", None)
+            state.pop("heal_circuit_open_until", None)
+            state.pop("heal_escalated_hour", None)
+            _save_wdog_state(state)
+
     # Liveness = is the agent writing its log AT ALL? Use the log file MTIME, which
     # advances on every cycle (decision or INFO line). The previous metric keyed on
     # _last_decision_age_minutes -> metadata.data_readiness.timestamp, a field present
@@ -1277,7 +1352,7 @@ def run_watchdog() -> None:
 
     if log_age_min > stale_threshold:
         _log(f"Log stale {log_age_min:.1f} min (mtime) — restarting")
-        ok = _restart_agent()
+        ok = _guarded_restart(state, now, "watchdog auto-heal")
         fixes_applied.append(f"Log stale ({log_age_min:.1f} min) → restarted")
         if log_age_min > 20:
             _send_telegram(f"⚠️ <b>V83 Watchdog</b>\nLog stale {log_age_min:.1f} min → restarted at {now.strftime('%H:%M IST')}")
@@ -1317,7 +1392,7 @@ def run_watchdog() -> None:
                     f"Dhan historical candle API appears to be down.\n"
                     f"Check API status at {now.strftime('%H:%M IST')}."
                 )
-                ok = _restart_agent()
+                ok = _guarded_restart(state, now, "watchdog auto-heal")
                 fixes_applied.append(f"All-day INSUFFICIENT_DATA ({insuff_count} cycles) → restarted")
                 state["restart_grace_until"] = (now + timedelta(minutes=3)).isoformat()
         else:
@@ -1337,7 +1412,7 @@ def run_watchdog() -> None:
                 if not last_h or abs(int(cur_h) - int(last_h)) >= 30:
                     state["oc_alert_sent_hhmm"] = cur_h
                     if _api_reachable():
-                        ok = _restart_agent()
+                        ok = _guarded_restart(state, now, "watchdog auto-heal")
                         fixes_applied.append(f"OC unavailable {block_minutes:.0f}min → restarted")
                         state["restart_grace_until"] = (now + timedelta(minutes=3)).isoformat()
                         _send_telegram(
@@ -1361,7 +1436,7 @@ def run_watchdog() -> None:
             break
     if dp_streak >= BLOCK_THRESHOLD:
         _log(f"DATA_PIPELINE_HEALTH_BLOCKED {dp_streak} cycles — restarting")
-        ok = _restart_agent()
+        ok = _guarded_restart(state, now, "watchdog auto-heal")
         fixes_applied.append(f"DATA_PIPELINE_HEALTH_BLOCKED {dp_streak}× → restarted")
         state["restart_grace_until"] = (now + timedelta(minutes=3)).isoformat()
         _send_telegram(
