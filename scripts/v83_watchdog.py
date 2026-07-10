@@ -1286,7 +1286,16 @@ def run_watchdog() -> None:
             if (d.get("metadata", {}).get("data_readiness") or {}).get("reason") == "MIN_5M_CANDLES_NOT_READY"
             or (d.get("metadata", {}).get("data_readiness") or {}).get("candle_count", 1) == 0
         )
-        if insuff_count == len(decisions) and insuff_count >= 3:
+        # FALSE-POSITIVE GUARD: _todays_decisions() can only date INSUFFICIENT_DATA lines
+        # (healthy decisions carry no timestamp), so on a NORMAL day `decisions` is just the
+        # morning warmup (e.g. 35 lines up to ~09:34) and insuff_count == len(decisions) is
+        # ALWAYS true — firing a bogus "DATA API DOWN" alert + restart even though the agent
+        # went healthy and traded. Only treat it as a real outage when the warmup is CURRENT
+        # (newest INSUFFICIENT_DATA within the stale window, not hours-old) AND Dhan is
+        # genuinely unreachable via a live probe.
+        insuff_age = _last_decision_age_minutes(decisions)
+        currently_starved = insuff_age is not None and insuff_age <= stale_threshold
+        if insuff_count == len(decisions) and insuff_count >= 3 and currently_starved and not _api_reachable():
             last_insuff_alert = state.get("insuff_data_alert_hhmm", "")
             cur_h = now.strftime("%H%M")
             if not last_insuff_alert or abs(int(cur_h) - int(last_insuff_alert)) >= 30:
