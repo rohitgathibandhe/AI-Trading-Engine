@@ -1251,22 +1251,26 @@ def run_watchdog() -> None:
             _log("CRITICAL: Token expired — alerted")
 
     # ── LAYER 1: Stale log ────────────────────────────────────────────────────
-    decisions = _todays_decisions(n=600)  # large n: gap detection needs full day window
-    age = _last_decision_age_minutes(decisions)
+    decisions = _todays_decisions(n=600)  # still needed by layer 1b (INSUFFICIENT_DATA) below
+
+    # Liveness = is the agent writing its log AT ALL? Use the log file MTIME, which
+    # advances on every cycle (decision or INFO line). The previous metric keyed on
+    # _last_decision_age_minutes -> metadata.data_readiness.timestamp, a field present
+    # ONLY on warmup / INSUFFICIENT_DATA lines. Once the agent went healthy, that
+    # timestamp froze at the last warmup value (e.g. 09:34) and read as 2+ hours forever,
+    # so the watchdog restarted a perfectly healthy agent every poll — the "log stale"
+    # Telegram spam + restart loop. mtime reflects true liveness: a genuinely frozen loop
+    # stops writing (mtime grows -> restart); a healthy OR data-API-down agent keeps
+    # writing (mtime fresh -> no restart). API-down is handled by layer 1b, not here.
+    log_age_min = (time.time() - _LOG.stat().st_mtime) / 60.0 if _LOG.exists() else 999.0
     stale_threshold = STALE_THRESHOLD_EARLY if now.strftime("%H%M") < "0945" else STALE_THRESHOLD_LATE
 
-    # Blind-spot fix: when age is None (no JSON decisions at all today), fall back to
-    # log file mtime. An agent that is completely frozen produces no JSON lines, so
-    # _last_decision_age_minutes returns None and the original check was silently skipped.
-    if age is None and _LOG.exists():
-        age = (time.time() - _LOG.stat().st_mtime) / 60.0
-
-    if age is not None and age > stale_threshold:
-        _log(f"Log stale {age:.1f} min — restarting")
+    if log_age_min > stale_threshold:
+        _log(f"Log stale {log_age_min:.1f} min (mtime) — restarting")
         ok = _restart_agent()
-        fixes_applied.append(f"Log stale ({age:.1f} min) → restarted")
-        if age > 20:
-            _send_telegram(f"⚠️ <b>V83 Watchdog</b>\nLog stale {age:.1f} min → restarted at {now.strftime('%H:%M IST')}")
+        fixes_applied.append(f"Log stale ({log_age_min:.1f} min) → restarted")
+        if log_age_min > 20:
+            _send_telegram(f"⚠️ <b>V83 Watchdog</b>\nLog stale {log_age_min:.1f} min → restarted at {now.strftime('%H:%M IST')}")
         state["restart_grace_until"] = (now + timedelta(minutes=3)).isoformat()
 
     # ── LAYER 1b: All-day INSUFFICIENT_DATA detection ─────────────────────────
