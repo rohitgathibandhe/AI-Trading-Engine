@@ -2154,23 +2154,33 @@ def _build_v83_open_position_payload() -> Dict[str, Any]:
         state = _json_read(V83_PAPER_STATE_JSON) or {}
     except Exception:
         state = {}
-    if not state or not state.get("structure"):
+    # The agent nests the live position under "active_position" (older schema kept the
+    # structure at top level). Read from active_position when present so the UI actually
+    # shows the open trade — without this, a real open paper position renders as "flat".
+    pos = state.get("active_position") if isinstance(state.get("active_position"), dict) else state
+    if not pos or not pos.get("structure"):
         return {"open": False, "legs": [], "open_mtm": None, "expiry": None, "playbook": None}
 
-    structure = state.get("structure") or {}
+    structure = pos.get("structure") or {}
     legs_raw = structure.get("legs") or []
+    # MFE/MAE/mark P&L are top-level in the agent's state; metadata lives under the position.
     mfe = _parse_float(state.get("mfe_rupees"), 0.0)
     mae = _parse_float(state.get("mae_rupees"), 0.0)
     mark_pnl = _parse_float(state.get("last_mark_pnl_rupees"), None)
-    playbook = (state.get("metadata") or {}).get("playbook")
+    playbook = (pos.get("metadata") or structure.get("metadata") or {}).get("playbook")
     expiry = None
+
+    # Leg qty lives at the position level (lots x lot_size), not on each leg.
+    _lots = _parse_int(pos.get("lots"), 0)
+    _lot_size = _parse_int(pos.get("lot_size"), 0)
+    _pos_qty = _lots * _lot_size if (_lots and _lot_size) else 0
 
     ui_legs: List[Dict[str, Any]] = []
     for leg in legs_raw:
         strike = leg.get("strike")
         option_type = leg.get("option_type") or leg.get("instrument_type") or ""
         action = str(leg.get("action") or "").upper()
-        qty = abs(int(leg.get("quantity") or leg.get("qty") or 0))
+        qty = abs(int(leg.get("quantity") or leg.get("qty") or _pos_qty or 0))
         entry_price = _parse_float(leg.get("entry_price") or leg.get("ltp"), None)
         ltp = _parse_float(leg.get("ltp"), entry_price)
         exp = leg.get("expiry")
