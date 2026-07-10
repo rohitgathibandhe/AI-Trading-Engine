@@ -140,17 +140,43 @@ def _append(row: dict) -> None:
 
 
 def _sync_iv_history(date_str: str, avg_iv) -> None:
-    """Keep the legacy date,avg_chain_iv file current (CLOSE value wins)."""
+    """Update iv_history.csv as date,avg_chain_iv,iv_rank (CLOSE value wins).
+
+    This is the LIVE connection: execution._read_current_iv_rank() reads column 3
+    (iv_rank, 0-100 percentile) and scales each trade's take-profit on it — high IV
+    rank holds longer, compressed IV exits sooner. iv_rank needs >=10 days of history
+    (compute_iv_rank); until then the column is blank and execution safely gets None.
+    """
     if avg_iv is None:
         return
     try:
+        from market_ai.intraday_defined_risk.volatility_engine import compute_iv_rank
+    except Exception:
+        compute_iv_rank = None
+    try:
         rows = list(csv.DictReader(open(IV_HISTORY))) if IV_HISTORY.exists() else []
         rows = [r for r in rows if r.get("date") != date_str]
-        rows.append({"date": date_str, "avg_chain_iv": avg_iv})
+        hist = []
+        for r in rows:
+            try:
+                v = float(r.get("avg_chain_iv") or 0)
+                if v > 0:
+                    hist.append(v)
+            except (TypeError, ValueError):
+                continue
+        iv_rank = None
+        if compute_iv_rank is not None:
+            rank01 = compute_iv_rank(float(avg_iv), hist + [float(avg_iv)])
+            iv_rank = round(rank01 * 100.0, 1) if rank01 is not None else None  # 0-100 scale for execution
+        rows.append({"date": date_str, "avg_chain_iv": avg_iv,
+                     "iv_rank": iv_rank if iv_rank is not None else ""})
         with open(IV_HISTORY, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["date", "avg_chain_iv"])
+            w = csv.DictWriter(f, fieldnames=["date", "avg_chain_iv", "iv_rank"])
             w.writeheader()
-            w.writerows(rows)
+            for r in rows:
+                w.writerow({"date": r.get("date"),
+                            "avg_chain_iv": r.get("avg_chain_iv"),
+                            "iv_rank": r.get("iv_rank", "")})
     except Exception:
         pass
 
