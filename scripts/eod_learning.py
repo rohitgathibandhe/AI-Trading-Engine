@@ -46,6 +46,7 @@ CREDS_FILE           = STATE / "creds.json"
 EOD_REPORT_FILE      = STATE / "eod_learning_report.json"
 PLAYBOOK_STATS_FILE  = STATE / "playbook_performance_stats.json"
 IV_HISTORY_FILE      = STATE / "iv_history.csv"
+IV_SNAPSHOTS_FILE    = STATE / "iv_snapshots.csv"
 DAILY_STUDY_FILE     = STATE / "daily_market_study.jsonl"
 
 
@@ -83,18 +84,41 @@ def _run_daily_market_study(session_date: str) -> dict | None:
         if last.get("date") != session_date:
             prev_close = last.get("close"); prev_move = last.get("day_move_pct")
 
-    # IV from iv_history (day value; open/close IV snapshots are the next enhancement)
-    iv_close = None
+    # Open/close ATM premium + IV from the daily snapshots (capture_iv_snapshot.py).
+    # This is what powers the premium-crush study — a down day's rich premium that
+    # crushes on the next gap-up is only visible with a real open->close pair.
+    def _fnum(v):
+        try:
+            return float(v) if v not in (None, "", "None") else None
+        except (TypeError, ValueError):
+            return None
+
+    iv_open = iv_close = atm_prem_open = atm_prem_close = None
     try:
-        rows = list(_csv.DictReader(open(IV_HISTORY_FILE))) if IV_HISTORY_FILE.exists() else []
-        for r in rows:
-            if r.get("date") == session_date:
-                iv_close = float(r.get("avg_chain_iv") or 0) or None
+        snaps = list(_csv.DictReader(open(IV_SNAPSHOTS_FILE))) if IV_SNAPSHOTS_FILE.exists() else []
+        for r in snaps:
+            if r.get("date") != session_date:
+                continue
+            phase = (r.get("phase") or "").upper()
+            if phase == "OPEN":
+                iv_open, atm_prem_open = _fnum(r.get("avg_iv")), _fnum(r.get("atm_straddle"))
+            elif phase == "CLOSE":
+                iv_close, atm_prem_close = _fnum(r.get("avg_iv")), _fnum(r.get("atm_straddle"))
     except Exception:  # noqa: BLE001
         pass
+    if iv_close is None:  # legacy fallback: day-value iv_history
+        try:
+            rows = list(_csv.DictReader(open(IV_HISTORY_FILE))) if IV_HISTORY_FILE.exists() else []
+            for r in rows:
+                if r.get("date") == session_date:
+                    iv_close = float(r.get("avg_chain_iv") or 0) or None
+        except Exception:  # noqa: BLE001
+            pass
 
     study = study_day(session_date, prev_close or o, o, h, l, c,
-                      prev_day_move_pct=prev_move, iv_close=iv_close)
+                      prev_day_move_pct=prev_move,
+                      iv_open=iv_open, iv_close=iv_close,
+                      atm_premium_open=atm_prem_open, atm_premium_close=atm_prem_close)
     d = asdict(study)
     try:
         with open(DAILY_STUDY_FILE, "a") as f:
