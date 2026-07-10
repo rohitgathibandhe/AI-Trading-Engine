@@ -84,6 +84,8 @@ V83_RUNNER_LOG = STATE_DIR / "intraday_v83_runner.log"
 V83_PAPER_STATE_JSON = STATE_DIR / "intraday_v83_paper_state.json"
 V83_RUNTIME_STATE_JSON = STATE_DIR / "intraday_v83_runtime_state.json"
 V83_PAPER_LIVE_TRADES_JSONL = STATE_DIR / "intraday_v83_paper_live_trades.jsonl"
+V83_RUNTIME_CONFIG_JSON = STATE_DIR / "intraday_v83_runtime_config.json"
+V83_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / "com.algoagent.intraday_v83.plist"
 # New unified frontend location
 STATIC_DIR = ROOT / "web" / "app"
 INDEX_SECURITY_ID = int(os.getenv("MARKET_AI_INDEX_SECURITY_ID", "13"))
@@ -3221,6 +3223,151 @@ def _watchdog_health_status() -> Dict[str, Any]:
     return watchdog
 
 
+_preflight_cache: Dict[str, Any] = {}
+_preflight_cache_ts: float = 0.0
+_PREFLIGHT_TTL = 30.0          # whole rollup: cheap file reads, refresh often
+_preflight_token_cache: Dict[str, Any] = {}
+_preflight_token_cache_ts: float = 0.0
+_PREFLIGHT_TOKEN_TTL = 300.0   # broker calls: throttle to once / 5 min
+
+
+def _read_v83_plist_env() -> Dict[str, str]:
+    """Env toggles the launchd job is configured with (USE_SELECTOR, SEL_* …)."""
+    try:
+        import plistlib
+        with open(V83_PLIST_PATH, "rb") as fh:
+            data = plistlib.load(fh)
+        env = data.get("EnvironmentVariables") or {}
+        return {str(k): str(v) for k, v in env.items()}
+    except Exception:
+        return {}
+
+
+def _preflight_token_check() -> Dict[str, Any]:
+    """Live broker reachability — cached 5 min so dashboard polls don't hammer Dhan."""
+    global _preflight_token_cache, _preflight_token_cache_ts
+    now = time.time()
+    if _preflight_token_cache and (now - _preflight_token_cache_ts) < _PREFLIGHT_TOKEN_TTL:
+        return _preflight_token_cache
+    out: Dict[str, Any] = {"ok": False, "detail": "", "chain_ok": False, "chain_detail": ""}
+    try:
+        from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
+        creds = _json_read(CREDS_FILE)
+        cid = (creds.get("client_id") or "").strip() if isinstance(creds, dict) else ""
+        tok = (creds.get("access_token") or "").strip() if isinstance(creds, dict) else ""
+        if cid and tok:
+            os.environ["DHAN_CLIENT_ID"] = cid
+            os.environ["DHAN_ACCESS_TOKEN"] = tok
+        dw = DhanWrapper(logger=None)
+        funds = dw.get_funds()
+        avail = funds.get("available") if isinstance(funds, dict) else None
+        out["ok"] = bool(funds) and avail is not None
+        out["detail"] = (f"funds available Rs {avail:,.0f}" if out["ok"]
+                         else "get_funds empty — token may be expired")
+        try:
+            el = dw.get_optionchain_expirylist("IDX_I", INDEX_SECURITY_ID)
+            out["chain_ok"] = bool(el)
+            out["chain_detail"] = (f"{len(el)} expiries (next {el[0]})" if el else "no expiries returned")
+        except Exception as exc:
+            out["chain_detail"] = f"error: {str(exc)[:80]}"
+    except Exception as exc:
+        out["detail"] = f"error: {str(exc)[:100]}"
+    _preflight_token_cache = out
+    _preflight_token_cache_ts = time.time()
+    return out
+
+
+def _preflight_status() -> Dict[str, Any]:
+    """One-glance 'is the agent ready to trade today' rollup: process, broker token,
+    config armed, and the active strategy toggles. GREEN = clear to trade."""
+    global _preflight_cache, _preflight_cache_ts
+    now = time.time()
+    if _preflight_cache and (now - _preflight_cache_ts) < _PREFLIGHT_TTL:
+        return _preflight_cache
+
+    # Market-session context (IST) — computed first so checks can be session-aware.
+    try:
+        from zoneinfo import ZoneInfo
+        ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+        hhmm = ist.strftime("%H:%M")
+        weekday = ist.weekday() < 5
+        market_open = weekday and ("09:15" <= hhmm <= "15:30")
+        session = ("OPEN" if market_open else ("PRE_OPEN" if (weekday and hhmm < "09:15")
+                   else ("CLOSED" if weekday else "WEEKEND")))
+        gen_at = ist.strftime("%Y-%m-%d %H:%M:%S IST")
+    except Exception:
+        session, market_open, gen_at = "UNKNOWN", False, ""
+
+    checks: List[Dict[str, Any]] = []
+
+    def add(key: str, label: str, ok: bool, detail: str, critical: bool = True) -> None:
+        checks.append({
+            "key": key, "label": label, "ok": bool(ok), "critical": critical,
+            "status": "PASS" if ok else ("FAIL" if critical else "WARN"),
+            "detail": detail,
+        })
+
+    # 1) Process / heartbeat — STALE heartbeat only matters once the market is open.
+    try:
+        wd = _watchdog_health_status()
+        st = str(wd.get("status") or "").upper()
+        alive = bool(wd.get("pid_alive") or wd.get("active_pid_running"))
+        stopped = (st == "STOPPED") or (not alive)
+        fresh_ok = st not in ("STALE", "STOPPED")
+        if stopped:
+            add("process", "Agent running", False, f"status={st or 'UNKNOWN'} — process not alive")
+        elif market_open and not fresh_ok:
+            add("process", "Agent running", False, f"status={st} during market hours — heartbeat stalled")
+        else:
+            note = st if fresh_ok else f"{st} (idle pre-open — normal)"
+            add("process", "Agent running", True, f"status={note}, pid={wd.get('active_pid') or '—'}")
+    except Exception as exc:
+        add("process", "Agent running", False, f"error: {str(exc)[:80]}")
+
+    # 2) Broker token + option chain (cached)
+    tok = _preflight_token_check()
+    add("token", "Broker token valid", bool(tok.get("ok")), tok.get("detail", ""))
+    add("chain", "Option chain reachable", bool(tok.get("chain_ok")), tok.get("chain_detail", ""))
+
+    # 3) Config armed (from runtime config file)
+    cfg = _json_read(V83_RUNTIME_CONFIG_JSON)
+    cfg = cfg if isinstance(cfg, dict) else {}
+    mode = cfg.get("mode")
+    live_arm = cfg.get("live_arm")
+    frozen = cfg.get("v83_frozen")
+    strategies = cfg.get("live_enabled_strategies") or []
+    add("mode", "Paper mode", mode == "PAPER_LIVE", f"mode={mode}")
+    add("safety", "Live-arm OFF (safe)", live_arm is False, f"live_arm={live_arm}")
+    add("frozen", "Config not frozen", frozen is False, f"v83_frozen={frozen}", critical=False)
+    add("engine", "Put-debit engine enabled", "PUT_DEBIT_SPREAD" in strategies,
+        f"{len(strategies)} strategies enabled")
+
+    # 4) Strategy toggles the launchd job runs with
+    env = _read_v83_plist_env()
+    add("selector", "Strategy selector ON", env.get("USE_SELECTOR") == "1",
+        f"USE_SELECTOR={env.get('USE_SELECTOR') or 'unset'}")
+    add("condor", "Condor-off (validated)", env.get("SEL_NO_CONDOR") == "1",
+        f"SEL_NO_CONDOR={env.get('SEL_NO_CONDOR') or 'unset'}", critical=False)
+    add("blackout", "10:00-10:30 blackout", bool(env.get("SEL_DEBIT_BLACKOUT")),
+        f"SEL_DEBIT_BLACKOUT={env.get('SEL_DEBIT_BLACKOUT') or 'unset'}", critical=False)
+
+    crit_fail = any((not c["ok"]) and c["critical"] for c in checks)
+    warn = any((not c["ok"]) and (not c["critical"]) for c in checks)
+    overall = "RED" if crit_fail else ("AMBER" if warn else "GREEN")
+
+    result = {
+        "overall": overall,
+        "checks": checks,
+        "pass_count": sum(1 for c in checks if c["ok"]),
+        "total": len(checks),
+        "market_session": session,
+        "generated_at": gen_at,
+    }
+    _preflight_cache = result
+    _preflight_cache_ts = now
+    return result
+
+
 def _load_alerts_tail(limit: int = 100) -> List[Dict[str, Any]]:
     journal = AlertJournal(path=AGENT_ALERTS_JSONL, config=AlertConfig(), logger=None)
     return journal.tail(limit=max(0, int(limit)))
@@ -4194,6 +4341,12 @@ class PaperHandler(SimpleHTTPRequestHandler):
         return super().do_POST()
 
     def do_GET(self) -> None:  # type: ignore[override]
+        if self.path.startswith("/api/preflight"):
+            try:
+                self._send_json(_preflight_status())
+            except Exception as exc:  # pragma: no cover - defensive
+                self._send_json({"error": str(exc)}, status=500)
+            return
         if self.path.startswith("/api/paper_positions"):
             try:
                 # ── V83-specific data (primary source of truth for PnL tab) ──

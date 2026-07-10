@@ -164,6 +164,23 @@
   <main>
     <!-- Control -->
     <section id="tab-control">
+      <div class="card" id="preflight-card" style="margin-bottom:12px; border-left:4px solid #64748b;">
+        <div class="card-header">
+          <div style="font-weight:700; display:flex; align-items:center; gap:10px;">
+            <span id="preflight-badge" style="display:inline-flex;align-items:center;justify-content:center;min-width:74px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:800;letter-spacing:.5px;background:#334155;color:#e2e8f0;">— — —</span>
+            <span>Pre-Flight Readiness</span>
+          </div>
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <span class="chip" id="preflight-session">—</span>
+            <span class="chip" id="preflight-summary">—</span>
+            <button id="preflight-refresh" style="background:#0f172a; color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:8px; cursor:pointer; font-size:12px;">Recheck</button>
+          </div>
+        </div>
+        <div id="preflight-grid" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:6px; margin-top:10px;">
+          <div class="muted">Loading readiness…</div>
+        </div>
+        <div class="hint" id="preflight-updated" style="margin-top:8px;">—</div>
+      </div>
       <div class="grid">
         <div class="card">
           <div class="card-header"><div style="font-weight:700;">Credentials</div></div>
@@ -2287,11 +2304,50 @@
       }
     }
 
+    async function loadPreflight() {
+      const grid = document.getElementById("preflight-grid");
+      const badge = document.getElementById("preflight-badge");
+      const card = document.getElementById("preflight-card");
+      try {
+        const d = await fetchJSON("/api/preflight");
+        const palette = {
+          GREEN: { bar: "#22c55e", bg: "#14532d", fg: "#bbf7d0", label: "READY" },
+          AMBER: { bar: "#f59e0b", bg: "#78350f", fg: "#fde68a", label: "CHECK" },
+          RED:   { bar: "#ef4444", bg: "#7f1d1d", fg: "#fecaca", label: "NOT READY" },
+        };
+        const p = palette[d.overall] || palette.RED;
+        badge.textContent = p.label;
+        badge.style.background = p.bg;
+        badge.style.color = p.fg;
+        card.style.borderLeftColor = p.bar;
+        document.getElementById("preflight-session").textContent = "Market: " + (d.market_session || "—");
+        document.getElementById("preflight-summary").textContent = (d.pass_count + "/" + d.total + " checks");
+        document.getElementById("preflight-updated").textContent = "Checked " + (d.generated_at || "—") + " · broker token cached up to 5 min";
+        grid.innerHTML = "";
+        (d.checks || []).forEach(c => {
+          const dot = c.ok ? "#22c55e" : (c.critical ? "#ef4444" : "#f59e0b");
+          const row = document.createElement("div");
+          row.style.cssText = "display:flex;align-items:flex-start;gap:8px;padding:6px 8px;border:1px solid var(--border);border-radius:8px;background:#0b1224;";
+          row.innerHTML =
+            '<span style="flex:0 0 auto;width:9px;height:9px;border-radius:50%;margin-top:5px;background:' + dot + ';"></span>' +
+            '<div style="min-width:0;"><div style="font-size:12px;font-weight:600;color:var(--text);">' + c.label + '</div>' +
+            '<div style="font-size:11px;color:var(--muted);word-break:break-word;">' + (c.detail || "") + '</div></div>';
+          grid.appendChild(row);
+        });
+      } catch (e) {
+        badge.textContent = "ERROR";
+        badge.style.background = "#7f1d1d";
+        badge.style.color = "#fecaca";
+        grid.innerHTML = '<div class="muted">Readiness check unavailable: ' + (e && e.message ? e.message : e) + '</div>';
+      }
+    }
+
     async function loadControl() {
       if (inflight.control) return;
       inflight.control = true;
       try {
         await Promise.all([
+          loadPreflight(),
           loadCreds(),
           loadStrategy(),
           refreshAgentStatus(),
@@ -2342,6 +2398,7 @@
     document.getElementById("save-settings").addEventListener("click", saveSettings);
     document.getElementById("save-creds").addEventListener("click", saveCreds);
     document.getElementById("test-telegram").addEventListener("click", testTelegram);
+    document.getElementById("preflight-refresh").addEventListener("click", () => loadPreflight().catch(() => {}));
     document.getElementById("start-agent").addEventListener("click", startAgent);
     document.getElementById("stop-agent").addEventListener("click", stopAgent);
     document.getElementById("bkm-ai-clear-lock").addEventListener("click", toggleBkmAiProtection);
@@ -2361,6 +2418,8 @@
       if (!pageVisible()) return;
       // Always refresh agent status (used by the header health chip on every tab).
       refreshAgentStatus().catch(() => {});
+      // Keep the readiness panel current while the Control tab is open.
+      if (activeTab === "control") loadPreflight().catch(() => {});
       // Refresh the active tab's content.
       if (activeTab === "pnl") loadPnl().catch(() => {});
       else if (activeTab === "live") loadLive().catch(() => {});
