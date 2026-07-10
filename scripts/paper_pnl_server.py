@@ -2144,6 +2144,51 @@ def _load_intraday_trade_history(limit: Optional[int] = None) -> List[Dict[str, 
     return rows
 
 
+_open_leg_ltp_cache: Dict[float, Dict[str, Any]] = {}
+_open_leg_ltp_cache_ts: float = 0.0
+_OPEN_LEG_LTP_TTL = 6.0
+
+
+def _live_leg_ltps() -> Dict[float, Dict[str, Any]]:
+    """Current LTP per strike from the live Nifty chain: {strike: {"CALL":x, "PUT":y}}.
+
+    The agent stores only ENTRY-time leg quotes in paper_state (frozen), so the UI showed
+    static LTP and 0 per-leg P&L. Fetching live prices here makes both update each poll.
+    Cached 6s so UI polling doesn't hammer Dhan's 1-req/3s chain limit.
+    """
+    global _open_leg_ltp_cache, _open_leg_ltp_cache_ts
+    now = time.time()
+    if _open_leg_ltp_cache and (now - _open_leg_ltp_cache_ts) < _OPEN_LEG_LTP_TTL:
+        return _open_leg_ltp_cache
+    out: Dict[float, Dict[str, Any]] = {}
+    try:
+        from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
+        creds = _json_read(CREDS_FILE)
+        cid = (creds.get("client_id") or "").strip() if isinstance(creds, dict) else ""
+        tok = (creds.get("access_token") or "").strip() if isinstance(creds, dict) else ""
+        if cid and tok:
+            os.environ["DHAN_CLIENT_ID"] = cid
+            os.environ["DHAN_ACCESS_TOKEN"] = tok
+        dw = DhanWrapper(logger=None)
+        exp = dw.get_optionchain_expirylist("IDX_I", INDEX_SECURITY_ID)[0]
+        raw = dw.get_option_chain(INDEX_SECURITY_ID, "IDX_I", exp)
+        oc = ((((raw or {}).get("data") or {}).get("data")) or {}).get("oc") or {}
+        for k, node in oc.items():
+            try:
+                sk = round(float(k), 2)
+            except (TypeError, ValueError):
+                continue
+            ce = (node.get("ce") or {}).get("last_price")
+            pe = (node.get("pe") or {}).get("last_price")
+            out[sk] = {"CALL": ce, "CE": ce, "PUT": pe, "PE": pe}
+    except Exception:
+        out = {}
+    if out:
+        _open_leg_ltp_cache = out
+        _open_leg_ltp_cache_ts = now
+    return out
+
+
 def _build_v83_open_position_payload() -> Dict[str, Any]:
     """Return the current v83 paper open position in a UI-ready format.
 
@@ -2200,10 +2245,36 @@ def _build_v83_open_position_payload() -> Dict[str, Any]:
             "pnl": round(pnl, 2) if pnl is not None else None,
         })
 
+    # Overlay LIVE leg prices (agent stores only frozen entry quotes). Each leg's stored
+    # "entry" is the entry price; fetch the current LTP by strike and recompute per-leg P&L
+    # so both the LTP column and the legs total update every poll instead of showing 0.
+    live = _live_leg_ltps()
+    live_total = 0.0
+    have_live = False
+    for leg in ui_legs:
+        entry = leg.get("entry")
+        strike = leg.get("strike")
+        otype = str(leg.get("option_type") or "").upper()
+        qty = leg.get("qty") or 0
+        live_ltp = None
+        if strike is not None:
+            live_ltp = (live.get(round(float(strike), 2)) or {}).get(otype)
+        if live_ltp is not None:
+            have_live = True
+            leg["ltp"] = live_ltp
+            if entry is not None and qty:
+                pnl = (entry - live_ltp) * qty if leg.get("side") == "SELL" else (live_ltp - entry) * qty
+                leg["pnl"] = round(pnl, 2)
+                live_total += pnl
+
+    # Prefer the live-computed total (fresh each poll); fall back to the agent's mark.
+    open_mtm = round(live_total, 2) if have_live else mark_pnl
+
     return {
         "open": True,
         "legs": ui_legs,
-        "open_mtm": mark_pnl,
+        "open_mtm": open_mtm,
+        "mark_pnl_rupees": mark_pnl,
         "mfe_rupees": mfe,
         "mae_rupees": mae,
         "expiry": expiry,
