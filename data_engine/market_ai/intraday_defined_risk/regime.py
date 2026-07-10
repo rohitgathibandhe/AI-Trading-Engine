@@ -473,6 +473,28 @@ def _average_chain_iv(snapshot: MarketSnapshot) -> float | None:
     return sum(ivs) / len(ivs)
 
 
+def _compute_chain_gex(snapshot: MarketSnapshot):
+    """Dealer gamma-exposure read from the chain snapshot. Advisory only — attached to
+    metadata for analysis/validation; does not gate any decision yet."""
+    from .gamma_exposure import compute_gex
+    chain = snapshot.option_chain
+    rows = [
+        {
+            "strike": q.strike,
+            "option_type": q.option_type.value if hasattr(q.option_type, "value") else str(q.option_type),
+            "iv": q.iv,
+            "oi": q.oi,
+        }
+        for q in chain.quotes
+    ]
+    ts = snapshot.timestamp
+    days = (chain.expiry - ts.date()).days
+    # remaining fraction of the current trading session (09:15–15:30 IST)
+    frac = max(0.0, min(1.0, (15.5 - (ts.hour + ts.minute / 60.0)) / 6.25))
+    t_years = max(days + frac, 0.1) / 252.0
+    return compute_gex(rows, chain.spot, t_years)
+
+
 def _bullish_shadow_subtype(
     *,
     playbook: str,
@@ -2617,6 +2639,16 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     range_compression_score = max(0.0, min(2.0, (params.rv_mid_cutoff - rv30_pct) / max(params.rv_mid_cutoff, 0.05))) if rv30_pct <= params.rv_mid_cutoff else 0.0
     metadata["avg_chain_iv"] = round(avg_chain_iv, 4) if avg_chain_iv is not None else None
     metadata["range_compression_score"] = round(range_compression_score, 4)
+
+    # Dealer gamma exposure (advisory) — pin vs trend regime, for GEX validation.
+    try:
+        _gex = _compute_chain_gex(snapshot)
+        metadata["gex_regime"] = _gex.regime
+        metadata["gex_net"] = _gex.net_gex
+        metadata["gex_flip_strike"] = _gex.flip_strike
+        metadata["gex_dist_to_flip_pct"] = _gex.distance_to_flip_pct
+    except Exception:
+        metadata["gex_regime"] = None
 
     bullish_shadow_subtype = _bullish_shadow_subtype(
         playbook=str(metadata.get("playbook") or "NO_TRADE"),

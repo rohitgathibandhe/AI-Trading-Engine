@@ -701,6 +701,10 @@ def run_backtest(
                 "vol_implied": _vs.implied_vol,
                 "vol_realized": _vs.realized_vol,
                 "vol_regime": _vs.regime,
+                # Dealer gamma-exposure at entry — for validating GEX as a signal
+                "gex_regime": position.metadata.get("gex_regime"),
+                "gex_net": position.metadata.get("gex_net"),
+                "gex_dist_to_flip_pct": position.metadata.get("gex_dist_to_flip_pct"),
             }
         )
 
