@@ -61,6 +61,37 @@ def _parse_window(s: str):
     except Exception:
         return None
 _DEBIT_BLACKOUT = _parse_window(os.environ.get("SEL_DEBIT_BLACKOUT", ""))
+
+# Strategy MODE. Default = the validated directional config (put-debit engine).
+#   SELLER = always-positioned DEFINED-RISK premium seller, condition-matched:
+#            bullish -> bull-put credit, bearish -> bear-call credit, sideways -> iron condor.
+#   HYBRID = buy the sharp down-move (proven put-debit) but SELL premium everywhere else.
+# This is the user's vision (never idle; sell defined-risk premium matched to the read).
+# Gated so it can be validated on the ordering-robust harness before it drives live.
+_SELLER_MODE = os.environ.get("SEL_MODE", "").upper()
+
+
+def _seller_choice(choice, condition, now_time, *, hybrid: bool = False):
+    """Defined-risk, always-positioned premium seller: match a credit structure to the
+    market condition. hybrid=True keeps the proven PUT-DEBIT on sharp down-moves."""
+    if condition in (STRONG_TREND_UP, BREAKOUT_UP):
+        choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
+        choice.rationale = f"{condition}: SELL bull-put credit (defined risk) — theta pays if price holds up or sideways."
+    elif condition in (STRONG_TREND_DOWN, BREAKOUT_DOWN):
+        if hybrid:
+            choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
+            choice.rationale = f"{condition}: BUY put-debit (proven engine — Nifty falls sharp)."
+        else:
+            choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BEAR_CALL_CREDIT_SPREAD"]
+            choice.rationale = f"{condition}: SELL bear-call credit (defined risk) — theta pays if price stays below."
+    elif condition in (RANGE_WIDE, RANGE_TIGHT, HIGH_VOL_UNDIRECTED):
+        choice.family, choice.structures = FAM_PREMIUM_SELL, ["IRON_CONDOR"]
+        choice.rationale = f"{condition}: SELL iron condor (defined risk) — theta pays if price stays in the range."
+    else:  # CHOP
+        choice.family, choice.structures = FAM_STAND_ASIDE, []
+        choice.rationale = "CHOP: uncommitted tape — even a seller stands aside (whipsaw risk on both wings)."
+    choice.executable_today = bool(choice.structures) and all(s in _EXECUTABLE for s in choice.structures)
+    return choice
 from .volatility_engine import assess_vol, RICH_SELL, CHEAP_BUY
 
 # ── Condition labels ────────────────────────────────────────────────────────
@@ -166,6 +197,13 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     choice = StrategyChoice(condition=condition, iv_regime=iv, read=read, conviction=read.conviction)
     choice.vol_regime = vol.regime
     choice.vol_notes = vol.notes
+
+    # Defined-risk SELLER / HYBRID modes — always-positioned premium selling matched to
+    # the condition. Validated on the ordering-robust harness before it drives live.
+    if _SELLER_MODE == "SELLER":
+        return _seller_choice(choice, condition, now_time, hybrid=False)
+    if _SELLER_MODE == "HYBRID":
+        return _seller_choice(choice, condition, now_time, hybrid=True)
 
     if condition in (STRONG_TREND_UP, BREAKOUT_UP):
         # Nifty UP-moves grind and chop — a call-debit needs a clean continued rally
