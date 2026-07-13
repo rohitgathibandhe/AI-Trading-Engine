@@ -241,7 +241,11 @@ def _load_events(path: Path) -> list[dict[str, Any]]:
 
 
 def _load_price_frames(config: WeeklyResearchConfig) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    price = pd.read_csv(config.price_5m_path, parse_dates=["timestamp"])
+    price = pd.read_csv(config.price_5m_path)
+    # Robust timestamp parse: some datasets have stray/malformed rows that make
+    # parse_dates silently yield object dtype (then .dt crashes). Coerce + drop bad rows.
+    price["timestamp"] = pd.to_datetime(price["timestamp"], errors="coerce")
+    price = price[price["timestamp"].notna()].copy()
     price = price[price["timestamp"].dt.weekday < 5].copy()
     price = price.sort_values("timestamp")
     price["date"] = price["timestamp"].dt.date
@@ -300,9 +304,14 @@ def _load_price_frames(config: WeeklyResearchConfig) -> tuple[pd.DataFrame, pd.D
 
 
 def _load_option_chain(config: WeeklyResearchConfig) -> pd.DataFrame:
-    header = pd.read_csv(config.option_chain_path, nrows=0)
-    parse_dates = [column for column in ("timestamp", "previous_timestamp", "expiry") if column in header.columns]
-    option_chain = pd.read_csv(config.option_chain_path, parse_dates=parse_dates)
+    option_chain = pd.read_csv(config.option_chain_path)
+    # Robust datetime parse (some datasets have malformed rows that make parse_dates
+    # silently yield object dtype, then .dt crashes). Coerce the date-like columns and
+    # drop rows with an unparseable timestamp.
+    for _col in ("timestamp", "previous_timestamp", "expiry"):
+        if _col in option_chain.columns:
+            option_chain[_col] = pd.to_datetime(option_chain[_col], errors="coerce")
+    option_chain = option_chain[option_chain["timestamp"].notna()].copy()
     if "oi_change" not in option_chain.columns:
         option_chain["oi_change"] = 0.0
     option_chain = option_chain[option_chain["timestamp"].dt.weekday < 5].copy()
