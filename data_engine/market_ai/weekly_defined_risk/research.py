@@ -587,6 +587,16 @@ def _classify_weekly_regime(
         and (wall_balance is None or wall_balance <= 250)
     ):
         return "SIDEWAYS_RANGE"
+    # ALWAYS-POSITIONED mode (user's vision: never idle — sell the structure matched to the
+    # prevailing lean instead of standing aside). Toggle so we can compare selective vs
+    # always-positioned on the ordering-robust... err, the weekly harness.
+    import os as _os
+    if _os.environ.get("WEEKLY_ALWAYS_POSITION") == "1":
+        if daily_trend == "BULLISH":
+            return "BULLISH_CONTINUATION"   # -> sell BULL_PUT credit
+        if daily_trend == "BEARISH":
+            return "BEARISH_CONTINUATION"   # -> sell BEAR_CALL credit
+        return "SIDEWAYS_RANGE"             # -> sell IRON_CONDOR
     return "LOW_EDGE_NO_TRADE"
 
 
