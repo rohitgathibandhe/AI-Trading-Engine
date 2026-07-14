@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from math import inf
 
@@ -354,6 +355,24 @@ def _select_debit_spread(
     # on 2026-07-14 expiry). Allowing a 50pt width is VALIDATED on the ordering-robust harness:
     # median 82,662 -> 108,284 (+25.6k) and worst-case 56,462 -> 64,920 (+8.5k), all orderings up.
     widths.add(50.0)
+    # On high-IV big-down days the skew flattens the delta curve, so the short-band strike
+    # (delta 0.20-0.32) sits >150pt from the long-band strike and NO width in {50,100,150} can
+    # span the gap -> NO_DEBIT_STRUCTURE on exactly the days we most want (e.g. 2026-03-11 -1.58%
+    # was skipped entirely). Allowing a 200pt width is VALIDATED on the ordering-robust harness
+    # (10 grids, dense 7mo, condor off): median 109,529 -> 141,523 (+32k), worst-case 66,135 ->
+    # 91,368 (+25k), EVERY grid up +20-43k, PF up on all. Gain = 22 newly-unblocked genuine
+    # down-day setups (45% win, +38k net); existing trades ~unchanged (200 only wins when the
+    # bands are >150pt apart — i.e. only on the high-IV days it's meant for). See
+    # [[project_ordering_robustness]].
+    widths.add(200.0)
+    # Env hook for probing still-wider widths (e.g. "250") in research; unset in production.
+    _extra_widths = os.environ.get("SEL_DEBIT_EXTRA_WIDTHS")
+    if _extra_widths:
+        for _w in _extra_widths.split(","):
+            try:
+                widths.add(float(_w))
+            except ValueError:
+                pass
 
     best = None
     best_score = -inf
