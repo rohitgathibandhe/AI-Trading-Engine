@@ -42,6 +42,15 @@ from .trade_planner import assess_market, MarketRead, _f
 # noisy condor (and freeing the slot for the robust edge) helps across orderings.
 _NO_CONDOR = os.environ.get("SEL_NO_CONDOR") == "1"
 
+# Selection-skill filter (VALIDATED, default ON): the agent's entry SCORE does not separate
+# put-debit winners from losers (7.15 vs 7.09). The one signal that DOES: option_chain_pressure_state.
+# Trades opened under OVERHEAD_CALL_PRESSURE (capped/grinding tape, no clean down-leg) lose
+# -1,333/trade over 29 trades (34% win, -38.7k total) vs BALANCED_WALLS +3,563/trade (61% win).
+# Skipping them is ordering-robust: median 141,523 -> ~165,900, worst-case 91,368 -> 123,678,
+# EVERY grid up +10-38k, PF up on all 10. NOTE: signal mined in-sample on the dense 7mo set —
+# mechanism is sound but confirm on forward/live data. Set SEL_SKIP_OVERHEAD_PRESSURE=0 to disable.
+_SKIP_OVERHEAD_PRESSURE = os.environ.get("SEL_SKIP_OVERHEAD_PRESSURE", "1") == "1"
+
 # Research toggle: which structure to deploy on STRONG_TREND_UP / BREAKOUT_UP.
 # Baseline "BULL_PUT" earns ~0 across orderings (no up-side edge). Values:
 #   BULL_PUT   — with-trend credit spread (current default)
@@ -229,6 +238,9 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         if _in_blackout:
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = f"{condition} but in the {_DEBIT_BLACKOUT[0].strftime('%H:%M')}-{_DEBIT_BLACKOUT[1].strftime('%H:%M')} blackout — post-open-drive exhaustion zone (debit entries here leak); wait for a fresh leg."
+        elif _SKIP_OVERHEAD_PRESSURE and str(metadata.get("option_chain_pressure_state")) == "OVERHEAD_CALL_PRESSURE":
+            choice.family, choice.structures = FAM_STAND_ASIDE, []
+            choice.rationale = f"{condition} but OVERHEAD_CALL_PRESSURE — capped/grinding tape, put-debit has no clean down-leg here (34% win, -1,333/trade); stand aside."
         else:
             choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
             choice.rationale = f"{condition}: buy PUT DEBIT with the down-move (Nifty falls sharply — +skew capped-loss captures it)."
