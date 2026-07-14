@@ -189,6 +189,16 @@ def _effective_directional_credit_ratio(
 ) -> float:
     playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
     base_ratio = params.directional_credit_width_ratio
+    # Research override: the 0.26 credit-ratio floor rejects ~99.9% of bull-puts on up-days
+    # (OTM puts too cheap to hit 26% of width). A put SELLER legitimately runs ~10-15% credit
+    # at high win-rate. Env-gated so we can test whether unblocking put-selling actually pays.
+    import os as _os
+    _ov = _os.environ.get("SEL_CREDIT_RATIO_OVERRIDE")
+    if _ov:
+        try:
+            return float(_ov)
+        except ValueError:
+            pass
     if (
         playbook in {"SIDEWAYS_TO_BULLISH_RECLAIM", "SIDEWAYS_TO_BEARISH_REJECTION", "GAP_DOWN_BEARISH_CONTINUATION", "GAP_UP_BEARISH_FAILURE"}
         and setup_quality_score >= params.strong_setup_quality_threshold
