@@ -51,6 +51,24 @@ _NO_CONDOR = os.environ.get("SEL_NO_CONDOR") == "1"
 # mechanism is sound but confirm on forward/live data. Set SEL_SKIP_OVERHEAD_PRESSURE=0 to disable.
 _SKIP_OVERHEAD_PRESSURE = os.environ.get("SEL_SKIP_OVERHEAD_PRESSURE", "1") == "1"
 
+
+def _sel_env_float(name):
+    v = os.environ.get(name)
+    try:
+        return float(v) if v not in (None, "") else None
+    except ValueError:
+        return None
+
+
+# Anti-chase (VALIDATED, default 0.4): live 2026-07-15 the agent entered a put-debit AFTER a sharp
+# recent drop (last hour -0.58%, price -136 vs VWAP) — it bought the EXHAUSTION of a ~100pt impulse
+# right before the tape went flat, and bled theta. Skip the debit when the last-hour drop already
+# exceeds the threshold (the impulse is spent → no continuation for the debit). Ordering-robust on
+# the dense 7mo: median 170,665 -> 186,848 (+16k), floor held (147,821 -> 147,961), PF up on ALL 10
+# grids (2.15-4.09). Mechanism sound (don't chase); confirm on forward/live. SEL_ANTICHASE_HOUR_DROP=0 disables.
+_ac_env = os.environ.get("SEL_ANTICHASE_HOUR_DROP")
+_ANTICHASE_HOUR_DROP = 0.4 if _ac_env is None else (_sel_env_float("SEL_ANTICHASE_HOUR_DROP") or None)
+
 # Research toggle: which structure to deploy on STRONG_TREND_UP / BREAKOUT_UP.
 # Baseline "BULL_PUT" earns ~0 across orderings (no up-side edge). Values:
 #   BULL_PUT   — with-trend credit spread (current default)
@@ -241,6 +259,9 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         elif _SKIP_OVERHEAD_PRESSURE and str(metadata.get("option_chain_pressure_state")) == "OVERHEAD_CALL_PRESSURE":
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = f"{condition} but OVERHEAD_CALL_PRESSURE — capped/grinding tape, put-debit has no clean down-leg here (34% win, -1,333/trade); stand aside."
+        elif _ANTICHASE_HOUR_DROP is not None and float(metadata.get("last_hour_change_pct") or 0.0) <= -_ANTICHASE_HOUR_DROP:
+            choice.family, choice.structures = FAM_STAND_ASIDE, []
+            choice.rationale = f"{condition} but last hour already fell {float(metadata.get('last_hour_change_pct') or 0.0):.2f}% — chasing an extended move (impulse likely spent); stand aside."
         else:
             choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
             choice.rationale = f"{condition}: buy PUT DEBIT with the down-move (Nifty falls sharply — +skew capped-loss captures it)."
