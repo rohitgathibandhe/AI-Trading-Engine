@@ -105,8 +105,13 @@ def select_best_structure(
             short_delta_band = (0.10, 0.25)
             long_delta_band = (0.0, 0.10)
         else:
-            short_delta_band = (0.18, 0.25)
-            long_delta_band = (0.05, 0.10)
+            # Upper bound 0.30 (was 0.25) — mirrors the bear-call fix above. On BREAKOUT_UP
+            # the OI-wall/anchor floor pushes the short put toward a 0.26-0.30-delta strike, so
+            # a 0.25 cap rejected EVERY candidate with DELTA_TOO_HIGH and built nothing (live
+            # 2026-07-15: 996 BREAKOUT_UP decisions, 0 bull-puts built — a Δ0.29 short was
+            # buildable and would have been +Rs1,393/lot). 0.30 is a defensible OTM credit strike.
+            short_delta_band = (0.18, 0.30)
+            long_delta_band = (0.05, 0.15)
         return _evaluate_vertical_candidates(
             strategy=strategy,
             snapshot=snapshot,
