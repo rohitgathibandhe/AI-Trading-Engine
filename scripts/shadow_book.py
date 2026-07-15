@@ -42,6 +42,9 @@ def _parse_snapshot(rec):
             a = float(leg.get("top_ask_price") or 0)
             ltp = float(leg.get("last_price") or 0)
             mid = (b + a) / 2 if b > 0 and a > 0 else ltp
+            # bid/ask retained for REALISTIC fills — mid-price P&L is a mirage for multi-leg
+            # selling (2026-07-16: mid condor +6k flipped to -124k with real fills). A credit
+            # spread is entered SELL short @ bid, BUY long @ ask; the P&L must use those.
             rows[strike][side] = {"delta": g.get("delta"), "mid": mid, "bid": b, "ask": a}
     t = rec.get("captured_at", "")[11:19]
     return t, spot, rows
@@ -61,23 +64,28 @@ def _pick(rows, side, dtarget):
 
 
 def _credit_spread(entry_rows, exit_rows, side):
-    """Short ~0.30 delta, long ~0.15 delta. Returns (entry_credit, final_value, pnl_rupees, legs)."""
+    """Short ~0.30 delta, long ~0.15 delta, marked with REALISTIC fills (sell@bid, buy@ask).
+    Mid-price P&L is a mirage for multi-leg selling (mid condor +6k → -124k on real fills)."""
     sp = _pick(entry_rows, side, 0.30)
     lp = _pick(entry_rows, side, 0.15)
     if not sp or not lp:
         return None
     sk, sv = sp; lk, lv = lp
-    credit = sv["mid"] - lv["mid"]
+    # entry: SELL short @ bid, BUY long @ ask
+    if not (sv.get("bid") and lv.get("ask")):
+        return None
+    credit = sv["bid"] - lv["ask"]
     if credit <= 0:
         return None
     ex_s = (exit_rows.get(sk) or {}).get(side) or {}
     ex_l = (exit_rows.get(lk) or {}).get(side) or {}
-    if not ex_s.get("mid") or ex_l.get("mid") is None:
+    # close: BUY BACK short @ ask, SELL long @ bid
+    if not ex_s.get("ask") or ex_l.get("bid") is None:
         return None
-    final_val = ex_s["mid"] - ex_l["mid"]
-    pnl = (credit - final_val) * LOT
+    close_cost = ex_s["ask"] - ex_l["bid"]
+    pnl = (credit - close_cost) * LOT
     return {"short": sk, "long": lk, "credit_pts": round(credit, 2),
-            "final_val_pts": round(final_val, 2), "pnl_rupees": round(pnl), }
+            "close_cost_pts": round(close_cost, 2), "pnl_rupees": round(pnl), }
 
 
 def main() -> int:
