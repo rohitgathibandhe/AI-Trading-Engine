@@ -69,6 +69,16 @@ def _sel_env_float(name):
 _ac_env = os.environ.get("SEL_ANTICHASE_HOUR_DROP")
 _ANTICHASE_HOUR_DROP = 0.4 if _ac_env is None else (_sel_env_float("SEL_ANTICHASE_HOUR_DROP") or None)
 
+# Selection signal (VALIDATED, default ON): skip put-debit when smart_money_bias==BULLISH — buying
+# puts against institutional bullish OI flow (screen: 6 trades, 0% win, -15.2k). Ordering-robust
+# (dense 7mo, on top of overhead+anti-chase): median 186,848 -> 192,058, floor 147,961 -> 157,194
+# (+9k), variance tighter (swing 60k->50k). Small sample (6) but 0% win + clean mechanism + robust.
+# SEL_SKIP_SMB_BULLISH=0 disables.
+_SKIP_SMB_BULLISH = os.environ.get("SEL_SKIP_SMB_BULLISH", "1") == "1"
+# state_confidence floor: screen showed low-third loses, but no trade falls below 0.55/0.65 so a
+# safe threshold can't bind — NOT actionable, left env-gated off. SEL_MIN_STATE_CONF to research.
+_MIN_STATE_CONF = _sel_env_float("SEL_MIN_STATE_CONF")
+
 # Research toggle: which structure to deploy on STRONG_TREND_UP / BREAKOUT_UP.
 # Baseline "BULL_PUT" earns ~0 across orderings (no up-side edge). Values:
 #   BULL_PUT   — with-trend credit spread (current default)
@@ -262,6 +272,12 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         elif _ANTICHASE_HOUR_DROP is not None and float(metadata.get("last_hour_change_pct") or 0.0) <= -_ANTICHASE_HOUR_DROP:
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = f"{condition} but last hour already fell {float(metadata.get('last_hour_change_pct') or 0.0):.2f}% — chasing an extended move (impulse likely spent); stand aside."
+        elif _SKIP_SMB_BULLISH and str(metadata.get("smart_money_bias")) == "BULLISH":
+            choice.family, choice.structures = FAM_STAND_ASIDE, []
+            choice.rationale = f"{condition} but smart_money_bias BULLISH — buying puts against institutional flow (0% win in screen); stand aside."
+        elif _MIN_STATE_CONF is not None and float(metadata.get("state_confidence_score") or metadata.get("state_confidence") or 1.0) < _MIN_STATE_CONF:
+            choice.family, choice.structures = FAM_STAND_ASIDE, []
+            choice.rationale = f"{condition} but state_confidence below {_MIN_STATE_CONF} — low-conviction read (loses in screen); stand aside."
         else:
             choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
             choice.rationale = f"{condition}: buy PUT DEBIT with the down-move (Nifty falls sharply — +skew capped-loss captures it)."
