@@ -210,6 +210,21 @@ ROLLING_WINDOW_SESSIONS = 30  # sessions used for rolling stats
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+def _opt_float(value: Any) -> float | None:
+    """None-preserving float.
+
+    `float(x or 0.0)` collapses "not applicable" and "genuinely zero" into the same 0.0.
+    That is how mfe_capture_pct/theta_capture_pct/rv30_pct read as a confident zero rather
+    than as unmeasured, and the learning loop could not tell the difference. Keep None.
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _log(msg: str) -> None:
     ts = datetime.now(IST).strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
@@ -352,7 +367,7 @@ def _parse_completed_trades(session_date: str) -> list[dict]:
             "exit_reason": ex.get("exit_reason"),
             "mae_rupees": float(ex.get("mae_rupees") or 0.0),
             "mfe_rupees": float(ex.get("mfe_rupees") or 0.0),
-            "mfe_capture_pct": float(ex.get("mfe_capture_pct") or 0.0),
+            "mfe_capture_pct": _opt_float(ex.get("mfe_capture_pct")),
             "attribution": ex.get("paper_trade_attribution") or ex.get("paper_candidate_reason"),
             "market_state": gate.get("market_state"),
             "bearish_trade_score": bearish_score,
@@ -364,9 +379,9 @@ def _parse_completed_trades(session_date: str) -> list[dict]:
             "spot_at_entry": float(ex.get("spot_at_entry") or en.get("spot_at_entry") or 0.0),
             "spot_at_exit": float(ex.get("spot_at_exit") or 0.0),
             "spot_move_pts": float(ex.get("spot_move_pts") or 0.0),
-            "theta_capture_pct": float(ex.get("theta_capture_pct") or 0.0),
+            "theta_capture_pct": _opt_float(ex.get("theta_capture_pct")),
             "iv_rank_at_entry": ex.get("iv_rank_at_entry") or en.get("entry_iv_rank"),
-            "rv30_pct": float(en.get("ml_rv30_pct") or 0.0),
+            "rv30_pct": _opt_float(en.get("ml_rv30_pct")),
         })
     return trades
 

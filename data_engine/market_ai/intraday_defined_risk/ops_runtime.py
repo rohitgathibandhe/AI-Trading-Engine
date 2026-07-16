@@ -1783,9 +1783,20 @@ def manage_paper_position(
     _spot_move_pts = round(_spot_at_exit - _spot_at_entry, 2) if _spot_at_entry > 0 else 0.0
     _holding_min = round((snapshot.timestamp - position.entry_time).total_seconds() / 60.0, 1)
     _max_profit_rupees = round(position.entry_credit_points * position.lot_size * position.lots, 2)
+    # Theta capture is a CREDIT concept (how much of the premium we sold decayed to us). A debit
+    # spread has entry_credit_points <= 0, so this used to fall through to 0.0 and assert
+    # "captured zero theta" — a lie about a metric that simply does not apply. None = N/A.
     _theta_capture_pct = round(
         exit_decision.pnl_rupees / _max_profit_rupees, 3
-    ) if _max_profit_rupees > 0 else 0.0
+    ) if _max_profit_rupees > 0 else None
+    # MFE capture = how much of the peak we actually kept (realized / MFE). Strategy-agnostic,
+    # which the old value was NOT: it read position.metadata["mfe_capture_pct"], a trailing-stop
+    # internal written only by _mfe_profit_trail_reason(), which early-returns when
+    # entry_credit_points <= 0 — i.e. never fires for a debit spread, so every put-debit logged
+    # 0.0. On 2026-07-16 MFE was 3,380 and the trade closed at 1,638 (~48% kept) yet still
+    # recorded 0.0, leaving the learning loop unable to see exit quality at all.
+    # A negative value is meaningful (went green, closed red); None only if it never went green.
+    _mfe_capture_pct = round(exit_decision.pnl_rupees / mfe, 3) if mfe > 0 else None
     event = {
         "event": "PAPER_EXIT",
         "timestamp": snapshot.timestamp.isoformat(),
@@ -1809,7 +1820,7 @@ def manage_paper_position(
         "spot_move_pts": _spot_move_pts,
         "theta_capture_pct": _theta_capture_pct,
         "iv_rank_at_entry": position.metadata.get("iv_rank_at_entry"),
-        "mfe_capture_pct": position.metadata.get("mfe_capture_pct"),
+        "mfe_capture_pct": _mfe_capture_pct,
     }
     _append_jsonl(paths.paper_trades, event)
     save_paper_position(None, paths=paths, extra={"last_exit": event, "mfe_rupees": 0.0, "mae_rupees": 0.0})

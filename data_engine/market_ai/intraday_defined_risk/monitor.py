@@ -109,6 +109,32 @@ def _canonical_strategy_rejection(reasons: list[str], *, setup_detected: bool) -
     return "SETUP_FILTERED"
 
 
+def _ml_feature_snapshot(regime_state) -> dict:
+    """The ml_*-prefixed feature snapshot every entry stores for win-probability training.
+
+    These are just renamed copies of regime_state fields, and BOTH decision paths must
+    attach them. When Stage 3 made the selector the live driver (USE_SELECTOR), only the
+    legacy path still did — so every live PAPER_ENTRY logged all ten ml_* fields as null.
+    Downstream that silently starved the win-prob model (it could only ever train on the
+    stale backfill, producing collinear/dead weights) and made eod_learning's rv30_pct
+    read 0.0. Keep this as the single source so the two paths cannot drift again.
+    """
+    m = regime_state.metadata
+    return {
+        "ml_bearish_entry_score": m.get("bearish_entry_score"),
+        "ml_bullish_entry_score": m.get("bullish_entry_score"),
+        "ml_india_vix": m.get("india_vix"),
+        "ml_session_phase": m.get("session_phase"),
+        "ml_vwap_reclaim": m.get("vwap_reclaim"),
+        "ml_banknifty_divergence": m.get("banknifty_divergence"),
+        "ml_days_to_monthly_expiry": m.get("days_to_monthly_expiry"),
+        "ml_bullish_momentum": m.get("bullish_momentum_persistence"),
+        "ml_bearish_momentum": m.get("bearish_momentum_persistence"),
+        "ml_rv30_pct": regime_state.rv30_pct,
+        "ml_order_flow_imbalance": m.get("order_flow_imbalance"),
+    }
+
+
 def _decision_block_reason(decision: DecisionOutput, explicit: str | None = None) -> str:
     if explicit:
         return explicit
@@ -990,6 +1016,9 @@ class IntradayDefinedRiskAgent:
         from .strategy_selector import FAM_STAND_ASIDE
         spot = float(snapshot.option_chain.spot)
         meta = regime_state.metadata
+        # Attach the ml_* snapshot on the SELECTOR path too — it is the live decision driver,
+        # and without this every PAPER_ENTRY it wrote logged ml_* as null (see helper docstring).
+        meta.update(_ml_feature_snapshot(regime_state))
         choice = _select(meta, spot, now_time=snapshot.timestamp.time())
         meta["selector_condition"] = choice.condition
         meta["selector_family"] = choice.family
@@ -1449,17 +1478,7 @@ class IntradayDefinedRiskAgent:
                 "experimental_policy_name": self.experimental_policy.get("name"),
                 "trade_funnel": trade_funnel,
                 # Phase 8: ML feature snapshot stored at entry for win-probability training
-                "ml_bearish_entry_score": regime_state.metadata.get("bearish_entry_score"),
-                "ml_bullish_entry_score": regime_state.metadata.get("bullish_entry_score"),
-                "ml_india_vix": regime_state.metadata.get("india_vix"),
-                "ml_session_phase": regime_state.metadata.get("session_phase"),
-                "ml_vwap_reclaim": regime_state.metadata.get("vwap_reclaim"),
-                "ml_banknifty_divergence": regime_state.metadata.get("banknifty_divergence"),
-                "ml_days_to_monthly_expiry": regime_state.metadata.get("days_to_monthly_expiry"),
-                "ml_bullish_momentum": regime_state.metadata.get("bullish_momentum_persistence"),
-                "ml_bearish_momentum": regime_state.metadata.get("bearish_momentum_persistence"),
-                "ml_rv30_pct": regime_state.rv30_pct,
-                "ml_order_flow_imbalance": regime_state.metadata.get("order_flow_imbalance"),
+                **_ml_feature_snapshot(regime_state),
                 # PH 21 early-session gate reads these directly (not ml_-prefixed)
                 "execution_5m": regime_state.execution_5m,
                 "order_flow_imbalance": regime_state.metadata.get("order_flow_imbalance"),
