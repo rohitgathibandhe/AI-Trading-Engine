@@ -44,17 +44,32 @@ def _spot_at(path, hhmm):
 
 
 def _today_trades(day):
-    out = []
+    """One record per TRADE, not per event: PAPER_ENTRY joined with its PAPER_EXIT.
+
+    Both event records carry the same entry_timestamp, so matching on that alone counted
+    every closed trade twice (1 trade -> "trades": 2). The exit record holds the outcome
+    (realized_paper_pnl, exit_reason, MAE/MFE); merge it onto the entry so the audit can
+    actually see its own P&L.
+    """
     f = STATE / "intraday_v83_paper_live_trades.jsonl"
     if not f.exists():
-        return out
+        return []
+    entries: dict[str, dict] = {}
+    exits: dict[str, dict] = {}
     for line in f.read_text().splitlines():
         try:
             d = json.loads(line)
         except Exception:
             continue
-        if str(d.get("entry_timestamp", "")).startswith(day):
-            out.append(d)
+        ets = str(d.get("entry_timestamp", ""))
+        if not ets.startswith(day):
+            continue
+        (exits if d.get("event") == "PAPER_EXIT" else entries)[ets] = d
+    out = []
+    for ets in sorted(set(entries) | set(exits)):
+        rec = dict(entries.get(ets) or {})
+        rec.update({k: v for k, v in (exits.get(ets) or {}).items() if v is not None})
+        out.append(rec)
     return out
 
 
@@ -94,7 +109,11 @@ def main() -> int:
         # LOW-punch (<0.13) put-debits WIN 73% vs HIGH-punch (>0.18) 41%, corr(netΔ,pnl)=-0.086.
         # The R:R-optimizing selector picking cheaper low-punch spreads is CORRECT. No flag.
         audits.append({"entry": et, "strategy": strat, "net_delta": net_delta,
-                       "pnl": t.get("pnl_rupees"), "exit_reason": t.get("exit_reason"), "flags": flags})
+                       # the P&L field is realized_paper_pnl; "pnl_rupees" never existed on these
+                       # records, so every audit reported pnl: null — the retrospective could not
+                       # see its own outcomes (a +1,638 winner on 2026-07-16 logged as null).
+                       "pnl": t.get("realized_paper_pnl"), "exit_reason": t.get("exit_reason"),
+                       "flags": flags})
 
     # shadow book today
     shadow = None
@@ -108,16 +127,24 @@ def main() -> int:
             except Exception:
                 continue
 
-    # errors
-    def _count(path_, pat):
+    # errors — TODAY's lines only, matched on real signatures. Two traps this avoids:
+    #  (1) the tail window spans ~2 sessions, so an undated count reports stale events as today's
+    #      (2026-07-16 reported delta_too_high=43 when today's real count was 0 — all from 07-14/15);
+    #  (2) a bare "429" substring matches decimal noise inside the JSON payload
+    #      ("0.358919791026429", "24196.31428571429") — it scored 200 phantom rate-limits on
+    #      2026-07-16 when the true count was 0, manufacturing a false API_CONTENTION focus item.
+    def _count(path_, pats):
         try:
-            return sum(1 for l in Path(path_).read_text(errors="ignore").splitlines()[-2000:] if pat in l.lower())
+            lines = Path(path_).read_text(errors="ignore").splitlines()[-4000:]
         except Exception:
             return 0
-    errors = {"agent_429_cooldown": _count(STATE / "intraday_v83_runner.log", "429") +
-                                     _count(STATE / "intraday_v83_runner.log", "cooldown"),
-              "no_debit_structure": _count(STATE / "intraday_v83_runner.log", "no_debit_structure"),
-              "delta_too_high": _count(STATE / "intraday_v83_runner.log", "delta_too_high")}
+        return sum(1 for l in lines if day in l and any(p in l.lower() for p in pats))
+    log = STATE / "intraday_v83_runner.log"
+    errors = {"agent_429_cooldown": _count(log, ("too many requests", "rate limit", "ratelimit",
+                                                 "http 429", '"status": 429', '"status_code": 429',
+                                                 "cooldown")),
+              "no_debit_structure": _count(log, ("no_debit_structure",)),
+              "delta_too_high": _count(log, ("delta_too_high",))}
 
     # tomorrow's focus = distinct flags + standing gaps
     focus = sorted({f.split("(")[0] for a in audits for f in a["flags"]})
