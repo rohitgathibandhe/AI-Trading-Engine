@@ -67,6 +67,43 @@ def _pick(rows, side, dt, tol=0.08):
     return best if bd <= tol else None
 
 
+def _pick_strike(rows, side, want, tol=25.0):
+    """Nearest usable leg to an exact strike — for EQUAL-WIDTH wings."""
+    best = None; bd = 1e9
+    for sk, sides in rows.items():
+        leg = sides.get(side) or {}
+        if leg.get("bid", 0) <= 0 or leg.get("ask", 0) <= 0:
+            continue
+        e = abs(sk - want)
+        if e < bd:
+            bd = e; best = (sk, leg)
+    return best if bd <= tol else None
+
+
+def _settle(sp, lp, sc, lc, spot_t):
+    """Build one condor variant and settle it at intrinsic. Shorts are shared across variants;
+    only the WING rule differs, so this isolates wing design as the single variable."""
+    if not (sp and lp and sc and lc and lp[0] < sp[0] < sc[0] < lc[0]):
+        return None
+    credit = (sp[1]["bid"] - lp[1]["ask"]) + (sc[1]["bid"] - lc[1]["ask"]) - 4 * FEE
+    if credit <= 0:
+        return None
+    clamp = lambda x, lo, hi: max(lo, min(hi, x))  # noqa: E731
+    pw, cw = sp[0] - lp[0], lc[0] - sc[0]
+    put_liab = clamp(sp[0] - spot_t, 0, pw)
+    call_liab = clamp(spot_t - sc[0], 0, cw)
+    return {
+        "condor": {"lp": lp[0], "sp": sp[0], "sc": sc[0], "lc": lc[0]},
+        "put_width": pw, "call_width": cw,
+        "credit_pts": round(credit, 2),
+        "put_liab": round(put_liab, 1), "call_liab": round(call_liab, 1),
+        "pnl_rupees": round((credit - put_liab - call_liab) * LOT),
+        # max loss per side — the risk the delta rule silently unbalances
+        "put_maxloss_rupees": round((credit - pw) * LOT),
+        "call_maxloss_rupees": round((credit - cw) * LOT),
+    }
+
+
 def _capture_days():
     if not ROLL.exists():
         return []
@@ -93,27 +130,53 @@ def main() -> int:
         print(f"[weekly] no entry-day capture found for expiry {today}; skip"); return 0
 
     er, es, _ = _entry_rows(entry_day)
-    sp = _pick(er, "pe", SHORT_D); lp = _pick(er, "pe", LONG_D)
-    sc = _pick(er, "ce", SHORT_D); lc = _pick(er, "ce", LONG_D)
-    if not (sp and lp and sc and lc and lp[0] < sp[0] < sc[0] < lc[0]):
-        print(f"[weekly] could not build condor from {entry_day}; skip"); return 0
-    # entry credit at real fills: sell shorts @ bid, buy longs @ ask
-    credit = (sp[1]["bid"] - lp[1]["ask"]) + (sc[1]["bid"] - lc[1]["ask"]) - 4 * FEE
-    # intrinsic settlement at today's expiry spot
-    def clamp(x, lo, hi): return max(lo, min(hi, x))
-    put_liab = clamp(sp[0] - spot_t, 0, sp[0] - lp[0])
-    call_liab = clamp(spot_t - sc[0], 0, lc[0] - sc[0])
-    pnl = round((credit - put_liab - call_liab) * LOT)
+    sp = _pick(er, "pe", SHORT_D)
+    sc = _pick(er, "ce", SHORT_D)
+    if not (sp and sc):
+        print(f"[weekly] no ~{SHORT_D} short strikes on {entry_day}; skip"); return 0
+
+    # Three WING designs on the SAME shorts — logged side by side so live evidence, not a
+    # backtest row, picks the winner. Found 2026-07-17: delta-selected wings are delta-neutral
+    # but NOT risk-neutral. Puts carry richer IV, so delta moves more slowly per strike and
+    # "0.22 -> 0.12" spans more points on the put side: the live 07-15 condor came out 200pt put
+    # / 100pt call, i.e. -11,768 put max loss vs -4,268 call — ~3x more risk on one side of a
+    # structure that looks balanced. On the dense 14 weeks at real spreads, equal-150 beat delta
+    # on EVERY metric (+31,643 vs +29,881, worst -6,071 vs -6,377, max loss -5,682 vs -6,744,
+    # asym 1.00x vs 1.60x) and equal-200 earned far more (+48,656, 13/13 weeks better) but at a
+    # -8,559/side max loss that never materialised in 13 weeks — a tail too fat to price on that
+    # sample. So: log all three, decide forward.
+    variants = {
+        "delta": _settle(sp, _pick(er, "pe", LONG_D), sc, _pick(er, "ce", LONG_D), spot_t),
+        "equal_150": _settle(sp, _pick_strike(er, "pe", sp[0] - 150.0),
+                             sc, _pick_strike(er, "ce", sc[0] + 150.0), spot_t),
+        "equal_200": _settle(sp, _pick_strike(er, "pe", sp[0] - 200.0),
+                             sc, _pick_strike(er, "ce", sc[0] + 200.0), spot_t),
+    }
+    if not variants["delta"]:
+        print(f"[weekly] could not build the delta condor from {entry_day}; skip"); return 0
     dte = (datetime.strptime(today, "%Y-%m-%d") - datetime.strptime(entry_day, "%Y-%m-%d")).days
 
+    d = variants["delta"]
     rec = {"expiry": today, "entry_day": entry_day, "dte_at_entry": dte,
-           "condor": {"sp": sp[0], "lp": lp[0], "sc": sc[0], "lc": lc[0]},
            "entry_spot": round(es, 1), "expiry_spot": round(spot_t, 1),
-           "credit_pts": round(credit, 2), "put_liab": round(put_liab, 1),
-           "call_liab": round(call_liab, 1), "pnl_rupees": pnl}
+           # top-level mirrors the DELTA variant so the existing record shape still reads
+           "condor": d["condor"], "credit_pts": d["credit_pts"],
+           "put_liab": d["put_liab"], "call_liab": d["call_liab"],
+           "pnl_rupees": d["pnl_rupees"],
+           "variants": variants}
     (STATE / "weekly_shadow_ledger.jsonl").open("a").write(json.dumps(rec) + "\n")
-    print(f"[weekly] {entry_day}->{today} ({dte}DTE) condor {lp[0]:.0f}/{sp[0]:.0f}-{sc[0]:.0f}/{lc[0]:.0f} "
-          f"credit {credit:.1f} settle spot {spot_t:.0f} -> P&L Rs {pnl:+,}")
+
+    c = d["condor"]
+    print(f"[weekly] {entry_day}->{today} ({dte}DTE) settle spot {spot_t:.0f}")
+    print(f"[weekly]   delta     {c['lp']:.0f}/{c['sp']:.0f}-{c['sc']:.0f}/{c['lc']:.0f} "
+          f"credit {d['credit_pts']:.1f} -> Rs {d['pnl_rupees']:+,}")
+    for k in ("equal_150", "equal_200"):
+        v = variants[k]
+        if not v:
+            print(f"[weekly]   {k:<9} not buildable"); continue
+        vc = v["condor"]
+        print(f"[weekly]   {k:<9} {vc['lp']:.0f}/{vc['sp']:.0f}-{vc['sc']:.0f}/{vc['lc']:.0f} "
+              f"credit {v['credit_pts']:.1f} -> Rs {v['pnl_rupees']:+,}")
     return 0
 
 
