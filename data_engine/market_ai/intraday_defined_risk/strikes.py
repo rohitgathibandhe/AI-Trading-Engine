@@ -501,11 +501,20 @@ def _evaluate_vertical_candidates(
         setup_quality_score=setup_quality_score,
         playbook_tier=playbook_tier,
     )
-    avg_chain_iv = (
-        float(regime_state.metadata.get("avg_chain_iv"))
-        if regime_state.metadata.get("avg_chain_iv") is not None
-        else None
-    )
+    # Classify the vol regime on NEAR-ATM IV, not the whole-chain mean. The thresholds inside
+    # _iv_adjusted_credit_ratio (15/18/22) are on the VIX/ATM scale, but avg_chain_iv is a flat
+    # average across every strike, which the volatility smile inflates ~2.2x (live 2026-07-17:
+    # avg_chain_iv 26.5 vs ATM IV / India VIX ~11.8, on 616/616 decisions). That units mismatch
+    # pinned the floor in the ">= 22 -> x1.15 TIGHTEN" branch forever, so the agent demanded
+    # 0.299 credit/width instead of the intended 0.187 in a low-IV market — needing 59.8pts on a
+    # 200pt width when only 44.45 was available. Result: every bull-put blocked on low-IV up days
+    # (348 rejections on 07-17, a +0.73% trend day with zero trades taken). Set
+    # IV_FLOOR_USE_ATM=0 to fall back to the old whole-chain behaviour.
+    _iv_key = "avg_chain_iv" if os.environ.get("IV_FLOOR_USE_ATM") == "0" else "atm_chain_iv"
+    _iv_raw = regime_state.metadata.get(_iv_key)
+    if _iv_raw is None:
+        _iv_raw = regime_state.metadata.get("avg_chain_iv")
+    avg_chain_iv = float(_iv_raw) if _iv_raw is not None else None
     required_credit_ratio, iv_adjusted_credit_floor_active = _iv_adjusted_credit_ratio(
         base_required_credit_ratio,
         avg_chain_iv,

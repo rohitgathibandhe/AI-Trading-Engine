@@ -473,6 +473,39 @@ def _average_chain_iv(snapshot: MarketSnapshot) -> float | None:
     return sum(ivs) / len(ivs)
 
 
+def _atm_chain_iv(snapshot: MarketSnapshot, band_pct: float = 1.0) -> float | None:
+    """Mean IV of NEAR-ATM strikes — an implied-vol read on the same scale as India VIX.
+
+    `_average_chain_iv()` flat-averages every strike in the chain, and the volatility smile
+    drags that mean far above at-the-money IV. Measured live on 2026-07-17: the chain (281
+    legs, out to +/-1200pts) averaged 26.5 while ATM IV and India VIX were both ~11.8 — a
+    2.2x overstatement, on 616 of 616 decisions. Within +/-100pts of spot the same chain read
+    11.74; the inflation is entirely the wings (600-1200pts averaged 20.1).
+
+    This matters because the credit-floor thresholds (15/18/22 in `_iv_adjusted_credit_ratio`)
+    are calibrated on the VIX/ATM scale. Feeding them the smile-inflated mean pinned the agent
+    permanently in the ">= 22 -> tighten x1.15" branch, so it demanded MORE credit exactly when
+    premium was thinnest — blocking every bull-put on low-IV up days (348 CREDIT_TOO_LOW
+    rejections on 07-17, a clean +0.73% trend day on which it took zero trades).
+
+    Restricting to near-ATM strikes puts the metric back on the scale the thresholds expect.
+    Kept separate from avg_chain_iv, which has other callers with their own calibration.
+    """
+    chain = snapshot.option_chain
+    spot = float(chain.spot or 0.0)
+    if spot <= 0:
+        return None
+    usable = [q for q in chain.quotes if q.iv is not None and float(q.iv) > 0 and q.ltp > 0]
+    band = spot * band_pct / 100.0
+    ivs = [float(q.iv) for q in usable if abs(float(q.strike) - spot) <= band]
+    if not ivs:
+        # Wide strike spacing can leave the band empty — fall back to the nearest strikes.
+        ivs = [float(q.iv) for q in sorted(usable, key=lambda q: abs(float(q.strike) - spot))[:8]]
+    if not ivs:
+        return None
+    return sum(ivs) / len(ivs)
+
+
 def _compute_chain_gex(snapshot: MarketSnapshot):
     """Dealer gamma-exposure read from the chain snapshot. Advisory only — attached to
     metadata for analysis/validation; does not gate any decision yet."""
@@ -2658,6 +2691,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     avg_chain_iv = _average_chain_iv(snapshot)
     range_compression_score = max(0.0, min(2.0, (params.rv_mid_cutoff - rv30_pct) / max(params.rv_mid_cutoff, 0.05))) if rv30_pct <= params.rv_mid_cutoff else 0.0
     metadata["avg_chain_iv"] = round(avg_chain_iv, 4) if avg_chain_iv is not None else None
+    _atm_iv = _atm_chain_iv(snapshot)
+    metadata["atm_chain_iv"] = round(_atm_iv, 4) if _atm_iv is not None else None
     metadata["range_compression_score"] = round(range_compression_score, 4)
 
     # Dealer gamma exposure (advisory) — pin vs trend regime, for GEX validation.
