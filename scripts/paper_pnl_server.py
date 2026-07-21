@@ -3605,97 +3605,29 @@ _live_positions_lock = threading.Lock()
 _LIVE_POSITIONS_TTL = 10.0
 
 
-def _paper_live_positions_payload() -> Dict[str, Any]:
-    """Paper-mode Live Trades: mirror the agent's PAPER activity (open position legs + today's
-    closed paper trades) so the tab shows the user's own trades instead of empty broker data.
-    Cheap — reads the open-position payload (background-cached LTP) and the paper trades jsonl."""
-    from datetime import date as _d
-    open_payload = _build_v83_open_position_payload()
-    positions = [
-        {
-            "side": lg.get("side"),
-            "strike": lg.get("strike"),
-            "expiry": lg.get("expiry"),
-            "sec_id": lg.get("sec_id"),
-            "qty": lg.get("qty"),
-            "entry": lg.get("entry"),
-            "ltp": lg.get("ltp"),
-            "pnl": lg.get("pnl"),
-        }
-        for lg in (open_payload.get("legs") or [])
-    ]
-    today = _d.today().isoformat()
-    closed: List[Dict[str, Any]] = []
-    try:
-        for line in V83_PAPER_LIVE_TRADES_JSONL.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            r = json.loads(line)
-            if r.get("event") != "PAPER_EXIT":
-                continue
-            ts = str(r.get("exit_timestamp") or "")
-            if not ts.startswith(today):
-                continue
-            legs = r.get("legs") or []
-            pnl = r.get("realized_paper_pnl")
-            for i, lg in enumerate(legs):
-                closed.append({
-                    "side": lg.get("action") or lg.get("side"),
-                    "strike": lg.get("strike"),
-                    "expiry": lg.get("expiry") or r.get("expiry"),
-                    "sec_id": lg.get("security_id") or lg.get("sec_id"),
-                    "qty": lg.get("qty"),
-                    "entry": lg.get("entry_price"),
-                    "exit": lg.get("exit_price"),
-                    # trade-level realized P&L on the first leg so the closed total sums correctly
-                    "pnl": pnl if i == 0 else 0,
-                    "timestamp": ts,
-                    "playbook": r.get("playbook"),
-                })
-    except Exception:
-        pass
-    return {
-        "positions": positions,
-        "closed": closed,
-        "total_pnl": open_payload.get("open_mtm") or 0.0,
-        "source": "paper",
-    }
-
-
 def _build_live_positions_payload() -> Dict[str, Any]:
-    """The live/broker positions build — runs only on the background refresh thread."""
-    # Paper mode (live-arm OFF) has NO broker positions. Instead of the pointless ~37s broker fetch
-    # (which also hammers the Dhan/broker API the agent needs), mirror the agent's PAPER activity so
-    # the Live Trades tab shows the user's own open + closed paper trades. Only a genuinely
-    # live-armed run does the real broker fetch below.
-    try:
-        cfg = _json_read(STATE_DIR / "intraday_v83_runtime_config.json") or {}
-        if str(cfg.get("mode") or "").upper() != "MICRO_LIVE" or not cfg.get("live_arm"):
-            return _paper_live_positions_payload()
-    except Exception:
-        pass
-    local_payload = load_positions(BLOTTER_CSV, mode="live")
-    payload = local_payload
+    """Fetch the user's REAL Dhan account — open positions (with Dhan's native LTP + P&L) and today's
+    closed trades — so the Live Trades tab mirrors the Dhan app. Reads the real broker via creds.json
+    even in PAPER mode (the agent's paper/live setting is irrelevant to what's in the Dhan account).
+
+    Runs only on the background refresh thread (stale-while-revalidate), so its latency never blocks
+    the tab. Deliberately does NOT call load_positions(BLOTTER) — that did a throttled option-chain
+    LTP enrichment on a STALE local blotter and was the ~37s culprit; Dhan's positions API already
+    carries LTP and unrealised P&L per leg."""
     broker_payload = _load_broker_live_positions()
-    if isinstance(broker_payload, dict) and str(broker_payload.get("source") or "") == "broker":
-        payload = {
+    if isinstance(broker_payload, dict):
+        payload: Dict[str, Any] = {
             "positions": broker_payload.get("positions", []) or [],
             "closed": broker_payload.get("closed", []) or [],
             "total_pnl": broker_payload.get("total_pnl", 0.0) or 0.0,
             "as_of": broker_payload.get("as_of"),
-            "blotter_tail": local_payload.get("blotter_tail", []) if isinstance(local_payload, dict) else [],
-            "source": "broker",
+            "source": broker_payload.get("source") or "broker",
             "margin_available": broker_payload.get("margin_available"),
             "margin_used": broker_payload.get("margin_used"),
         }
-    elif not payload.get("positions") and broker_payload:
-        payload = broker_payload
     else:
-        if broker_payload and broker_payload.get("closed"):
-            closed = payload.get("closed", []) or []
-            closed.extend(broker_payload.get("closed", []))
-            payload["closed"] = closed
-    # Also surface today's broker executions as closed rows (legacy)
+        payload = {"positions": [], "closed": [], "total_pnl": 0.0, "source": "none"}
+    # Merge today's broker executions (fills) as additional closed rows.
     try:
         trades = _load_broker_trades_today()
         if trades:
@@ -3711,11 +3643,9 @@ def _build_live_positions_payload() -> Dict[str, Any]:
                 key = (str(c.get("sec_id")), c.get("strike"))
                 if key not in dedup:
                     dedup[key] = c
-            cleaned = [c for c in dedup.values() if c.get("side") == "FLAT"]
+            cleaned = list(dedup.values())
             non_empty = [c for c in cleaned if c.get("expiry") not in (None, "", "0001-01-01")]
-            if non_empty:
-                cleaned = non_empty
-            payload["closed"] = cleaned
+            payload["closed"] = non_empty if non_empty else cleaned
     except Exception:
         pass
     return payload
