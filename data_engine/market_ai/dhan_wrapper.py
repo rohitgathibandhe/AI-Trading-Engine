@@ -756,7 +756,12 @@ class DhanWrapper:
                     cooldown = time.time() + 90.0
                     self._chain_cooldown_until = cooldown
                     with self._GLOBAL_CHAIN_LOCK:
-                        self._GLOBAL_CHAIN_COOLDOWN_UNTIL = cooldown
+                        # Write to the CLASS, not self. `self._GLOBAL_..= x` creates an instance
+                        # attribute that shadows the class-level shared marker, so the UI's wrapper
+                        # and the agent's wrapper would each throttle only against themselves and
+                        # both hit the 1/3s endpoint in the same window — the shared throttle was
+                        # silently per-instance. This is the main 429 source.
+                        DhanWrapper._GLOBAL_CHAIN_COOLDOWN_UNTIL = cooldown
                     return None
                 if status == "success" or data:
                     return resp
@@ -765,6 +770,7 @@ class DhanWrapper:
             return None
 
         resp: Optional[Dict[str, Any]] = None
+        hit_429 = False
         for seg in segs:
             if not seg or seg in seen:
                 continue
@@ -777,9 +783,19 @@ class DhanWrapper:
                 resp = _try_fetch(seg)
                 if resp is not None:
                     break
-                # backoff to avoid 429
-                time.sleep(1.5)
-            if resp is not None:
+                # A 429 inside _try_fetch just set a 90s global cooldown. Stop NOW — do not keep
+                # retrying across attempts or segments. That storm (up to segs*attempts = 9 hits)
+                # is what gets the account blocked, and it ignored the very cooldown it had just
+                # set (previously only checked at the method top, never inside the loop).
+                cd = DhanWrapper._GLOBAL_CHAIN_COOLDOWN_UNTIL
+                if cd and time.time() < cd:
+                    hit_429 = True
+                    break
+                # Respect the global 1/3s limit between retries. Was 1.5s — two retries inside one
+                # call meant 3 hits in <3s, which itself tripped 429s.
+                if attempt < max_attempts - 1:
+                    time.sleep(3.0)
+            if resp is not None or hit_429:
                 break
 
         if resp is None:
@@ -789,10 +805,11 @@ class DhanWrapper:
         ts_now = time.time()
         self._last_chain_resp = resp
         self._last_chain_ts = ts_now
-        # update shared markers
+        # update shared markers — class-level writes so the throttle is genuinely shared
+        # across every instance (UI + agent), not shadowed onto this one.
         with self._GLOBAL_CHAIN_LOCK:
-            self._GLOBAL_LAST_CHAIN_TS = ts_now
-            self._GLOBAL_CHAIN_COOLDOWN_UNTIL = None
+            DhanWrapper._GLOBAL_LAST_CHAIN_TS = ts_now
+            DhanWrapper._GLOBAL_CHAIN_COOLDOWN_UNTIL = None
         self._last_chain_key = key
         return resp
 
