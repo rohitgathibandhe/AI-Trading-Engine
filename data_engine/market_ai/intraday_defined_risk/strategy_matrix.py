@@ -157,14 +157,13 @@ def _pc_iron_condor(m):  # SHORT IRON CONDOR (sell) — neutral, WIDE two-sided 
     return ok, score, "neutral wide range + rich/neutral IV + walls apart (sell condor, harvest range)"
 
 
-def _pc_iron_fly(m):  # SHORT IRON BUTTERFLY (sell) — a tight PIN, max premium at the ATM. NOT built yet.
+def _pc_iron_fly(m):  # SHORT IRON BUTTERFLY (sell) — a tight PIN, max premium at the ATM
     spot_to_pin = abs(_f(m, "spot_to_pin_pts", 999))
     ok = (
-        _bias(m) == NEUTRAL
-        and _pinned(m)
-        and not _iv_cheap(m)
-        and spot_to_pin <= 40                               # price glued to the pin/ATM
-    )
+        _pinned(m)                                          # a strong long-gamma PIN IS the neutral
+        and not _iv_cheap(m)                                # signal — do NOT gate on the agent's
+        and spot_to_pin <= 40                               # directional read (often wrong on a pin,
+    )                                                       # e.g. 2026-07-21 it read BEARISH on a range)
     score = 5.0 + _f(m, "gamma_concentration") * 10 - spot_to_pin / 40.0
     return ok, score, "tight long-gamma PIN at the ATM + rich/neutral IV (sell the pin, max theta)"
 
@@ -181,8 +180,7 @@ def _pc_short_strangle(m):  # SHORT STRANGLE (sell, naked-ish) — range but wid
 
 def _pc_short_straddle(m):  # SHORT STRADDLE (sell, naked) — strong pin, very rich IV. Highest risk.
     ok = (
-        _bias(m) == NEUTRAL
-        and _pinned(m)
+        _pinned(m)                                          # pin is the signal, not the directional read
         and _iv_rich(m)
         and abs(_f(m, "spot_to_pin_pts", 999)) <= 25
     )
