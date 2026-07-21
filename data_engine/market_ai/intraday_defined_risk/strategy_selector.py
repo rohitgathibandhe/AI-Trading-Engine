@@ -120,6 +120,15 @@ _SELLER_MODE = os.environ.get("SEL_MODE", "").upper()
 _PIN_VETO = os.environ.get("SEL_PIN_VETO", "1") == "1"
 _PIN_VETO_EFF_MAX = _sel_env_float("SEL_PIN_VETO_EFF_MAX") or 0.40
 
+# Selection filter (NEW 2026-07-21, default ON): a fresh opening-range break must be ACCEPTED — held
+# past a retest — to be classified as a BREAKOUT, not a fakeout that immediately reverts. Today 11:35:
+# opening_range_break_state=DOWN but accepted_breakout=False and trend_efficiency_ratio=0.0049 — a fake
+# breakdown that a long-gamma pin pulled straight back, so the put-debit had no follow-through. An
+# un-accepted break falls through to STRONG_TREND (if trend-quality is high) or CHOP, where the other
+# gates apply. Complements the pin veto (this also catches fakeouts on normal, non-pinned days).
+# FAILED_UP (a rejected upside break) is left as-is — it's itself a rejection signal. SEL_REQUIRE_ACCEPTED_BREAKOUT=0 disables.
+_REQUIRE_ACCEPTED_BREAKOUT = os.environ.get("SEL_REQUIRE_ACCEPTED_BREAKOUT", "1") == "1"
+
 
 def _pinned_range_veto(m: dict[str, Any]) -> tuple[bool, str]:
     """True when the tape is a pinned long-gamma, low-efficiency range — where a directional debit
@@ -222,10 +231,15 @@ def classify_condition(read: MarketRead, metadata: dict[str, Any]) -> str:
     rv = _f(m, "rv30_pct", 0.0)
     vix = _f(m, "india_vix", 0.0)
 
-    # Breakout: OR break with directional consensus
-    if orb == "UP" and read.bias == "BULLISH":
+    # Breakout: OR break with directional consensus — but a fresh UP/DOWN break must be ACCEPTED
+    # (held past retest), not a fakeout that immediately reverts. FAILED_UP is a rejection signal and
+    # is exempt. An un-accepted fresh break falls through to STRONG_TREND / CHOP below.
+    accepted = bool(m.get("accepted_breakout")) or not _REQUIRE_ACCEPTED_BREAKOUT
+    if orb == "UP" and read.bias == "BULLISH" and accepted:
         return BREAKOUT_UP
-    if orb in {"DOWN", "FAILED_UP"} and read.bias == "BEARISH":
+    if orb == "DOWN" and read.bias == "BEARISH" and accepted:
+        return BREAKOUT_DOWN
+    if orb == "FAILED_UP" and read.bias == "BEARISH":
         return BREAKOUT_DOWN
 
     # Strong trend: high trend-quality + directional bias + conviction
