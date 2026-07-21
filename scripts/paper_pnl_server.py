@@ -2146,20 +2146,43 @@ def _load_intraday_trade_history(limit: Optional[int] = None) -> List[Dict[str, 
 
 _open_leg_ltp_cache: Dict[float, Dict[str, Any]] = {}
 _open_leg_ltp_cache_ts: float = 0.0
+_open_leg_ltp_cache_exp: Optional[str] = None  # which expiry the cache is for (invalidate on change)
 _OPEN_LEG_LTP_TTL = 3.0   # Dhan chain is ~1 req/3s; 3s is the floor for the fast poller
 
 
-def _live_leg_ltps() -> Dict[float, Dict[str, Any]]:
+def _live_leg_ltps(position_expiry: Optional[str] = None) -> Dict[float, Dict[str, Any]]:
     """Current LTP per strike from the live Nifty chain: {strike: {"CALL":x, "PUT":y}}.
 
     The agent stores only ENTRY-time leg quotes in paper_state (frozen), so the UI showed
     static LTP and 0 per-leg P&L. Fetching live prices here makes both update each poll.
-    Cached 6s so UI polling doesn't hammer Dhan's 1-req/3s chain limit.
+    Cached (per expiry) so UI polling doesn't hammer Dhan's 1-req/3s chain limit.
+
+    `position_expiry` (YYYY-MM-DD) marks the open position against the EXACT series it was booked
+    on — so entry and LTP always agree. When absent (older positions with no stamped expiry) it
+    falls back to the front TRADEABLE weekly (skipping a series expiring today on roll days).
     """
-    global _open_leg_ltp_cache, _open_leg_ltp_cache_ts
+    global _open_leg_ltp_cache, _open_leg_ltp_cache_ts, _open_leg_ltp_cache_exp
+    from datetime import date as _date
     now = time.time()
-    if _open_leg_ltp_cache and (now - _open_leg_ltp_cache_ts) < _OPEN_LEG_LTP_TTL:
+
+    # Resolve the target expiry up front when the position told us; avoids an extra expirylist call.
+    exp: Optional[str] = None
+    if position_expiry:
+        try:
+            _date.fromisoformat(str(position_expiry))
+            exp = str(position_expiry)
+        except (TypeError, ValueError):
+            exp = None
+
+    # Cache is valid only for the SAME expiry (a roll would otherwise serve stale prices).
+    if (
+        exp is not None
+        and _open_leg_ltp_cache
+        and _open_leg_ltp_cache_exp == exp
+        and (now - _open_leg_ltp_cache_ts) < _OPEN_LEG_LTP_TTL
+    ):
         return _open_leg_ltp_cache
+
     out: Dict[float, Dict[str, Any]] = {}
     try:
         from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
@@ -2170,27 +2193,31 @@ def _live_leg_ltps() -> Dict[float, Dict[str, Any]]:
             os.environ["DHAN_CLIENT_ID"] = cid
             os.environ["DHAN_ACCESS_TOKEN"] = tok
         dw = DhanWrapper(logger=None)
-        # Mark against the front TRADEABLE expiry — the one the agent actually trades — not simply
-        # expirylist[0]. On a weekly-expiry day expirylist[0] is the series expiring TODAY (0 DTE),
-        # but the agent has already rolled to the next weekly; marking the open position's live LTP
-        # against the expiring chain while its entry was booked on the new front produced a nonsense
-        # Open MTM (e.g. entry on 07-28 vs LTP pulled from the expiring 07-21). Skip an expiry that
-        # expires today so entry and LTP come from the same series. (Fixed 2026-07-21.)
-        from datetime import date as _date
-        _exps = dw.get_optionchain_expirylist("IDX_I", INDEX_SECURITY_ID) or []
-        _today = _date.today()
-        exp = None
-        for _e in _exps:
-            try:
-                if _date.fromisoformat(str(_e)) > _today:
-                    exp = _e
-                    break
-            except (TypeError, ValueError):
-                continue
-        if exp is None:  # all expiries today/past or unparseable — fall back to nearest
-            exp = _exps[0] if _exps else None
+        if exp is None:
+            # No stamped expiry: mark against the front TRADEABLE weekly — NOT simply expirylist[0].
+            # On a weekly-expiry day expirylist[0] is the series expiring TODAY (0 DTE) while the
+            # agent has already rolled to the next weekly; marking the open position's LTP against
+            # the expiring chain produced a nonsense Open MTM. Skip a series expiring today.
+            _exps = dw.get_optionchain_expirylist("IDX_I", INDEX_SECURITY_ID) or []
+            _today = _date.today()
+            for _e in _exps:
+                try:
+                    if _date.fromisoformat(str(_e)) > _today:
+                        exp = str(_e)
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if exp is None:  # all expiries today/past or unparseable — fall back to nearest
+                exp = str(_exps[0]) if _exps else None
         if exp is None:
             return {}
+        # Re-check cache now that a heuristic expiry is resolved (avoids a redundant chain fetch).
+        if (
+            _open_leg_ltp_cache
+            and _open_leg_ltp_cache_exp == exp
+            and (now - _open_leg_ltp_cache_ts) < _OPEN_LEG_LTP_TTL
+        ):
+            return _open_leg_ltp_cache
         raw = dw.get_option_chain(INDEX_SECURITY_ID, "IDX_I", exp)
         oc = ((((raw or {}).get("data") or {}).get("data")) or {}).get("oc") or {}
         for k, node in oc.items():
@@ -2206,6 +2233,7 @@ def _live_leg_ltps() -> Dict[float, Dict[str, Any]]:
     if out:
         _open_leg_ltp_cache = out
         _open_leg_ltp_cache_ts = now
+        _open_leg_ltp_cache_exp = exp
     return out
 
 
@@ -2268,7 +2296,9 @@ def _build_v83_open_position_payload() -> Dict[str, Any]:
     # Overlay LIVE leg prices (agent stores only frozen entry quotes). Each leg's stored
     # "entry" is the entry price; fetch the current LTP by strike and recompute per-leg P&L
     # so both the LTP column and the legs total update every poll instead of showing 0.
-    live = _live_leg_ltps()
+    # Pass the position's own expiry so live LTP is marked against the SAME series the legs
+    # were booked on (exact); falls back to the front tradeable weekly when unstamped.
+    live = _live_leg_ltps(expiry)
     live_total = 0.0
     have_live = False
     for leg in ui_legs:

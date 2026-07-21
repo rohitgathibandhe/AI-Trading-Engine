@@ -1282,6 +1282,14 @@ def open_position_from_decision(decision: DecisionOutput, snapshot: MarketSnapsh
     structure = structure_from_decision(decision)
     extra = dict(decision.metadata or {})
     extra["spot_at_entry"] = snapshot.option_chain.spot
+    # Stamp the traded expiry onto the position so the persisted state — and the UI marking its
+    # live LTP — always know which series each leg belongs to. Without this the legs carried
+    # expiry=None, so on a roll day the UI could not tell the front from the expiring series and
+    # marked entry vs LTP across different expiries (the bad Open-MTM bug, 2026-07-21).
+    try:
+        extra["expiry"] = snapshot.option_chain.expiry.isoformat()
+    except Exception:
+        pass
     return build_open_position(
         structure=structure,
         lots=int(decision.lots or 1),
@@ -1294,6 +1302,9 @@ def open_position_from_decision(decision: DecisionOutput, snapshot: MarketSnapsh
 
 
 def serialize_open_position(position: OpenPosition) -> dict[str, Any]:
+    # Traded expiry stamped at entry (see open_position_from_decision). Persisted per leg so the
+    # UI marks each leg's live LTP against the exact series it was booked on.
+    _expiry = (position.metadata or {}).get("expiry")
     return {
         "structure": {
             "strategy": position.structure.strategy.value,
@@ -1302,6 +1313,13 @@ def serialize_open_position(position: OpenPosition) -> dict[str, Any]:
                     "action": leg.action,
                     "option_type": leg.option_type.value,
                     "strike": leg.strike,
+                    "expiry": _expiry,
+                    # Real FROZEN entry fill. leg.quote is the entry-time quote on a frozen
+                    # dataclass — it never drifts on re-save — so this is the true entry price,
+                    # not a modelled number (legs previously persisted entry_price=None).
+                    "entry_price": (
+                        leg.quote.mid_price if leg.quote.mid_price is not None else leg.quote.ltp
+                    ),
                     "bid": leg.quote.bid,
                     "ask": leg.quote.ask,
                     "ltp": leg.quote.ltp,
