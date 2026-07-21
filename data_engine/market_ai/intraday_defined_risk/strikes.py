@@ -133,6 +133,14 @@ def select_best_structure(
             setup_quality_score=setup_quality,
             playbook_tier=playbook_tier,
         )
+    if strategy == StrategyType.IRON_FLY:
+        return _select_iron_fly_candidates(
+            snapshot=snapshot,
+            regime_state=regime_state,
+            params=params,
+            setup_quality_score=setup_quality,
+            playbook_tier=playbook_tier,
+        )
     if strategy == StrategyType.SHORT_STRANGLE:
         return _select_strangle_candidates(
             snapshot=snapshot,
@@ -1385,6 +1393,124 @@ def _select_straddle_candidates(
             "short_put_strike": atm_put.strike,
             "avg_chain_iv": avg_chain_iv,
             "monetization_score": monetization_score,
+        },
+    )
+    return structure, rationale, report
+
+
+def _select_iron_fly_candidates(
+    snapshot: MarketSnapshot,
+    regime_state: RegimeState,
+    params: AdaptiveParameters,
+    *,
+    setup_quality_score: float,
+    playbook_tier: str,
+) -> tuple[TradeStructure | None, list[str], dict[str, object]]:
+    """Select a short IRON FLY: SELL ATM call + SELL ATM put (max premium at the pin), BUY OTM call +
+    BUY OTM put wings for DEFINED risk. This is the seller's expression of a tight long-gamma pin —
+    higher premium than a condor because the shorts sit at the ATM where price is glued. Defined risk
+    (capped loss = wing width - credit) means it can be held into the pin / to expiry safely."""
+    spot = snapshot.option_chain.spot
+    avg_chain_iv = float(regime_state.metadata.get("avg_chain_iv") or 0.0)
+    quotes = snapshot.option_chain.quotes
+
+    _empty_report: dict[str, object] = {
+        "strategy": StrategyType.IRON_FLY.value,
+        "setup_quality_score": round(setup_quality_score, 4),
+        "monetization_score": 0.0, "final_trade_score": 0.0,
+        "passed_spread_construction": False, "passed_liquidity": False,
+        "passed_credit_width": False, "passed_delta_band": False, "passed_anchor_distance": True,
+        "canonical_rejection_reason": "LIQUIDITY_BAD",
+        "best_candidate": None, "best_failed_candidate": None, "candidate_evaluations": [],
+    }
+    calls = [q for q in quotes if q.option_type == OptionType.CALL]
+    puts = [q for q in quotes if q.option_type == OptionType.PUT]
+    if not calls or not puts:
+        return None, ["Iron fly: no call/put quotes near ATM."], _empty_report
+
+    # Shorts: nearest strike to spot (the ATM / pin) on each side.
+    atm_call = min([q for q in calls if q.strike >= spot] or calls, key=lambda q: abs(q.strike - spot))
+    atm_put = min([q for q in puts if q.strike <= spot] or puts, key=lambda q: abs(q.strike - spot))
+    # Wings: buy protection ~wing_pts OTM of each short (defines the max loss).
+    wing_pts = float(regime_state.metadata.get("iron_fly_wing_pts") or 200.0)
+    long_call = min([q for q in calls if q.strike >= atm_call.strike + wing_pts] or calls,
+                    key=lambda q: abs(q.strike - (atm_call.strike + wing_pts)))
+    long_put = min([q for q in puts if q.strike <= atm_put.strike - wing_pts] or puts,
+                   key=lambda q: abs(q.strike - (atm_put.strike - wing_pts)))
+
+    sc = atm_call.mid_price or atm_call.ltp or 0.0
+    sp = atm_put.mid_price or atm_put.ltp or 0.0
+    lc = long_call.mid_price or long_call.ltp or 0.0
+    lp = long_put.mid_price or long_put.ltp or 0.0
+    total_credit = (sc + sp) - (lc + lp)                       # net credit received
+    call_width = long_call.strike - atm_call.strike
+    put_width = atm_put.strike - long_put.strike
+    max_width = max(call_width, put_width)
+
+    spread_ratio = sum((q.spread_ratio or 0.0) for q in (atm_call, atm_put, long_call, long_put)) / 4.0
+    min_credit = max(80.0, spot * 0.003)                        # fly needs meaningful premium to be worth the pin risk
+    passed_liquidity = spread_ratio <= params.liquidity_spread_ratio_cap
+    # An iron fly's two shorts sit at the ATM (often the SAME strike), so the middle is <= not <:
+    # long_put < short_put <= short_call < long_call.
+    ordered = long_put.strike < atm_put.strike <= atm_call.strike < long_call.strike
+    passed_credit = total_credit >= min_credit and max_width > 0 and ordered
+
+    if not passed_liquidity or not passed_credit:
+        reason = "LIQUIDITY_BAD" if not passed_liquidity else "CREDIT_TOO_LOW"
+        _empty_report["canonical_rejection_reason"] = reason
+        _empty_report["best_failed_candidate"] = {
+            "short_call_strike": atm_call.strike, "short_put_strike": atm_put.strike,
+            "long_call_strike": long_call.strike, "long_put_strike": long_put.strike,
+            "total_credit": round(total_credit, 4), "avg_spread_ratio": round(spread_ratio, 4),
+            "canonical_rejection_reason": reason,
+        }
+        return None, [f"Iron fly: {reason} (credit={total_credit:.1f}, width={max_width:.0f}, spread_ratio={spread_ratio:.3f})."], _empty_report
+
+    monetization_score = round((total_credit / max(max_width, 1.0)) * 20.0
+                               + max(0.0, 1.0 - spread_ratio / max(params.liquidity_spread_ratio_cap, 0.01)) * 0.5, 4)
+    best_valid: dict[str, object] = {
+        "short_call_strike": atm_call.strike, "short_put_strike": atm_put.strike,
+        "long_call_strike": long_call.strike, "long_put_strike": long_put.strike,
+        "total_credit": round(total_credit, 4), "max_width": max_width,
+        "avg_spread_ratio": round(spread_ratio, 4), "monetization_score": monetization_score,
+        "canonical_rejection_reason": "NONE",
+    }
+    report: dict[str, object] = {
+        "strategy": StrategyType.IRON_FLY.value,
+        "setup_quality_score": round(setup_quality_score, 4),
+        "monetization_score": monetization_score,
+        "final_trade_score": round(setup_quality_score + monetization_score, 4),
+        "passed_spread_construction": True, "passed_liquidity": True,
+        "passed_credit_width": True, "passed_delta_band": True, "passed_anchor_distance": True,
+        "canonical_rejection_reason": "NONE",
+        "best_candidate": best_valid, "best_failed_candidate": None, "candidate_evaluations": [best_valid],
+    }
+    rationale = [
+        f"Iron fly: SELL {atm_call.strike:.0f}C + {atm_put.strike:.0f}P (ATM/pin), "
+        f"BUY {long_call.strike:.0f}C + {long_put.strike:.0f}P wings ({wing_pts:.0f}pt).",
+        f"Net credit {total_credit:.2f} pts, max loss {max(max_width - total_credit, 0.0):.2f} pts, avg IV {avg_chain_iv:.1f}%.",
+        "Max premium at the pin with defined risk — harvest the suppressed long-gamma range.",
+    ]
+    derived_margin = max(max_width - total_credit, 0.0) * snapshot.lot_size
+    structure = TradeStructure(
+        strategy=StrategyType.IRON_FLY,
+        legs=[
+            StrategyLeg(action="SELL", option_type=OptionType.CALL, strike=atm_call.strike, quote=atm_call),
+            StrategyLeg(action="SELL", option_type=OptionType.PUT, strike=atm_put.strike, quote=atm_put),
+            StrategyLeg(action="BUY", option_type=OptionType.CALL, strike=long_call.strike, quote=long_call),
+            StrategyLeg(action="BUY", option_type=OptionType.PUT, strike=long_put.strike, quote=long_put),
+        ],
+        credit_points=total_credit,
+        width_points=max_width,
+        call_width_points=call_width,
+        put_width_points=put_width,
+        margin_estimate_per_lot=snapshot.option_chain.margin_estimate_per_lot or derived_margin,
+        rationale=rationale,
+        metadata={
+            "selection_mode": "IRON_FLY",
+            "short_call_strike": atm_call.strike, "short_put_strike": atm_put.strike,
+            "long_call_strike": long_call.strike, "long_put_strike": long_put.strike,
+            "wing_pts": wing_pts, "avg_chain_iv": avg_chain_iv, "monetization_score": monetization_score,
         },
     )
     return structure, rationale, report

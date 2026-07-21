@@ -22,6 +22,7 @@ class StrategyType(str, Enum):
     CALL_DEBIT_SPREAD = "CALL_DEBIT_SPREAD"
     PUT_DEBIT_SPREAD = "PUT_DEBIT_SPREAD"
     IRON_CONDOR = "IRON_CONDOR"
+    IRON_FLY = "IRON_FLY"                 # short ATM straddle + protective wings (defined-risk pin seller)
     SHORT_STRANGLE = "SHORT_STRANGLE"
     SHORT_STRADDLE = "SHORT_STRADDLE"
     NO_TRADE = "NO_TRADE"

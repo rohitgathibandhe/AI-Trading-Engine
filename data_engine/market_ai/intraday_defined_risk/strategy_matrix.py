@@ -197,7 +197,7 @@ SPECS: list[StratSpec] = [
     StratSpec("BULL_PUT_CREDIT_SPREAD",  BULLISH, is_credit=True,  defined_risk=True,  default_hold=HOLD_SWING,    precondition=_pc_bull_put),
     StratSpec("BEAR_CALL_CREDIT_SPREAD", BEARISH, is_credit=True,  defined_risk=True,  default_hold=HOLD_SWING,    precondition=_pc_bear_call),
     StratSpec("IRON_CONDOR",             NEUTRAL, is_credit=True,  defined_risk=True,  default_hold=HOLD_EXPIRY,   precondition=_pc_iron_condor),
-    StratSpec("IRON_FLY",                NEUTRAL, is_credit=True,  defined_risk=True,  default_hold=HOLD_EXPIRY,   precondition=_pc_iron_fly, built=False),
+    StratSpec("IRON_FLY",                NEUTRAL, is_credit=True,  defined_risk=True,  default_hold=HOLD_EXPIRY,   precondition=_pc_iron_fly),
     StratSpec("SHORT_STRANGLE",          NEUTRAL, is_credit=True,  defined_risk=False, default_hold=HOLD_EXPIRY,   precondition=_pc_short_strangle),
     StratSpec("SHORT_STRADDLE",          NEUTRAL, is_credit=True,  defined_risk=False, default_hold=HOLD_EXPIRY,   precondition=_pc_short_straddle),
 ]

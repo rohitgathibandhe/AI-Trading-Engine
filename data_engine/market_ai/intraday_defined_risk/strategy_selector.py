@@ -204,7 +204,7 @@ IV_CHEAP = "CHEAP"   # buy premium is favoured
 IV_NORMAL = "NORMAL"
 
 # Executable today (Stage 2 added the directional debit spreads).
-_EXECUTABLE = {"BEAR_CALL_CREDIT_SPREAD", "BULL_PUT_CREDIT_SPREAD", "IRON_CONDOR",
+_EXECUTABLE = {"BEAR_CALL_CREDIT_SPREAD", "BULL_PUT_CREDIT_SPREAD", "IRON_CONDOR", "IRON_FLY",
                "SHORT_STRANGLE", "SHORT_STRADDLE", "CALL_DEBIT_SPREAD", "PUT_DEBIT_SPREAD"}
 
 

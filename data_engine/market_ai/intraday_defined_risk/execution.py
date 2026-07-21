@@ -89,7 +89,7 @@ def validate_entry_time(strategy: StrategyType, now: datetime) -> tuple[bool, st
         return False, "Directional entries prefer time >= 09:30 IST."
     if strategy in {StrategyType.BEAR_CALL_CREDIT_SPREAD, StrategyType.BULL_PUT_CREDIT_SPREAD} and now.time() > LATEST_DIRECTIONAL_ENTRY:
         return False, "Directional entries are blocked after 14:30 IST to avoid low-quality late-session deployment."
-    if strategy in {StrategyType.IRON_CONDOR, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE} and now.time() < time(10, 0):
+    if strategy in {StrategyType.IRON_CONDOR, StrategyType.IRON_FLY, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE} and now.time() < time(10, 0):
         return False, "Iron Condor / Short Strangle / Short Straddle entries are allowed only after 10:00 IST."
     if now.time() >= TIME_EXIT:
         return False, "No new entries are allowed after the 15:15 IST flattening cut-off."
@@ -158,7 +158,7 @@ def build_open_position(
     max_loss_rupees_per_lot: float,
     extra_metadata: dict[str, object] | None = None,
 ) -> OpenPosition:
-    tp_capture = DIRECTIONAL_TP_CAPTURE if structure.strategy not in {StrategyType.IRON_CONDOR, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE} else CONDOR_TP_CAPTURE
+    tp_capture = DIRECTIONAL_TP_CAPTURE if structure.strategy not in {StrategyType.IRON_CONDOR, StrategyType.IRON_FLY, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE} else CONDOR_TP_CAPTURE
     # IV rank-based TP scaling: high IV → hold longer (more premium to decay, wider targets);
     # compressed IV → exit sooner (less edge available, favour quick capture).
     _iv_rank = _read_current_iv_rank()
@@ -205,8 +205,8 @@ def build_trade_decision(
 ) -> DecisionOutput:
     regime_label = regime if isinstance(regime, RegimeLabel) else RegimeLabel(regime)
     entry_credit_points = simulate_entry_credit(structure, slippage_points=slippage_points)
-    tp_capture = DIRECTIONAL_TP_CAPTURE if structure.strategy not in {StrategyType.IRON_CONDOR, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE} else CONDOR_TP_CAPTURE
-    delta_sl = DIRECTIONAL_DELTA_SL if structure.strategy not in {StrategyType.IRON_CONDOR, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE} else CONDOR_DELTA_SL
+    tp_capture = DIRECTIONAL_TP_CAPTURE if structure.strategy not in {StrategyType.IRON_CONDOR, StrategyType.IRON_FLY, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE} else CONDOR_TP_CAPTURE
+    delta_sl = DIRECTIONAL_DELTA_SL if structure.strategy not in {StrategyType.IRON_CONDOR, StrategyType.IRON_FLY, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE} else CONDOR_DELTA_SL
     playbook = str(extra_metadata.get("playbook")) if extra_metadata else ""
     if structure.strategy == StrategyType.BULL_PUT_CREDIT_SPREAD and playbook in {
         "OPEN_DRIVE_BULLISH",
@@ -529,7 +529,7 @@ def evaluate_exit(
         if put_short_deltas and max(put_short_deltas) >= CONDOR_PARTIAL_CLOSE_DELTA:
             return ExitDecision(True, "CONDOR_PUT_SIDE_CLOSE", current_value_points, pnl_rupees)
 
-    short_delta_limit = DIRECTIONAL_DELTA_SL if position.structure.strategy not in {StrategyType.IRON_CONDOR, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE} else CONDOR_DELTA_SL
+    short_delta_limit = DIRECTIONAL_DELTA_SL if position.structure.strategy not in {StrategyType.IRON_CONDOR, StrategyType.IRON_FLY, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE} else CONDOR_DELTA_SL
     selection_mode = position.structure.metadata.get("selection_mode")
     if position.structure.strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD and selection_mode == "STRUCTURE_DISTANCE_FALLBACK":
         short_delta_limit = 1.01
@@ -551,7 +551,7 @@ def evaluate_exit(
         # - Theta strategies (condor, strangle, straddle): 20 min — position must breathe
         #   before delta noise from the first few candles triggers an exit
         _is_theta_strategy = position.structure.strategy in {
-            StrategyType.IRON_CONDOR, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE
+            StrategyType.IRON_CONDOR, StrategyType.IRON_FLY, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE
         }
         _max_profit_r = position.entry_credit_points * position.lot_size * position.lots
         _min_hold = 20 if _is_theta_strategy else 10
@@ -652,7 +652,7 @@ def _regime_invalidation_reason(
             return "REVERSAL_STRUCTURE"
         if closed_bar_check_allowed and spot > vwap and last_n_closes_above(vwap, bars, n=2):
             return "VWAP_INVALIDATION"
-    elif strategy in {StrategyType.IRON_CONDOR, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE}:
+    elif strategy in {StrategyType.IRON_CONDOR, StrategyType.IRON_FLY, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE}:
         # Regime change is a live signal, not a bar check — fire immediately.
         if current_regime is not None and current_regime.regime != RegimeLabel.RANGE:
             return "RANGE_INVALIDATION"
