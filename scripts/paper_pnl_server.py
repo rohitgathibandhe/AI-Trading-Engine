@@ -2234,6 +2234,15 @@ def _live_leg_ltps(position_expiry: Optional[str] = None) -> Dict[float, Dict[st
         _open_leg_ltp_cache = out
         _open_leg_ltp_cache_ts = now
         _open_leg_ltp_cache_exp = exp
+        return out
+    # Fetch failed or came back empty — almost always a 429. The UI shares Dhan's 1-req/3s chain
+    # limit with the agent, and the throttle can't coordinate ACROSS processes, so the UI's poll
+    # gets rate-limited intermittently. Serve the last-known-good live prices for THIS expiry
+    # instead of returning {}. Returning {} makes the caller fall back to each leg's FROZEN entry
+    # quote, so the displayed P&L snaps to ~0 on every rate-limited poll — that is the flicker the
+    # user sees. Stale-but-real keeps the number steady; it refreshes on the next successful fetch.
+    if _open_leg_ltp_cache and _open_leg_ltp_cache_exp == exp:
+        return _open_leg_ltp_cache
     return out
 
 
