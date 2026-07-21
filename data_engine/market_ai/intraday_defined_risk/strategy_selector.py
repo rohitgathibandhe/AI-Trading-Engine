@@ -297,11 +297,20 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         _pv, _pv_why = _pinned_range_veto(metadata)
         if _pv:
             if _PIN_SELL and vol.regime != CHEAP_BUY:
-                choice.family, choice.structures = FAM_PREMIUM_SELL, ["IRON_CONDOR"]
+                # Tight pin (spot glued to the ATM) → IRON FLY: max premium at the pin, defined risk.
+                # Wider range → IRON CONDOR. Fly is best-first with condor as the build fallback.
+                _spot_to_pin = abs(_f(metadata, "spot_to_pin_pts", 999.0))
+                if _spot_to_pin <= 40.0:
+                    choice.structures = ["IRON_FLY", "IRON_CONDOR"]
+                    _lbl = f"IRON FLY at the pin (spot {_spot_to_pin:.0f}pt from ATM)"
+                else:
+                    choice.structures = ["IRON_CONDOR"]
+                    _lbl = "IRON CONDOR across the range"
+                choice.family = FAM_PREMIUM_SELL
                 choice.rationale = (
-                    f"PINNED LONG-GAMMA range → SELL defined-risk IRON CONDOR at the pin — harvest the "
-                    f"suppressed realized vol (vol={vol.regime}). [was {condition}; a directional debit "
-                    f"would bleed here: {_pv_why}]"
+                    f"PINNED LONG-GAMMA range → SELL defined-risk {_lbl} — harvest the suppressed "
+                    f"realized vol (vol={vol.regime}). [was {condition}; a directional debit would "
+                    f"bleed here: {_pv_why}]"
                 )
             else:
                 choice.family, choice.structures = FAM_STAND_ASIDE, []
