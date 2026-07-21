@@ -129,6 +129,17 @@ _PIN_VETO_EFF_MAX = _sel_env_float("SEL_PIN_VETO_EFF_MAX") or 0.40
 # FAILED_UP (a rejected upside break) is left as-is — it's itself a rejection signal. SEL_REQUIRE_ACCEPTED_BREAKOUT=0 disables.
 _REQUIRE_ACCEPTED_BREAKOUT = os.environ.get("SEL_REQUIRE_ACCEPTED_BREAKOUT", "1") == "1"
 
+# Core stance (NEW 2026-07-21, default ON): the agent's primary skill is OPTION SELLING, not buying.
+# A pinned long-gamma range (what _pinned_range_veto detects) is the BEST premium-sell condition —
+# dealers suppress realized vol, so a defined-risk iron condor at the pin harvests theta reliably.
+# So on that detection, instead of standing aside, SELL an iron condor at the pin — UNLESS premium is
+# genuinely cheap (vol regime CHEAP_BUY = implied under realized), in which case there's nothing worth
+# selling and we stand aside. This is deliberately independent of SEL_NO_CONDOR (which disabled the
+# generic sell-everywhere condor); this is the TARGETED sell only on days the greeks say vol is pinned.
+# Runs paper-on-live so the cost math is proven forward before it ever earns real money. SEL_PIN_SELL=0
+# reverts to stand-aside.
+_PIN_SELL = os.environ.get("SEL_PIN_SELL", "1") == "1"
+
 
 def _pinned_range_veto(m: dict[str, Any]) -> tuple[bool, str]:
     """True when the tape is a pinned long-gamma, low-efficiency range — where a directional debit
@@ -279,13 +290,23 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     choice.vol_regime = vol.regime
     choice.vol_notes = vol.notes
 
-    # VETO a directional trend/breakout debit in a pinned long-gamma range (see _pinned_range_veto).
-    # Applied before every mode so it holds on the live directional path and the seller/hybrid paths.
+    # Pinned long-gamma range detected (see _pinned_range_veto): DON'T buy a directional debit into it.
+    # Think like a SELLER — this is the best premium-harvest condition, so SELL a defined-risk iron
+    # condor at the pin (unless premium is cheap, then stand aside). Applied before every mode.
     if condition in (STRONG_TREND_UP, STRONG_TREND_DOWN, BREAKOUT_UP, BREAKOUT_DOWN):
         _pv, _pv_why = _pinned_range_veto(metadata)
         if _pv:
-            choice.family, choice.structures = FAM_STAND_ASIDE, []
-            choice.rationale = f"VETOED {condition}: {_pv_why}"
+            if _PIN_SELL and vol.regime != CHEAP_BUY:
+                choice.family, choice.structures = FAM_PREMIUM_SELL, ["IRON_CONDOR"]
+                choice.rationale = (
+                    f"PINNED LONG-GAMMA range → SELL defined-risk IRON CONDOR at the pin — harvest the "
+                    f"suppressed realized vol (vol={vol.regime}). [was {condition}; a directional debit "
+                    f"would bleed here: {_pv_why}]"
+                )
+            else:
+                choice.family, choice.structures = FAM_STAND_ASIDE, []
+                _why = "premium too cheap to sell (implied<realized)" if vol.regime == CHEAP_BUY else "pin-sell OFF"
+                choice.rationale = f"VETOED {condition} — stand aside ({_why}): {_pv_why}"
             return choice
 
     # Defined-risk SELLER / HYBRID modes — always-positioned premium selling matched to
