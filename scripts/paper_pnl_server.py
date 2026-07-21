@@ -2170,7 +2170,27 @@ def _live_leg_ltps() -> Dict[float, Dict[str, Any]]:
             os.environ["DHAN_CLIENT_ID"] = cid
             os.environ["DHAN_ACCESS_TOKEN"] = tok
         dw = DhanWrapper(logger=None)
-        exp = dw.get_optionchain_expirylist("IDX_I", INDEX_SECURITY_ID)[0]
+        # Mark against the front TRADEABLE expiry — the one the agent actually trades — not simply
+        # expirylist[0]. On a weekly-expiry day expirylist[0] is the series expiring TODAY (0 DTE),
+        # but the agent has already rolled to the next weekly; marking the open position's live LTP
+        # against the expiring chain while its entry was booked on the new front produced a nonsense
+        # Open MTM (e.g. entry on 07-28 vs LTP pulled from the expiring 07-21). Skip an expiry that
+        # expires today so entry and LTP come from the same series. (Fixed 2026-07-21.)
+        from datetime import date as _date
+        _exps = dw.get_optionchain_expirylist("IDX_I", INDEX_SECURITY_ID) or []
+        _today = _date.today()
+        exp = None
+        for _e in _exps:
+            try:
+                if _date.fromisoformat(str(_e)) > _today:
+                    exp = _e
+                    break
+            except (TypeError, ValueError):
+                continue
+        if exp is None:  # all expiries today/past or unparseable — fall back to nearest
+            exp = _exps[0] if _exps else None
+        if exp is None:
+            return {}
         raw = dw.get_option_chain(INDEX_SECURITY_ID, "IDX_I", exp)
         oc = ((((raw or {}).get("data") or {}).get("data")) or {}).get("oc") or {}
         for k, node in oc.items():
