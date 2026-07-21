@@ -472,21 +472,27 @@ class DhanLiveMarketDataProvider:
                 spot=spot,
             )
         expiry = str(self.config.get("expiry") or "") or self._cached_front_expiry(today)
-        # On post-expiry day (series ≤2 days old), OI in the new front-week chain is near-zero,
-        # silencing all option-chain pressure signals.  Load the next-week chain for OI signals.
-        oi_expiry = _oi_signal_expiry(
-            self._dw,
-            underlying_id=self.underlying_id,
-            underlying_seg=self.underlying_seg,
-            today=today,
-            front_expiry_str=expiry,
-        )
-        chain_raw = self._dw.get_option_chain(self.underlying_id, self.underlying_seg, oi_expiry)
+        # Build the TRADEABLE chain from the FRONT expiry — the one we price, select strikes from,
+        # and execute against. The snapshot is labeled with this same `expiry` below, so the prices
+        # and the label MUST come from the same series.
+        #
+        # BUG FIXED 2026-07-21: this previously fetched the chain with `oi_expiry` (the next-week
+        # series _oi_signal_expiry returns on post-roll days) while still labeling the snapshot as
+        # `expiry` (the front). So for the 1-2 days after every weekly expiry the agent PRICED,
+        # SELECTED and BOOKED trades off the wrong expiry — e.g. today a 07-28 spread was recorded
+        # with 08-04 premiums (24200 PUT booked at ~224 vs the real 07-28 ~171), which also made
+        # the UI's MTM meaningless (entry from one expiry, LTP from another). The substitution
+        # existed to dodge "near-zero OI" on a brand-new front series, but a normal ~7-DTE weekly
+        # front is deeply liquid (verified 07-28: 184M total OI, 6.7M on the ATM put), so it fixed
+        # a non-problem and corrupted real pricing. Price from the front; if the front chain is
+        # genuinely empty, `quotes` stays empty and the snapshot degrades to NO_TRADE below — the
+        # correct fail-safe, far better than trading a mislabeled expiry.
+        chain_raw = self._dw.get_option_chain(self.underlying_id, self.underlying_seg, expiry)
         chain_rows = _flatten_option_chain_payload(
             chain_raw,
             timestamp=now,
             decision_time=now.strftime("%H:%M"),
-            expiry=oi_expiry,
+            expiry=expiry,
         )
         quotes = [_quote_from_row(dict(row)) for row in chain_rows]
         quotes = [quote for quote in quotes if quote is not None]
@@ -497,7 +503,7 @@ class DhanLiveMarketDataProvider:
                 _log.warning(
                     "[option_chain] HEALTH ALERT: chain unavailable for %d consecutive polls "
                     "(expiry=%s, seg=%s). Check Dhan API connectivity and token validity.",
-                    self._chain_miss_streak, oi_expiry, self.underlying_seg,
+                    self._chain_miss_streak, expiry, self.underlying_seg,
                 )
             elif self._chain_miss_streak % 20 == 0:
                 _log.error(
