@@ -653,9 +653,20 @@ def _load_broker_live_positions() -> Dict[str, Any]:
                 }
             )
         else:
-            # closed leg today or still in book; compute realized from buy/sell avgs
+            # Closed leg — match the DHAN APP display: entry = costPrice (the position's average
+            # cost, which for a carry-forward short is the original sell/entry price), exit = the
+            # buy-back avg (buyAvg), and P&L = Dhan's own realizedProfit. The intraday buy/sell avgs
+            # alone reconcile to the P&L but do NOT match the app when there's a carry-forward cost
+            # basis — e.g. 24250 PE shorted a prior day at costPrice 111.34, covered today at buyAvg
+            # 71.39, realized +2431 (the app shows 111.34 / 71.39, not buyAvg 71.39 / sellAvg 77.63).
             if buy_qty > 0 and sell_qty > 0:
-                pnl_real = (sell_avg - buy_avg) * min(buy_qty, sell_qty)
+                fr = full_row if isinstance(full_row, dict) else {}
+                cost_price = _parse_float(fr.get("costPrice") or row.get("costPrice") or row.get("cost_price"), 0.0)
+                realized = _parse_float(
+                    fr.get("realizedProfit") or row.get("realizedProfit"),
+                    (sell_avg - buy_avg) * min(buy_qty, sell_qty),
+                )
+                buy_back = _parse_float(fr.get("buyAvg"), buy_avg)
                 closed.append(
                     {
                         "side": "FLAT",
@@ -663,9 +674,9 @@ def _load_broker_live_positions() -> Dict[str, Any]:
                         "expiry": expiry,
                         "sec_id": sec_id,
                         "qty": min(buy_qty, sell_qty),
-                        "entry": buy_avg,
-                        "exit": sell_avg,
-                        "pnl": pnl_real,
+                        "entry": cost_price or buy_avg,
+                        "exit": buy_back,
+                        "pnl": realized,
                         "timestamp": row.get("updateTime") or row.get("createTime") or "",
                     }
                 )
