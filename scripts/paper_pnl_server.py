@@ -3641,11 +3641,12 @@ def _build_live_positions_payload() -> Dict[str, Any]:
             dedup = {}
             for c in closed:
                 key = (str(c.get("sec_id")), c.get("strike"))
-                if key not in dedup:
+                if key not in dedup:  # sort above puts the FLAT row first, so it wins the key
                     dedup[key] = c
-            cleaned = list(dedup.values())
-            non_empty = [c for c in cleaned if c.get("expiry") not in (None, "", "0001-01-01")]
-            payload["closed"] = non_empty if non_empty else cleaned
+            # Only netted-out (side == FLAT) legs are genuinely CLOSED. The fills feed also carries
+            # the open-side SELL/BUY executions of still-OPEN positions; those must not show as
+            # closed (that inflated the count, e.g. 8 -> 11). Keep FLAT only, matching the Dhan app.
+            payload["closed"] = [c for c in dedup.values() if str(c.get("side") or "").upper() == "FLAT"]
     except Exception:
         pass
     return payload
