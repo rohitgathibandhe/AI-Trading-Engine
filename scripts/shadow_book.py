@@ -103,6 +103,124 @@ def _credit_spread(entry_rows, exit_rows, side):
             "pnl_rupees": round(pnl), }
 
 
+def _debit_spread(entry_rows, exit_rows, side):
+    """Directional DEBIT: BUY near-ATM (~0.45 delta) + SELL further OTM (~0.25 delta). side 'pe' =
+    bearish put-debit, 'ce' = bullish call-debit. Real fills: buy@ask / sell@bid, reverse on exit."""
+    lp = _pick(entry_rows, side, 0.45)   # long leg (buy), near ATM
+    sp = _pick(entry_rows, side, 0.25)   # short leg (sell), further OTM
+    if not lp or not sp:
+        return None
+    lk, lv = lp; sk, sv = sp
+    if not (lv.get("ask") and sv.get("bid")):
+        return None
+    debit = lv["ask"] - sv["bid"]
+    if debit <= 0:
+        return None
+    ex_l = (exit_rows.get(lk) or {}).get(side) or {}
+    ex_s = (exit_rows.get(sk) or {}).get(side) or {}
+    if ex_l.get("bid") is None or ex_s.get("ask") is None:
+        return None
+    exit_val = ex_l["bid"] - ex_s["ask"]                    # close: sell long @ bid, buy short @ ask
+    fees = VERTICAL_FILLS * FEE_PTS_PER_FILL
+    pnl = (exit_val - debit - fees) * LOT
+    return {"long": lk, "short": sk, "debit_pts": round(debit, 2),
+            "exit_val_pts": round(exit_val, 2), "fees_pts": round(fees, 2), "pnl_rupees": round(pnl)}
+
+
+def _iron_fly(entry_rows, exit_rows, spot_e, wing=200.0):
+    """SELL ATM straddle + BUY ~wing-pt OTM wings (defined risk). Real fills."""
+    if not entry_rows:
+        return None
+    atm = min(entry_rows.keys(), key=lambda k: abs(k - spot_e))
+    lc_k = min(entry_rows.keys(), key=lambda k: abs(k - (atm + wing)))
+    lp_k = min(entry_rows.keys(), key=lambda k: abs(k - (atm - wing)))
+    sc = entry_rows[atm].get("ce") or {}; sp = entry_rows[atm].get("pe") or {}
+    wc = entry_rows[lc_k].get("ce") or {}; wp = entry_rows[lp_k].get("pe") or {}
+    if not (sc.get("bid") and sp.get("bid") and wc.get("ask") and wp.get("ask")):
+        return None
+    credit = (sc["bid"] + sp["bid"]) - (wc["ask"] + wp["ask"])   # sell straddle@bid, buy wings@ask
+    if credit <= 0 or not (lp_k < atm < lc_k):
+        return None
+    xc = (exit_rows.get(atm) or {}).get("ce") or {}; xp = (exit_rows.get(atm) or {}).get("pe") or {}
+    xwc = (exit_rows.get(lc_k) or {}).get("ce") or {}; xwp = (exit_rows.get(lp_k) or {}).get("pe") or {}
+    if not (xc.get("ask") and xp.get("ask")) or xwc.get("bid") is None or xwp.get("bid") is None:
+        return None
+    close_cost = (xc["ask"] + xp["ask"]) - (xwc["bid"] + xwp["bid"])
+    fees = 8 * FEE_PTS_PER_FILL                             # 4 legs round-trip
+    pnl = (credit - close_cost - fees) * LOT
+    return {"short_atm": atm, "wings": [lp_k, lc_k], "credit_pts": round(credit, 2),
+            "close_cost_pts": round(close_cost, 2), "fees_pts": round(fees, 2), "pnl_rupees": round(pnl)}
+
+
+def _short_2leg(entry_rows, exit_rows, *, atm_spot=None, delta=0.15):
+    """Naked short: SELL a call + a put. atm_spot set => SHORT STRADDLE (ATM); else SHORT STRANGLE
+    (~delta OTM each side). Real fills: sell@bid, buy back@ask. NOTE: naked (undefined risk)."""
+    if atm_spot is not None:
+        if not entry_rows:
+            return None
+        ck = pk = min(entry_rows.keys(), key=lambda k: abs(k - atm_spot))
+        cv = entry_rows[ck].get("ce") or {}; pv = entry_rows[pk].get("pe") or {}
+    else:
+        sc = _pick(entry_rows, "ce", delta); spu = _pick(entry_rows, "pe", delta)
+        if not sc or not spu:
+            return None
+        ck, cv = sc; pk, pv = spu
+    if not (cv.get("bid") and pv.get("bid")):
+        return None
+    credit = cv["bid"] + pv["bid"]
+    xc = (exit_rows.get(ck) or {}).get("ce") or {}; xp = (exit_rows.get(pk) or {}).get("pe") or {}
+    if not (xc.get("ask") and xp.get("ask")):
+        return None
+    close_cost = xc["ask"] + xp["ask"]
+    fees = 4 * FEE_PTS_PER_FILL                             # 2 legs round-trip
+    pnl = (credit - close_cost - fees) * LOT
+    return {"short_call": ck, "short_put": pk, "credit_pts": round(credit, 2),
+            "close_cost_pts": round(close_cost, 2), "fees_pts": round(fees, 2), "pnl_rupees": round(pnl)}
+
+
+# Precondition fields to stamp on each row — the FEATURES the matrix selects on. Joining these to the
+# per-structure P&L is the labelled dataset for learning `preconditions -> which strategy wins`.
+_PRECOND_KEYS = [
+    "gex_regime", "pin_risk_active", "spot_to_pin_pts", "gamma_concentration", "trend_efficiency_ratio",
+    "vol_regime", "option_chain_pressure_state", "range_balance_score", "range_penalty_score",
+    "bullish_trend_quality_score", "bearish_trend_quality_score", "put_support_strike",
+    "call_resistance_strike", "opening_range_break_state", "accepted_breakout", "inside_opening_range",
+    "smart_money_bias", "oi_pressure_bias", "overhead_call_pressure_score", "india_vix",
+    "expected_move_pts", "daily_trend", "opening_gap_pct",
+]
+
+
+def _preconditions_for(day: str, entry_time: str) -> dict:
+    """The agent's precondition vector nearest the shadow ENTRY time — pulled from the decision log,
+    which stamps full metadata every cycle. This is what the day 'looked like' when the trade opened."""
+    log = STATE / "intraday_v83_runner.log"
+    if not log.exists():
+        return {}
+    try:
+        et = datetime.strptime(entry_time, "%H:%M:%S")
+    except ValueError:
+        return {}
+    best, best_gap = {}, 1e9
+    for line in log.read_text(errors="ignore").splitlines():
+        if day not in line or '"day_archetype"' not in line:
+            continue
+        try:
+            d = json.loads(line[line.index("{"):])
+        except (ValueError, json.JSONDecodeError):
+            continue
+        t = str(d.get("emitted_at") or "")[11:19]
+        try:
+            gap = abs((datetime.strptime(t, "%H:%M:%S") - et).total_seconds())
+        except ValueError:
+            continue
+        if gap < best_gap:
+            md = d.get("metadata") or {}
+            best_gap = gap
+            best = {k: md.get(k) for k in _PRECOND_KEYS if k in md}
+            best["_decision_time"] = t
+    return best
+
+
 def main() -> int:
     now = datetime.now(IST)
     day = now.strftime("%Y-%m-%d")
@@ -128,31 +246,49 @@ def main() -> int:
     move_pct = (spot_x - spot_e) / spot_e * 100 if spot_e else 0.0
     realized = "UP" if move_pct >= 0.3 else "DOWN" if move_pct <= -0.3 else "RANGE"
 
-    bull_put = _credit_spread(rows_e, rows_x, "pe")   # profits up/sideways
-    bear_call = _credit_spread(rows_e, rows_x, "ce")  # profits down/sideways
+    # ── The full structure menu, each at REAL fills + fees (see helpers) ──────────────────────
+    bull_put = _credit_spread(rows_e, rows_x, "pe")   # sell puts — profits up/sideways
+    bear_call = _credit_spread(rows_e, rows_x, "ce")  # sell calls — profits down/sideways
     condor = None
     if bull_put and bear_call:
-        # a condor is the two verticals; its costs are the SUM of theirs (each already net of
-        # spread + fees). Surface combined close_cost/fees so the retrospective shows real numbers,
-        # not None — a None here is what first read as "no cost model" (2026-07-21).
         condor = {"pnl_rupees": bull_put["pnl_rupees"] + bear_call["pnl_rupees"],
                   "credit_pts": round(bull_put["credit_pts"] + bear_call["credit_pts"], 2),
                   "close_cost_pts": round(bull_put["close_cost_pts"] + bear_call["close_cost_pts"], 2),
                   "fees_pts": round(bull_put["fees_pts"] + bear_call["fees_pts"], 2)}
+    structures = {
+        "bull_put": bull_put,
+        "bear_call": bear_call,
+        "iron_condor": condor,
+        "put_debit": _debit_spread(rows_e, rows_x, "pe"),    # buy puts — bearish
+        "call_debit": _debit_spread(rows_e, rows_x, "ce"),   # buy calls — bullish
+        "iron_fly": _iron_fly(rows_e, rows_x, spot_e),       # sell ATM straddle + wings (defined)
+        "short_strangle": _short_2leg(rows_e, rows_x, delta=0.15),          # naked
+        "short_straddle": _short_2leg(rows_e, rows_x, atm_spot=spot_e),     # naked
+    }
+
+    # ── The FEATURES the day looked like at entry — the label side is the per-structure P&L above ─
+    preconditions = _preconditions_for(day, te)
 
     record = {
         "date": day, "entry_time": te, "exit_time": tx,
         "spot_entry": round(spot_e, 1), "spot_exit": round(spot_x, 1),
         "day_move_pct": round(move_pct, 2), "realized_regime": realized,
         "snapshots": len(snaps),
+        "preconditions": preconditions,          # FEATURES (the matrix selects on these)
+        "structures": structures,                # LABELS (what each structure actually made, real fills)
+        # legacy top-level keys kept so the existing retrospective still reads them
         "bull_put": bull_put, "bear_call": bear_call, "iron_condor": condor,
     }
     out = STATE / "shadow_book.jsonl"
     with out.open("a") as f:
         f.write(json.dumps(record) + "\n")
+
     def _p(x): return f"{x['pnl_rupees']:+,}" if x else "n/a"
-    print(f"[shadow] {day} {realized} ({move_pct:+.2f}%) | bull_put {_p(bull_put)} | "
-          f"bear_call {_p(bear_call)} | condor {_p(condor)} -> {out}")
+    parts = " | ".join(f"{k} {_p(v)}" for k, v in structures.items())
+    print(f"[shadow] {day} {realized} ({move_pct:+.2f}%) | {parts}")
+    print(f"[shadow]   preconditions: gex={preconditions.get('gex_regime')} "
+          f"pin={preconditions.get('pin_risk_active')} vol={preconditions.get('vol_regime')} "
+          f"eff={preconditions.get('trend_efficiency_ratio')} -> {out}")
     return 0
 
 
