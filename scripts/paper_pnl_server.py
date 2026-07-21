@@ -662,27 +662,41 @@ def _load_broker_live_positions() -> Dict[str, Any]:
             if buy_qty > 0 and sell_qty > 0:
                 fr = full_row if isinstance(full_row, dict) else {}
                 cost_price = _parse_float(fr.get("costPrice") or row.get("costPrice") or row.get("cost_price"), 0.0)
-                realized = _parse_float(
-                    fr.get("realizedProfit") or row.get("realizedProfit"),
-                    (sell_avg - buy_avg) * min(buy_qty, sell_qty),
-                )
-                buy_back = _parse_float(fr.get("buyAvg"), buy_avg)
-                _cqty = min(buy_qty, sell_qty)
-                # Match the Dhan APP's displayed P&L, which is derived from the entry/exit it shows —
-                # (costPrice - buy-back) * qty — NOT Dhan's separate realizedProfit field. E.g. 24250
-                # PE: (111.34 - 71.39) * 390 = 15,580 (the app), vs realizedProfit 2,431. For these
-                # short premium legs cost>buyback => profit. Fall back to realizedProfit if no cost.
-                entry_px = cost_price or buy_avg
-                app_pnl = (entry_px - buy_back) * _cqty if cost_price else realized
+                f_buy = _parse_float(fr.get("buyAvg"), buy_avg)
+                f_sell = _parse_float(fr.get("sellAvg"), sell_avg)
+                day_buy = _parse_int(fr.get("dayBuyQty"), 0)
+                day_sell = _parse_int(fr.get("daySellQty"), 0)
+                cqty = min(buy_qty, sell_qty)
+                realized = _parse_float(fr.get("realizedProfit") or row.get("realizedProfit"),
+                                        (f_sell - f_buy) * cqty)
+                # Match the Dhan APP's displayed entry/exit/P&L, which it derives from the position's
+                # DIRECTION — not from its realizedProfit field. A carry-forward LONG is closed today
+                # by SELLING (daySell > dayBuy); a SHORT by BUYING (dayBuy > daySell). On a tie
+                # (intraday round-trip) fall back to whether costPrice sits nearer the sell or buy avg.
+                #   LONG : entry=costPrice(buy),  exit=sellAvg, P&L=(sell-cost)*qty
+                #   SHORT: entry=costPrice(sell), exit=buyAvg,  P&L=(cost-buy)*qty
+                # e.g. 24250 PE SHORT (111.34-71.39)*390=+15,580; 23150 PE LONG (0.60-3.45)*195=-555.75.
+                if day_buy != day_sell:
+                    is_short = day_buy > day_sell
+                else:
+                    ref = cost_price or f_buy
+                    is_short = abs(ref - f_sell) < abs(ref - f_buy)
+                entry_px = cost_price or (f_sell if is_short else f_buy)
+                if is_short:
+                    exit_px = f_buy
+                    app_pnl = (entry_px - exit_px) * cqty
+                else:
+                    exit_px = f_sell
+                    app_pnl = (exit_px - entry_px) * cqty
                 closed.append(
                     {
                         "side": "FLAT",
                         "strike": strike,
                         "expiry": expiry,
                         "sec_id": sec_id,
-                        "qty": _cqty,
+                        "qty": cqty,
                         "entry": entry_px,
-                        "exit": buy_back,
+                        "exit": exit_px,
                         "pnl": app_pnl,
                         "realized_profit": realized,   # Dhan's own realized field, kept for reference
                         "timestamp": row.get("updateTime") or row.get("createTime") or "",
