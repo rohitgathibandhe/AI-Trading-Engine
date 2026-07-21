@@ -3592,6 +3592,89 @@ _paper_positions_cache_ts: float = 0.0
 _paper_positions_rebuild_lock = threading.Lock()
 _PAPER_POSITIONS_TTL = 3.0
 
+# /api/live_positions makes THREE synchronous broker fetches (blotter LTP enrichment, broker open
+# positions, broker executions). In paper mode there are no broker positions, so these just time
+# out/retry — measured 20-37s — and the Live Trades tab's Promise.all waits for the whole thing.
+# Stale-while-revalidate: the endpoint returns the cached payload INSTANTLY and kicks the (slow)
+# rebuild onto a background thread, so the tab never blocks. First load shows "loading" until the
+# first rebuild lands.
+_live_positions_cache: Optional[Dict[str, Any]] = None
+_live_positions_cache_ts: float = 0.0
+_live_positions_rebuilding = False
+_live_positions_lock = threading.Lock()
+_LIVE_POSITIONS_TTL = 10.0
+
+
+def _build_live_positions_payload() -> Dict[str, Any]:
+    """The expensive live/broker positions build — runs only on the background refresh thread."""
+    # Paper mode (live-arm OFF) has NO broker positions. Skip the broker/blotter fetches entirely:
+    # they'd just time out and retry (~37s) AND hammer the same Dhan/broker API the agent needs
+    # (risking 429s). Return the same empty result, instantly. Only a genuinely live-armed run does
+    # the real broker fetch below.
+    try:
+        cfg = _json_read(STATE_DIR / "intraday_v83_runtime_config.json") or {}
+        if str(cfg.get("mode") or "").upper() != "MICRO_LIVE" or not cfg.get("live_arm"):
+            return {"positions": [], "closed": [], "total_pnl": 0.0, "source": "paper_no_broker"}
+    except Exception:
+        pass
+    local_payload = load_positions(BLOTTER_CSV, mode="live")
+    payload = local_payload
+    broker_payload = _load_broker_live_positions()
+    if isinstance(broker_payload, dict) and str(broker_payload.get("source") or "") == "broker":
+        payload = {
+            "positions": broker_payload.get("positions", []) or [],
+            "closed": broker_payload.get("closed", []) or [],
+            "total_pnl": broker_payload.get("total_pnl", 0.0) or 0.0,
+            "as_of": broker_payload.get("as_of"),
+            "blotter_tail": local_payload.get("blotter_tail", []) if isinstance(local_payload, dict) else [],
+            "source": "broker",
+            "margin_available": broker_payload.get("margin_available"),
+            "margin_used": broker_payload.get("margin_used"),
+        }
+    elif not payload.get("positions") and broker_payload:
+        payload = broker_payload
+    else:
+        if broker_payload and broker_payload.get("closed"):
+            closed = payload.get("closed", []) or []
+            closed.extend(broker_payload.get("closed", []))
+            payload["closed"] = closed
+    # Also surface today's broker executions as closed rows (legacy)
+    try:
+        trades = _load_broker_trades_today()
+        if trades:
+            closed = payload.get("closed", []) or []
+            closed.extend(trades)
+            closed.sort(key=lambda c: (
+                c.get("expiry") not in (None, "", "0001-01-01"),
+                c.get("entry") is not None and c.get("exit") is not None,
+                c.get("side") == "FLAT"
+            ), reverse=True)
+            dedup = {}
+            for c in closed:
+                key = (str(c.get("sec_id")), c.get("strike"))
+                if key not in dedup:
+                    dedup[key] = c
+            cleaned = [c for c in dedup.values() if c.get("side") == "FLAT"]
+            non_empty = [c for c in cleaned if c.get("expiry") not in (None, "", "0001-01-01")]
+            if non_empty:
+                cleaned = non_empty
+            payload["closed"] = cleaned
+    except Exception:
+        pass
+    return payload
+
+
+def _live_positions_bg_rebuild() -> None:
+    global _live_positions_cache, _live_positions_cache_ts, _live_positions_rebuilding
+    try:
+        payload = _build_live_positions_payload()
+        _live_positions_cache = payload
+        _live_positions_cache_ts = time.time()
+    except Exception:
+        pass
+    finally:
+        _live_positions_rebuilding = False
+
 
 def _load_v83_ops_status() -> Dict[str, Any]:
     global _v83_ops_cache, _v83_ops_cache_ts
@@ -4602,57 +4685,25 @@ class PaperHandler(SimpleHTTPRequestHandler):
             return
         if self.path.startswith("/api/live_positions"):
             try:
-                local_payload = load_positions(BLOTTER_CSV, mode="live")
-                payload = local_payload
-                broker_payload = _load_broker_live_positions()
-                # In live mode, broker open positions are the source of truth when available.
-                # Local blotter/journal can lag or be stale after manual intervention/imports.
-                if isinstance(broker_payload, dict) and str(broker_payload.get("source") or "") == "broker":
-                    payload = {
-                        "positions": broker_payload.get("positions", []) or [],
-                        "closed": broker_payload.get("closed", []) or [],
-                        "total_pnl": broker_payload.get("total_pnl", 0.0) or 0.0,
-                        "as_of": broker_payload.get("as_of"),
-                        "blotter_tail": local_payload.get("blotter_tail", []) if isinstance(local_payload, dict) else [],
-                        "source": "broker",
-                        "margin_available": broker_payload.get("margin_available"),
-                        "margin_used": broker_payload.get("margin_used"),
-                    }
-                elif not payload.get("positions") and broker_payload:
-                    payload = broker_payload
-                else:
-                    # Broker unavailable: keep local payload. If broker closed rows exist from partial payload, merge them.
-                    if broker_payload and broker_payload.get("closed"):
-                        closed = payload.get("closed", []) or []
-                        closed.extend(broker_payload.get("closed", []))
-                        payload["closed"] = closed
-    # Also surface today's broker executions as closed rows (legacy)
-                try:
-                    trades = _load_broker_trades_today()
-                    if trades:
-                        closed = payload.get("closed", []) or []
-                        closed.extend(trades)
-                        # de-dupe prefer rows with expiry and entry
-                        closed.sort(key=lambda c: (
-                            c.get("expiry") not in (None, "", "0001-01-01"),
-                            c.get("entry") is not None and c.get("exit") is not None,
-                            c.get("side") == "FLAT"
-                        ), reverse=True)
-                        dedup = {}
-                        for c in closed:
-                            key = (str(c.get("sec_id")), c.get("strike"))
-                            if key in dedup:
-                                continue
-                            dedup[key] = c
-                        cleaned = list(dedup.values())
-                        cleaned = [c for c in cleaned if c.get("side") == "FLAT"]
-                        non_empty = [c for c in cleaned if c.get("expiry") not in (None, "", "0001-01-01")]
-                        if non_empty:
-                            cleaned = non_empty
-                        payload["closed"] = cleaned
-                except Exception:
-                    pass
-                self._send_json(payload)
+                global _live_positions_rebuilding
+                _now = time.time()
+                fresh = (
+                    _live_positions_cache is not None
+                    and (_now - _live_positions_cache_ts) < _LIVE_POSITIONS_TTL
+                )
+                # Stale (or never built) → kick a background rebuild, but DON'T wait for it.
+                if not fresh and not _live_positions_rebuilding:
+                    with _live_positions_lock:
+                        if not _live_positions_rebuilding:
+                            _live_positions_rebuilding = True
+                            threading.Thread(
+                                target=_live_positions_bg_rebuild, daemon=True, name="live-positions"
+                            ).start()
+                # Serve whatever we have RIGHT NOW — never block the Live Trades tab on the broker.
+                self._send_json(
+                    _live_positions_cache
+                    or {"positions": [], "closed": [], "total_pnl": 0.0, "source": "loading"}
+                )
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return
