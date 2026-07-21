@@ -27,6 +27,19 @@ LOT = 75
 ENTRY_AFTER = "09:30"   # let the opening range form
 MARK_BY = "15:20"
 
+# Transaction cost per FILL, in index points, on top of the bid/ask spread (which is already
+# modelled via sell@bid / buy@ask). The bid/ask captures slippage; this captures the fee stack
+# the exchange/broker take, which the spread does NOT include and which was silently zero before
+# (2026-07-21). For ONE lot (75) of Nifty weekly options a round-trip fill is dominated by flat
+# brokerage (~Rs20/order), plus STT (0.0625% sell premium), exchange txn (~0.035%), GST (18% on
+# brokerage+txn), SEBI + stamp. All-in that lands near Rs20-27 per fill ≈ 0.30-0.36 pts at LOT=75;
+# we take a deliberately conservative 0.35. It is per-fill, so a 2-leg vertical marked out intraday
+# pays it 4x (enter short+long, exit short+long) and a condor pays it 8x. NOTE: this is scale-
+# sensitive — flat brokerage means more lots would lower the per-lot points cost; the shadow book
+# is 1 lot, so 0.35 is right for THIS ledger and would be pessimistic for a larger book.
+FEE_PTS_PER_FILL = 0.35
+VERTICAL_FILLS = 4   # short+long entered, short+long exited (intraday mark-out, not expiry)
+
 
 def _parse_snapshot(rec):
     oc = (((rec.get("response") or {}).get("data") or {}).get("data") or {})
@@ -83,9 +96,11 @@ def _credit_spread(entry_rows, exit_rows, side):
     if not ex_s.get("ask") or ex_l.get("bid") is None:
         return None
     close_cost = ex_s["ask"] - ex_l["bid"]
-    pnl = (credit - close_cost) * LOT
+    fees = VERTICAL_FILLS * FEE_PTS_PER_FILL   # brokerage/STT/exch/GST the bid/ask does NOT include
+    pnl = (credit - close_cost - fees) * LOT
     return {"short": sk, "long": lk, "credit_pts": round(credit, 2),
-            "close_cost_pts": round(close_cost, 2), "pnl_rupees": round(pnl), }
+            "close_cost_pts": round(close_cost, 2), "fees_pts": round(fees, 2),
+            "pnl_rupees": round(pnl), }
 
 
 def main() -> int:
@@ -117,8 +132,13 @@ def main() -> int:
     bear_call = _credit_spread(rows_e, rows_x, "ce")  # profits down/sideways
     condor = None
     if bull_put and bear_call:
+        # a condor is the two verticals; its costs are the SUM of theirs (each already net of
+        # spread + fees). Surface combined close_cost/fees so the retrospective shows real numbers,
+        # not None — a None here is what first read as "no cost model" (2026-07-21).
         condor = {"pnl_rupees": bull_put["pnl_rupees"] + bear_call["pnl_rupees"],
-                  "credit_pts": round(bull_put["credit_pts"] + bear_call["credit_pts"], 2)}
+                  "credit_pts": round(bull_put["credit_pts"] + bear_call["credit_pts"], 2),
+                  "close_cost_pts": round(bull_put["close_cost_pts"] + bear_call["close_cost_pts"], 2),
+                  "fees_pts": round(bull_put["fees_pts"] + bear_call["fees_pts"], 2)}
 
     record = {
         "date": day, "entry_time": te, "exit_time": tx,
