@@ -2144,10 +2144,88 @@ def _load_intraday_trade_history(limit: Optional[int] = None) -> List[Dict[str, 
     return rows
 
 
+import threading  # noqa: E402  (local: used only by the live-price refresher below)
+
 _open_leg_ltp_cache: Dict[float, Dict[str, Any]] = {}
 _open_leg_ltp_cache_ts: float = 0.0
 _open_leg_ltp_cache_exp: Optional[str] = None  # which expiry the cache is for (invalidate on change)
 _OPEN_LEG_LTP_TTL = 3.0   # Dhan chain is ~1 req/3s; 3s is the floor for the fast poller
+
+# Background live-price refresher. The Dhan chain fetch can BLOCK for seconds (the 1-req/3s
+# throttle, or up to 90s on a 429 cooldown), so doing it inline made /api/open_position_live stall
+# ~2.5s every time the 3s cache expired — the UI lag the user reported. Instead a single daemon
+# thread refreshes the cache continuously and the endpoint just reads it (always instant).
+_ltp_refresher_thread: Optional[threading.Thread] = None
+_ltp_refresher_lock = threading.Lock()
+_ltp_wanted_exp: Optional[str] = None   # requested by the endpoint; None => resolve front tradeable
+_ltp_wanted_at: float = 0.0             # last time the endpoint asked (thread idles when stale)
+_open_leg_spot: Optional[float] = None  # underlying spot from the same chain fetch (cheap for the UI)
+
+
+def _resolve_front_tradeable_expiry(dw) -> Optional[str]:
+    """First expiry AFTER today — the front weekly the agent trades (skips a 0-DTE series on roll day)."""
+    from datetime import date as _date
+    try:
+        exps = dw.get_optionchain_expirylist("IDX_I", INDEX_SECURITY_ID) or []
+    except Exception:
+        return None
+    today = _date.today()
+    for e in exps:
+        try:
+            if _date.fromisoformat(str(e)) > today:
+                return str(e)
+        except (TypeError, ValueError):
+            continue
+    return str(exps[0]) if exps else None
+
+
+def _ltp_refresher_loop() -> None:
+    """Daemon: keep _open_leg_ltp_cache fresh for the currently-wanted expiry. ALL the slow/blocking
+    Dhan work lives here, off the request path, so the endpoint never waits."""
+    global _open_leg_ltp_cache, _open_leg_ltp_cache_ts, _open_leg_ltp_cache_exp, _open_leg_spot
+    dw = None
+    while True:
+        try:
+            if (time.time() - _ltp_wanted_at) > 60:  # nobody viewed the position in 60s → idle
+                time.sleep(2)
+                continue
+            if dw is None:
+                from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
+                creds = _json_read(CREDS_FILE)
+                if isinstance(creds, dict):
+                    cid = (creds.get("client_id") or "").strip()
+                    tok = (creds.get("access_token") or "").strip()
+                    if cid and tok:
+                        os.environ["DHAN_CLIENT_ID"] = cid
+                        os.environ["DHAN_ACCESS_TOKEN"] = tok
+                dw = DhanWrapper(logger=None)
+            exp = _ltp_wanted_exp or _resolve_front_tradeable_expiry(dw)
+            if exp:
+                raw = dw.get_option_chain(INDEX_SECURITY_ID, "IDX_I", exp)
+                _dd = ((((raw or {}).get("data") or {}).get("data")) or {})
+                oc = _dd.get("oc") or {}
+                out: Dict[float, Dict[str, Any]] = {}
+                for k, node in oc.items():
+                    try:
+                        sk = round(float(k), 2)
+                    except (TypeError, ValueError):
+                        continue
+                    ce = (node.get("ce") or {}).get("last_price")
+                    pe = (node.get("pe") or {}).get("last_price")
+                    out[sk] = {"CALL": ce, "CE": ce, "PUT": pe, "PE": pe}
+                if out:  # rebind (atomic); readers never see a half-built dict
+                    _open_leg_ltp_cache = out
+                    _open_leg_ltp_cache_ts = time.time()
+                    _open_leg_ltp_cache_exp = exp
+                    try:
+                        _sp = _dd.get("last_price")
+                        if _sp:
+                            _open_leg_spot = float(_sp)
+                    except (TypeError, ValueError):
+                        pass
+        except Exception:
+            pass
+        time.sleep(_OPEN_LEG_LTP_TTL)
 
 
 def _live_leg_ltps(position_expiry: Optional[str] = None) -> Dict[float, Dict[str, Any]]:
@@ -2161,11 +2239,9 @@ def _live_leg_ltps(position_expiry: Optional[str] = None) -> Dict[float, Dict[st
     on — so entry and LTP always agree. When absent (older positions with no stamped expiry) it
     falls back to the front TRADEABLE weekly (skipping a series expiring today on roll days).
     """
-    global _open_leg_ltp_cache, _open_leg_ltp_cache_ts, _open_leg_ltp_cache_exp
     from datetime import date as _date
-    now = time.time()
+    global _ltp_refresher_thread, _ltp_wanted_exp, _ltp_wanted_at
 
-    # Resolve the target expiry up front when the position told us; avoids an extra expirylist call.
     exp: Optional[str] = None
     if position_expiry:
         try:
@@ -2174,76 +2250,27 @@ def _live_leg_ltps(position_expiry: Optional[str] = None) -> Dict[float, Dict[st
         except (TypeError, ValueError):
             exp = None
 
-    # Cache is valid only for the SAME expiry (a roll would otherwise serve stale prices).
-    if (
-        exp is not None
-        and _open_leg_ltp_cache
-        and _open_leg_ltp_cache_exp == exp
-        and (now - _open_leg_ltp_cache_ts) < _OPEN_LEG_LTP_TTL
-    ):
-        return _open_leg_ltp_cache
+    # Tell the background refresher which expiry to keep warm, and note that someone's watching.
+    _ltp_wanted_exp = exp
+    _ltp_wanted_at = time.time()
 
-    out: Dict[float, Dict[str, Any]] = {}
-    try:
-        from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
-        creds = _json_read(CREDS_FILE)
-        cid = (creds.get("client_id") or "").strip() if isinstance(creds, dict) else ""
-        tok = (creds.get("access_token") or "").strip() if isinstance(creds, dict) else ""
-        if cid and tok:
-            os.environ["DHAN_CLIENT_ID"] = cid
-            os.environ["DHAN_ACCESS_TOKEN"] = tok
-        dw = DhanWrapper(logger=None)
-        if exp is None:
-            # No stamped expiry: mark against the front TRADEABLE weekly — NOT simply expirylist[0].
-            # On a weekly-expiry day expirylist[0] is the series expiring TODAY (0 DTE) while the
-            # agent has already rolled to the next weekly; marking the open position's LTP against
-            # the expiring chain produced a nonsense Open MTM. Skip a series expiring today.
-            _exps = dw.get_optionchain_expirylist("IDX_I", INDEX_SECURITY_ID) or []
-            _today = _date.today()
-            for _e in _exps:
-                try:
-                    if _date.fromisoformat(str(_e)) > _today:
-                        exp = str(_e)
-                        break
-                except (TypeError, ValueError):
-                    continue
-            if exp is None:  # all expiries today/past or unparseable — fall back to nearest
-                exp = str(_exps[0]) if _exps else None
-        if exp is None:
-            return {}
-        # Re-check cache now that a heuristic expiry is resolved (avoids a redundant chain fetch).
-        if (
-            _open_leg_ltp_cache
-            and _open_leg_ltp_cache_exp == exp
-            and (now - _open_leg_ltp_cache_ts) < _OPEN_LEG_LTP_TTL
-        ):
-            return _open_leg_ltp_cache
-        raw = dw.get_option_chain(INDEX_SECURITY_ID, "IDX_I", exp)
-        oc = ((((raw or {}).get("data") or {}).get("data")) or {}).get("oc") or {}
-        for k, node in oc.items():
-            try:
-                sk = round(float(k), 2)
-            except (TypeError, ValueError):
-                continue
-            ce = (node.get("ce") or {}).get("last_price")
-            pe = (node.get("pe") or {}).get("last_price")
-            out[sk] = {"CALL": ce, "CE": ce, "PUT": pe, "PE": pe}
-    except Exception:
-        out = {}
-    if out:
-        _open_leg_ltp_cache = out
-        _open_leg_ltp_cache_ts = now
-        _open_leg_ltp_cache_exp = exp
-        return out
-    # Fetch failed or came back empty — almost always a 429. The UI shares Dhan's 1-req/3s chain
-    # limit with the agent, and the throttle can't coordinate ACROSS processes, so the UI's poll
-    # gets rate-limited intermittently. Serve the last-known-good live prices for THIS expiry
-    # instead of returning {}. Returning {} makes the caller fall back to each leg's FROZEN entry
-    # quote, so the displayed P&L snaps to ~0 on every rate-limited poll — that is the flicker the
-    # user sees. Stale-but-real keeps the number steady; it refreshes on the next successful fetch.
-    if _open_leg_ltp_cache and _open_leg_ltp_cache_exp == exp:
+    # Lazily start the single daemon refresher (double-checked under a lock).
+    if _ltp_refresher_thread is None or not _ltp_refresher_thread.is_alive():
+        with _ltp_refresher_lock:
+            if _ltp_refresher_thread is None or not _ltp_refresher_thread.is_alive():
+                _ltp_refresher_thread = threading.Thread(
+                    target=_ltp_refresher_loop, daemon=True, name="ltp-refresher"
+                )
+                _ltp_refresher_thread.start()
+
+    # Return the refresher's latest cache INSTANTLY — never block the request on Dhan. When a
+    # position stamped a specific expiry, only serve the cache if it's for that same series; for
+    # the heuristic (unstamped) path serve whatever the refresher last fetched. Empty only until
+    # the first refresh lands (a few seconds on first load), during which the caller shows the
+    # frozen entry quote.
+    if _open_leg_ltp_cache and (exp is None or _open_leg_ltp_cache_exp == exp):
         return _open_leg_ltp_cache
-    return out
+    return {}
 
 
 def _build_v83_open_position_payload() -> Dict[str, Any]:
@@ -3555,6 +3582,16 @@ _secondary_pnl_cache: Dict[str, Any] = {}
 _secondary_pnl_cache_ts: float = 0.0
 _SECONDARY_PNL_CACHE_TTL = 60.0
 
+# /api/paper_positions rebuilds a HEAVY payload (incl. load_positions -> synchronous Dhan fetches
+# that block up to a 429 cooldown → 6-22s observed). Serve-stale-while-rebuilding cache: rapid
+# polls return instantly from cache; only ONE thread rebuilds at a time while the rest serve the
+# last payload, so slow rebuilds never pile up or block the UI. Live P&L still comes fresh from
+# the fast /api/open_position_live.
+_paper_positions_cache: Optional[Dict[str, Any]] = None
+_paper_positions_cache_ts: float = 0.0
+_paper_positions_rebuild_lock = threading.Lock()
+_PAPER_POSITIONS_TTL = 3.0
+
 
 def _load_v83_ops_status() -> Dict[str, Any]:
     global _v83_ops_cache, _v83_ops_cache_ts
@@ -4498,46 +4535,67 @@ class PaperHandler(SimpleHTTPRequestHandler):
             return
         if self.path.startswith("/api/paper_positions"):
             try:
-                # ── V83-specific data (primary source of truth for PnL tab) ──
-                intraday_perf = _build_intraday_performance_payload(trade_mode="paper")
-                v83_open = _build_v83_open_position_payload()
-                v83_market_state = _get_v83_market_state()
+                global _paper_positions_cache, _paper_positions_cache_ts
+                _now = time.time()
+                # Fresh cache → instant.
+                if _paper_positions_cache is not None and (_now - _paper_positions_cache_ts) < _PAPER_POSITIONS_TTL:
+                    self._send_json(_paper_positions_cache)
+                    return
+                # Stale: only ONE thread rebuilds; everyone else serves the last payload so a slow
+                # rebuild never blocks the UI or piles up.
+                if not _paper_positions_rebuild_lock.acquire(blocking=False):
+                    if _paper_positions_cache is not None:
+                        self._send_json(_paper_positions_cache)
+                        return
+                    _paper_positions_rebuild_lock.acquire()  # first-ever load: wait for the build
+                try:
+                    # ── V83-specific data (primary source of truth for PnL tab) ──
+                    intraday_perf = _build_intraday_performance_payload(trade_mode="paper")
+                    v83_open = _build_v83_open_position_payload()
+                    v83_market_state = _get_v83_market_state()
 
-                # ── Legacy blotter payload kept for payoff-chart spot price ──
-                blotter = load_positions(BLOTTER_CSV, mode="paper")
+                    # Spot for the payoff chart now comes from the background LTP refresher's cache
+                    # (free) instead of load_positions(BLOTTER) — a SYNCHRONOUS Dhan fetch that
+                    # dominated this endpoint's latency (6-22s) and enriched a blotter v83 doesn't
+                    # even use. _build_v83_open_position_payload already started the refresher.
+                    _spot_cached = _open_leg_spot
 
-                payload: Dict[str, Any] = {
-                    # V83 open position — authoritative source for Open Legs / MTM
-                    "v83_open_position": v83_open,
-                    "positions": v83_open["legs"],          # UI legs-table uses this
-                    "total_pnl": v83_open["open_mtm"] or 0.0,
-                    # V83 realized P&L — authoritative source (intraday_performance)
-                    "realized_pnl": intraday_perf["realized_pnl_rs"],
-                    # Market state for the "Market Status" card
-                    "v83_market_state": v83_market_state,
-                    # Pass-through fields the UI also uses
-                    "spot": blotter.get("spot"),
-                    "ltp_status": blotter.get("ltp_status"),
-                    "as_of": blotter.get("as_of"),
-                    # Full performance payload for Trade History section
-                    "intraday_performance": intraday_perf,
-                    # Strategy state kept for any legacy widget that still reads it
-                    "strategy_state": {},
-                }
-
-                # Secondary payloads (batman/committee/learning) cached 60 s —
-                # no longer rendered in main UI but kept for completeness.
-                global _secondary_pnl_cache, _secondary_pnl_cache_ts
-                _now_ts = time.time()
-                if not _secondary_pnl_cache or (_now_ts - _secondary_pnl_cache_ts) > _SECONDARY_PNL_CACHE_TTL:
-                    _secondary_pnl_cache = {
-                        "committee_review": _build_committee_review_payload(trade_mode="paper"),
-                        "intraday_learning": _load_intraday_learning_status(),
-                        "batman_bkm_review": _build_batman_bkm_review_payload(trade_mode="paper"),
-                        "batman_bkm_learning": _build_batman_bkm_learning_payload(trade_mode="paper"),
+                    payload: Dict[str, Any] = {
+                        # V83 open position — authoritative source for Open Legs / MTM
+                        "v83_open_position": v83_open,
+                        "positions": v83_open["legs"],          # UI legs-table uses this
+                        "total_pnl": v83_open["open_mtm"] or 0.0,
+                        # V83 realized P&L — authoritative source (intraday_performance)
+                        "realized_pnl": intraday_perf["realized_pnl_rs"],
+                        # Market state for the "Market Status" card
+                        "v83_market_state": v83_market_state,
+                        # Pass-through fields the UI also uses
+                        "spot": _spot_cached,
+                        "ltp_status": "LIVE" if _spot_cached else "STALE",
+                        "as_of": None,
+                        # Full performance payload for Trade History section
+                        "intraday_performance": intraday_perf,
+                        # Strategy state kept for any legacy widget that still reads it
+                        "strategy_state": {},
                     }
-                    _secondary_pnl_cache_ts = _now_ts
-                payload.update(_secondary_pnl_cache)
+
+                    # Secondary payloads (batman/committee/learning) cached 60 s —
+                    # no longer rendered in main UI but kept for completeness.
+                    global _secondary_pnl_cache, _secondary_pnl_cache_ts
+                    _now_ts = time.time()
+                    if not _secondary_pnl_cache or (_now_ts - _secondary_pnl_cache_ts) > _SECONDARY_PNL_CACHE_TTL:
+                        _secondary_pnl_cache = {
+                            "committee_review": _build_committee_review_payload(trade_mode="paper"),
+                            "intraday_learning": _load_intraday_learning_status(),
+                            "batman_bkm_review": _build_batman_bkm_review_payload(trade_mode="paper"),
+                            "batman_bkm_learning": _build_batman_bkm_learning_payload(trade_mode="paper"),
+                        }
+                        _secondary_pnl_cache_ts = _now_ts
+                    payload.update(_secondary_pnl_cache)
+                    _paper_positions_cache = payload
+                    _paper_positions_cache_ts = time.time()
+                finally:
+                    _paper_positions_rebuild_lock.release()
                 self._send_json(payload)
             except Exception as exc:  # pragma: no cover - defensive
                 self._send_json({"error": str(exc)}, status=500)
