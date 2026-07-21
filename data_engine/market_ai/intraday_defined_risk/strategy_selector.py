@@ -107,6 +107,36 @@ _DEBIT_BLACKOUT = _parse_window(os.environ.get("SEL_DEBIT_BLACKOUT", ""))
 # Gated so it can be validated on the ordering-robust harness before it drives live.
 _SELLER_MODE = os.environ.get("SEL_MODE", "").upper()
 
+# Selection filter (NEW 2026-07-21, default ON): VETO a directional TREND/BREAKOUT debit when the
+# tape is a PINNED LONG-GAMMA range. Retrospective on today's live loss: the agent selected
+# STRONG_TREND_DOWN / BREAKOUT_DOWN (put-debit) at 0.78 conviction on a 0.29%-range day, while its OWN
+# signals all said "range, no trend": gex_regime=LONG_GAMMA, pin_risk_active=True,
+# trend_efficiency_ratio=0.13, inside_opening_range=True, opening_range_break_state=NONE. A directional
+# debit needs follow-through; in a dealer-long-gamma pin the tape is suppressed / mean-reverting, so it
+# just bleeds (today: -84.5 on the booked leg). Require all THREE independent range signals to agree so
+# this never fires on a real trend. Mechanism is sound (long gamma => dealers dampen realized vol);
+# one strong live example so far — confirm as forward data accumulates. SEL_PIN_VETO=0 disables;
+# SEL_PIN_VETO_EFF_MAX tunes the trend-efficiency ceiling.
+_PIN_VETO = os.environ.get("SEL_PIN_VETO", "1") == "1"
+_PIN_VETO_EFF_MAX = _sel_env_float("SEL_PIN_VETO_EFF_MAX") or 0.40
+
+
+def _pinned_range_veto(m: dict[str, Any]) -> tuple[bool, str]:
+    """True when the tape is a pinned long-gamma, low-efficiency range — where a directional debit
+    bleeds. All three signals must agree, so it won't veto a genuine trend."""
+    if not _PIN_VETO:
+        return False, ""
+    gex = str(m.get("gex_regime") or "").upper()
+    pinned = bool(m.get("pin_risk_active"))
+    eff = _f(m, "trend_efficiency_ratio", 1.0)  # missing -> treat as high -> no veto
+    if gex == "LONG_GAMMA" and pinned and eff < _PIN_VETO_EFF_MAX:
+        return True, (
+            f"pinned long-gamma range (gex=LONG_GAMMA, pin_risk_active, trend_efficiency "
+            f"{eff:.2f}<{_PIN_VETO_EFF_MAX:.2f}) — dealers suppress the range; a directional debit "
+            f"needs follow-through it won't get. Stand aside."
+        )
+    return False, ""
+
 
 def _seller_choice(choice, condition, now_time, *, hybrid: bool = False):
     """Defined-risk, always-positioned premium seller: match a credit structure to the
@@ -234,6 +264,15 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     choice = StrategyChoice(condition=condition, iv_regime=iv, read=read, conviction=read.conviction)
     choice.vol_regime = vol.regime
     choice.vol_notes = vol.notes
+
+    # VETO a directional trend/breakout debit in a pinned long-gamma range (see _pinned_range_veto).
+    # Applied before every mode so it holds on the live directional path and the seller/hybrid paths.
+    if condition in (STRONG_TREND_UP, STRONG_TREND_DOWN, BREAKOUT_UP, BREAKOUT_DOWN):
+        _pv, _pv_why = _pinned_range_veto(metadata)
+        if _pv:
+            choice.family, choice.structures = FAM_STAND_ASIDE, []
+            choice.rationale = f"VETOED {condition}: {_pv_why}"
+            return choice
 
     # Defined-risk SELLER / HYBRID modes — always-positioned premium selling matched to
     # the condition. Validated on the ordering-robust harness before it drives live.
