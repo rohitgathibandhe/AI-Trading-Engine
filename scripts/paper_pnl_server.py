@@ -667,16 +667,24 @@ def _load_broker_live_positions() -> Dict[str, Any]:
                     (sell_avg - buy_avg) * min(buy_qty, sell_qty),
                 )
                 buy_back = _parse_float(fr.get("buyAvg"), buy_avg)
+                _cqty = min(buy_qty, sell_qty)
+                # Match the Dhan APP's displayed P&L, which is derived from the entry/exit it shows —
+                # (costPrice - buy-back) * qty — NOT Dhan's separate realizedProfit field. E.g. 24250
+                # PE: (111.34 - 71.39) * 390 = 15,580 (the app), vs realizedProfit 2,431. For these
+                # short premium legs cost>buyback => profit. Fall back to realizedProfit if no cost.
+                entry_px = cost_price or buy_avg
+                app_pnl = (entry_px - buy_back) * _cqty if cost_price else realized
                 closed.append(
                     {
                         "side": "FLAT",
                         "strike": strike,
                         "expiry": expiry,
                         "sec_id": sec_id,
-                        "qty": min(buy_qty, sell_qty),
-                        "entry": cost_price or buy_avg,
+                        "qty": _cqty,
+                        "entry": entry_px,
                         "exit": buy_back,
-                        "pnl": realized,
+                        "pnl": app_pnl,
+                        "realized_profit": realized,   # Dhan's own realized field, kept for reference
                         "timestamp": row.get("updateTime") or row.get("createTime") or "",
                     }
                 )
