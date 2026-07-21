@@ -1167,16 +1167,42 @@ class DhanWrapper:
 
         out: Dict[tuple[str, int], Optional[float]] = {}
         try:
-            resp = mf.ticker_data(payload)
-            if isinstance(resp, dict) and resp.get("status") == "failure":
-                msg = resp.get("remarks", {}).get("error_message")
-                if msg:
-                    self.log.debug(f"[LTP-bulk] status=failure remarks={msg}")
+            # Retry on 429/failure. The UI's live-positions refresher shares Dhan's marketfeed limit
+            # with the agent, so the first call is often rate-limited. Without a retry an empty result
+            # makes callers fall back to a STALE derived LTP (back-computed from a lagging
+            # unrealizedProfit), showing a wrong price and P&L (e.g. 27 when the leg is really ~44).
+            # Callers run this off the UI request path, so the short backoff never blocks the tab.
+            resp = None
+            for _attempt in range(4):
+                try:
+                    resp = mf.ticker_data(payload)
+                except Exception as _e:
+                    self.log.debug(f"[LTP-bulk] ticker attempt {_attempt} error: {_e}")
+                    resp = None
+                if isinstance(resp, dict) and resp.get("status") == "failure":
+                    _msg = (resp.get("remarks") or {}).get("error_message")
+                    self.log.debug(f"[LTP-bulk] status=failure remarks={_msg}; retry {_attempt}")
+                    resp = None
+                    time.sleep(1.2)
+                    continue
+                if resp is not None:
+                    break
+            if resp is None:
                 return out
             data = resp.get("data", resp) if isinstance(resp, dict) else resp
+            # Dhan double-wraps the ticker response: resp['data']['data']['NSE_FNO'][sid].
+            # Unwrap the extra level, else the seg-loop below never finds the segment and every
+            # LTP comes back empty — which is exactly what made callers fall back to a stale
+            # derived LTP (showed 27 when the leg was really ~43).
+            if isinstance(data, dict) and isinstance(data.get("data"), dict):
+                inner = data["data"]
+                if any(isinstance(v, (dict, list)) for k, v in inner.items() if k != "status"):
+                    data = inner
 
             if isinstance(data, dict):
                 for seg, node in data.items():
+                    if seg == "status":
+                        continue
                     # dict-of-dicts: {'NSE_FNO': {'52802': {'last_price': ...}, ...}}
                     if isinstance(node, dict):
                         for k, v in node.items():
@@ -1352,7 +1378,13 @@ class DhanWrapper:
                 ltp_val = candidate_ltp if candidate_ltp is not None else raw.get("ltp") or raw.get("lastPrice") or buy_avg or cost_price
                 ltp_val = self._as_float(ltp_val) or self._as_float(cost_price)
                 avg_val = buy_avg if buy_avg is not None else cost_price
-                pnl_val = unrealized if unrealized is not None else r.get("pnl") or 0.0
+                # Recompute P&L from the FRESH market LTP when we have one, so LTP and P&L agree.
+                # Dhan's unrealizedProfit lags the marketfeed and drove the wrong 27-vs-44 display.
+                _ltp_f = self._as_float(ltp_val); _avg_f = self._as_float(avg_val)
+                if ltp_live is not None and _ltp_f is not None and _avg_f is not None:
+                    pnl_val = (_ltp_f - _avg_f) * abs(int(net_qty or 0))  # LONG: profit as price rises
+                else:
+                    pnl_val = unrealized if unrealized is not None else r.get("pnl") or 0.0
                 r["qty"] = int(qty_disp or 0)
                 r["ltp"] = ltp_val
                 r["pnl"] = pnl_val
@@ -1363,7 +1395,12 @@ class DhanWrapper:
                 ltp_val = candidate_ltp if candidate_ltp is not None else raw.get("ltp") or raw.get("lastPrice") or sell_avg or cost_price
                 ltp_val = self._as_float(ltp_val) or self._as_float(cost_price)
                 avg_val = sell_avg if sell_avg is not None else cost_price
-                pnl_val = unrealized if unrealized is not None else r.get("pnl") or 0.0
+                # SHORT: profit when price falls. Recompute from fresh LTP (see LONG note).
+                _ltp_f = self._as_float(ltp_val); _avg_f = self._as_float(avg_val)
+                if ltp_live is not None and _ltp_f is not None and _avg_f is not None:
+                    pnl_val = (_avg_f - _ltp_f) * abs(int(net_qty or 0))
+                else:
+                    pnl_val = unrealized if unrealized is not None else r.get("pnl") or 0.0
                 r["qty"] = int(qty_disp or 0)
                 r["ltp"] = ltp_val
                 r["pnl"] = pnl_val
