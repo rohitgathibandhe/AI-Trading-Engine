@@ -289,6 +289,16 @@ def main() -> int:
     print(f"[shadow]   preconditions: gex={preconditions.get('gex_regime')} "
           f"pin={preconditions.get('pin_risk_active')} vol={preconditions.get('vol_regime')} "
           f"eff={preconditions.get('trend_efficiency_ratio')} -> {out}")
+
+    # Autonomous loop: today's row is written → re-run the promotion gate so eligibility (promote /
+    # demote-on-drift) reflects it. The runtime picks up the refreshed promotion_state.json next cycle.
+    try:
+        import subprocess
+        subprocess.run([sys.executable, str(Path(__file__).with_name("promotion_gate.py"))],
+                       timeout=90, check=False)
+        print("[shadow]   promotion gate refreshed")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[shadow]   promotion gate refresh skipped: {exc}")
     return 0
 
 
