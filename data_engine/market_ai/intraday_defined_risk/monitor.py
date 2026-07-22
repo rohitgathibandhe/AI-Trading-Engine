@@ -2020,17 +2020,37 @@ def run_live(config: dict[str, object]) -> None:
                         )
                         _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="NONE")
                     elif gate["allowed"] and runtime_config.mode == RuntimeMode.MICRO_LIVE and runtime_config.live_arm:
-                        executor.enter_trade(decision)
-                        agent.start_position(snapshot, decision)
-                        record_runtime_trade_entry(decision, snapshot, decision_origin="V83_APPROVED")
-                        log_validation_decision(
-                            decision,
-                            snapshot=snapshot,
-                            block_reason="NONE",
-                            actual_trade_created=True,
-                            decision_origin="V83_APPROVED",
-                        )
-                        _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="NONE")
+                        # AUTO-PROMOTION: place a REAL order only if this strategy has cleared the
+                        # promotion gate on the forward shadow record; otherwise keep it PAPER even
+                        # though the runtime is live-armed. Strategies graduate to real money one at a
+                        # time, automatically, as they earn it — an un-vetted structure never reaches
+                        # real capital by accident (fail-closed if promotion_state.json is empty).
+                        from .promotion import real_money_eligible
+                        if real_money_eligible(decision.strategy):
+                            executor.enter_trade(decision)
+                            agent.start_position(snapshot, decision)
+                            record_runtime_trade_entry(decision, snapshot, decision_origin="V83_APPROVED")
+                            log_validation_decision(
+                                decision,
+                                snapshot=snapshot,
+                                block_reason="NONE",
+                                actual_trade_created=True,
+                                decision_origin="V83_APPROVED",
+                            )
+                            _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="NONE")
+                        else:
+                            # Not yet promoted → keep paper (forward-testing) even while live-armed.
+                            position = open_position_from_decision(decision, snapshot)
+                            agent.open_position = position
+                            record_paper_entry(position, decision=decision, snapshot=snapshot, gate=gate)
+                            log_validation_decision(
+                                decision,
+                                snapshot=snapshot,
+                                block_reason="NOT_PROMOTED_KEPT_PAPER",
+                                actual_trade_created=True,
+                                decision_origin="V83_PAPER_PENDING_PROMOTION",
+                            )
+                            _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="NOT_PROMOTED_KEPT_PAPER")
                     else:
                         log_shadow_decision(decision, snapshot=snapshot, block_reason=str(gate.get("primary_block_reason") or "ENTRY_GATE_BLOCKED"))
                         log_validation_decision(

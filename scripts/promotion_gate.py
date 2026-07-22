@@ -33,6 +33,16 @@ MIN_AVG_PNL = 0.0     # positive average P&L per qualifying day
 MIN_WIN_RATE = 55.0   # % of qualifying days green
 MIN_RET_TAIL = 3.0    # total edge >= 3x the worst single qualifying day (survives a bad day)
 
+# ── Drift demotion: auto-revert a PROMOTED pairing to shadow when its RECENT edge decays ──────
+# A strategy that earned its way to live can stop working when the market regime shifts. Watch the
+# most recent qualifying days; if the recent edge turns negative or the recent win-rate collapses,
+# demote it back to shadow (remove from eligible) so it must re-earn promotion. This is the
+# "re-evaluate on drift" half of the loop — the gate promotes AND demotes, by rule.
+DRIFT_WINDOW = 10     # look at the most recent N qualifying days
+DRIFT_MIN_DAYS = 5    # need at least this many recent days to call drift
+DRIFT_AVG_FLOOR = 0.0 # recent avg P&L must stay above this
+DRIFT_WIN_FLOOR = 40.0  # recent win-rate floor (%)
+
 # matrix strategy name -> shadow_book structure key
 KEY = {
     "PUT_DEBIT_SPREAD": "put_debit", "CALL_DEBIT_SPREAD": "call_debit",
@@ -69,7 +79,7 @@ def evaluate() -> list[dict]:
     out = []
     for spec in M.SPECS:
         key = KEY.get(spec.name)
-        pnls, dates = [], []
+        dp = []                                          # (date, pnl) on qualifying days
         for row in rows:
             pc = row.get("preconditions") or {}
             if not pc:                                   # can't precondition-filter a legacy row
@@ -79,7 +89,9 @@ def evaluate() -> list[dict]:
                 continue
             p = _structure_pnl(row, key)
             if p is not None:
-                pnls.append(float(p)); dates.append(row.get("date"))
+                dp.append((str(row.get("date") or ""), float(p)))
+        dp.sort(key=lambda x: x[0])                      # chronological — so the recent window is real
+        pnls = [p for _, p in dp]
         n = len(pnls)
         rec = {"strategy": spec.name, "is_credit": spec.is_credit, "defined_risk": spec.defined_risk,
                "hold": spec.default_hold, "qualifying_days": n}
@@ -91,7 +103,18 @@ def evaluate() -> list[dict]:
             worst = min(pnls)
             ret_tail = (total / abs(worst)) if worst < 0 else float("inf")
             passed = (n >= MIN_DAYS and avg > MIN_AVG_PNL and wr >= MIN_WIN_RATE and ret_tail >= MIN_RET_TAIL)
-            if passed:
+            # DRIFT: a promoted strategy whose recent window has decayed gets demoted back to shadow.
+            recent = pnls[-DRIFT_WINDOW:]
+            drifted = False
+            if passed and len(recent) >= DRIFT_MIN_DAYS:
+                r_avg = sum(recent) / len(recent)
+                r_wr = 100.0 * sum(1 for x in recent if x > 0) / len(recent)
+                if r_avg <= DRIFT_AVG_FLOOR or r_wr < DRIFT_WIN_FLOOR:
+                    drifted = True
+            if drifted:
+                status = "DEMOTED_DRIFT"                  # earned promotion but recent edge decayed
+                passed = False
+            elif passed:
                 status = "ELIGIBLE_FOR_LIVE"
             elif n < MIN_DAYS:
                 status = f"NEED_MORE_DATA ({n}/{MIN_DAYS} days)"
