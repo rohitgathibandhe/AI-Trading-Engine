@@ -2015,7 +2015,26 @@ def run_live(config: dict[str, object]) -> None:
                     save_runtime_state(runtime_state)
                 else:
                     gate = evaluate_entry_gate(decision, snapshot, config=runtime_config, health=health)
-                    if gate["allowed"] and runtime_config.mode == RuntimeMode.PAPER_LIVE:
+                    # Entry timing: on a directional DEBIT, don't pay up into the move we are
+                    # reacting to — wait for a retrace to a better price, or for the window to
+                    # expire. Fails open, and the signal stays live while we wait. See entry_timing.
+                    _wait = False
+                    if gate["allowed"]:
+                        from .entry_timing import should_wait
+                        _wait, _wait_why = should_wait(
+                            decision.strategy.value if hasattr(decision.strategy, "value") else str(decision.strategy),
+                            float(snapshot.option_chain.spot), snapshot.timestamp,
+                        )
+                        if _wait:
+                            log_validation_decision(
+                                decision, snapshot=snapshot, block_reason=_wait_why,
+                                actual_trade_created=False, decision_origin="V83_ENTRY_WAIT",
+                            )
+                            _update_runtime_decision_state(decision, runtime_config=runtime_config,
+                                                           snapshot=snapshot, block_reason=_wait_why)
+                    if _wait:
+                        pass          # hold this cycle; re-evaluated next cycle at a fresh price
+                    elif gate["allowed"] and runtime_config.mode == RuntimeMode.PAPER_LIVE:
                         position = open_position_from_decision(decision, snapshot)
                         agent.open_position = position
                         record_paper_entry(position, decision=decision, snapshot=snapshot, gate=gate)
