@@ -1061,8 +1061,16 @@ class IntradayDefinedRiskAgent:
             "SHORT_STRANGLE": StrategyType.SHORT_STRANGLE,
             "CALL_DEBIT_SPREAD": StrategyType.CALL_DEBIT_SPREAD,
             "PUT_DEBIT_SPREAD": StrategyType.PUT_DEBIT_SPREAD,
+            # IRON_FLY and SHORT_STRADDLE exist in StrategyType and the selector already emits
+            # IRON_FLY (RANGE_TIGHT branch), but they were missing here — so every IRON_FLY choice
+            # mapped to None and silently dropped the whole selector path back to legacy. The
+            # theta-collecting structures the shadow book likes most were unreachable.
+            "IRON_FLY": StrategyType.IRON_FLY,
+            "SHORT_STRADDLE": StrategyType.SHORT_STRADDLE,
         }
-        strategy = _strat_map.get(choice.structures[0])
+        # choice.structures is a RANKED list, not a single pick — walk it and take the first the
+        # runtime can actually express, so one unmappable structure does not forfeit the day.
+        strategy = next((s for s in (_strat_map.get(n) for n in choice.structures) if s is not None), None)
         if strategy is None:
             return None  # fall back to legacy
 

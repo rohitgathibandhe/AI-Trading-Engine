@@ -79,6 +79,45 @@ _SKIP_SMB_BULLISH = os.environ.get("SEL_SKIP_SMB_BULLISH", "1") == "1"
 # safe threshold can't bind — NOT actionable, left env-gated off. SEL_MIN_STATE_CONF to research.
 _MIN_STATE_CONF = _sel_env_float("SEL_MIN_STATE_CONF")
 
+# ── SELLER-FIRST (default ON) ────────────────────────────────────────────────────────────────
+# Until now a down-read mapped unconditionally to PUT_DEBIT — the selector never COMPARED
+# structures, it looked one up. That made the agent a permanent option BUYER on every bearish day,
+# paying theta for hours. The live shadow book (real fills, same tape) says that is the wrong
+# default: over 7 days put_debit is the ONLY net-negative structure (-416) while every
+# theta-COLLECTING structure is green (bear_call +780, short_strangle +3,022, iron_fly +5,529,
+# short_straddle +10,984).
+#
+# Measured on the agent's own trade (2026-07-23): spot made a LOWER LOW at 14:51 (23,814) than at
+# 13:15 (23,829) and the position was worth LESS. The move went further in our favour and we earned
+# less — that is theta, and no exit rule can fix it. It is a structure problem.
+#
+# So: SELL the bearish view by default, and BUY the debit only on a genuinely efficient trend,
+# because a debit needs follow-through to beat its own decay. trend_efficiency_ratio measures
+# exactly that follow-through, and it separates the live record cleanly:
+#     eff = 1.00  -> put_debit +2,535 / +922 / +240   (3/3 green, BEATS bear_call's +2,047)
+#     eff ~0.1-0.2-> put_debit -1,946 / -2,287 / -491 / +611  (net -4,113 vs bear_call -1,267)
+# Verified NOT lookahead: shadow preconditions are computed as-of entry time, and the live agent
+# already carries trend_efficiency_ratio in its entry metadata (0.0269 at today's 09:48 entry).
+#
+# HONEST CAVEAT: n=7 live days and the eff values are bimodal (~1.0 or ~0.15), so any threshold in
+# (0.2, 1.0) fits this sample equally — 0.50 is the midpoint, not a tuned optimum. This is a
+# DEFAULT-FLIP justified by theta mechanics + the user's seller-first doctrine, to be confirmed
+# forward like everything else. SEL_SELLER_FIRST=0 restores the old buy-always behaviour.
+_SELLER_FIRST = os.environ.get("SEL_SELLER_FIRST", "1") == "1"
+_BUY_MIN_EFFICIENCY = _sel_env_float("SEL_BUY_MIN_EFFICIENCY")
+if _BUY_MIN_EFFICIENCY is None:
+    _BUY_MIN_EFFICIENCY = 0.50
+
+
+def _trend_efficiency(metadata: dict) -> float:
+    """Follow-through of the move: |net displacement| / total path travelled. ~1.0 = clean trend
+    (a debit's move keeps extending), ~0.1 = chop (the tape retraces everything it gives)."""
+    for k in ("trend_efficiency_ratio", "trend_efficiency", "efficiency_ratio"):
+        v = metadata.get(k)
+        if isinstance(v, (int, float)):
+            return float(v)
+    return 0.0
+
 # Research toggle: which structure to deploy on STRONG_TREND_UP / BREAKOUT_UP.
 # Baseline "BULL_PUT" earns ~0 across orderings (no up-side edge). Values:
 #   BULL_PUT   — with-trend credit spread (current default)
@@ -362,8 +401,25 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = f"{condition} but state_confidence below {_MIN_STATE_CONF} — low-conviction read (loses in screen); stand aside."
         else:
-            choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
-            choice.rationale = f"{condition}: buy PUT DEBIT with the down-move (Nifty falls sharply — +skew capped-loss captures it)."
+            _eff = _trend_efficiency(metadata)
+            if _SELLER_FIRST and _eff < _BUY_MIN_EFFICIENCY:
+                # Same bearish view, expressed as a SELLER so time works for us instead of against
+                # us. Ranked list, not a single pick — the runtime walks it and takes the first
+                # structure it can express, so IRON_FLY backs up the bear-call.
+                choice.family = FAM_DIRECTIONAL_CREDIT
+                choice.structures = ["BEAR_CALL_CREDIT_SPREAD", "IRON_FLY"]
+                choice.rationale = (
+                    f"{condition} but trend_efficiency {_eff:.2f} < {_BUY_MIN_EFFICIENCY:.2f} — the tape is "
+                    f"retracing what it gives, so a debit pays theta waiting for follow-through that is not "
+                    f"coming. SELL the same bearish view (bear-call, fly fallback) and collect the decay instead."
+                )
+            else:
+                choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
+                choice.rationale = (
+                    f"{condition}: buy PUT DEBIT with the down-move (trend_efficiency {_eff:.2f} >= "
+                    f"{_BUY_MIN_EFFICIENCY:.2f} — clean follow-through, the one regime where the debit "
+                    f"out-earns selling the move)."
+                )
 
     elif condition == RANGE_WIDE:
         # Retrospective lesson: morning condors LOSE (-Rs1,151/24tr @10-12) because the
