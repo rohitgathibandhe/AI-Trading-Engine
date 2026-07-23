@@ -313,7 +313,17 @@ def mark_to_market_value_points(position: OpenPosition, quotes_by_leg: list[Stra
 DEBIT_TP_CAPTURE = 0.60       # take profit at 60% of max profit
 DEBIT_STOP_FRAC = 0.50        # stop when 50% of the debit is lost
 DEBIT_MIN_HOLD = 10           # min minutes before the stop can fire (noise guard)
-DEBIT_TRAIL_ARM = 0.40        # once 40% of max profit is captured, trail
+# The trail arms on a fraction of MAX profit — but max profit needs spot through the short strike
+# (a ~200pt move), which intraday Nifty almost never delivers. At 0.40 the trail was unreachable:
+# across the first 7 debit trades it armed ONCE (peaks were 0/12/20/21/22/40/48% of max profit), so
+# 7/7 exited on the 15:15 flatten and gave back 78% of peak (Rs 12,087 peak -> Rs 2,615 realized).
+# 0.15 is reachable (5/7) while still demanding a real move; 0.20 left 07-22/07-23 within ~1pt of
+# the line, too fragile to rely on. Note the ARM level only controls COVERAGE — the GIVEBACK below
+# is what bounds tail risk — so arming earlier costs nothing on the winners. Checked against the one
+# big winner (07-09, peak 48%, realized 92% of peak): it arms, but its floor lands BELOW what it
+# realized, so the trail never fires and the fat tail is preserved — the failure mode that made
+# naive trailing validated-negative here. Forward evidence: exit_reason + mfe_capture_pct per trade.
+DEBIT_TRAIL_ARM = 0.15        # once 15% of max profit is captured, trail
 DEBIT_TRAIL_GIVEBACK = 0.35   # exit if the trade gives back 35% of its peak profit
 
 
