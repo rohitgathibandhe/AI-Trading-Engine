@@ -1794,6 +1794,10 @@ def manage_paper_position(
     mfe = max(float(state.get("mfe_rupees") or 0.0), open_pnl)
     mae = min(float(state.get("mae_rupees") or 0.0), open_pnl)
     save_paper_position(position, paths=paths, extra={"mfe_rupees": mfe, "mae_rupees": mae, "last_mark_pnl_rupees": open_pnl})
+    # Exit shadow book: record this mark so candidate exit rules can be scored against the SAME
+    # real live prices the agent traded on. Pure recorder — it decides nothing. See exit_shadow.py.
+    from . import exit_shadow
+    exit_shadow.record_mark(position, snapshot, open_pnl)
     if not exit_decision.should_exit:
         return position
     # Phase 7: P&L attribution at exit
@@ -1842,6 +1846,7 @@ def manage_paper_position(
         "mfe_capture_pct": _mfe_capture_pct,
     }
     _append_jsonl(paths.paper_trades, event)
+    exit_shadow.finalize(position, event)   # score every candidate exit rule over this trade's path
     save_paper_position(None, paths=paths, extra={"last_exit": event, "mfe_rupees": 0.0, "mae_rupees": 0.0})
     config = load_runtime_config(paths)
     runtime_state = load_runtime_state(paths, config)
