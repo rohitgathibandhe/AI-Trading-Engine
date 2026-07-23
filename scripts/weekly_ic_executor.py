@@ -24,7 +24,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
+import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -63,17 +65,41 @@ def _load_creds() -> dict[str, str]:
         return {}
 
 
-def _send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
+def _alert_fallback_log(text: str, delivered: bool) -> None:
+    """Every alert is ALSO written locally, so a Telegram outage never loses a decision.
+    (2026-07-23: a weekly IC was cancelled silently — the only record was a dropped Telegram post.)"""
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
-        return r.status_code == 200
-    except Exception as e:
-        print(f"[telegram] {e}", file=sys.stderr)
-        return False
+        line = {"at": datetime.now(IST).isoformat(timespec="seconds"),
+                "delivered": delivered,
+                "text": re.sub(r"<[^>]+>", "", text)}   # strip HTML for a readable local record
+        with (STATE_DIR / "weekly_ic_alerts.jsonl").open("a") as f:
+            f.write(json.dumps(line) + "\n")
+    except Exception:
+        pass
+
+
+def _send_telegram(bot_token: str, chat_id: str, text: str, *, retries: int = 3) -> bool:
+    """Send with retry+backoff. Telegram is a flaky dependency on a home connection; a single
+    transient failure used to silently drop the alert entirely. Always mirrored to a local log."""
+    last = ""
+    for attempt in range(retries):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                _alert_fallback_log(text, True)
+                return True
+            last = f"HTTP {r.status_code}: {r.text[:120]}"
+        except Exception as e:  # noqa: BLE001
+            last = str(e)[:160]
+        if attempt < retries - 1:
+            time.sleep(2 * (attempt + 1))          # 2s, 4s backoff
+    print(f"[telegram] FAILED after {retries} attempts: {last}", file=sys.stderr)
+    _alert_fallback_log(text, False)
+    return False
 
 
 def _dhan_headers(creds: dict) -> dict[str, str]:
@@ -793,6 +819,30 @@ def run_market_assessment(force: bool = False) -> None:
     n_passed = len(passed)
     n_gates  = len(gates)
 
+    # ── Gate instrumentation ─────────────────────────────────────────────────
+    # Structured, numeric record of every gate (value vs threshold, and the MARGIN by which it
+    # passed/failed) so we can see week-over-week WHICH gate blocks and BY HOW MUCH. The executor
+    # built 9 plans since June and deployed 0 — without this the veto reason was invisible.
+    _range_ratio = (day_range / expected_move) if day_range is not None else None
+    gate_details = [
+        {"name": "opening_data", "passed": num_candles >= 8,
+         "value": num_candles, "threshold": 8, "margin": num_candles - 8},
+        {"name": "day_range_ratio", "passed": bool(_range_ratio is not None and _range_ratio < _MAX_DAY_RANGE_RATIO),
+         "value": round(_range_ratio, 4) if _range_ratio is not None else None,
+         "threshold": _MAX_DAY_RANGE_RATIO, "day_range_pts": day_range,
+         "margin": round(_MAX_DAY_RANGE_RATIO - _range_ratio, 4) if _range_ratio is not None else None},
+        {"name": "iv_settled", "passed": current_iv <= _MAX_IV_AT_ENTRY,
+         "value": round(current_iv, 2), "threshold": _MAX_IV_AT_ENTRY,
+         "margin": round(_MAX_IV_AT_ENTRY - current_iv, 2)},
+        {"name": "strike_margin", "passed": bool(call_safe and put_safe),
+         "call_margin_pts": round(sc_margin, 1), "put_margin_pts": round(sp_margin, 1),
+         "threshold": round(min_required_margin, 1),
+         "margin": round(min(sc_margin, sp_margin) - min_required_margin, 1)},
+        {"name": "pcr_balanced", "passed": bool(_PCR_LOW <= current_pcr <= _PCR_HIGH),
+         "value": round(current_pcr, 2), "low": _PCR_LOW, "high": _PCR_HIGH,
+         "margin": round(min(current_pcr - _PCR_LOW, _PCR_HIGH - current_pcr), 2)},
+    ]
+
     # ── Decision ─────────────────────────────────────────────────────────────
     gate_lines = "\n".join(f"  {'✅' if g[0] else '❌'} {g[1]}: {g[2]}" for g in gates)
     paper_mode = _is_paper_mode()
@@ -893,6 +943,30 @@ def run_market_assessment(force: bool = False) -> None:
             result_str = "HOLD"
 
     ok = _send_telegram(bot_token, chat_id, msg)
+    # Persist the structured gate assessment — the evidence trail for whether these gates are
+    # earning their keep (compare against the UNGATED weekly_shadow_ledger, which enters every week).
+    try:
+        blockers = [g["name"] for g in gate_details if not g["passed"]]
+        _rec = {
+            "assessed_at": now.isoformat(timespec="seconds"),
+            "assessment_label": assessment_label,
+            "expiry": expiry_str,
+            "spot": round(spot, 1) if spot else None,
+            "short_call": planned_sc, "short_put": planned_sp,
+            "plan_credit": plan_credit,
+            "expected_move": expected_move,
+            "n_passed": n_passed, "n_gates": n_gates,
+            "decision": result_str,
+            "blocked_by": blockers,
+            "gates": gate_details,
+        }
+        with (STATE_DIR / "weekly_ic_gate_log.jsonl").open("a") as _f:
+            _f.write(json.dumps(_rec) + "\n")
+        if blockers:
+            print(f"[weekly_ic_assess] BLOCKED BY: {', '.join(blockers)}")
+    except Exception as _exc:  # noqa: BLE001
+        print(f"[weekly_ic_assess] gate-log write failed: {_exc}", file=sys.stderr)
+
     print(f"[weekly_ic_assess] Result={result_str} ({n_passed}/{n_gates}). "
           f"Paper={paper_mode} IV={current_iv:.1f}% PCR={current_pcr:.2f} "
           f"SC_margin={sc_margin:.0f} SP_margin={sp_margin:.0f}. "
