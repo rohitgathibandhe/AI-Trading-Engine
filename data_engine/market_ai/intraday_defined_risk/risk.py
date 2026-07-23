@@ -201,6 +201,14 @@ def assess_trade_risk(
     lots = _compute_kelly_lot_cap(playbook, lots, max_lots=lots)
     # PH 23: VIX-regime lot cap — reduce exposure in extreme vol environments.
     lots = _apply_vix_lot_scale(lots)
+    # Baseline size floor. Every scaler above only cuts DOWN, so a merely-decent setup collapses to
+    # 1 lot even when the risk budget comfortably allows more. Lift back to the configured baseline,
+    # but NEVER past the hard limits — the floor is clamped to what risk and margin already permit,
+    # so it can only undo conviction shrinkage, never breach the per-trade risk cap.
+    hard_cap = min(max_lots_by_risk, max_lots_by_margin)
+    floor_lots = max(int(getattr(risk_limits, "min_lots_per_trade", 1) or 1), 1)
+    if lots >= 1 and hard_cap >= 1:
+        lots = min(max(lots, floor_lots), hard_cap)
     projected_margin = account_state.margin_used_rupees + (lots * effective_margin)
     projected_utilisation = projected_margin / risk_limits.max_margin_rupees if risk_limits.max_margin_rupees > 0 else 1.0
 

@@ -225,6 +225,13 @@ class AccountRiskLimits:
     max_risk_rupees_per_trade: float
     max_margin_rupees: float
     max_daily_loss_rupees: float
+    # Baseline position size. The conviction scalers (confidence / Kelly / VIX) only ever cut lots
+    # DOWN, so on a merely-decent setup they collapse sizing to 1 even when the risk budget allows
+    # several — e.g. 2026-07-23: risk permitted 3 lots (18,000 / 4,644) but confidence 0.68 scaled
+    # it to round(3 x 0.40) = 1, and a correct read of the day earned only Rs 408. This is the floor
+    # under that. It is a FLOOR, never an override: it can never raise lots above what the per-trade
+    # risk cap and available margin already permit.
+    min_lots_per_trade: int = 1
 
     def validate(self) -> None:
         if self.max_risk_rupees_per_trade <= 0:
@@ -233,6 +240,8 @@ class AccountRiskLimits:
             raise ValidationError("Margin limit must be positive.")
         if self.max_daily_loss_rupees <= 0:
             raise ValidationError("Daily loss limit must be positive.")
+        if self.min_lots_per_trade < 1:
+            raise ValidationError("Minimum lots per trade must be at least 1.")
 
 
 @dataclass(frozen=True)

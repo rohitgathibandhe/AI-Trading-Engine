@@ -534,6 +534,7 @@ class DhanLiveMarketDataProvider:
                 max_risk_rupees_per_trade=float(self.config.get("max_risk_rupees_per_trade") or 10_000.0),
                 max_margin_rupees=float(self.config.get("max_margin_rupees") or 200_000.0),
                 max_daily_loss_rupees=float(self.config.get("max_daily_loss_rupees") or 10_000.0),
+                min_lots_per_trade=int(self.config.get("min_lots_per_trade") or 1),
             ),
             account_state=AccountState(realised_pnl_rupees=0.0, margin_used_rupees=0.0),
             live_vwap=_vwap_from_bars(bars_5m),
