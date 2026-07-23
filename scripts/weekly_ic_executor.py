@@ -629,7 +629,15 @@ _PCR_HIGH              = 1.80   # above this = very complacent (put writers domi
 
 
 def _get_nifty_ohlc_today(creds: dict) -> dict[str, float | None]:
-    """Fetch today's OHLC for NIFTY from Dhan intraday endpoint."""
+    """Fetch today's OHLC for NIFTY from Dhan intraday endpoint.
+
+    fromDate/toDate are MANDATORY on this endpoint. Omitting them returned
+    HTTP 400 DH-905 "fromDate is required" on EVERY call, so candles was always 0 — which failed
+    both the 'opening data' gate (needs >= 8 candles) AND the 'day range' gate (its else-branch is a
+    hard fail when OHLC is missing). Two guaranteed failures capped every assessment at 3/5 against
+    a 4/5 auto-deploy bar, so the weekly IC could never deploy: 9 plans built since June, 0 deployed.
+    """
+    _today = datetime.now(IST).strftime("%Y-%m-%d")
     try:
         r = requests.post(
             "https://api.dhan.co/v2/charts/intraday",
@@ -640,9 +648,15 @@ def _get_nifty_ohlc_today(creds: dict) -> dict[str, float | None]:
                 "instrument": "INDEX",
                 "interval": "5",
                 "oi": False,
+                "fromDate": _today,
+                "toDate": _today,
             },
             timeout=10,
         )
+        if r.status_code != 200:
+            # Loud, not silent — this failure mode silently vetoed the trade for two months.
+            print(f"[ohlc] HTTP {r.status_code}: {r.text[:200]}", file=sys.stderr)
+            return {"open": None, "high": None, "low": None, "close": None, "candles": 0}
         d = r.json()
         opens  = d.get("open")  or []
         highs  = d.get("high")  or []
