@@ -1431,12 +1431,49 @@ def _select_iron_fly_candidates(
     # Shorts: nearest strike to spot (the ATM / pin) on each side.
     atm_call = min([q for q in calls if q.strike >= spot] or calls, key=lambda q: abs(q.strike - spot))
     atm_put = min([q for q in puts if q.strike <= spot] or puts, key=lambda q: abs(q.strike - spot))
-    # Wings: buy protection ~wing_pts OTM of each short (defines the max loss).
-    wing_pts = float(regime_state.metadata.get("iron_fly_wing_pts") or 200.0)
-    long_call = min([q for q in calls if q.strike >= atm_call.strike + wing_pts] or calls,
-                    key=lambda q: abs(q.strike - (atm_call.strike + wing_pts)))
-    long_put = min([q for q in puts if q.strike <= atm_put.strike - wing_pts] or puts,
-                   key=lambda q: abs(q.strike - (atm_put.strike - wing_pts)))
+    # ── Wings: buy the WIDEST protection the risk budget can actually carry ──────────────────
+    # A fixed 200pt wing is expensive protection you rarely need. Measured on the live 2026-07-23
+    # chain (ATM straddle credit 270.65):
+    #     wing  cost   % of credit kept   max loss/lot
+    #      200  119.70      56%              3,188
+    #      400   48.15      82%             11,538
+    #     1000    7.25      97%             47,879
+    # The 200pt wings hand back 44% of the premium — on a theta trade that IS the edge. But the far
+    # cheap wings are not free either: the agent sizes on MAX LOSS (not broker margin), so 1000pt
+    # wings push max loss past the per-trade risk cap and the trade is refused entirely.
+    #
+    # So neither a fixed narrow nor a fixed wide wing is right — the correct wing is the widest one
+    # whose max loss still lets us trade our baseline size. Widen while (width - credit) * lot_size
+    # * min_lots stays inside max_risk_rupees_per_trade, then stop. That keeps as much premium as
+    # the risk budget allows, and self-adjusts with IV, credit and the configured risk limits
+    # instead of being a hardcoded number that silently stops fitting.
+    _explicit_wing = regime_state.metadata.get("iron_fly_wing_pts")
+
+    def _wing_pair(w: float):
+        lc_q = min([q for q in calls if q.strike >= atm_call.strike + w] or calls,
+                   key=lambda q: abs(q.strike - (atm_call.strike + w)))
+        lp_q = min([q for q in puts if q.strike <= atm_put.strike - w] or puts,
+                   key=lambda q: abs(q.strike - (atm_put.strike - w)))
+        return lc_q, lp_q
+
+    if _explicit_wing is not None:
+        wing_pts = float(_explicit_wing)
+        long_call, long_put = _wing_pair(wing_pts)
+    else:
+        _risk_cap = float(getattr(snapshot.risk_limits, "max_risk_rupees_per_trade", 0.0) or 0.0)
+        _min_lots = max(int(getattr(snapshot.risk_limits, "min_lots_per_trade", 1) or 1), 1)
+        wing_pts, long_call, long_put = 200.0, *_wing_pair(200.0)
+        _lot_size = int(snapshot.lot_size or 0)
+        if _risk_cap > 0 and _lot_size > 0:
+            for _w in (200.0, 250.0, 300.0, 350.0, 400.0, 500.0, 600.0, 800.0, 1000.0):
+                _lc, _lp = _wing_pair(_w)
+                _net = ((atm_call.mid_price or atm_call.ltp or 0.0) + (atm_put.mid_price or atm_put.ltp or 0.0)
+                        - (_lc.mid_price or _lc.ltp or 0.0) - (_lp.mid_price or _lp.ltp or 0.0))
+                _w_actual = max(_lc.strike - atm_call.strike, atm_put.strike - _lp.strike)
+                _max_loss = (_w_actual - _net) * _lot_size
+                if _max_loss <= 0 or _max_loss * _min_lots > _risk_cap:
+                    break                      # this width no longer fits the budget — keep the last
+                wing_pts, long_call, long_put = _w, _lc, _lp
 
     sc = atm_call.mid_price or atm_call.ltp or 0.0
     sp = atm_put.mid_price or atm_put.ltp or 0.0
