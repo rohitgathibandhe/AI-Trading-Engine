@@ -767,6 +767,38 @@ def run_market_assessment(force: bool = False) -> None:
     current_iv  = float(analysis.get("avg_iv") or pending.get("avg_iv") or 15.0)
     current_pcr = float(analysis.get("pcr")    or pending.get("pcr")    or 1.0)
 
+    # ── Re-select strikes on 10:15 data before judging them ──────────────────────────────────
+    # The strike_margin gate demands spot be >= 0.80x expected move from BOTH shorts, but the
+    # strikes it judged were chosen at the 09:00 review — which runs BEFORE the 09:15 open, so they
+    # are placed off the previous close. The selector puts shorts at ~0.9-1.15x expected move, so
+    # after an overnight gap plus the first hour of trade the buffer is only ~0.1-0.35x EM
+    # (~39-138pts on a 395pt move) and one ordinary morning drift fails the gate. That is a STALE
+    # STRIKE artifact, not a risk signal — the answer is to re-strike on current data, NOT to lower
+    # the safety margin, which is a real protection.
+    # Re-selecting makes the gate mean what it says: "can the chain give us safe strikes RIGHT NOW?"
+    # If it cannot, the gate fails honestly and we stand down.
+    if parsed.get("strikes") and analysis.get("ok"):
+        _fresh = _select_legs(parsed, analysis, expiry_str, lots=DEFAULT_LOTS)
+        if _fresh is not None:
+            _old_sc, _old_sp = planned_sc, planned_sp
+            _fresh["avg_iv"] = analysis["avg_iv"]
+            _fresh["expected_move"] = analysis["expected_move"]
+            _fresh["pcr"] = analysis["pcr"]
+            # Keep the SAME token: the deploy path resolves the pending plan by token, so reusing it
+            # means auto-deploy picks up these refreshed legs rather than the stale ones.
+            _save_pending(_fresh, str(pending.get("token") or ""))
+            pending = _fresh
+            planned_sc = float(_fresh["short_call"])
+            planned_sp = float(_fresh["short_put"])
+            expected_move = float(_fresh["expected_move"])
+            plan_credit = float(_fresh["gross_credit"])
+            if (_old_sc, _old_sp) != (planned_sc, planned_sp):
+                print(f"[weekly_ic_assess] Re-struck on 10:15 data: "
+                      f"SC {_old_sc:,.0f}->{planned_sc:,.0f}  SP {_old_sp:,.0f}->{planned_sp:,.0f}")
+        else:
+            print("[weekly_ic_assess] Re-strike found no valid legs — judging the 09:00 strikes.",
+                  file=sys.stderr)
+
     # Day range
     day_high   = ohlc.get("high")
     day_low    = ohlc.get("low")
