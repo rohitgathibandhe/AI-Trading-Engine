@@ -69,6 +69,50 @@ PLAYBOOK_BAD_PROFIT_FACTOR = 0.90
 PLAYBOOK_GOOD_PROFIT_FACTOR = 1.20
 STATE_ROOT = Path(__file__).resolve().parents[1] / "state"
 AGENT_HEARTBEAT_PATH = STATE_ROOT / "intraday_v83_heartbeat.json"
+_SELECTION_LOG = STATE_ROOT / "selection_log.jsonl"
+
+
+def _log_selection_outcome(
+    *, snapshot, choice, strategy, outcome: str, reason: str,
+    structure_report=None, risk=None,
+) -> None:
+    """One row per selector decision that reached structure evaluation, so 'why didn't it trade the
+    fly/strangle/bull-put' is answerable from data instead of reconstruction.
+
+    Records the CHOSEN structure, the exact rejection reason with the NUMBERS behind it (the strikes,
+    short delta, credit, width from the candidate report; the lots and max-loss from risk), and the
+    market context (spot, efficiency, walls). This is the intraday twin of weekly_ic_gate_log — built
+    after guessing wrong twice about which gate was blocking the sellers. Never raises.
+    """
+    try:
+        m = getattr(snapshot, "option_chain", None)
+        spot = float(getattr(m, "spot", 0.0) or 0.0)
+        meta = getattr(choice, "read", None)
+        rep = structure_report or {}
+        cand = rep.get("best_candidate") or rep.get("best_failed_candidate") or {}
+        row = {
+            "at": snapshot.timestamp.isoformat(timespec="seconds"),
+            "session_date": snapshot.timestamp.date().isoformat(),
+            "condition": getattr(choice, "condition", None),
+            "family": getattr(choice, "family", None),
+            "strategy": strategy.value if hasattr(strategy, "value") else str(strategy),
+            "outcome": outcome,                       # ENTERED | STRUCTURE_FAIL | RISK_FAIL
+            "reason": reason,
+            "spot": round(spot, 2),
+            # candidate numbers — the strike-selection evidence the retro needs
+            "short_strike": cand.get("short_strike") or cand.get("short_put_strike") or cand.get("short_call_strike"),
+            "long_strike": cand.get("long_strike") or cand.get("long_put_strike") or cand.get("long_call_strike"),
+            "short_delta": cand.get("short_delta") or cand.get("short_delta_abs"),
+            "credit": cand.get("credit") or cand.get("total_credit"),
+            "width": cand.get("width") or cand.get("max_width"),
+            "lots": getattr(risk, "lots", None) if risk is not None else None,
+            "max_loss_per_lot": getattr(risk, "max_loss_rupees_per_lot", None) if risk is not None else None,
+            "risk_reasons": list(getattr(risk, "reasons", []) or []) if risk is not None else None,
+        }
+        with _SELECTION_LOG.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
 
 
 def _write_v83_agent_heartbeat(*, runtime_config: object, phase: str) -> None:
@@ -1123,6 +1167,11 @@ class IntradayDefinedRiskAgent:
             setup_quality_score=float(meta.get("setup_quality_score") or 0.0), playbook_tier="A",
         )
         if not structure:
+            _log_selection_outcome(
+                snapshot=snapshot, choice=choice, strategy=strategy, outcome="STRUCTURE_FAIL",
+                reason=str(structure_report.get("canonical_rejection_reason") or "SPREAD_CONSTRUCTION_FAILED"),
+                structure_report=structure_report,
+            )
             return build_no_trade_decision(
                 regime_state.regime.value, [choice.rationale] + structure_reasons,
                 confidence_score=choice.conviction,
@@ -1136,11 +1185,19 @@ class IntradayDefinedRiskAgent:
             margin_estimate_per_lot=structure.margin_estimate_per_lot, playbook=playbook,
         )
         if not risk.allowed:
+            _log_selection_outcome(
+                snapshot=snapshot, choice=choice, strategy=strategy, outcome="RISK_FAIL",
+                reason="RISK_LIMIT", structure_report=structure_report, risk=risk,
+            )
             return build_no_trade_decision(
                 regime_state.regime.value, [choice.rationale] + risk.reasons,
                 confidence_score=choice.conviction,
                 extra_metadata=dict(meta) | {"trade_funnel": _funnel("RISK_LIMIT", strategy.value, "NO_TRADE")},
             )
+        _log_selection_outcome(
+            snapshot=snapshot, choice=choice, strategy=strategy, outcome="ENTERED",
+            reason="OK", structure_report=structure_report, risk=risk,
+        )
         self._current_features = {"playbook": playbook, "setup_direction": direction,
                                   "selector_condition": choice.condition, "selector_family": choice.family}
         return build_trade_decision(
