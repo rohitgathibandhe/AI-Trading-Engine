@@ -1139,6 +1139,15 @@ class IntradayDefinedRiskAgent:
             meta["bearish_trade_score"] = max(float(meta.get("bearish_trade_score") or 0.0), _sel_score)
         elif direction == "BULLISH":
             meta["bullish_trade_score"] = max(float(meta.get("bullish_trade_score") or 0.0), _sel_score)
+        else:
+            # RANGE / neutral premium sellers (IRON_FLY, IRON_CONDOR, SHORT_STRANGLE, SHORT_STRADDLE)
+            # have no directional side. The live entry gate scores RANGE as max(bearish, bullish), so
+            # if we leave both at 0 the gate fails every neutral seller with DIRECTIONAL_SCORE_MARGIN_FAIL
+            # — the fly/strangle would be selected, built, risk-approved, then silently killed here.
+            # (This is why IRON_FLY had 0 live fills even once the selector could choose it.) A neutral
+            # seller's conviction is symmetric, so express it on BOTH sides.
+            meta["bearish_trade_score"] = max(float(meta.get("bearish_trade_score") or 0.0), _sel_score)
+            meta["bullish_trade_score"] = max(float(meta.get("bullish_trade_score") or 0.0), _sel_score)
         # Credit spreads take a wall/level floor for strike selection; debit spreads
         # use their own delta-band selection, so no strike guidance is imposed.
         if not _is_debit:
