@@ -22,7 +22,7 @@ from .data_models import (
     StrategyType,
     TradeStructure,
 )
-from .execution import build_no_trade_decision, build_open_position, build_trade_decision, evaluate_exit, evaluate_hedge_opportunity, validate_entry_context, validate_entry_time
+from .execution import build_no_trade_decision, build_open_position, build_trade_decision, estimate_round_trip_cost_rupees, evaluate_exit, evaluate_hedge_opportunity, validate_entry_context, validate_entry_time
 from .learning import LearningStore
 from .ops_runtime import (
     RuntimeMode,
@@ -329,7 +329,7 @@ def _shadow_only_failed_breakout_candidate(
     if not risk.allowed:
         return None
     expected_credit_rupees = max(structure.credit_points - snapshot.slippage_points, 0.0) * snapshot.lot_size * risk.lots
-    expected_round_trip_cost_rupees = ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT * risk.lots
+    expected_round_trip_cost_rupees = estimate_round_trip_cost_rupees(structure, snapshot.option_chain, risk.lots, snapshot.lot_size)
     expected_net_edge_rupees = expected_credit_rupees - expected_round_trip_cost_rupees
     playbook_min_edge = float(regime_state.metadata.get("minimum_net_edge_rupees") or 0.0)
     min_required_edge = max(MIN_NET_EDGE_RUPEES, playbook_min_edge, expected_round_trip_cost_rupees * MIN_NET_EDGE_COST_MULTIPLE)
@@ -620,7 +620,7 @@ def _paper_context_override_candidate(
     capped_lots = max(1, min(risk.lots, ops_max_lots))
 
     expected_credit_rupees = max(structure.credit_points - snapshot.slippage_points, 0.0) * snapshot.lot_size * capped_lots
-    expected_round_trip_cost_rupees = ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT * risk.lots
+    expected_round_trip_cost_rupees = estimate_round_trip_cost_rupees(structure, snapshot.option_chain, risk.lots, snapshot.lot_size)
     expected_net_edge_rupees = expected_credit_rupees - expected_round_trip_cost_rupees
     playbook_min_edge = float(regime_metadata.get("minimum_net_edge_rupees") or 0.0)
     min_required_edge = max(MIN_NET_EDGE_RUPEES, playbook_min_edge, expected_round_trip_cost_rupees * MIN_NET_EDGE_COST_MULTIPLE)
@@ -772,7 +772,7 @@ def _build_bullish_paper_override(
     capped_lots = max(1, min(risk.lots, ops_max_lots))
 
     expected_credit_rupees = max(structure.credit_points - snapshot.slippage_points, 0.0) * snapshot.lot_size * capped_lots
-    expected_round_trip_cost_rupees = ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT * risk.lots
+    expected_round_trip_cost_rupees = estimate_round_trip_cost_rupees(structure, snapshot.option_chain, risk.lots, snapshot.lot_size)
     expected_net_edge_rupees = expected_credit_rupees - expected_round_trip_cost_rupees
     playbook_min_edge = float(regime_metadata.get("minimum_net_edge_rupees") or 0.0)
     min_required_edge = max(MIN_NET_EDGE_RUPEES, playbook_min_edge, expected_round_trip_cost_rupees * MIN_NET_EDGE_COST_MULTIPLE)
@@ -1470,7 +1470,7 @@ class IntradayDefinedRiskAgent:
             return decision
 
         expected_credit_rupees = max(structure.credit_points - snapshot.slippage_points, 0.0) * snapshot.lot_size * risk.lots
-        expected_round_trip_cost_rupees = ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT * risk.lots
+        expected_round_trip_cost_rupees = estimate_round_trip_cost_rupees(structure, snapshot.option_chain, risk.lots, snapshot.lot_size)
         expected_net_edge_rupees = expected_credit_rupees - expected_round_trip_cost_rupees
         self._current_features["expected_credit_rupees"] = expected_credit_rupees
         self._current_features["expected_round_trip_cost_rupees"] = expected_round_trip_cost_rupees

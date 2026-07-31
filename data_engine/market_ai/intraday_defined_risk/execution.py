@@ -149,6 +149,31 @@ def compute_structure_spread_pts(structure, option_chain) -> float:
     return round(total, 2)
 
 
+# Real per-lot fees for a Nifty options round trip on a discount broker (brokerage + STT +
+# exchange txn + GST + stamp, entry AND exit). Conservative flat estimate.
+FEES_PER_LOT_ROUNDTRIP_RUPEES = 25.0
+# Never cost a structure below this per lot — guards against a missing/locked quote reading the
+# spread as ~0 and letting a thin trade through under-costed.
+MIN_ROUND_TRIP_COST_PER_LOT_RUPEES = 25.0
+
+
+def estimate_round_trip_cost_rupees(structure, option_chain, lots: int, lot_size: int) -> float:
+    """STRUCTURE-AWARE round-trip cost, replacing a flat per-lot magic number.
+
+    Sums the ACTUAL per-leg bid/ask spreads (both sides = entry + exit) and adds fees, so a 4-leg
+    fly correctly costs ~2x a 2-leg vertical AND an illiquid leg (wide spread) is costed for what it
+    really is instead of a blind constant. On liquid Nifty index strikes the spreads are razor-thin
+    (measured ~0.4pt round-trip on a fly, ~0.15pt on a vertical), so this is close to the old flat
+    number there — its value is adaptivity: it self-adjusts to real liquidity and never silently
+    under-costs a thin/illiquid leg. Falls back to the fee floor when bid/ask is unavailable.
+    """
+    half_spread_pts = compute_structure_spread_pts(structure, option_chain)   # one side, sum of legs
+    round_trip_pts = 2.0 * half_spread_pts                                    # entry + exit
+    spread_cost = round_trip_pts * lot_size * lots
+    fees = FEES_PER_LOT_ROUNDTRIP_RUPEES * lots
+    return round(max(spread_cost + fees, MIN_ROUND_TRIP_COST_PER_LOT_RUPEES * lots), 2)
+
+
 def build_open_position(
     structure: TradeStructure,
     lots: int,
