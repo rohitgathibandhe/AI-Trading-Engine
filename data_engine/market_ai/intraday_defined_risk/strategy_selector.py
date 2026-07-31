@@ -458,7 +458,7 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
             # NOTE: the volatility engine is ADVISORY here — its rich/cheap read is attached but does
             # NOT yet gate (a "stand aside when vol cheap" rule was REJECTED: 7mo +104,858 -> +84,945).
             choice.family = FAM_PREMIUM_SELL
-            choice.structures = ["IRON_FLY", "SHORT_STRANGLE"] if _NO_CONDOR else ["IRON_CONDOR", "IRON_FLY", "SHORT_STRANGLE"]
+            choice.structures = ["IRON_FLY", "IRON_CONDOR"] if _NO_CONDOR else ["IRON_CONDOR", "IRON_FLY"]
             _rich = " (vol RICH)" if vol.regime == RICH_SELL else (" (vol CHEAP — watch)" if vol.regime == CHEAP_BUY else "")
             choice.rationale = f"RANGE_WIDE / mid-day{_rich}: two-sided walls, balanced tape — sell NEUTRAL premium inside the formed range{' (condor off: fly/strangle)' if _NO_CONDOR else ''}."
         else:
@@ -484,7 +484,7 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
             # work; the RANGE_INVALIDATION exit cuts it if the chop breaks into a trend. This is the
             # opposite of the directional credit spread that made CHOP the -Rs73k killer.
             choice.family = FAM_PREMIUM_SELL
-            choice.structures = ["IRON_FLY", "SHORT_STRANGLE"]
+            choice.structures = ["IRON_FLY", "IRON_CONDOR"]
             choice.rationale = (
                 f"CHOP (bias {read.bias}, conviction {read.conviction:.2f}) but premium is sellable "
                 f"and the range has formed — SELL NEUTRAL (defined-risk fly, strangle fallback) and "

@@ -4,7 +4,7 @@ import json
 import math
 from pathlib import Path
 
-from .data_models import AccountRiskLimits, AccountState, RiskAssessment, StrategyType, TradeStructure
+from .data_models import AccountRiskLimits, AccountState, OptionType, RiskAssessment, StrategyType, TradeStructure
 
 _STATE_ROOT = Path(__file__).resolve().parents[1] / "state"
 
@@ -143,7 +143,10 @@ def compute_max_loss_rupees_per_lot(structure: TradeStructure, lot_size: int) ->
         # Debit spread: the debit paid is the entire max loss.
         debit_points = float(structure.metadata.get("debit_points") or 0.0)
         return max(debit_points * lot_size, 0.0)
-    if structure.strategy == StrategyType.IRON_CONDOR:
+    if structure.strategy in {StrategyType.IRON_CONDOR, StrategyType.IRON_FLY}:
+        # Defined risk both sides: worst case is the wider wing minus the credit kept. IRON_FLY was
+        # missing here and fell through to 0.0 -> assess_trade_risk rejected every fly as "max loss
+        # non-positive". The fly has the SAME max-loss shape as the condor (shorts + protective wings).
         call_side = max(structure.call_width_points - structure.credit_points, 0.0)
         put_side = max(structure.put_width_points - structure.credit_points, 0.0)
         return max(call_side, put_side) * lot_size
@@ -154,6 +157,27 @@ def compute_max_loss_rupees_per_lot(structure: TradeStructure, lot_size: int) ->
     return 0.0
 
 
+def _has_unhedged_short(structure: TradeStructure) -> bool:
+    """True if any SHORT leg lacks a protective long wing on the same option type.
+
+    A short put at K is hedged only by a long put at a strike < K; a short call at K only by a long
+    call at a strike > K. A naked short (short strangle/straddle with no wings) has an unhedged short
+    and — on an overnight gap, the primary tail of a Nifty short-premium book — unbounded loss with no
+    exit until 09:15. This is the one rule that must be NON-OVERRIDABLE in code (per the Nifty
+    option-selling architecture), so it lives in the risk gate every structure passes through.
+    """
+    longs_put = [l.strike for l in structure.legs if l.action == "BUY" and l.option_type == OptionType.PUT]
+    longs_call = [l.strike for l in structure.legs if l.action == "BUY" and l.option_type == OptionType.CALL]
+    for leg in structure.legs:
+        if leg.action != "SELL":
+            continue
+        if leg.option_type == OptionType.PUT and not any(lp < leg.strike for lp in longs_put):
+            return True
+        if leg.option_type == OptionType.CALL and not any(lc > leg.strike for lc in longs_call):
+            return True
+    return False
+
+
 def assess_trade_risk(
     structure: TradeStructure,
     lot_size: int,
@@ -162,6 +186,15 @@ def assess_trade_risk(
     margin_estimate_per_lot: float | None = None,
     playbook: str = "",
 ) -> RiskAssessment:
+    if _has_unhedged_short(structure):
+        return RiskAssessment(
+            allowed=False,
+            reasons=["NAKED_SHORT_REJECTED: every short leg must carry a long wing (defined risk only)."],
+            max_loss_rupees_per_lot=0.0,
+            lots=0,
+            projected_margin_rupees=account_state.margin_used_rupees,
+            projected_margin_utilisation=account_state.margin_used_rupees / risk_limits.max_margin_rupees,
+        )
     max_loss_per_lot = compute_max_loss_rupees_per_lot(structure, lot_size=lot_size)
     if max_loss_per_lot <= 0:
         return RiskAssessment(
