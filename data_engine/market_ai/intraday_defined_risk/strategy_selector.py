@@ -108,6 +108,21 @@ _BUY_MIN_EFFICIENCY = _sel_env_float("SEL_BUY_MIN_EFFICIENCY")
 if _BUY_MIN_EFFICIENCY is None:
     _BUY_MIN_EFFICIENCY = 0.50
 
+# ── SELL THE CHOP / RANGE (default ON) ────────────────────────────────────────────────────────
+# The classifier funnels every moderate-conviction / mild-bias day into CHOP, which stood aside — so
+# the agent did NOTHING on the majority of sessions (531 CHOP + 259 RANGE_WIDE cycles over 4 days,
+# all stand-aside). Those are premium-selling days: on the exact days the agent stood aside, the
+# neutral sellers made iron_fly +4,053 / strangle +2,723 / straddle +8,029 (live shadow book). The
+# old "CHOP = -Rs73k killer" warning was about DIRECTIONAL credit spreads whipsawing in chop — a
+# NEUTRAL seller is the opposite trade and the forward record says it profits. So route a chop/range
+# with ADEQUATE premium to a neutral seller (defined-risk fly first) instead of standing aside.
+# Guards keep it honest: premium rich/normal (not cheap) and the range formed (after 11:00 — morning
+# flies get run over before the range sets). Stays NEUTRAL so the -73k directional failure can't
+# recur; the RANGE_INVALIDATION exit cuts it if the chop breaks into a trend. n is small —
+# SEL_SELL_CHOP=0 disables. Ties to [[project_ordering_robustness]].
+_SELL_CHOP = os.environ.get("SEL_SELL_CHOP", "1") == "1"
+_CHOP_SELL_AFTER = time(11, 0)   # let the range form before selling the ATM
+
 
 def _trend_efficiency(metadata: dict) -> float:
     """Follow-through of the move: |net displacement| / total path travelled. ~1.0 = clean trend
@@ -431,22 +446,21 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         # day's range hasn't formed yet; mid-day condors win (+Rs7.6k @70%). Only sell
         # the range once it's established (>= 11:30).
         _too_early = now_time is not None and now_time < time(11, 30)
-        if _NO_CONDOR:
-            choice.family, choice.structures = FAM_STAND_ASIDE, []
-            choice.rationale = "RANGE_WIDE but condor disabled (SEL_NO_CONDOR) — condor P&L is order-noise; stand aside, keep the slot for the robust directional edge."
-        elif _too_early:
+        if _too_early:
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = "RANGE_WIDE but before 11:30 — range not yet formed (morning condors lose); wait."
         elif iv in (IV_RICH, IV_NORMAL):
-            # NOTE: the volatility engine is ADVISORY here for now — its rich/cheap read
-            # is attached to the decision (choice.vol_regime/vol_notes) but does NOT yet
-            # gate the trade. A "stand aside when vol cheap" rule was tested and REJECTED
-            # (7mo: +104,858 -> +84,945) — the VRP thresholds need calibration for Nifty
-            # before vol drives trades. Kept computing so it can be calibrated on real data.
+            # SEL_NO_CONDOR drops the CONDOR specifically (its P&L is order-noise on the ordering-robust
+            # harness) — but that should NOT mean standing aside on a formed range, which cost real
+            # money: on range/stand-aside days the live shadow made strangle +2,723 / fly +4,053. So
+            # sell the range with a NEUTRAL structure the record likes (fly first, strangle fallback),
+            # only adding the condor when it is not disabled.
+            # NOTE: the volatility engine is ADVISORY here — its rich/cheap read is attached but does
+            # NOT yet gate (a "stand aside when vol cheap" rule was REJECTED: 7mo +104,858 -> +84,945).
             choice.family = FAM_PREMIUM_SELL
-            choice.structures = ["IRON_CONDOR", "SHORT_STRANGLE"]
+            choice.structures = ["IRON_FLY", "SHORT_STRANGLE"] if _NO_CONDOR else ["IRON_CONDOR", "IRON_FLY", "SHORT_STRANGLE"]
             _rich = " (vol RICH)" if vol.regime == RICH_SELL else (" (vol CHEAP — watch)" if vol.regime == CHEAP_BUY else "")
-            choice.rationale = f"RANGE_WIDE / mid-day{_rich}: two-sided walls, balanced tape — sell premium inside the formed range."
+            choice.rationale = f"RANGE_WIDE / mid-day{_rich}: two-sided walls, balanced tape — sell NEUTRAL premium inside the formed range{' (condor off: fly/strangle)' if _NO_CONDOR else ''}."
         else:
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = "RANGE_WIDE but IV CHEAP: premium too thin to sell; stand aside."
@@ -462,8 +476,24 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         choice.rationale = "HIGH_VOL_UNDIRECTED: elevated vol without direction = whipsaw risk — stand aside."
 
     else:  # CHOP
-        choice.family, choice.structures = FAM_STAND_ASIDE, []
-        choice.rationale = f"CHOP: uncommitted tape (bias {read.bias}, conviction {read.conviction:.2f}) — stand aside. This condition was the -Rs73k killer."
+        _prem_ok = iv in (IV_RICH, IV_NORMAL)
+        _range_formed = now_time is None or now_time >= _CHOP_SELL_AFTER
+        if _SELL_CHOP and _prem_ok and _range_formed:
+            # Uncommitted tape = no direction, but a CONTAINED chop with real premium is a
+            # premium-SELLER's day. Sell a NEUTRAL, defined-risk structure (fly first) and let theta
+            # work; the RANGE_INVALIDATION exit cuts it if the chop breaks into a trend. This is the
+            # opposite of the directional credit spread that made CHOP the -Rs73k killer.
+            choice.family = FAM_PREMIUM_SELL
+            choice.structures = ["IRON_FLY", "SHORT_STRANGLE"]
+            choice.rationale = (
+                f"CHOP (bias {read.bias}, conviction {read.conviction:.2f}) but premium is sellable "
+                f"and the range has formed — SELL NEUTRAL (defined-risk fly, strangle fallback) and "
+                f"collect theta. NEUTRAL, not directional: the -Rs73k killer was directional spreads here."
+            )
+        else:
+            choice.family, choice.structures = FAM_STAND_ASIDE, []
+            _why = "premium too cheap to sell" if not _prem_ok else ("range not yet formed (< 11:00)" if not _range_formed else "chop-selling disabled")
+            choice.rationale = f"CHOP: uncommitted tape (bias {read.bias}, conviction {read.conviction:.2f}) — stand aside ({_why})."
 
     # NOTE: a vol rule "skip debit when IV 12-16" was calibrated from post-hoc buckets
     # (that bucket showed -Rs18,807/25% win) and REJECTED on validation: applying it made
