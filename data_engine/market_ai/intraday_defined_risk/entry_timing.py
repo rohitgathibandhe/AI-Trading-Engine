@@ -57,6 +57,20 @@ _ENABLED = os.environ.get("ENTRY_WAIT_ENABLED", "1") == "1"
 _BEARISH = {"PUT_DEBIT_SPREAD"}
 _BULLISH = {"CALL_DEBIT_SPREAD"}
 
+# Credit SELLERS reuse the SAME timing mechanic (wait for spot to move a set amount before entering)
+# for a different REASON. A debit buyer waits for a retrace to get a cheaper fill; a credit seller
+# waits for the thesis to CONFIRM so it doesn't sell into a local extreme that instantly reverses.
+# 2026-07-30: a bull-put entered at 24,277 the instant its up-signal fired — right before a dip to
+# VWAP that stopped it out (-331), then the tape recovered and closed higher; the shadow book shows
+# the same structure made +401. Waiting for confirmation would have entered AFTER that dip.
+# The wait DIRECTION coincides with the debits: a BULL_PUT (bullish) waits for spot UP exactly like a
+# PUT_DEBIT; a BEAR_CALL (bearish) waits for spot DOWN exactly like a CALL_DEBIT. Only the rationale
+# differs. n=1 so far — SELLER_ENTRY_WAIT_ENABLED=0 disables independently while the forward record
+# (selection_log + exit_shadow) judges it.
+_SELLER_ENABLED = os.environ.get("SELLER_ENTRY_WAIT_ENABLED", "1") == "1"
+_SELL_WAIT_UP = {"BULL_PUT_CREDIT_SPREAD"}      # bullish seller — confirm up before selling puts
+_SELL_WAIT_DOWN = {"BEAR_CALL_CREDIT_SPREAD"}   # bearish seller — confirm down before selling calls
+
 
 def _read() -> dict:
     try:
@@ -96,18 +110,25 @@ def should_wait(strategy_name: str, spot: float, now: datetime) -> tuple[bool, s
         # path in a module whose entire contract is to fail open.
         if not _ENABLED or not math.isfinite(spot) or spot <= 0:
             return False, "ENTRY_WAIT_DISABLED"
-        direction = 1 if strategy_name in _BEARISH else (-1 if strategy_name in _BULLISH else 0)
+        is_seller = strategy_name in _SELL_WAIT_UP or strategy_name in _SELL_WAIT_DOWN
+        if is_seller and not _SELLER_ENABLED:
+            return False, "SELLER_ENTRY_WAIT_DISABLED"
+        direction = (
+            1 if (strategy_name in _BEARISH or strategy_name in _SELL_WAIT_UP)
+            else -1 if (strategy_name in _BULLISH or strategy_name in _SELL_WAIT_DOWN)
+            else 0
+        )
         if direction == 0:
-            return False, "NOT_DIRECTIONAL_DEBIT"      # sellers/neutral: unchanged behaviour
+            return False, "NOT_TIMED_ENTRY"      # neutral sellers (fly/condor/strangle/straddle): unchanged
 
         st = _read()
         key = f"{now.date().isoformat()}|{strategy_name}"
         if st.get("key") != key:
             st = {"key": key, "armed_at": now.isoformat(timespec="seconds"), "signal_spot": round(spot, 2)}
             _write(st)
-            return True, (f"ENTRY_WAIT_ARMED: signal at {spot:,.0f}; want a "
-                          f"{'bounce' if direction > 0 else 'dip'} of "
-                          f"{spot * _RETRACE_PCT:.0f}pts before paying up")
+            _verb = "confirm" if is_seller else "retrace"
+            return True, (f"ENTRY_WAIT_ARMED: signal at {spot:,.0f}; want spot "
+                          f"{'+' if direction > 0 else '-'}{spot * _RETRACE_PCT:.0f}pts to {_verb} before entry")
 
         s0 = float(st.get("signal_spot") or spot)
         armed = datetime.fromisoformat(st["armed_at"])
@@ -117,8 +138,9 @@ def should_wait(strategy_name: str, spot: float, now: datetime) -> tuple[bool, s
 
         if reached:
             clear()
-            return False, (f"ENTRY_WAIT_FILLED: spot {spot:,.0f} retraced to target {target:,.0f} "
-                           f"after {waited:.0f}m — entering at the better price")
+            _why = "thesis confirmed" if is_seller else "better price"
+            return False, (f"ENTRY_WAIT_FILLED: spot {spot:,.0f} reached {target:,.0f} "
+                           f"after {waited:.0f}m — entering ({_why})")
         if waited >= _TIMEOUT_MIN:
             clear()
             return False, (f"ENTRY_WAIT_TIMEOUT: no {abs(target - s0):.0f}pt retrace in "
