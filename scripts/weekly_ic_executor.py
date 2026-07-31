@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -627,6 +628,39 @@ _MAX_DAY_RANGE_RATIO   = 0.50   # day's high-low range must be < 50% of expected
 _PCR_LOW               = 0.70   # below this = very bearish (call writers dominating)
 _PCR_HIGH              = 1.80   # above this = very complacent (put writers dominating)
 
+# Gap-shock: the weekly IC is held 3-5 days, so its primary tail is an OVERNIGHT GAP — Nifty prices
+# global news at the 09:15 open in one jump, with no chance to exit. The IC is defined-risk, so the
+# gap loss is BOUNDED at its max loss, but this makes that bound explicit and refuses a position
+# whose worst-case overnight loss exceeds tolerance. Env-configurable.
+_MAX_OVERNIGHT_LOSS_RUPEES = float(os.environ.get("WEEKLY_IC_MAX_OVERNIGHT_LOSS", "50000") or 50000)
+_GAP_SHOCKS = (-0.06, -0.04, -0.02, -0.01, 0.01, 0.02, 0.04, 0.06)   # calibrate to Nifty's real gap tail
+
+
+def _ic_pnl_at(plan: dict, settle: float) -> float:
+    """Iron-condor P&L at an expiry settlement price (rupees). Defined-risk: bounded both sides."""
+    qty = float(plan.get("quantity") or 0)
+    credit = float(plan.get("gross_credit") or 0.0)
+    sc, lc = float(plan["short_call"]), float(plan["long_call"])
+    sp, lp = float(plan["short_put"]), float(plan["long_put"])
+    call_loss = max(0.0, min(settle - sc, lc - sc)) * qty
+    put_loss = max(0.0, min(sp - settle, sp - lp)) * qty
+    return credit - call_loss - put_loss
+
+
+def _gap_shock(plan: dict, spot: float) -> dict:
+    """Stress the IC across an overnight-gap ladder. Returns worst-case loss and the smallest gap
+    (either direction) that already reaches the defined max loss."""
+    rows = [(s, _ic_pnl_at(plan, spot * (1.0 + s))) for s in _GAP_SHOCKS]
+    worst = min(p for _, p in rows)
+    max_loss = -float(plan.get("max_loss") or 0.0)
+    gap_to_maxloss = None
+    for s, p in sorted(rows, key=lambda x: abs(x[0])):
+        if p <= max_loss + 1:            # first (smallest) gap that hits the floor
+            gap_to_maxloss = abs(s)
+            break
+    return {"worst_loss": round(worst, 0), "gap_to_maxloss_pct": gap_to_maxloss,
+            "ladder": {f"{s:+.0%}": round(p, 0) for s, p in rows}}
+
 
 def _get_nifty_ohlc_today(creds: dict) -> dict[str, float | None]:
     """Fetch today's OHLC for NIFTY from Dhan intraday endpoint.
@@ -860,6 +894,19 @@ def run_market_assessment(force: bool = False) -> None:
         f"{'✅ balanced' if _PCR_LOW <= current_pcr <= _PCR_HIGH else ('⚠️ extremely bearish' if current_pcr < _PCR_LOW else '⚠️ extremely complacent')}"
     ))
 
+    # 6. Gap shock — the overnight tail. Worst-case gap loss must be within tolerance, and it is
+    # bounded ONLY because the IC is defined-risk (wings). Shows the smallest gap that hits max loss.
+    _gs = _gap_shock(pending, spot)
+    _gap_ok = _gs["worst_loss"] >= -_MAX_OVERNIGHT_LOSS_RUPEES
+    _g2m = _gs["gap_to_maxloss_pct"]
+    _g2m_txt = f"max loss at a {_g2m*100:.1f}% gap; " if _g2m is not None else ""
+    _gap_status = f"✅ within ₹{_MAX_OVERNIGHT_LOSS_RUPEES:,.0f}" if _gap_ok else f"🚨 exceeds ₹{_MAX_OVERNIGHT_LOSS_RUPEES:,.0f} tolerance"
+    gates.append((
+        _gap_ok,
+        "Gap shock",
+        f"Worst overnight gap loss ₹{-_gs['worst_loss']:,.0f} ({_g2m_txt}{_gap_status})",
+    ))
+
     passed   = [g for g in gates if g[0]]
     failed   = [g for g in gates if not g[0]]
     n_passed = len(passed)
@@ -887,6 +934,10 @@ def run_market_assessment(force: bool = False) -> None:
         {"name": "pcr_balanced", "passed": bool(_PCR_LOW <= current_pcr <= _PCR_HIGH),
          "value": round(current_pcr, 2), "low": _PCR_LOW, "high": _PCR_HIGH,
          "margin": round(min(current_pcr - _PCR_LOW, _PCR_HIGH - current_pcr), 2)},
+        {"name": "gap_shock", "passed": bool(_gap_ok),
+         "worst_overnight_loss": _gs["worst_loss"], "gap_to_maxloss_pct": _gs["gap_to_maxloss_pct"],
+         "threshold": -_MAX_OVERNIGHT_LOSS_RUPEES, "ladder": _gs["ladder"],
+         "margin": round(_gs["worst_loss"] + _MAX_OVERNIGHT_LOSS_RUPEES, 0)},
     ]
 
     # ── Decision ─────────────────────────────────────────────────────────────
