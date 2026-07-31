@@ -44,6 +44,41 @@ def select_structure(
     return structure, reasons
 
 
+def _vertical_with_anchor_fallback(
+    *, strategy, snapshot, regime_state, option_type, short_delta_band, long_delta_band,
+    params, setup_quality, playbook_tier, anchor_kw: str, anchor_val,
+):
+    """Select a credit vertical (bull-put / bear-call), and if the OI-wall/support ANCHOR leaves no
+    delta-valid strike, retry WITHOUT the anchor so the delta band picks the strike.
+
+    Why this exists (2026-07-31): on an up-trend the support anchor capped the short put ~400pts OTM
+    (delta 0.08, ~4% credit), while the 0.18-0.30 delta band wants ~ATM-100..ATM-200 (delta 0.19-0.30,
+    ~14-18% credit — a proper sell strike). The anchor and the band were mutually exclusive, so 294/294
+    bull-puts were rejected and the agent could not sell puts on the exact up-days it wanted to.
+
+    The fallback does NOT loosen risk: the delta band still caps the short at 0.30 (~ATM-100), a
+    standard OTM credit strike. It only stops the anchor from vetoing the band's own legitimate strikes.
+    The anchor is still PREFERRED — we fall back only when it would otherwise build nothing.
+    """
+    common = dict(
+        strategy=strategy, snapshot=snapshot, regime_state=regime_state, option_type=option_type,
+        short_delta_band=short_delta_band, long_delta_band=long_delta_band, params=params,
+        setup_quality_score=setup_quality, playbook_tier=playbook_tier,
+        allow_distance_fallback_when_deltas_present=False,
+    )
+    structure, reasons, report = _evaluate_vertical_candidates(**common, **{anchor_kw: anchor_val})
+    if structure is not None or anchor_val is None:
+        return structure, reasons, report
+    # Anchored pass built nothing and an anchor was set — let the delta band pick the strike.
+    s2, r2, rep2 = _evaluate_vertical_candidates(**common, **{anchor_kw: None})
+    if s2 is not None:
+        rep2["anchor_relaxed"] = True
+        note = ("Support/OI anchor relaxed: no delta-valid strike on the anchored side; sold the "
+                "delta-band strike (<=0.30, ~ATM-100) instead of standing aside.")
+        return s2, [*r2, note], rep2
+    return structure, reasons, report   # neither worked — keep the original (anchored) report
+
+
 def select_best_structure(
     strategy: StrategyType,
     snapshot: MarketSnapshot,
@@ -77,18 +112,11 @@ def select_best_structure(
             # still a defensible OTM credit-spread strike for a directional bear view.
             bc_short_band = (0.18, 0.30)
             bc_long_band = (0.05, 0.15)
-        return _evaluate_vertical_candidates(
-            strategy=strategy,
-            snapshot=snapshot,
-            regime_state=regime_state,
-            option_type=OptionType.CALL,
-            short_delta_band=bc_short_band,
-            long_delta_band=bc_long_band,
-            params=params,
-            setup_quality_score=setup_quality,
-            playbook_tier=playbook_tier,
-            allow_distance_fallback_when_deltas_present=False,
-            min_short_strike=regime_state.metadata.get("min_short_call_strike"),
+        return _vertical_with_anchor_fallback(
+            strategy=strategy, snapshot=snapshot, regime_state=regime_state,
+            option_type=OptionType.CALL, short_delta_band=bc_short_band, long_delta_band=bc_long_band,
+            params=params, setup_quality=setup_quality, playbook_tier=playbook_tier,
+            anchor_kw="min_short_strike", anchor_val=regime_state.metadata.get("min_short_call_strike"),
         )
     if strategy == StrategyType.BULL_PUT_CREDIT_SPREAD:
         playbook = regime_state.metadata.get("playbook")
@@ -112,18 +140,11 @@ def select_best_structure(
             # buildable and would have been +Rs1,393/lot). 0.30 is a defensible OTM credit strike.
             short_delta_band = (0.18, 0.30)
             long_delta_band = (0.05, 0.15)
-        return _evaluate_vertical_candidates(
-            strategy=strategy,
-            snapshot=snapshot,
-            regime_state=regime_state,
-            option_type=OptionType.PUT,
-            short_delta_band=short_delta_band,
-            long_delta_band=long_delta_band,
-            params=params,
-            setup_quality_score=setup_quality,
-            playbook_tier=playbook_tier,
-            allow_distance_fallback_when_deltas_present=False,
-            max_short_strike=regime_state.metadata.get("max_short_put_strike"),
+        return _vertical_with_anchor_fallback(
+            strategy=strategy, snapshot=snapshot, regime_state=regime_state,
+            option_type=OptionType.PUT, short_delta_band=short_delta_band, long_delta_band=long_delta_band,
+            params=params, setup_quality=setup_quality, playbook_tier=playbook_tier,
+            anchor_kw="max_short_strike", anchor_val=regime_state.metadata.get("max_short_put_strike"),
         )
     if strategy == StrategyType.IRON_CONDOR:
         return _select_condor_candidates(
