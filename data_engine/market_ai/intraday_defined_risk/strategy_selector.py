@@ -154,30 +154,74 @@ _ORB_FORMED_AFTER = time(9, 45)      # first two 15-min candles = the opening ra
 # SEL_ZONE_CONFLUENCE=0 disables.
 _ZONE_CONFLUENCE = os.environ.get("SEL_ZONE_CONFLUENCE", "1") == "1"
 _ZONE_EDGE_FRAC = _sel_env_float("SEL_ZONE_EDGE_FRAC") or 0.33   # price within this fraction of a wall = "at the zone"
+_ZONE_MIN_CONFLUENCE = int(_sel_env_float("SEL_ZONE_MIN_CONFLUENCE") or 2)   # confluences beyond location+level
+
+
+def _levels_near(m: dict, price: float, tol: float, side: str) -> list[str]:
+    """Higher-timeframe structure levels within `tol` of price — the multi-timeframe stack that turns
+    an OI wall into a zone a desk actually defends. DEMAND uses supports, SUPPLY uses resistances;
+    daily EMAs / VWAP bands / weekly extremes / the round number count on the right side."""
+    if side == "DEMAND":
+        keys = ("support_15m", "daily_ema20", "daily_ema50", "weekly_low", "vwap_lower_1", "vwap_lower_2")
+    else:
+        keys = ("resistance_15m", "daily_ema20", "daily_ema50", "weekly_high", "vwap_upper_1", "vwap_upper_2")
+    hits = []
+    for k in keys:
+        v = _f(m, k, 0.0)
+        if v > 0 and abs(v - price) <= tol:
+            hits.append(k)
+    if abs(round(price / 100.0) * 100.0 - price) <= tol:     # a round 100-level at price
+        hits.append("round_100")
+    return hits
 
 
 def _zone_confluence(read, m: dict, spot: float) -> str | None:
-    """Return 'DEMAND' (price at support/put-wall, bullish confluence) or 'SUPPLY' (resistance/call-
-    wall, bearish confluence), else None. The big-player range read: LOCATION + OI + PATTERN + flow."""
+    """Seasoned-trader demand/supply read. A zone is valid only when the OI wall STACKS with
+    higher-timeframe price levels (multi-TF confluence), order flow confirms, and it does not fight
+    the higher-timeframe trend. Writes zone_confluence_score / _why to metadata for conviction + audit.
+      DEMAND: price at the put-wall zone + >=1 HTF support at price + (bullish hold OR OI holding) +
+              daily bias not bearish + flow not bearish.
+      SUPPLY: the mirror at the call-wall zone.
+    Returns 'DEMAND' / 'SUPPLY' / None."""
     if not _ZONE_CONFLUENCE or spot <= 0:
         return None
-    cw = _f(m, "current_call_wall", 0.0)
-    pw = _f(m, "current_put_wall", 0.0)
+    cw, pw = _f(m, "current_call_wall", 0.0), _f(m, "current_put_wall", 0.0)
     if cw <= 0 or pw <= 0 or cw <= pw:
         return None
     rng = cw - pw
-    near_demand = spot <= pw + rng * _ZONE_EDGE_FRAC          # lower third — at the demand zone
-    near_supply = spot >= cw - rng * _ZONE_EDGE_FRAC          # upper third — at the supply zone
+    tol = max(rng * 0.15, spot * 0.0025)                     # zone thickness: ~0.25% of spot or 15% of the wall range
+    daily_bias = _f(m, "daily_bias_score", 0.0)
     smb = str(m.get("smart_money_bias") or "NEUTRAL").upper()
-    bull_pat = str(m.get("bullish_candle_pattern") or "NONE") != "NONE"
-    bear_pat = str(m.get("bearish_candle_pattern") or "NONE") != "NONE"
+    mig = str(m.get("wall_migration_bias") or "NEUTRAL").upper()
     first_test = bool(m.get("at_first_test_of_level"))
-    # DEMAND: price at the put-wall zone, a bullish hold/rejection, and flow not against us.
-    if near_demand and (bull_pat or first_test) and smb != "BEARISH":
-        return "DEMAND"
-    # SUPPLY: price at the call-wall zone, a bearish rejection, and flow not against us.
-    if near_supply and (bear_pat or first_test) and smb != "BULLISH":
-        return "SUPPLY"
+
+    def _decide(side: str) -> str | None:
+        levels = _levels_near(m, spot, tol, side)
+        if not levels:                                       # MULTI-TF REQUIREMENT: no HTF level here -> not a zone
+            return None
+        if side == "DEMAND":
+            pattern = str(m.get("bullish_candle_pattern") or "NONE") != "NONE" or first_test
+            oi_holding = _f(m, "put_wall_shift", 0.0) >= 0 and mig != "BEARISH"     # supports not being pulled
+            trend_ok = daily_bias >= 0 and smb != "BEARISH"                          # HTF permits longs (no knife-catch)
+        else:
+            pattern = str(m.get("bearish_candle_pattern") or "NONE") != "NONE" or first_test
+            oi_holding = _f(m, "call_wall_shift", 0.0) <= 0 and mig != "BULLISH"     # resistance not lifting
+            trend_ok = daily_bias <= 0 and smb != "BULLISH"
+        if not trend_ok:                                     # never trade a zone against the higher-TF trend
+            return None
+        conf = len(levels) + (1 if pattern else 0) + (1 if oi_holding else 0)
+        if conf < 1 + _ZONE_MIN_CONFLUENCE:                  # location+HTF level is the floor; need real stack on top
+            return None
+        m["zone_confluence_score"] = conf
+        m["zone_confluence_why"] = f"HTF levels {levels}; pattern={pattern}; oi_holding={oi_holding}; daily_bias={daily_bias:g}"
+        return side
+
+    if spot <= pw + rng * _ZONE_EDGE_FRAC:                   # at the demand edge
+        d = _decide("DEMAND")
+        if d:
+            return d
+    if spot >= cw - rng * _ZONE_EDGE_FRAC:                   # at the supply edge
+        return _decide("SUPPLY")
     return None
 
 
@@ -539,20 +583,24 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
                 )
 
     elif condition == ZONE_DEMAND:
-        # Price at an OI-defended DEMAND zone (support/put wall) with a bullish hold — position WITH
-        # the institutions: SELL a defined-risk BULL-PUT below the zone (strike selection already
-        # anchors the short put to support, so the wall defends it). Collects premium AND is right
-        # with the structural bid — the desk trade in a range, no rich IV or breakout required.
+        # Multi-TF DEMAND zone: OI put wall stacked with higher-timeframe supports, a bullish hold,
+        # flow not against, higher-TF trend permitting. Position WITH the institutions — SELL a
+        # defined-risk BULL-PUT below the zone (strike selection anchors the short put to support).
+        # Conviction scales with the confluence stack (a desk sizes up the higher-confluence zone).
+        _cf = int(_f(metadata, "zone_confluence_score", 3))
+        choice.conviction = min(0.90, 0.55 + 0.07 * _cf)
         choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
-        choice.rationale = ("ZONE_DEMAND: price at the put-wall/support demand zone with a bullish hold and "
-                            "supportive flow — SELL a bull-put below the zone (the OI wall defends it).")
+        choice.rationale = (f"ZONE_DEMAND (confluence {_cf}): OI put wall + HTF supports + bullish hold — "
+                            f"SELL a bull-put below the zone. [{metadata.get('zone_confluence_why','')}]")
 
     elif condition == ZONE_SUPPLY:
-        # Price at an OI-defended SUPPLY zone (resistance/call wall) with a bearish rejection — SELL a
-        # defined-risk BEAR-CALL above the zone (short call anchored to resistance).
+        # Multi-TF SUPPLY zone: OI call wall stacked with higher-timeframe resistances, a bearish
+        # rejection, flow not against, higher-TF trend permitting — SELL a bear-call above the zone.
+        _cf = int(_f(metadata, "zone_confluence_score", 3))
+        choice.conviction = min(0.90, 0.55 + 0.07 * _cf)
         choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BEAR_CALL_CREDIT_SPREAD"]
-        choice.rationale = ("ZONE_SUPPLY: price at the call-wall/resistance supply zone with a bearish rejection "
-                            "and flow not against — SELL a bear-call above the zone (the OI wall caps it).")
+        choice.rationale = (f"ZONE_SUPPLY (confluence {_cf}): OI call wall + HTF resistances + bearish rejection — "
+                            f"SELL a bear-call above the zone. [{metadata.get('zone_confluence_why','')}]")
 
     elif condition == RANGE_WIDE:
         # Retrospective lesson: morning condors LOSE (-Rs1,151/24tr @10-12) because the
