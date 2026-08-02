@@ -123,6 +123,51 @@ if _BUY_MIN_EFFICIENCY is None:
 _SELL_CHOP = os.environ.get("SEL_SELL_CHOP", "1") == "1"
 _CHOP_SELL_AFTER = time(11, 0)   # let the range form before selling the ATM
 
+# ── ORB-GATED TREND (default ON) ──────────────────────────────────────────────────────────────
+# Verification 2026-08 found the agent calls STRONG_TREND on choppy days: it fired STRONG_TREND_DOWN
+# at 09:48 on 2026-07-23 (a -0.9% gap, accepted_breakout=False) — before the 30-min opening range
+# even formed — and the day was flat chop. Across 07-16/21/23 it called trends with
+# accepted_breakout=False; those are exactly the days it should have SOLD premium, not chased a
+# direction. The BREAKOUT branch already requires an accepted breakout; the STRONG_TREND branch did
+# NOT. Grounded in ORB research (8yr Nifty ORB backtest + Zerodha options ORB): only call a trend
+# once the 30-min range has formed, the breakout is ACCEPTED (price closed beyond and held), and the
+# range is wide enough to matter (tiny ranges = fakeouts). OI is a SOFT confirm only — the wall
+# velocity fields are frequently 0, so they can veto a clearly-defended break but never gate on
+# absence. An un-confirmed "trend" falls through to CHOP/RANGE -> sell the neutral fly.
+# SEL_ORB_GATE_TREND=0 restores the old un-gated trend classification.
+_ORB_GATE_TREND = os.environ.get("SEL_ORB_GATE_TREND", "1") == "1"
+_ORB_MIN_RANGE_PTS = _sel_env_float("SEL_ORB_MIN_RANGE_PTS")
+if _ORB_MIN_RANGE_PTS is None:
+    _ORB_MIN_RANGE_PTS = 40.0        # skip tiny opening ranges — they break falsely (ORB backtest)
+_ORB_FORMED_AFTER = time(9, 45)      # first two 15-min candles = the opening range
+
+
+def _orb_confirms_trend(m: dict, now_time, direction: str) -> bool:
+    """True only if a STRONG_TREND in `direction` ('UP'/'DOWN') is confirmed by an accepted
+    opening-range breakout — the ORB discipline. Fixes 'trend called on unconfirmed early momentum'."""
+    if not _ORB_GATE_TREND:
+        return True
+    # (a) the 30-min opening range must have formed
+    if now_time is not None and now_time < _ORB_FORMED_AFTER:
+        return False
+    # (b) the breakout must be ACCEPTED (price closed beyond the OR and held — not a fakeout)
+    if not bool(m.get("accepted_breakout")):
+        return False
+    # (c) and in the trend's direction (FAILED_UP is a down-rejection, valid for a down trend)
+    orb = str(m.get("opening_range_break_state") or "NONE")
+    if direction == "UP" and orb != "UP":
+        return False
+    if direction == "DOWN" and orb not in ("DOWN", "FAILED_UP"):
+        return False
+    # (d) opening range wide enough to be meaningful
+    orh, orl = _f(m, "or_high", 0.0), _f(m, "or_low", 0.0)
+    if orh > 0 and orl > 0 and (orh - orl) < _ORB_MIN_RANGE_PTS:
+        return False
+    return True
+    # NOTE: OI confirmation (veto a break where the wall is still BUILDING = writers defending) is a
+    # sound refinement but deferred — the wall-velocity scale (0..30, ~25% of readings > 0.5) needs a
+    # calibrated threshold before it gates, or it over-blocks real trends. Follow-up, validated first.
+
 
 def _trend_efficiency(metadata: dict) -> float:
     """Follow-through of the move: |net displacement| / total path travelled. ~1.0 = clean trend
@@ -287,7 +332,7 @@ def _iv_regime(metadata: dict[str, Any]) -> str:
     return IV_NORMAL
 
 
-def classify_condition(read: MarketRead, metadata: dict[str, Any]) -> str:
+def classify_condition(read: MarketRead, metadata: dict[str, Any], now_time=None) -> str:
     """Name the market condition from the read + structure signals."""
     m = metadata
     orb = str(m.get("opening_range_break_state") or "NONE")
@@ -307,10 +352,12 @@ def classify_condition(read: MarketRead, metadata: dict[str, Any]) -> str:
     if orb == "FAILED_UP" and read.bias == "BEARISH":
         return BREAKOUT_DOWN
 
-    # Strong trend: high trend-quality + directional bias + conviction
-    if read.bias == "BULLISH" and trend_up_q >= 4.0 and read.conviction >= 0.60:
+    # Strong trend: high trend-quality + directional bias + conviction, AND confirmed by an accepted
+    # opening-range breakout (ORB gate) — otherwise early/gap momentum masquerades as a trend and the
+    # day is really chop (2026-07-23: STRONG_TREND_DOWN at 09:48, accepted_breakout=False, flat day).
+    if read.bias == "BULLISH" and trend_up_q >= 4.0 and read.conviction >= 0.60 and _orb_confirms_trend(m, now_time, "UP"):
         return STRONG_TREND_UP
-    if read.bias == "BEARISH" and trend_dn_q >= 4.0 and read.conviction >= 0.60:
+    if read.bias == "BEARISH" and trend_dn_q >= 4.0 and read.conviction >= 0.60 and _orb_confirms_trend(m, now_time, "DOWN"):
         return STRONG_TREND_DOWN
 
     # Range: two-sided walls, balanced tape
@@ -335,7 +382,7 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     now_time (datetime.time, optional): used for time-of-day rules learned from the
     retrospective — e.g. condors only after the range forms (mid-day)."""
     read = assess_market(metadata, spot)
-    condition = classify_condition(read, metadata)
+    condition = classify_condition(read, metadata, now_time)
     iv = _iv_regime(metadata)
     # Volatility engine FIRST — trade vol, not just direction. This tells us whether
     # premium is rich (sell) or cheap (buy), which the pros decide before direction.
