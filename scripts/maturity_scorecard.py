@@ -83,7 +83,7 @@ def main() -> int:
     worst = min((float(t.get("realized_paper_pnl") or 0) for t in exits), default=0.0)
     results.append(("TAIL bounded", worst >= -RISK_CAP, f"worst day Rs {worst:+,.0f} vs floor Rs {-RISK_CAP:,.0f}"))
 
-    score = sum(1 for _, ok, _ in results)
+    score = sum(1 for _, ok, _ in results if ok)
     print("MATURITY SCORECARD — the gate to the stocks phase (forward record only)\n")
     for name, ok, detail in results:
         print(f"  [{'PASS' if ok else 'FAIL'}]  {name:<16} {detail}")
