@@ -141,6 +141,45 @@ if _ORB_MIN_RANGE_PTS is None:
     _ORB_MIN_RANGE_PTS = 40.0        # skip tiny opening ranges — they break falsely (ORB backtest)
 _ORB_FORMED_AFTER = time(9, 45)      # first two 15-min candles = the opening range
 
+# ── ZONE CONFLUENCE — the big-player range trade (default ON) ──────────────────────────────────
+# Root cause (5-whys, 2026-08): the agent has only two modes — trend-follow (needs a confirmed
+# breakout) and premium-sell (needs rich IV). In a low-vol rangebound tape NEITHER fires, so it
+# stands aside on the majority of days (501 chop stand-asides / 3 days). A desk does the third thing:
+# it positions AROUND demand and supply zones — buy where institutions accumulate (support / put
+# wall, put writers defending), sell where they distribute (resistance / call wall). This mode fires
+# when price is AT a zone with OI + chart-pattern confluence, and positions WITH the zone as a
+# DEFINED-RISK spread anchored to the wall: at demand -> bull-put below support; at supply -> bear-call
+# above resistance. It needs neither rich IV nor a breakout — the edge is the OI-defended zone holding,
+# which is exactly the structural, institutional read the user asked for. All signals already exist.
+# SEL_ZONE_CONFLUENCE=0 disables.
+_ZONE_CONFLUENCE = os.environ.get("SEL_ZONE_CONFLUENCE", "1") == "1"
+_ZONE_EDGE_FRAC = _sel_env_float("SEL_ZONE_EDGE_FRAC") or 0.33   # price within this fraction of a wall = "at the zone"
+
+
+def _zone_confluence(read, m: dict, spot: float) -> str | None:
+    """Return 'DEMAND' (price at support/put-wall, bullish confluence) or 'SUPPLY' (resistance/call-
+    wall, bearish confluence), else None. The big-player range read: LOCATION + OI + PATTERN + flow."""
+    if not _ZONE_CONFLUENCE or spot <= 0:
+        return None
+    cw = _f(m, "current_call_wall", 0.0)
+    pw = _f(m, "current_put_wall", 0.0)
+    if cw <= 0 or pw <= 0 or cw <= pw:
+        return None
+    rng = cw - pw
+    near_demand = spot <= pw + rng * _ZONE_EDGE_FRAC          # lower third — at the demand zone
+    near_supply = spot >= cw - rng * _ZONE_EDGE_FRAC          # upper third — at the supply zone
+    smb = str(m.get("smart_money_bias") or "NEUTRAL").upper()
+    bull_pat = str(m.get("bullish_candle_pattern") or "NONE") != "NONE"
+    bear_pat = str(m.get("bearish_candle_pattern") or "NONE") != "NONE"
+    first_test = bool(m.get("at_first_test_of_level"))
+    # DEMAND: price at the put-wall zone, a bullish hold/rejection, and flow not against us.
+    if near_demand and (bull_pat or first_test) and smb != "BEARISH":
+        return "DEMAND"
+    # SUPPLY: price at the call-wall zone, a bearish rejection, and flow not against us.
+    if near_supply and (bear_pat or first_test) and smb != "BULLISH":
+        return "SUPPLY"
+    return None
+
 
 def _orb_confirms_trend(m: dict, now_time, direction: str) -> bool:
     """True only if a STRONG_TREND in `direction` ('UP'/'DOWN') is confirmed by an accepted
@@ -288,6 +327,8 @@ BREAKOUT_DOWN = "BREAKOUT_DOWN"
 RANGE_WIDE = "RANGE_WIDE"
 RANGE_TIGHT = "RANGE_TIGHT"
 HIGH_VOL_UNDIRECTED = "HIGH_VOL_UNDIRECTED"
+ZONE_DEMAND = "ZONE_DEMAND"      # price at a demand zone (support/put-wall) — position long with it
+ZONE_SUPPLY = "ZONE_SUPPLY"      # price at a supply zone (resistance/call-wall) — position short with it
 CHOP = "CHOP"
 
 # ── Strategy families (the "what to deploy") ────────────────────────────────
@@ -332,7 +373,7 @@ def _iv_regime(metadata: dict[str, Any]) -> str:
     return IV_NORMAL
 
 
-def classify_condition(read: MarketRead, metadata: dict[str, Any], now_time=None) -> str:
+def classify_condition(read: MarketRead, metadata: dict[str, Any], now_time=None, spot: float = 0.0) -> str:
     """Name the market condition from the read + structure signals."""
     m = metadata
     orb = str(m.get("opening_range_break_state") or "NONE")
@@ -360,6 +401,15 @@ def classify_condition(read: MarketRead, metadata: dict[str, Any], now_time=None
     if read.bias == "BEARISH" and trend_dn_q >= 4.0 and read.conviction >= 0.60 and _orb_confirms_trend(m, now_time, "DOWN"):
         return STRONG_TREND_DOWN
 
+    # ZONE CONFLUENCE — no accepted breakout, so it's not a trend. Is price AT a demand/supply zone
+    # with OI + pattern confluence? That is the big-player range trade (buy demand, sell supply),
+    # checked BEFORE the generic range/chop buckets so a zone read wins over "just stand aside".
+    zone = _zone_confluence(read, m, spot)
+    if zone == "DEMAND":
+        return ZONE_DEMAND
+    if zone == "SUPPLY":
+        return ZONE_SUPPLY
+
     # Range: two-sided walls, balanced tape
     if read.bias == "NEUTRAL" and read.call_wall is not None and read.put_wall is not None:
         width = read.call_wall - read.put_wall
@@ -382,7 +432,7 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     now_time (datetime.time, optional): used for time-of-day rules learned from the
     retrospective — e.g. condors only after the range forms (mid-day)."""
     read = assess_market(metadata, spot)
-    condition = classify_condition(read, metadata, now_time)
+    condition = classify_condition(read, metadata, now_time, spot)
     iv = _iv_regime(metadata)
     # Volatility engine FIRST — trade vol, not just direction. This tells us whether
     # premium is rich (sell) or cheap (buy), which the pros decide before direction.
@@ -487,6 +537,22 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
                     f"{_BUY_MIN_EFFICIENCY:.2f} — clean follow-through, the one regime where the debit "
                     f"out-earns selling the move)."
                 )
+
+    elif condition == ZONE_DEMAND:
+        # Price at an OI-defended DEMAND zone (support/put wall) with a bullish hold — position WITH
+        # the institutions: SELL a defined-risk BULL-PUT below the zone (strike selection already
+        # anchors the short put to support, so the wall defends it). Collects premium AND is right
+        # with the structural bid — the desk trade in a range, no rich IV or breakout required.
+        choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
+        choice.rationale = ("ZONE_DEMAND: price at the put-wall/support demand zone with a bullish hold and "
+                            "supportive flow — SELL a bull-put below the zone (the OI wall defends it).")
+
+    elif condition == ZONE_SUPPLY:
+        # Price at an OI-defended SUPPLY zone (resistance/call wall) with a bearish rejection — SELL a
+        # defined-risk BEAR-CALL above the zone (short call anchored to resistance).
+        choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BEAR_CALL_CREDIT_SPREAD"]
+        choice.rationale = ("ZONE_SUPPLY: price at the call-wall/resistance supply zone with a bearish rejection "
+                            "and flow not against — SELL a bear-call above the zone (the OI wall caps it).")
 
     elif condition == RANGE_WIDE:
         # Retrospective lesson: morning condors LOSE (-Rs1,151/24tr @10-12) because the
