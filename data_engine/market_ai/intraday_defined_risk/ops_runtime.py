@@ -1016,11 +1016,17 @@ def evaluate_entry_gate(
         reasons.append("DAILY_REALIZED_LOSS_LOCK")
     if float(state.get("total_pnl_rupees") or 0.0) <= -abs(config.risk.max_daily_total_loss_rupees):
         reasons.append("DAILY_TOTAL_LOSS_LOCK")
-    # Expiry-day guard: credit spreads on same-day expiry carry extreme gamma risk
-    # (near-ATM options can move 10–50× in minutes). Block all new entries.
+    # Expiry-day guard: near-ATM options carry extreme gamma on same-day expiry. Block DIRECTIONAL
+    # DEBITS (buying that gamma) and any naked short — but ALLOW defined-risk credit SELLERS
+    # (iron fly/condor, bull-put/bear-call). Their loss is capped by the wings, and expiry day is the
+    # fastest-theta day to sell into. Blocking them cost real money (2026-07-28: iron_fly +3,446
+    # skipped). EXPIRY_ALLOW_DEFINED_SELLERS=0 restores the block-everything behaviour.
+    _EXPIRY_DEFINED_SELLERS = {"IRON_FLY", "IRON_CONDOR", "BULL_PUT_CREDIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD"}
     try:
         chain_expiry = snapshot.option_chain.expiry
-        if isinstance(chain_expiry, date) and chain_expiry == snapshot.timestamp.date():
+        _expiry_today = isinstance(chain_expiry, date) and chain_expiry == snapshot.timestamp.date()
+        _allow = os.environ.get("EXPIRY_ALLOW_DEFINED_SELLERS", "1") == "1" and strategy in _EXPIRY_DEFINED_SELLERS
+        if _expiry_today and not _allow:
             reasons.append("EXPIRY_DAY_BLOCKED")
     except Exception:
         pass
