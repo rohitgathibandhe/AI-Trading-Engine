@@ -1507,6 +1507,12 @@ def _select_iron_fly_candidates(
 
     spread_ratio = sum((q.spread_ratio or 0.0) for q in (atm_call, atm_put, long_call, long_put)) / 4.0
     min_credit = max(80.0, spot * 0.003)                        # fly needs meaningful premium to be worth the pin risk
+    if bool(regime_state.metadata.get("is_expiry_day")):
+        # Same-day expiry: the credit is 100% theta by 15:30, so a thinner premium is still worth
+        # selling — the multi-day floor over-rejects the fastest-theta day. 2026-08-04: a low-vol
+        # expiry offered an ~83pt ATM straddle -> net fly credit 77-81, right on the 80 floor, so the
+        # agent could build nothing on the best theta day of the week. A lower floor lets it trade.
+        min_credit = max(55.0, spot * 0.002)
     passed_liquidity = spread_ratio <= params.liquidity_spread_ratio_cap
     # An iron fly's two shorts sit at the ATM (often the SAME strike), so the middle is <= not <:
     # long_put < short_put <= short_call < long_call.
