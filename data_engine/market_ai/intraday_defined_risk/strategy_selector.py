@@ -123,6 +123,7 @@ if _BUY_MIN_EFFICIENCY is None:
 _SELL_CHOP = os.environ.get("SEL_SELL_CHOP", "1") == "1"
 _CHOP_SELL_AFTER = time(11, 0)   # let the range form before selling the ATM
 _CHOP_DRIFT_MIN_CONV = _sel_env_float("SEL_CHOP_DRIFT_MIN_CONV") or 0.40   # min lean to sell a with-drift spread in chop
+_CHOP_DRIFT_AFTER = time(10, 0)   # with-drift spread can enter earlier than the neutral fly (it leans with an established bias, needs less range-formation)
 
 # ── ORB-GATED TREND (default ON) ──────────────────────────────────────────────────────────────
 # Verification 2026-08 found the agent calls STRONG_TREND on choppy days: it fired STRONG_TREND_DOWN
@@ -640,8 +641,9 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     else:  # CHOP
         _prem_ok = iv in (IV_RICH, IV_NORMAL)
         _range_formed = now_time is None or now_time >= _CHOP_SELL_AFTER
+        _drift_ok = now_time is None or now_time >= _CHOP_DRIFT_AFTER
         _lean = read.bias in ("BULLISH", "BEARISH") and read.conviction >= _CHOP_DRIFT_MIN_CONV
-        if _SELL_CHOP and _lean and _range_formed and read.bias == "BULLISH":
+        if _SELL_CHOP and _lean and _drift_ok and read.bias == "BULLISH":
             # Mild UP-DRIFT (not a confirmed trend) — SELL a WITH-DRIFT bull-put. It leans with the
             # bias AND collects theta (wins on up OR sideways), sells an OTM short (less IV-sensitive
             # than the ATM fly, so it works when ATM premium is thin), and is a high-win-rate seller.
@@ -650,7 +652,7 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
             choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
             choice.rationale = (f"CHOP but mild BULLISH drift (conviction {read.conviction:.2f}) — SELL a "
                                 f"with-drift bull-put (theta + lean; high-win seller), not stand aside.")
-        elif _SELL_CHOP and _lean and _range_formed and read.bias == "BEARISH":
+        elif _SELL_CHOP and _lean and _drift_ok and read.bias == "BEARISH":
             choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BEAR_CALL_CREDIT_SPREAD"]
             choice.rationale = (f"CHOP but mild BEARISH drift (conviction {read.conviction:.2f}) — SELL a "
                                 f"with-drift bear-call (theta + lean), not stand aside.")
