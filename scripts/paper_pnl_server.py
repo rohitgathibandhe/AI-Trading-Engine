@@ -84,6 +84,8 @@ V83_RUNNER_LOG = STATE_DIR / "intraday_v83_runner.log"
 V83_PAPER_STATE_JSON = STATE_DIR / "intraday_v83_paper_state.json"
 V83_RUNTIME_STATE_JSON = STATE_DIR / "intraday_v83_runtime_state.json"
 V83_PAPER_LIVE_TRADES_JSONL = STATE_DIR / "intraday_v83_paper_live_trades.jsonl"
+V83_RUNTIME_CONFIG_JSON = STATE_DIR / "intraday_v83_runtime_config.json"
+V83_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / "com.algoagent.intraday_v83.plist"
 # New unified frontend location
 STATIC_DIR = ROOT / "web" / "app"
 INDEX_SECURITY_ID = int(os.getenv("MARKET_AI_INDEX_SECURITY_ID", "13"))
@@ -347,7 +349,7 @@ def load_positions(blotter_path: Path, mode: str = "paper") -> Dict[str, Any]:
 
     chain_map: Dict[str, Any] = {}
     spot_val: Optional[float] = None
-    if latest_expiry:
+    if latest_expiry and mode != "paper":
         cm = _build_chain_map(latest_expiry)
         chain_map = cm.get("map") or {}
         spot_val = cm.get("spot")
@@ -366,7 +368,7 @@ def load_positions(blotter_path: Path, mode: str = "paper") -> Dict[str, Any]:
             continue
         if sid:
             pairs.setdefault(seg, []).append(sid)
-    if pairs:
+    if pairs and mode != "paper":
         # dedupe sec_ids per segment to avoid API 400 on duplicates
         for seg, ids in pairs.items():
             pairs[seg] = sorted(list({int(i) for i in ids}))
@@ -651,19 +653,52 @@ def _load_broker_live_positions() -> Dict[str, Any]:
                 }
             )
         else:
-            # closed leg today or still in book; compute realized from buy/sell avgs
+            # Closed leg — match the DHAN APP display: entry = costPrice (the position's average
+            # cost, which for a carry-forward short is the original sell/entry price), exit = the
+            # buy-back avg (buyAvg), and P&L = Dhan's own realizedProfit. The intraday buy/sell avgs
+            # alone reconcile to the P&L but do NOT match the app when there's a carry-forward cost
+            # basis — e.g. 24250 PE shorted a prior day at costPrice 111.34, covered today at buyAvg
+            # 71.39, realized +2431 (the app shows 111.34 / 71.39, not buyAvg 71.39 / sellAvg 77.63).
             if buy_qty > 0 and sell_qty > 0:
-                pnl_real = (sell_avg - buy_avg) * min(buy_qty, sell_qty)
+                fr = full_row if isinstance(full_row, dict) else {}
+                cost_price = _parse_float(fr.get("costPrice") or row.get("costPrice") or row.get("cost_price"), 0.0)
+                f_buy = _parse_float(fr.get("buyAvg"), buy_avg)
+                f_sell = _parse_float(fr.get("sellAvg"), sell_avg)
+                day_buy = _parse_int(fr.get("dayBuyQty"), 0)
+                day_sell = _parse_int(fr.get("daySellQty"), 0)
+                cqty = min(buy_qty, sell_qty)
+                realized = _parse_float(fr.get("realizedProfit") or row.get("realizedProfit"),
+                                        (f_sell - f_buy) * cqty)
+                # Match the Dhan APP's displayed entry/exit/P&L, which it derives from the position's
+                # DIRECTION — not from its realizedProfit field. A carry-forward LONG is closed today
+                # by SELLING (daySell > dayBuy); a SHORT by BUYING (dayBuy > daySell). On a tie
+                # (intraday round-trip) fall back to whether costPrice sits nearer the sell or buy avg.
+                #   LONG : entry=costPrice(buy),  exit=sellAvg, P&L=(sell-cost)*qty
+                #   SHORT: entry=costPrice(sell), exit=buyAvg,  P&L=(cost-buy)*qty
+                # e.g. 24250 PE SHORT (111.34-71.39)*390=+15,580; 23150 PE LONG (0.60-3.45)*195=-555.75.
+                if day_buy != day_sell:
+                    is_short = day_buy > day_sell
+                else:
+                    ref = cost_price or f_buy
+                    is_short = abs(ref - f_sell) < abs(ref - f_buy)
+                entry_px = cost_price or (f_sell if is_short else f_buy)
+                if is_short:
+                    exit_px = f_buy
+                    app_pnl = (entry_px - exit_px) * cqty
+                else:
+                    exit_px = f_sell
+                    app_pnl = (exit_px - entry_px) * cqty
                 closed.append(
                     {
                         "side": "FLAT",
                         "strike": strike,
                         "expiry": expiry,
                         "sec_id": sec_id,
-                        "qty": min(buy_qty, sell_qty),
-                        "entry": buy_avg,
-                        "exit": sell_avg,
-                        "pnl": pnl_real,
+                        "qty": cqty,
+                        "entry": entry_px,
+                        "exit": exit_px,
+                        "pnl": app_pnl,
+                        "realized_profit": realized,   # Dhan's own realized field, kept for reference
                         "timestamp": row.get("updateTime") or row.get("createTime") or "",
                     }
                 )
@@ -2142,6 +2177,135 @@ def _load_intraday_trade_history(limit: Optional[int] = None) -> List[Dict[str, 
     return rows
 
 
+import threading  # noqa: E402  (local: used only by the live-price refresher below)
+
+_open_leg_ltp_cache: Dict[float, Dict[str, Any]] = {}
+_open_leg_ltp_cache_ts: float = 0.0
+_open_leg_ltp_cache_exp: Optional[str] = None  # which expiry the cache is for (invalidate on change)
+_OPEN_LEG_LTP_TTL = 3.0   # Dhan chain is ~1 req/3s; 3s is the floor for the fast poller
+
+# Background live-price refresher. The Dhan chain fetch can BLOCK for seconds (the 1-req/3s
+# throttle, or up to 90s on a 429 cooldown), so doing it inline made /api/open_position_live stall
+# ~2.5s every time the 3s cache expired — the UI lag the user reported. Instead a single daemon
+# thread refreshes the cache continuously and the endpoint just reads it (always instant).
+_ltp_refresher_thread: Optional[threading.Thread] = None
+_ltp_refresher_lock = threading.Lock()
+_ltp_wanted_exp: Optional[str] = None   # requested by the endpoint; None => resolve front tradeable
+_ltp_wanted_at: float = 0.0             # last time the endpoint asked (thread idles when stale)
+_open_leg_spot: Optional[float] = None  # underlying spot from the same chain fetch (cheap for the UI)
+
+
+def _resolve_front_tradeable_expiry(dw) -> Optional[str]:
+    """First expiry AFTER today — the front weekly the agent trades (skips a 0-DTE series on roll day)."""
+    from datetime import date as _date
+    try:
+        exps = dw.get_optionchain_expirylist("IDX_I", INDEX_SECURITY_ID) or []
+    except Exception:
+        return None
+    today = _date.today()
+    for e in exps:
+        try:
+            if _date.fromisoformat(str(e)) > today:
+                return str(e)
+        except (TypeError, ValueError):
+            continue
+    return str(exps[0]) if exps else None
+
+
+def _ltp_refresher_loop() -> None:
+    """Daemon: keep _open_leg_ltp_cache fresh for the currently-wanted expiry. ALL the slow/blocking
+    Dhan work lives here, off the request path, so the endpoint never waits."""
+    global _open_leg_ltp_cache, _open_leg_ltp_cache_ts, _open_leg_ltp_cache_exp, _open_leg_spot
+    dw = None
+    while True:
+        try:
+            if (time.time() - _ltp_wanted_at) > 60:  # nobody viewed the position in 60s → idle
+                time.sleep(2)
+                continue
+            if dw is None:
+                from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
+                creds = _json_read(CREDS_FILE)
+                if isinstance(creds, dict):
+                    cid = (creds.get("client_id") or "").strip()
+                    tok = (creds.get("access_token") or "").strip()
+                    if cid and tok:
+                        os.environ["DHAN_CLIENT_ID"] = cid
+                        os.environ["DHAN_ACCESS_TOKEN"] = tok
+                dw = DhanWrapper(logger=None)
+            exp = _ltp_wanted_exp or _resolve_front_tradeable_expiry(dw)
+            if exp:
+                raw = dw.get_option_chain(INDEX_SECURITY_ID, "IDX_I", exp)
+                _dd = ((((raw or {}).get("data") or {}).get("data")) or {})
+                oc = _dd.get("oc") or {}
+                out: Dict[float, Dict[str, Any]] = {}
+                for k, node in oc.items():
+                    try:
+                        sk = round(float(k), 2)
+                    except (TypeError, ValueError):
+                        continue
+                    ce = (node.get("ce") or {}).get("last_price")
+                    pe = (node.get("pe") or {}).get("last_price")
+                    out[sk] = {"CALL": ce, "CE": ce, "PUT": pe, "PE": pe}
+                if out:  # rebind (atomic); readers never see a half-built dict
+                    _open_leg_ltp_cache = out
+                    _open_leg_ltp_cache_ts = time.time()
+                    _open_leg_ltp_cache_exp = exp
+                    try:
+                        _sp = _dd.get("last_price")
+                        if _sp:
+                            _open_leg_spot = float(_sp)
+                    except (TypeError, ValueError):
+                        pass
+        except Exception:
+            pass
+        time.sleep(_OPEN_LEG_LTP_TTL)
+
+
+def _live_leg_ltps(position_expiry: Optional[str] = None) -> Dict[float, Dict[str, Any]]:
+    """Current LTP per strike from the live Nifty chain: {strike: {"CALL":x, "PUT":y}}.
+
+    The agent stores only ENTRY-time leg quotes in paper_state (frozen), so the UI showed
+    static LTP and 0 per-leg P&L. Fetching live prices here makes both update each poll.
+    Cached (per expiry) so UI polling doesn't hammer Dhan's 1-req/3s chain limit.
+
+    `position_expiry` (YYYY-MM-DD) marks the open position against the EXACT series it was booked
+    on — so entry and LTP always agree. When absent (older positions with no stamped expiry) it
+    falls back to the front TRADEABLE weekly (skipping a series expiring today on roll days).
+    """
+    from datetime import date as _date
+    global _ltp_refresher_thread, _ltp_wanted_exp, _ltp_wanted_at
+
+    exp: Optional[str] = None
+    if position_expiry:
+        try:
+            _date.fromisoformat(str(position_expiry))
+            exp = str(position_expiry)
+        except (TypeError, ValueError):
+            exp = None
+
+    # Tell the background refresher which expiry to keep warm, and note that someone's watching.
+    _ltp_wanted_exp = exp
+    _ltp_wanted_at = time.time()
+
+    # Lazily start the single daemon refresher (double-checked under a lock).
+    if _ltp_refresher_thread is None or not _ltp_refresher_thread.is_alive():
+        with _ltp_refresher_lock:
+            if _ltp_refresher_thread is None or not _ltp_refresher_thread.is_alive():
+                _ltp_refresher_thread = threading.Thread(
+                    target=_ltp_refresher_loop, daemon=True, name="ltp-refresher"
+                )
+                _ltp_refresher_thread.start()
+
+    # Return the refresher's latest cache INSTANTLY — never block the request on Dhan. When a
+    # position stamped a specific expiry, only serve the cache if it's for that same series; for
+    # the heuristic (unstamped) path serve whatever the refresher last fetched. Empty only until
+    # the first refresh lands (a few seconds on first load), during which the caller shows the
+    # frozen entry quote.
+    if _open_leg_ltp_cache and (exp is None or _open_leg_ltp_cache_exp == exp):
+        return _open_leg_ltp_cache
+    return {}
+
+
 def _build_v83_open_position_payload() -> Dict[str, Any]:
     """Return the current v83 paper open position in a UI-ready format.
 
@@ -2152,23 +2316,33 @@ def _build_v83_open_position_payload() -> Dict[str, Any]:
         state = _json_read(V83_PAPER_STATE_JSON) or {}
     except Exception:
         state = {}
-    if not state or not state.get("structure"):
+    # The agent nests the live position under "active_position" (older schema kept the
+    # structure at top level). Read from active_position when present so the UI actually
+    # shows the open trade — without this, a real open paper position renders as "flat".
+    pos = state.get("active_position") if isinstance(state.get("active_position"), dict) else state
+    if not pos or not pos.get("structure"):
         return {"open": False, "legs": [], "open_mtm": None, "expiry": None, "playbook": None}
 
-    structure = state.get("structure") or {}
+    structure = pos.get("structure") or {}
     legs_raw = structure.get("legs") or []
+    # MFE/MAE/mark P&L are top-level in the agent's state; metadata lives under the position.
     mfe = _parse_float(state.get("mfe_rupees"), 0.0)
     mae = _parse_float(state.get("mae_rupees"), 0.0)
     mark_pnl = _parse_float(state.get("last_mark_pnl_rupees"), None)
-    playbook = (state.get("metadata") or {}).get("playbook")
+    playbook = (pos.get("metadata") or structure.get("metadata") or {}).get("playbook")
     expiry = None
+
+    # Leg qty lives at the position level (lots x lot_size), not on each leg.
+    _lots = _parse_int(pos.get("lots"), 0)
+    _lot_size = _parse_int(pos.get("lot_size"), 0)
+    _pos_qty = _lots * _lot_size if (_lots and _lot_size) else 0
 
     ui_legs: List[Dict[str, Any]] = []
     for leg in legs_raw:
         strike = leg.get("strike")
         option_type = leg.get("option_type") or leg.get("instrument_type") or ""
         action = str(leg.get("action") or "").upper()
-        qty = abs(int(leg.get("quantity") or leg.get("qty") or 0))
+        qty = abs(int(leg.get("quantity") or leg.get("qty") or _pos_qty or 0))
         entry_price = _parse_float(leg.get("entry_price") or leg.get("ltp"), None)
         ltp = _parse_float(leg.get("ltp"), entry_price)
         exp = leg.get("expiry")
@@ -2188,10 +2362,38 @@ def _build_v83_open_position_payload() -> Dict[str, Any]:
             "pnl": round(pnl, 2) if pnl is not None else None,
         })
 
+    # Overlay LIVE leg prices (agent stores only frozen entry quotes). Each leg's stored
+    # "entry" is the entry price; fetch the current LTP by strike and recompute per-leg P&L
+    # so both the LTP column and the legs total update every poll instead of showing 0.
+    # Pass the position's own expiry so live LTP is marked against the SAME series the legs
+    # were booked on (exact); falls back to the front tradeable weekly when unstamped.
+    live = _live_leg_ltps(expiry)
+    live_total = 0.0
+    have_live = False
+    for leg in ui_legs:
+        entry = leg.get("entry")
+        strike = leg.get("strike")
+        otype = str(leg.get("option_type") or "").upper()
+        qty = leg.get("qty") or 0
+        live_ltp = None
+        if strike is not None:
+            live_ltp = (live.get(round(float(strike), 2)) or {}).get(otype)
+        if live_ltp is not None:
+            have_live = True
+            leg["ltp"] = live_ltp
+            if entry is not None and qty:
+                pnl = (entry - live_ltp) * qty if leg.get("side") == "SELL" else (live_ltp - entry) * qty
+                leg["pnl"] = round(pnl, 2)
+                live_total += pnl
+
+    # Prefer the live-computed total (fresh each poll); fall back to the agent's mark.
+    open_mtm = round(live_total, 2) if have_live else mark_pnl
+
     return {
         "open": True,
         "legs": ui_legs,
-        "open_mtm": mark_pnl,
+        "open_mtm": open_mtm,
+        "mark_pnl_rupees": mark_pnl,
         "mfe_rupees": mfe,
         "mae_rupees": mae,
         "expiry": expiry,
@@ -3221,6 +3423,151 @@ def _watchdog_health_status() -> Dict[str, Any]:
     return watchdog
 
 
+_preflight_cache: Dict[str, Any] = {}
+_preflight_cache_ts: float = 0.0
+_PREFLIGHT_TTL = 30.0          # whole rollup: cheap file reads, refresh often
+_preflight_token_cache: Dict[str, Any] = {}
+_preflight_token_cache_ts: float = 0.0
+_PREFLIGHT_TOKEN_TTL = 300.0   # broker calls: throttle to once / 5 min
+
+
+def _read_v83_plist_env() -> Dict[str, str]:
+    """Env toggles the launchd job is configured with (USE_SELECTOR, SEL_* …)."""
+    try:
+        import plistlib
+        with open(V83_PLIST_PATH, "rb") as fh:
+            data = plistlib.load(fh)
+        env = data.get("EnvironmentVariables") or {}
+        return {str(k): str(v) for k, v in env.items()}
+    except Exception:
+        return {}
+
+
+def _preflight_token_check() -> Dict[str, Any]:
+    """Live broker reachability — cached 5 min so dashboard polls don't hammer Dhan."""
+    global _preflight_token_cache, _preflight_token_cache_ts
+    now = time.time()
+    if _preflight_token_cache and (now - _preflight_token_cache_ts) < _PREFLIGHT_TOKEN_TTL:
+        return _preflight_token_cache
+    out: Dict[str, Any] = {"ok": False, "detail": "", "chain_ok": False, "chain_detail": ""}
+    try:
+        from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
+        creds = _json_read(CREDS_FILE)
+        cid = (creds.get("client_id") or "").strip() if isinstance(creds, dict) else ""
+        tok = (creds.get("access_token") or "").strip() if isinstance(creds, dict) else ""
+        if cid and tok:
+            os.environ["DHAN_CLIENT_ID"] = cid
+            os.environ["DHAN_ACCESS_TOKEN"] = tok
+        dw = DhanWrapper(logger=None)
+        funds = dw.get_funds()
+        avail = funds.get("available") if isinstance(funds, dict) else None
+        out["ok"] = bool(funds) and avail is not None
+        out["detail"] = (f"funds available Rs {avail:,.0f}" if out["ok"]
+                         else "get_funds empty — token may be expired")
+        try:
+            el = dw.get_optionchain_expirylist("IDX_I", INDEX_SECURITY_ID)
+            out["chain_ok"] = bool(el)
+            out["chain_detail"] = (f"{len(el)} expiries (next {el[0]})" if el else "no expiries returned")
+        except Exception as exc:
+            out["chain_detail"] = f"error: {str(exc)[:80]}"
+    except Exception as exc:
+        out["detail"] = f"error: {str(exc)[:100]}"
+    _preflight_token_cache = out
+    _preflight_token_cache_ts = time.time()
+    return out
+
+
+def _preflight_status() -> Dict[str, Any]:
+    """One-glance 'is the agent ready to trade today' rollup: process, broker token,
+    config armed, and the active strategy toggles. GREEN = clear to trade."""
+    global _preflight_cache, _preflight_cache_ts
+    now = time.time()
+    if _preflight_cache and (now - _preflight_cache_ts) < _PREFLIGHT_TTL:
+        return _preflight_cache
+
+    # Market-session context (IST) — computed first so checks can be session-aware.
+    try:
+        from zoneinfo import ZoneInfo
+        ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+        hhmm = ist.strftime("%H:%M")
+        weekday = ist.weekday() < 5
+        market_open = weekday and ("09:15" <= hhmm <= "15:30")
+        session = ("OPEN" if market_open else ("PRE_OPEN" if (weekday and hhmm < "09:15")
+                   else ("CLOSED" if weekday else "WEEKEND")))
+        gen_at = ist.strftime("%Y-%m-%d %H:%M:%S IST")
+    except Exception:
+        session, market_open, gen_at = "UNKNOWN", False, ""
+
+    checks: List[Dict[str, Any]] = []
+
+    def add(key: str, label: str, ok: bool, detail: str, critical: bool = True) -> None:
+        checks.append({
+            "key": key, "label": label, "ok": bool(ok), "critical": critical,
+            "status": "PASS" if ok else ("FAIL" if critical else "WARN"),
+            "detail": detail,
+        })
+
+    # 1) Process / heartbeat — STALE heartbeat only matters once the market is open.
+    try:
+        wd = _watchdog_health_status()
+        st = str(wd.get("status") or "").upper()
+        alive = bool(wd.get("pid_alive") or wd.get("active_pid_running"))
+        stopped = (st == "STOPPED") or (not alive)
+        fresh_ok = st not in ("STALE", "STOPPED")
+        if stopped:
+            add("process", "Agent running", False, f"status={st or 'UNKNOWN'} — process not alive")
+        elif market_open and not fresh_ok:
+            add("process", "Agent running", False, f"status={st} during market hours — heartbeat stalled")
+        else:
+            note = st if fresh_ok else f"{st} (idle pre-open — normal)"
+            add("process", "Agent running", True, f"status={note}, pid={wd.get('active_pid') or '—'}")
+    except Exception as exc:
+        add("process", "Agent running", False, f"error: {str(exc)[:80]}")
+
+    # 2) Broker token + option chain (cached)
+    tok = _preflight_token_check()
+    add("token", "Broker token valid", bool(tok.get("ok")), tok.get("detail", ""))
+    add("chain", "Option chain reachable", bool(tok.get("chain_ok")), tok.get("chain_detail", ""))
+
+    # 3) Config armed (from runtime config file)
+    cfg = _json_read(V83_RUNTIME_CONFIG_JSON)
+    cfg = cfg if isinstance(cfg, dict) else {}
+    mode = cfg.get("mode")
+    live_arm = cfg.get("live_arm")
+    frozen = cfg.get("v83_frozen")
+    strategies = cfg.get("live_enabled_strategies") or []
+    add("mode", "Paper mode", mode == "PAPER_LIVE", f"mode={mode}")
+    add("safety", "Live-arm OFF (safe)", live_arm is False, f"live_arm={live_arm}")
+    add("frozen", "Config not frozen", frozen is False, f"v83_frozen={frozen}", critical=False)
+    add("engine", "Put-debit engine enabled", "PUT_DEBIT_SPREAD" in strategies,
+        f"{len(strategies)} strategies enabled")
+
+    # 4) Strategy toggles the launchd job runs with
+    env = _read_v83_plist_env()
+    add("selector", "Strategy selector ON", env.get("USE_SELECTOR") == "1",
+        f"USE_SELECTOR={env.get('USE_SELECTOR') or 'unset'}")
+    add("condor", "Condor-off (validated)", env.get("SEL_NO_CONDOR") == "1",
+        f"SEL_NO_CONDOR={env.get('SEL_NO_CONDOR') or 'unset'}", critical=False)
+    add("blackout", "10:00-10:30 blackout", bool(env.get("SEL_DEBIT_BLACKOUT")),
+        f"SEL_DEBIT_BLACKOUT={env.get('SEL_DEBIT_BLACKOUT') or 'unset'}", critical=False)
+
+    crit_fail = any((not c["ok"]) and c["critical"] for c in checks)
+    warn = any((not c["ok"]) and (not c["critical"]) for c in checks)
+    overall = "RED" if crit_fail else ("AMBER" if warn else "GREEN")
+
+    result = {
+        "overall": overall,
+        "checks": checks,
+        "pass_count": sum(1 for c in checks if c["ok"]),
+        "total": len(checks),
+        "market_session": session,
+        "generated_at": gen_at,
+    }
+    _preflight_cache = result
+    _preflight_cache_ts = now
+    return result
+
+
 def _load_alerts_tail(limit: int = 100) -> List[Dict[str, Any]]:
     journal = AlertJournal(path=AGENT_ALERTS_JSONL, config=AlertConfig(), logger=None)
     return journal.tail(limit=max(0, int(limit)))
@@ -3267,6 +3614,87 @@ _V83_OPS_CACHE_TTL = 12.0
 _secondary_pnl_cache: Dict[str, Any] = {}
 _secondary_pnl_cache_ts: float = 0.0
 _SECONDARY_PNL_CACHE_TTL = 60.0
+
+# /api/paper_positions rebuilds a HEAVY payload (incl. load_positions -> synchronous Dhan fetches
+# that block up to a 429 cooldown → 6-22s observed). Serve-stale-while-rebuilding cache: rapid
+# polls return instantly from cache; only ONE thread rebuilds at a time while the rest serve the
+# last payload, so slow rebuilds never pile up or block the UI. Live P&L still comes fresh from
+# the fast /api/open_position_live.
+_paper_positions_cache: Optional[Dict[str, Any]] = None
+_paper_positions_cache_ts: float = 0.0
+_paper_positions_rebuild_lock = threading.Lock()
+_PAPER_POSITIONS_TTL = 3.0
+
+# /api/live_positions makes THREE synchronous broker fetches (blotter LTP enrichment, broker open
+# positions, broker executions). In paper mode there are no broker positions, so these just time
+# out/retry — measured 20-37s — and the Live Trades tab's Promise.all waits for the whole thing.
+# Stale-while-revalidate: the endpoint returns the cached payload INSTANTLY and kicks the (slow)
+# rebuild onto a background thread, so the tab never blocks. First load shows "loading" until the
+# first rebuild lands.
+_live_positions_cache: Optional[Dict[str, Any]] = None
+_live_positions_cache_ts: float = 0.0
+_live_positions_rebuilding = False
+_live_positions_lock = threading.Lock()
+_LIVE_POSITIONS_TTL = 10.0
+
+
+def _build_live_positions_payload() -> Dict[str, Any]:
+    """Fetch the user's REAL Dhan account — open positions (with Dhan's native LTP + P&L) and today's
+    closed trades — so the Live Trades tab mirrors the Dhan app. Reads the real broker via creds.json
+    even in PAPER mode (the agent's paper/live setting is irrelevant to what's in the Dhan account).
+
+    Runs only on the background refresh thread (stale-while-revalidate), so its latency never blocks
+    the tab. Deliberately does NOT call load_positions(BLOTTER) — that did a throttled option-chain
+    LTP enrichment on a STALE local blotter and was the ~37s culprit; Dhan's positions API already
+    carries LTP and unrealised P&L per leg."""
+    broker_payload = _load_broker_live_positions()
+    if isinstance(broker_payload, dict):
+        payload: Dict[str, Any] = {
+            "positions": broker_payload.get("positions", []) or [],
+            "closed": broker_payload.get("closed", []) or [],
+            "total_pnl": broker_payload.get("total_pnl", 0.0) or 0.0,
+            "as_of": broker_payload.get("as_of"),
+            "source": broker_payload.get("source") or "broker",
+            "margin_available": broker_payload.get("margin_available"),
+            "margin_used": broker_payload.get("margin_used"),
+        }
+    else:
+        payload = {"positions": [], "closed": [], "total_pnl": 0.0, "source": "none"}
+    # Merge today's broker executions (fills) as additional closed rows.
+    try:
+        trades = _load_broker_trades_today()
+        if trades:
+            closed = payload.get("closed", []) or []
+            closed.extend(trades)
+            closed.sort(key=lambda c: (
+                c.get("expiry") not in (None, "", "0001-01-01"),
+                c.get("entry") is not None and c.get("exit") is not None,
+                c.get("side") == "FLAT"
+            ), reverse=True)
+            dedup = {}
+            for c in closed:
+                key = (str(c.get("sec_id")), c.get("strike"))
+                if key not in dedup:  # sort above puts the FLAT row first, so it wins the key
+                    dedup[key] = c
+            # Only netted-out (side == FLAT) legs are genuinely CLOSED. The fills feed also carries
+            # the open-side SELL/BUY executions of still-OPEN positions; those must not show as
+            # closed (that inflated the count, e.g. 8 -> 11). Keep FLAT only, matching the Dhan app.
+            payload["closed"] = [c for c in dedup.values() if str(c.get("side") or "").upper() == "FLAT"]
+    except Exception:
+        pass
+    return payload
+
+
+def _live_positions_bg_rebuild() -> None:
+    global _live_positions_cache, _live_positions_cache_ts, _live_positions_rebuilding
+    try:
+        payload = _build_live_positions_payload()
+        _live_positions_cache = payload
+        _live_positions_cache_ts = time.time()
+    except Exception:
+        pass
+    finally:
+        _live_positions_rebuilding = False
 
 
 def _load_v83_ops_status() -> Dict[str, Any]:
@@ -4194,105 +4622,109 @@ class PaperHandler(SimpleHTTPRequestHandler):
         return super().do_POST()
 
     def do_GET(self) -> None:  # type: ignore[override]
+        if self.path.startswith("/api/preflight"):
+            try:
+                self._send_json(_preflight_status())
+            except Exception as exc:  # pragma: no cover - defensive
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/open_position_live"):
+            # Lightweight endpoint for FAST (~3s) polling of just the open position's live
+            # legs + total — avoids the heavy /api/paper_positions payload so the UI can
+            # refresh the live P&L far more often than the 15s full loop.
+            try:
+                self._send_json({"v83_open_position": _build_v83_open_position_payload()})
+            except Exception as exc:  # pragma: no cover - defensive
+                self._send_json({"error": str(exc)}, status=500)
+            return
         if self.path.startswith("/api/paper_positions"):
             try:
-                # ── V83-specific data (primary source of truth for PnL tab) ──
-                intraday_perf = _build_intraday_performance_payload(trade_mode="paper")
-                v83_open = _build_v83_open_position_payload()
-                v83_market_state = _get_v83_market_state()
+                global _paper_positions_cache, _paper_positions_cache_ts
+                _now = time.time()
+                # Fresh cache → instant.
+                if _paper_positions_cache is not None and (_now - _paper_positions_cache_ts) < _PAPER_POSITIONS_TTL:
+                    self._send_json(_paper_positions_cache)
+                    return
+                # Stale: only ONE thread rebuilds; everyone else serves the last payload so a slow
+                # rebuild never blocks the UI or piles up.
+                if not _paper_positions_rebuild_lock.acquire(blocking=False):
+                    if _paper_positions_cache is not None:
+                        self._send_json(_paper_positions_cache)
+                        return
+                    _paper_positions_rebuild_lock.acquire()  # first-ever load: wait for the build
+                try:
+                    # ── V83-specific data (primary source of truth for PnL tab) ──
+                    intraday_perf = _build_intraday_performance_payload(trade_mode="paper")
+                    v83_open = _build_v83_open_position_payload()
+                    v83_market_state = _get_v83_market_state()
 
-                # ── Legacy blotter payload kept for payoff-chart spot price ──
-                blotter = load_positions(BLOTTER_CSV, mode="paper")
+                    # Spot for the payoff chart now comes from the background LTP refresher's cache
+                    # (free) instead of load_positions(BLOTTER) — a SYNCHRONOUS Dhan fetch that
+                    # dominated this endpoint's latency (6-22s) and enriched a blotter v83 doesn't
+                    # even use. _build_v83_open_position_payload already started the refresher.
+                    _spot_cached = _open_leg_spot
 
-                payload: Dict[str, Any] = {
-                    # V83 open position — authoritative source for Open Legs / MTM
-                    "v83_open_position": v83_open,
-                    "positions": v83_open["legs"],          # UI legs-table uses this
-                    "total_pnl": v83_open["open_mtm"] or 0.0,
-                    # V83 realized P&L — authoritative source (intraday_performance)
-                    "realized_pnl": intraday_perf["realized_pnl_rs"],
-                    # Market state for the "Market Status" card
-                    "v83_market_state": v83_market_state,
-                    # Pass-through fields the UI also uses
-                    "spot": blotter.get("spot"),
-                    "ltp_status": blotter.get("ltp_status"),
-                    "as_of": blotter.get("as_of"),
-                    # Full performance payload for Trade History section
-                    "intraday_performance": intraday_perf,
-                    # Strategy state kept for any legacy widget that still reads it
-                    "strategy_state": {},
-                }
-
-                # Secondary payloads (batman/committee/learning) cached 60 s —
-                # no longer rendered in main UI but kept for completeness.
-                global _secondary_pnl_cache, _secondary_pnl_cache_ts
-                _now_ts = time.time()
-                if not _secondary_pnl_cache or (_now_ts - _secondary_pnl_cache_ts) > _SECONDARY_PNL_CACHE_TTL:
-                    _secondary_pnl_cache = {
-                        "committee_review": _build_committee_review_payload(trade_mode="paper"),
-                        "intraday_learning": _load_intraday_learning_status(),
-                        "batman_bkm_review": _build_batman_bkm_review_payload(trade_mode="paper"),
-                        "batman_bkm_learning": _build_batman_bkm_learning_payload(trade_mode="paper"),
+                    payload: Dict[str, Any] = {
+                        # V83 open position — authoritative source for Open Legs / MTM
+                        "v83_open_position": v83_open,
+                        "positions": v83_open["legs"],          # UI legs-table uses this
+                        "total_pnl": v83_open["open_mtm"] or 0.0,
+                        # V83 realized P&L — authoritative source (intraday_performance)
+                        "realized_pnl": intraday_perf["realized_pnl_rs"],
+                        # Market state for the "Market Status" card
+                        "v83_market_state": v83_market_state,
+                        # Pass-through fields the UI also uses
+                        "spot": _spot_cached,
+                        "ltp_status": "LIVE" if _spot_cached else "STALE",
+                        "as_of": None,
+                        # Full performance payload for Trade History section
+                        "intraday_performance": intraday_perf,
+                        # Strategy state kept for any legacy widget that still reads it
+                        "strategy_state": {},
                     }
-                    _secondary_pnl_cache_ts = _now_ts
-                payload.update(_secondary_pnl_cache)
+
+                    # Secondary payloads (batman/committee/learning) cached 60 s —
+                    # no longer rendered in main UI but kept for completeness.
+                    global _secondary_pnl_cache, _secondary_pnl_cache_ts
+                    _now_ts = time.time()
+                    if not _secondary_pnl_cache or (_now_ts - _secondary_pnl_cache_ts) > _SECONDARY_PNL_CACHE_TTL:
+                        _secondary_pnl_cache = {
+                            "committee_review": _build_committee_review_payload(trade_mode="paper"),
+                            "intraday_learning": _load_intraday_learning_status(),
+                            "batman_bkm_review": _build_batman_bkm_review_payload(trade_mode="paper"),
+                            "batman_bkm_learning": _build_batman_bkm_learning_payload(trade_mode="paper"),
+                        }
+                        _secondary_pnl_cache_ts = _now_ts
+                    payload.update(_secondary_pnl_cache)
+                    _paper_positions_cache = payload
+                    _paper_positions_cache_ts = time.time()
+                finally:
+                    _paper_positions_rebuild_lock.release()
                 self._send_json(payload)
             except Exception as exc:  # pragma: no cover - defensive
                 self._send_json({"error": str(exc)}, status=500)
             return
         if self.path.startswith("/api/live_positions"):
             try:
-                local_payload = load_positions(BLOTTER_CSV, mode="live")
-                payload = local_payload
-                broker_payload = _load_broker_live_positions()
-                # In live mode, broker open positions are the source of truth when available.
-                # Local blotter/journal can lag or be stale after manual intervention/imports.
-                if isinstance(broker_payload, dict) and str(broker_payload.get("source") or "") == "broker":
-                    payload = {
-                        "positions": broker_payload.get("positions", []) or [],
-                        "closed": broker_payload.get("closed", []) or [],
-                        "total_pnl": broker_payload.get("total_pnl", 0.0) or 0.0,
-                        "as_of": broker_payload.get("as_of"),
-                        "blotter_tail": local_payload.get("blotter_tail", []) if isinstance(local_payload, dict) else [],
-                        "source": "broker",
-                        "margin_available": broker_payload.get("margin_available"),
-                        "margin_used": broker_payload.get("margin_used"),
-                    }
-                elif not payload.get("positions") and broker_payload:
-                    payload = broker_payload
-                else:
-                    # Broker unavailable: keep local payload. If broker closed rows exist from partial payload, merge them.
-                    if broker_payload and broker_payload.get("closed"):
-                        closed = payload.get("closed", []) or []
-                        closed.extend(broker_payload.get("closed", []))
-                        payload["closed"] = closed
-    # Also surface today's broker executions as closed rows (legacy)
-                try:
-                    trades = _load_broker_trades_today()
-                    if trades:
-                        closed = payload.get("closed", []) or []
-                        closed.extend(trades)
-                        # de-dupe prefer rows with expiry and entry
-                        closed.sort(key=lambda c: (
-                            c.get("expiry") not in (None, "", "0001-01-01"),
-                            c.get("entry") is not None and c.get("exit") is not None,
-                            c.get("side") == "FLAT"
-                        ), reverse=True)
-                        dedup = {}
-                        for c in closed:
-                            key = (str(c.get("sec_id")), c.get("strike"))
-                            if key in dedup:
-                                continue
-                            dedup[key] = c
-                        cleaned = list(dedup.values())
-                        cleaned = [c for c in cleaned if c.get("side") == "FLAT"]
-                        non_empty = [c for c in cleaned if c.get("expiry") not in (None, "", "0001-01-01")]
-                        if non_empty:
-                            cleaned = non_empty
-                        payload["closed"] = cleaned
-                except Exception:
-                    pass
-                self._send_json(payload)
+                global _live_positions_rebuilding
+                _now = time.time()
+                fresh = (
+                    _live_positions_cache is not None
+                    and (_now - _live_positions_cache_ts) < _LIVE_POSITIONS_TTL
+                )
+                # Stale (or never built) → kick a background rebuild, but DON'T wait for it.
+                if not fresh and not _live_positions_rebuilding:
+                    with _live_positions_lock:
+                        if not _live_positions_rebuilding:
+                            _live_positions_rebuilding = True
+                            threading.Thread(
+                                target=_live_positions_bg_rebuild, daemon=True, name="live-positions"
+                            ).start()
+                # Serve whatever we have RIGHT NOW — never block the Live Trades tab on the broker.
+                self._send_json(
+                    _live_positions_cache
+                    or {"positions": [], "closed": [], "total_pnl": 0.0, "source": "loading"}
+                )
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
             return

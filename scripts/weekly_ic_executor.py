@@ -24,7 +24,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import re
 import sys
+import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -63,17 +66,41 @@ def _load_creds() -> dict[str, str]:
         return {}
 
 
-def _send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
+def _alert_fallback_log(text: str, delivered: bool) -> None:
+    """Every alert is ALSO written locally, so a Telegram outage never loses a decision.
+    (2026-07-23: a weekly IC was cancelled silently — the only record was a dropped Telegram post.)"""
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
-        return r.status_code == 200
-    except Exception as e:
-        print(f"[telegram] {e}", file=sys.stderr)
-        return False
+        line = {"at": datetime.now(IST).isoformat(timespec="seconds"),
+                "delivered": delivered,
+                "text": re.sub(r"<[^>]+>", "", text)}   # strip HTML for a readable local record
+        with (STATE_DIR / "weekly_ic_alerts.jsonl").open("a") as f:
+            f.write(json.dumps(line) + "\n")
+    except Exception:
+        pass
+
+
+def _send_telegram(bot_token: str, chat_id: str, text: str, *, retries: int = 3) -> bool:
+    """Send with retry+backoff. Telegram is a flaky dependency on a home connection; a single
+    transient failure used to silently drop the alert entirely. Always mirrored to a local log."""
+    last = ""
+    for attempt in range(retries):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                _alert_fallback_log(text, True)
+                return True
+            last = f"HTTP {r.status_code}: {r.text[:120]}"
+        except Exception as e:  # noqa: BLE001
+            last = str(e)[:160]
+        if attempt < retries - 1:
+            time.sleep(2 * (attempt + 1))          # 2s, 4s backoff
+    print(f"[telegram] FAILED after {retries} attempts: {last}", file=sys.stderr)
+    _alert_fallback_log(text, False)
+    return False
 
 
 def _dhan_headers(creds: dict) -> dict[str, str]:
@@ -601,9 +628,50 @@ _MAX_DAY_RANGE_RATIO   = 0.50   # day's high-low range must be < 50% of expected
 _PCR_LOW               = 0.70   # below this = very bearish (call writers dominating)
 _PCR_HIGH              = 1.80   # above this = very complacent (put writers dominating)
 
+# Gap-shock: the weekly IC is held 3-5 days, so its primary tail is an OVERNIGHT GAP — Nifty prices
+# global news at the 09:15 open in one jump, with no chance to exit. The IC is defined-risk, so the
+# gap loss is BOUNDED at its max loss, but this makes that bound explicit and refuses a position
+# whose worst-case overnight loss exceeds tolerance. Env-configurable.
+_MAX_OVERNIGHT_LOSS_RUPEES = float(os.environ.get("WEEKLY_IC_MAX_OVERNIGHT_LOSS", "50000") or 50000)
+_GAP_SHOCKS = (-0.06, -0.04, -0.02, -0.01, 0.01, 0.02, 0.04, 0.06)   # calibrate to Nifty's real gap tail
+
+
+def _ic_pnl_at(plan: dict, settle: float) -> float:
+    """Iron-condor P&L at an expiry settlement price (rupees). Defined-risk: bounded both sides."""
+    qty = float(plan.get("quantity") or 0)
+    credit = float(plan.get("gross_credit") or 0.0)
+    sc, lc = float(plan["short_call"]), float(plan["long_call"])
+    sp, lp = float(plan["short_put"]), float(plan["long_put"])
+    call_loss = max(0.0, min(settle - sc, lc - sc)) * qty
+    put_loss = max(0.0, min(sp - settle, sp - lp)) * qty
+    return credit - call_loss - put_loss
+
+
+def _gap_shock(plan: dict, spot: float) -> dict:
+    """Stress the IC across an overnight-gap ladder. Returns worst-case loss and the smallest gap
+    (either direction) that already reaches the defined max loss."""
+    rows = [(s, _ic_pnl_at(plan, spot * (1.0 + s))) for s in _GAP_SHOCKS]
+    worst = min(p for _, p in rows)
+    max_loss = -float(plan.get("max_loss") or 0.0)
+    gap_to_maxloss = None
+    for s, p in sorted(rows, key=lambda x: abs(x[0])):
+        if p <= max_loss + 1:            # first (smallest) gap that hits the floor
+            gap_to_maxloss = abs(s)
+            break
+    return {"worst_loss": round(worst, 0), "gap_to_maxloss_pct": gap_to_maxloss,
+            "ladder": {f"{s:+.0%}": round(p, 0) for s, p in rows}}
+
 
 def _get_nifty_ohlc_today(creds: dict) -> dict[str, float | None]:
-    """Fetch today's OHLC for NIFTY from Dhan intraday endpoint."""
+    """Fetch today's OHLC for NIFTY from Dhan intraday endpoint.
+
+    fromDate/toDate are MANDATORY on this endpoint. Omitting them returned
+    HTTP 400 DH-905 "fromDate is required" on EVERY call, so candles was always 0 — which failed
+    both the 'opening data' gate (needs >= 8 candles) AND the 'day range' gate (its else-branch is a
+    hard fail when OHLC is missing). Two guaranteed failures capped every assessment at 3/5 against
+    a 4/5 auto-deploy bar, so the weekly IC could never deploy: 9 plans built since June, 0 deployed.
+    """
+    _today = datetime.now(IST).strftime("%Y-%m-%d")
     try:
         r = requests.post(
             "https://api.dhan.co/v2/charts/intraday",
@@ -614,9 +682,15 @@ def _get_nifty_ohlc_today(creds: dict) -> dict[str, float | None]:
                 "instrument": "INDEX",
                 "interval": "5",
                 "oi": False,
+                "fromDate": _today,
+                "toDate": _today,
             },
             timeout=10,
         )
+        if r.status_code != 200:
+            # Loud, not silent — this failure mode silently vetoed the trade for two months.
+            print(f"[ohlc] HTTP {r.status_code}: {r.text[:200]}", file=sys.stderr)
+            return {"open": None, "high": None, "low": None, "close": None, "candles": 0}
         d = r.json()
         opens  = d.get("open")  or []
         highs  = d.get("high")  or []
@@ -727,6 +801,38 @@ def run_market_assessment(force: bool = False) -> None:
     current_iv  = float(analysis.get("avg_iv") or pending.get("avg_iv") or 15.0)
     current_pcr = float(analysis.get("pcr")    or pending.get("pcr")    or 1.0)
 
+    # ── Re-select strikes on 10:15 data before judging them ──────────────────────────────────
+    # The strike_margin gate demands spot be >= 0.80x expected move from BOTH shorts, but the
+    # strikes it judged were chosen at the 09:00 review — which runs BEFORE the 09:15 open, so they
+    # are placed off the previous close. The selector puts shorts at ~0.9-1.15x expected move, so
+    # after an overnight gap plus the first hour of trade the buffer is only ~0.1-0.35x EM
+    # (~39-138pts on a 395pt move) and one ordinary morning drift fails the gate. That is a STALE
+    # STRIKE artifact, not a risk signal — the answer is to re-strike on current data, NOT to lower
+    # the safety margin, which is a real protection.
+    # Re-selecting makes the gate mean what it says: "can the chain give us safe strikes RIGHT NOW?"
+    # If it cannot, the gate fails honestly and we stand down.
+    if parsed.get("strikes") and analysis.get("ok"):
+        _fresh = _select_legs(parsed, analysis, expiry_str, lots=DEFAULT_LOTS)
+        if _fresh is not None:
+            _old_sc, _old_sp = planned_sc, planned_sp
+            _fresh["avg_iv"] = analysis["avg_iv"]
+            _fresh["expected_move"] = analysis["expected_move"]
+            _fresh["pcr"] = analysis["pcr"]
+            # Keep the SAME token: the deploy path resolves the pending plan by token, so reusing it
+            # means auto-deploy picks up these refreshed legs rather than the stale ones.
+            _save_pending(_fresh, str(pending.get("token") or ""))
+            pending = _fresh
+            planned_sc = float(_fresh["short_call"])
+            planned_sp = float(_fresh["short_put"])
+            expected_move = float(_fresh["expected_move"])
+            plan_credit = float(_fresh["gross_credit"])
+            if (_old_sc, _old_sp) != (planned_sc, planned_sp):
+                print(f"[weekly_ic_assess] Re-struck on 10:15 data: "
+                      f"SC {_old_sc:,.0f}->{planned_sc:,.0f}  SP {_old_sp:,.0f}->{planned_sp:,.0f}")
+        else:
+            print("[weekly_ic_assess] Re-strike found no valid legs — judging the 09:00 strikes.",
+                  file=sys.stderr)
+
     # Day range
     day_high   = ohlc.get("high")
     day_low    = ohlc.get("low")
@@ -788,10 +894,51 @@ def run_market_assessment(force: bool = False) -> None:
         f"{'✅ balanced' if _PCR_LOW <= current_pcr <= _PCR_HIGH else ('⚠️ extremely bearish' if current_pcr < _PCR_LOW else '⚠️ extremely complacent')}"
     ))
 
+    # 6. Gap shock — the overnight tail. Worst-case gap loss must be within tolerance, and it is
+    # bounded ONLY because the IC is defined-risk (wings). Shows the smallest gap that hits max loss.
+    _gs = _gap_shock(pending, spot)
+    _gap_ok = _gs["worst_loss"] >= -_MAX_OVERNIGHT_LOSS_RUPEES
+    _g2m = _gs["gap_to_maxloss_pct"]
+    _g2m_txt = f"max loss at a {_g2m*100:.1f}% gap; " if _g2m is not None else ""
+    _gap_status = f"✅ within ₹{_MAX_OVERNIGHT_LOSS_RUPEES:,.0f}" if _gap_ok else f"🚨 exceeds ₹{_MAX_OVERNIGHT_LOSS_RUPEES:,.0f} tolerance"
+    gates.append((
+        _gap_ok,
+        "Gap shock",
+        f"Worst overnight gap loss ₹{-_gs['worst_loss']:,.0f} ({_g2m_txt}{_gap_status})",
+    ))
+
     passed   = [g for g in gates if g[0]]
     failed   = [g for g in gates if not g[0]]
     n_passed = len(passed)
     n_gates  = len(gates)
+
+    # ── Gate instrumentation ─────────────────────────────────────────────────
+    # Structured, numeric record of every gate (value vs threshold, and the MARGIN by which it
+    # passed/failed) so we can see week-over-week WHICH gate blocks and BY HOW MUCH. The executor
+    # built 9 plans since June and deployed 0 — without this the veto reason was invisible.
+    _range_ratio = (day_range / expected_move) if day_range is not None else None
+    gate_details = [
+        {"name": "opening_data", "passed": num_candles >= 8,
+         "value": num_candles, "threshold": 8, "margin": num_candles - 8},
+        {"name": "day_range_ratio", "passed": bool(_range_ratio is not None and _range_ratio < _MAX_DAY_RANGE_RATIO),
+         "value": round(_range_ratio, 4) if _range_ratio is not None else None,
+         "threshold": _MAX_DAY_RANGE_RATIO, "day_range_pts": day_range,
+         "margin": round(_MAX_DAY_RANGE_RATIO - _range_ratio, 4) if _range_ratio is not None else None},
+        {"name": "iv_settled", "passed": current_iv <= _MAX_IV_AT_ENTRY,
+         "value": round(current_iv, 2), "threshold": _MAX_IV_AT_ENTRY,
+         "margin": round(_MAX_IV_AT_ENTRY - current_iv, 2)},
+        {"name": "strike_margin", "passed": bool(call_safe and put_safe),
+         "call_margin_pts": round(sc_margin, 1), "put_margin_pts": round(sp_margin, 1),
+         "threshold": round(min_required_margin, 1),
+         "margin": round(min(sc_margin, sp_margin) - min_required_margin, 1)},
+        {"name": "pcr_balanced", "passed": bool(_PCR_LOW <= current_pcr <= _PCR_HIGH),
+         "value": round(current_pcr, 2), "low": _PCR_LOW, "high": _PCR_HIGH,
+         "margin": round(min(current_pcr - _PCR_LOW, _PCR_HIGH - current_pcr), 2)},
+        {"name": "gap_shock", "passed": bool(_gap_ok),
+         "worst_overnight_loss": _gs["worst_loss"], "gap_to_maxloss_pct": _gs["gap_to_maxloss_pct"],
+         "threshold": -_MAX_OVERNIGHT_LOSS_RUPEES, "ladder": _gs["ladder"],
+         "margin": round(_gs["worst_loss"] + _MAX_OVERNIGHT_LOSS_RUPEES, 0)},
+    ]
 
     # ── Decision ─────────────────────────────────────────────────────────────
     gate_lines = "\n".join(f"  {'✅' if g[0] else '❌'} {g[1]}: {g[2]}" for g in gates)
@@ -893,6 +1040,30 @@ def run_market_assessment(force: bool = False) -> None:
             result_str = "HOLD"
 
     ok = _send_telegram(bot_token, chat_id, msg)
+    # Persist the structured gate assessment — the evidence trail for whether these gates are
+    # earning their keep (compare against the UNGATED weekly_shadow_ledger, which enters every week).
+    try:
+        blockers = [g["name"] for g in gate_details if not g["passed"]]
+        _rec = {
+            "assessed_at": now.isoformat(timespec="seconds"),
+            "assessment_label": assessment_label,
+            "expiry": expiry_str,
+            "spot": round(spot, 1) if spot else None,
+            "short_call": planned_sc, "short_put": planned_sp,
+            "plan_credit": plan_credit,
+            "expected_move": expected_move,
+            "n_passed": n_passed, "n_gates": n_gates,
+            "decision": result_str,
+            "blocked_by": blockers,
+            "gates": gate_details,
+        }
+        with (STATE_DIR / "weekly_ic_gate_log.jsonl").open("a") as _f:
+            _f.write(json.dumps(_rec) + "\n")
+        if blockers:
+            print(f"[weekly_ic_assess] BLOCKED BY: {', '.join(blockers)}")
+    except Exception as _exc:  # noqa: BLE001
+        print(f"[weekly_ic_assess] gate-log write failed: {_exc}", file=sys.stderr)
+
     print(f"[weekly_ic_assess] Result={result_str} ({n_passed}/{n_gates}). "
           f"Paper={paper_mode} IV={current_iv:.1f}% PCR={current_pcr:.2f} "
           f"SC_margin={sc_margin:.0f} SP_margin={sp_margin:.0f}. "

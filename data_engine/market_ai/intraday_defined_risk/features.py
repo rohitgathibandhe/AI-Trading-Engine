@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, time
+from pathlib import Path
 from statistics import fmean
 from typing import Iterable
 
 from .data_models import OhlcvBar, OhlcvSeries, ORLevels, OptionType, OptionsContractQuote
+
+_MARKET_CONTEXT_PATH = Path(__file__).resolve().parents[1] / "state" / "market_context.json"
+_OI_SNAPSHOTS_PATH = Path(__file__).resolve().parents[1] / "state" / "oi_snapshots.json"
+_OI_TODAY_PATH = Path(__file__).resolve().parents[1] / "state" / "oi_today.json"
+_FII_BIAS_PATH = Path(__file__).resolve().parents[1] / "state" / "fii_bias.json"
 
 
 MARKET_OPEN = time(9, 15)
@@ -1084,6 +1091,250 @@ def market_structure_state(
     }
 
 
+def early_structure_intent_bearish(
+    bars_5m: list[OhlcvBar],
+    ema20_5m: float | None,
+    vwap: float | None,
+    opening_range_high: float | None,
+    opening_range_low: float | None,
+    bearish_chain_pressure: float,
+) -> dict:
+    """
+    Detects bearish intent in the first 2–5 bars of the session,
+    before trend_15m and execution_5m labels confirm.
+
+    Uses EMA20 position/crossover, LH/LL structure, candle quality,
+    OR location, and chain pressure as early confluence factors.
+    Fires when strength >= 2.5 AND at least one signal from each of
+    the three required categories (EMA, structure, pressure) is present.
+    """
+    result: dict = {"triggered": False, "strength": 0.0, "signals": {}}
+    if len(bars_5m) < 2:
+        return result
+
+    last = bars_5m[-1]
+    spot = last.close
+
+    # EMA signals
+    below_ema20 = ema20_5m is not None and spot < ema20_5m
+    ema20_cross_bearish = (
+        ema20_5m is not None
+        and len(bars_5m) >= 3
+        and bars_5m[-1].close < ema20_5m
+        and bars_5m[-2].close >= ema20_5m
+    )
+    ema20_holding_below = (
+        ema20_5m is not None
+        and len(bars_5m) >= 3
+        and all(b.close < ema20_5m for b in bars_5m[-3:])
+    )
+
+    # Candle signals
+    candle = bearish_candle_context(bars_5m)
+    strong_bearish_candle = float(candle.get("quality_score") or 0.0) >= 2.0
+    body_and_close = (
+        float(candle.get("body_fraction") or 0.0) >= 0.55
+        and float(candle.get("close_location") or 1.0) <= 0.30
+    )
+
+    # Market structure signals: LH/LL sequence within first few bars
+    lh_ll_sequence = len(bars_5m) >= 4 and recent_lower_highs(bars_5m[-4:], needed=2)
+    lower_high_from_open = (
+        len(bars_5m) >= 3
+        and all(b.high < bars_5m[0].high for b in bars_5m[1:])
+        and (len(bars_5m) < 3 or bars_5m[-1].high <= bars_5m[-2].high)
+    )
+
+    # OR location signals
+    or_mid = (
+        (opening_range_high + opening_range_low) / 2.0
+        if opening_range_high is not None and opening_range_low is not None
+        else None
+    )
+    below_or_mid = or_mid is not None and spot < or_mid
+    testing_or_low = opening_range_low is not None and spot <= opening_range_low * 1.001
+
+    # Pressure signals
+    strong_pressure = bearish_chain_pressure >= 0.62
+    moderate_pressure = bearish_chain_pressure >= 0.55
+
+    # VWAP
+    below_vwap = vwap is not None and spot < vwap
+
+    strength = 0.0
+    signals: dict = {}
+
+    if ema20_holding_below:
+        strength += 1.0
+        signals["ema20_holding_below"] = True
+    elif ema20_cross_bearish:
+        strength += 0.7
+        signals["ema20_cross_bearish"] = True
+    elif below_ema20:
+        strength += 0.5
+        signals["below_ema20"] = True
+
+    if strong_bearish_candle:
+        strength += 1.0
+        signals["strong_bearish_candle"] = True
+    elif body_and_close:
+        strength += 0.6
+        signals["bearish_body_and_close"] = True
+
+    if lh_ll_sequence:
+        strength += 0.8
+        signals["lh_ll_sequence"] = True
+    elif lower_high_from_open:
+        strength += 0.4
+        signals["lower_high_from_open"] = True
+
+    if strong_pressure:
+        strength += 0.8
+        signals["strong_chain_pressure"] = True
+    elif moderate_pressure:
+        strength += 0.4
+        signals["moderate_chain_pressure"] = True
+
+    if below_or_mid:
+        strength += 0.4
+        signals["below_or_mid"] = True
+    if testing_or_low:
+        strength += 0.3
+        signals["testing_or_low"] = True
+    if below_vwap:
+        strength += 0.4
+        signals["below_vwap"] = True
+
+    has_ema = bool(below_ema20 or ema20_cross_bearish or ema20_holding_below)
+    has_structure = bool(lh_ll_sequence or lower_high_from_open or strong_bearish_candle)
+    has_pressure = bool(strong_pressure or moderate_pressure)
+
+    result["triggered"] = bool(strength >= 2.5 and has_ema and has_structure and has_pressure)
+    result["strength"] = round(strength, 3)
+    result["signals"] = signals
+    return result
+
+
+def early_structure_intent_bullish(
+    bars_5m: list[OhlcvBar],
+    ema20_5m: float | None,
+    vwap: float | None,
+    opening_range_high: float | None,
+    opening_range_low: float | None,
+    bullish_chain_pressure: float,
+) -> dict:
+    """
+    Symmetric bullish counterpart to early_structure_intent_bearish.
+    Detects bullish intent in the first 2–5 bars using EMA20 position,
+    HL/HH structure, candle quality, OR location, and chain pressure.
+    """
+    result: dict = {"triggered": False, "strength": 0.0, "signals": {}}
+    if len(bars_5m) < 2:
+        return result
+
+    last = bars_5m[-1]
+    spot = last.close
+
+    # EMA signals
+    above_ema20 = ema20_5m is not None and spot > ema20_5m
+    ema20_cross_bullish = (
+        ema20_5m is not None
+        and len(bars_5m) >= 3
+        and bars_5m[-1].close > ema20_5m
+        and bars_5m[-2].close <= ema20_5m
+    )
+    ema20_holding_above = (
+        ema20_5m is not None
+        and len(bars_5m) >= 3
+        and all(b.close > ema20_5m for b in bars_5m[-3:])
+    )
+
+    # Candle signals
+    candle = bullish_candle_context(bars_5m)
+    strong_bullish_candle = float(candle.get("quality_score") or 0.0) >= 2.0
+    body_and_close = (
+        float(candle.get("body_fraction") or 0.0) >= 0.55
+        and float(candle.get("close_location") or 0.0) >= 0.70
+    )
+
+    # Market structure: HL/HH sequence
+    hl_hh_sequence = len(bars_5m) >= 4 and recent_higher_lows(bars_5m[-4:], needed=2)
+    higher_low_from_open = (
+        len(bars_5m) >= 3
+        and all(b.low > bars_5m[0].low for b in bars_5m[1:])
+        and (len(bars_5m) < 3 or bars_5m[-1].low >= bars_5m[-2].low)
+    )
+
+    # OR location
+    or_mid = (
+        (opening_range_high + opening_range_low) / 2.0
+        if opening_range_high is not None and opening_range_low is not None
+        else None
+    )
+    above_or_mid = or_mid is not None and spot > or_mid
+    testing_or_high = opening_range_high is not None and spot >= opening_range_high * 0.999
+
+    # Pressure
+    strong_pressure = bullish_chain_pressure >= 0.62
+    moderate_pressure = bullish_chain_pressure >= 0.55
+
+    # VWAP
+    above_vwap = vwap is not None and spot > vwap
+
+    strength = 0.0
+    signals: dict = {}
+
+    if ema20_holding_above:
+        strength += 1.0
+        signals["ema20_holding_above"] = True
+    elif ema20_cross_bullish:
+        strength += 0.7
+        signals["ema20_cross_bullish"] = True
+    elif above_ema20:
+        strength += 0.5
+        signals["above_ema20"] = True
+
+    if strong_bullish_candle:
+        strength += 1.0
+        signals["strong_bullish_candle"] = True
+    elif body_and_close:
+        strength += 0.6
+        signals["bullish_body_and_close"] = True
+
+    if hl_hh_sequence:
+        strength += 0.8
+        signals["hl_hh_sequence"] = True
+    elif higher_low_from_open:
+        strength += 0.4
+        signals["higher_low_from_open"] = True
+
+    if strong_pressure:
+        strength += 0.8
+        signals["strong_chain_pressure"] = True
+    elif moderate_pressure:
+        strength += 0.4
+        signals["moderate_chain_pressure"] = True
+
+    if above_or_mid:
+        strength += 0.4
+        signals["above_or_mid"] = True
+    if testing_or_high:
+        strength += 0.3
+        signals["testing_or_high"] = True
+    if above_vwap:
+        strength += 0.4
+        signals["above_vwap"] = True
+
+    has_ema = bool(above_ema20 or ema20_cross_bullish or ema20_holding_above)
+    has_structure = bool(hl_hh_sequence or higher_low_from_open or strong_bullish_candle)
+    has_pressure = bool(strong_pressure or moderate_pressure)
+
+    result["triggered"] = bool(strength >= 2.5 and has_ema and has_structure and has_pressure)
+    result["strength"] = round(strength, 3)
+    result["signals"] = signals
+    return result
+
+
 def in_market_hours(ts: datetime) -> bool:
     return MARKET_OPEN <= ts.time() <= FORCE_EXIT_TIME
 
@@ -1220,6 +1471,20 @@ def option_chain_oi_flow(
     else:
         smart_money_bias = "NEUTRAL"
 
+    # OI velocity: rate of buildup at dominant wall strikes (pct of prior OI per poll cycle).
+    # High velocity at call wall = resistance hardening fast → reinforces bearish bias.
+    # High velocity at put wall = support flooring fast → reinforces bullish bias.
+    call_wall_prev_oi = next(
+        (float(prev.oi or 0) for cur, prev in nearby_calls if cur.strike == call_wall_strike),
+        0.0,
+    )
+    put_wall_prev_oi = next(
+        (float(prev.oi or 0) for cur, prev in nearby_puts if cur.strike == put_wall_strike),
+        0.0,
+    )
+    call_wall_velocity = round(call_wall_change / max(call_wall_prev_oi, 1.0) * 100, 2)
+    put_wall_velocity = round(put_wall_change / max(put_wall_prev_oi, 1.0) * 100, 2)
+
     return {
         "bullish_flow_score": bullish_score,
         "bearish_flow_score": bearish_score,
@@ -1228,6 +1493,8 @@ def option_chain_oi_flow(
         "put_support_oi_change": put_wall_change,
         "call_resistance_oi_change": call_wall_change,
         "smart_money_bias": smart_money_bias,
+        "call_wall_oi_velocity": call_wall_velocity,
+        "put_wall_oi_velocity": put_wall_velocity,
     }
 
 
@@ -1355,10 +1622,33 @@ def compute_daily_trend_features(daily_series: OhlcvSeries | None) -> dict[str, 
     ema50 = _ema(closes, 50)
     ema200 = _ema(closes, 200)
 
-    # Weekly levels: last 5 trading days
+    # Weekly levels: last 5 completed trading days
     recent = bars[-5:] if len(bars) >= 5 else bars
     weekly_high = max(b.high for b in recent)
     weekly_low = min(b.low for b in recent)
+
+    # Monthly swing structure: last 20 trading days (~1 month).
+    # Swing highs = bars whose high exceeds both neighbours (simple 3-bar pivot).
+    # Nearest swing high ABOVE last_close = structural resistance.
+    # Nearest swing low BELOW last_close = structural support.
+    monthly_bars = bars[-20:] if len(bars) >= 20 else bars
+    monthly_high = max(b.high for b in monthly_bars)
+    monthly_low = min(b.low for b in monthly_bars)
+
+    swing_highs: list[float] = []
+    swing_lows: list[float] = []
+    for i in range(1, len(monthly_bars) - 1):
+        if monthly_bars[i].high > monthly_bars[i - 1].high and monthly_bars[i].high > monthly_bars[i + 1].high:
+            swing_highs.append(monthly_bars[i].high)
+        if monthly_bars[i].low < monthly_bars[i - 1].low and monthly_bars[i].low < monthly_bars[i + 1].low:
+            swing_lows.append(monthly_bars[i].low)
+
+    # Nearest swing high strictly above last_close = resistance; nearest swing low below = support
+    daily_swing_resistance = min((h for h in swing_highs if h > last_close), default=None)
+    daily_swing_support = max((l for l in swing_lows if l < last_close), default=None)
+    # If no pivot found above, use the monthly_high as the ceiling
+    if daily_swing_resistance is None and monthly_high > last_close:
+        daily_swing_resistance = monthly_high
 
     # ATR (14-day)
     atr: float | None = None
@@ -1414,8 +1704,403 @@ def compute_daily_trend_features(daily_series: OhlcvSeries | None) -> dict[str, 
         "daily_ema200": round(ema200, 2) if ema200 else None,
         "weekly_high": round(weekly_high, 2),
         "weekly_low": round(weekly_low, 2),
+        "monthly_high": round(monthly_high, 2),
+        "monthly_low": round(monthly_low, 2),
+        "daily_swing_resistance": round(daily_swing_resistance, 2) if daily_swing_resistance is not None else None,
+        "daily_swing_support": round(daily_swing_support, 2) if daily_swing_support is not None else None,
         "daily_atr": round(atr, 2) if atr else None,
         "price_vs_ema20_pct": round(price_vs_ema20_pct, 3) if price_vs_ema20_pct is not None else None,
         "price_vs_ema50_pct": round(price_vs_ema50_pct, 3) if price_vs_ema50_pct is not None else None,
         "higher_tf_available": True,
     }
+
+
+def compute_vwap_bands(bars: list[OhlcvBar]) -> dict[str, float | None]:
+    """VWAP with 1-sigma and 2-sigma volume-weighted standard deviation bands.
+
+    High-volume bars receive more influence on band width — mirroring how
+    institutional activity defines the expected intraday price envelope.
+    band_compression_pct < 1.0% signals a coiling market; > 2.5% = expansion.
+    """
+    denom = sum(bar.volume for bar in bars)
+    if denom <= 0:
+        return {
+            "vwap": None, "upper_1": None, "lower_1": None,
+            "upper_2": None, "lower_2": None,
+            "band_width": None, "band_compression_pct": None,
+        }
+    typicals = [(bar.high + bar.low + bar.close) / 3.0 for bar in bars]
+    vwap = sum(t * bar.volume for t, bar in zip(typicals, bars)) / denom
+    variance = sum(bar.volume * (t - vwap) ** 2 for t, bar in zip(typicals, bars)) / denom
+    std = variance ** 0.5
+    band_width = 4.0 * std  # full envelope: upper_2 to lower_2
+    band_compression_pct = round(band_width / vwap * 100, 3) if vwap > 0 else None
+    return {
+        "vwap": round(vwap, 2),
+        "upper_1": round(vwap + std, 2),
+        "lower_1": round(vwap - std, 2),
+        "upper_2": round(vwap + 2 * std, 2),
+        "lower_2": round(vwap - 2 * std, 2),
+        "band_width": round(band_width, 2),
+        "band_compression_pct": band_compression_pct,
+    }
+
+
+def compute_volume_spike(bars: list[OhlcvBar], window: int = 20) -> dict[str, float | bool]:
+    """Volume anomaly: compares the latest bar to the rolling mean of prior N bars.
+
+    ratio >= 1.5 → volume spike (institutional or news-driven surge, often precedes a move).
+    ratio < 0.5 → volume drought (watch for range-bound chop or liquidity thin-out).
+    """
+    if not bars:
+        return {"volume_ratio": 1.0, "is_spike": False}
+    lookback = bars[-min(window + 1, len(bars)):-1]
+    if not lookback:
+        return {"volume_ratio": 1.0, "is_spike": False}
+    avg_vol = sum(bar.volume for bar in lookback) / len(lookback)
+    if avg_vol <= 0:
+        return {"volume_ratio": 1.0, "is_spike": False}
+    ratio = bars[-1].volume / avg_vol
+    return {"volume_ratio": round(ratio, 2), "is_spike": ratio >= 1.5}
+
+
+def compute_max_pain(quotes: list[OptionsContractQuote]) -> dict[str, float | None]:
+    """Strike where total option-buyer notional pain is minimised.
+
+    For each candidate settlement S:
+      call_pain = Σ max(0, S - strike) × call_OI
+      put_pain  = Σ max(0, strike - S) × put_OI
+    max_pain_strike = argmin(call_pain + put_pain).
+
+    Market makers are net-short options so they tend to pin expiry near this level.
+    Use as a gravitational reference for where the chain may settle, not a hard gate.
+    """
+    if not quotes:
+        return {"max_pain_strike": None}
+    oi_by_strike: dict[int, dict[str, int]] = {}
+    for q in quotes:
+        k = int(q.strike)
+        if k not in oi_by_strike:
+            oi_by_strike[k] = {"ce": 0, "pe": 0}
+        if q.option_type == OptionType.CALL and q.oi:
+            oi_by_strike[k]["ce"] += int(q.oi)
+        elif q.option_type == OptionType.PUT and q.oi:
+            oi_by_strike[k]["pe"] += int(q.oi)
+    strikes = sorted(oi_by_strike)
+    if not strikes:
+        return {"max_pain_strike": None}
+    min_pain = float("inf")
+    max_pain_strike = strikes[len(strikes) // 2]
+    for candidate in strikes:
+        call_pain = sum(max(0, candidate - k) * oi_by_strike[k]["ce"] for k in strikes)
+        put_pain = sum(max(0, k - candidate) * oi_by_strike[k]["pe"] for k in strikes)
+        total = call_pain + put_pain
+        if total < min_pain:
+            min_pain = total
+            max_pain_strike = candidate
+    return {"max_pain_strike": float(max_pain_strike)}
+
+
+def compute_gamma_concentration(
+    quotes: list[OptionsContractQuote],
+    spot: float,
+) -> dict[str, float | None]:
+    """Find the max-gamma strike (highest combined call+put OI) and distance from spot.
+
+    On expiry day, market makers are net-short a massive notional of options at the
+    max-OI strike.  They must delta-hedge with futures, creating a gravitational pin
+    as spot approaches that strike.  Trading through the pin on expiry is low-edge.
+
+    Returns:
+      max_gamma_strike      — the strike with highest CE+PE open interest
+      gamma_concentration   — total OI at that strike as fraction of total chain OI
+      spot_to_pin_pts       — signed distance: spot - max_gamma_strike (+ = above pin)
+      spot_to_pin_pct       — same, as % of spot
+    """
+    if not quotes:
+        return {
+            "max_gamma_strike": None,
+            "gamma_concentration": 0.0,
+            "spot_to_pin_pts": None,
+            "spot_to_pin_pct": None,
+        }
+    oi_by_strike: dict[float, int] = {}
+    total_oi = 0
+    for q in quotes:
+        if q.oi:
+            oi_by_strike[q.strike] = oi_by_strike.get(q.strike, 0) + int(q.oi)
+            total_oi += int(q.oi)
+    if not oi_by_strike or total_oi == 0:
+        return {
+            "max_gamma_strike": None,
+            "gamma_concentration": 0.0,
+            "spot_to_pin_pts": None,
+            "spot_to_pin_pct": None,
+        }
+    max_gamma_strike = max(oi_by_strike, key=lambda k: oi_by_strike[k])
+    pin_oi = oi_by_strike[max_gamma_strike]
+    return {
+        "max_gamma_strike": float(max_gamma_strike),
+        "gamma_concentration": round(pin_oi / total_oi, 4),
+        "spot_to_pin_pts": round(spot - max_gamma_strike, 1),
+        "spot_to_pin_pct": round((spot - max_gamma_strike) / max(spot, 1.0) * 100, 3),
+    }
+
+
+def compute_multi_session_oi_walls(
+    spot: float,
+    lookback_days: int = 3,
+) -> dict[str, float | None]:
+    """Load rolling N-day OI snapshots and find accumulated call/put walls.
+
+    Intraday OI walls shift and grow throughout a single session.  A wall that
+    appears across 3 consecutive sessions is institutional conviction, not noise.
+    Call wall = strike with highest total CE OI over N days.
+    Put wall  = strike with highest total PE OI over N days.
+
+    Reads:
+      state/oi_snapshots.json  — rolling archive written by EOD watchdog
+      state/oi_today.json      — today's live OI (overwritten each poll)
+
+    Returns None values if insufficient data (< 2 days with OI).
+    """
+    try:
+        # Load archived days + today's live snapshot
+        snapshots: list[dict] = []
+        if _OI_SNAPSHOTS_PATH.exists():
+            archived = json.loads(_OI_SNAPSHOTS_PATH.read_text())
+            if isinstance(archived, list):
+                snapshots = archived[-(lookback_days - 1):]  # last N-1 archived days
+        if _OI_TODAY_PATH.exists():
+            today_snap = json.loads(_OI_TODAY_PATH.read_text())
+            snapshots.append(today_snap)
+
+        if len(snapshots) < 2:
+            return {"multi_session_call_wall": None, "multi_session_put_wall": None,
+                    "multi_session_days": len(snapshots)}
+
+        # Accumulate OI by strike across all sessions
+        total_ce: dict[float, int] = {}
+        total_pe: dict[float, int] = {}
+        for snap in snapshots:
+            for k_str, ois in (snap.get("strikes") or {}).items():
+                k = float(k_str)
+                total_ce[k] = total_ce.get(k, 0) + int(ois.get("ce_oi", 0))
+                total_pe[k] = total_pe.get(k, 0) + int(ois.get("pe_oi", 0))
+
+        if not total_ce and not total_pe:
+            return {"multi_session_call_wall": None, "multi_session_put_wall": None,
+                    "multi_session_days": len(snapshots)}
+
+        call_wall = float(max(total_ce, key=lambda k: total_ce[k])) if total_ce else None
+        put_wall = float(max(total_pe, key=lambda k: total_pe[k])) if total_pe else None
+        return {
+            "multi_session_call_wall": call_wall,
+            "multi_session_put_wall": put_wall,
+            "multi_session_days": len(snapshots),
+        }
+    except Exception:
+        return {"multi_session_call_wall": None, "multi_session_put_wall": None,
+                "multi_session_days": 0}
+
+
+def compute_atm_straddle(spot: float, quotes: list[OptionsContractQuote]) -> dict[str, float | None]:
+    """ATM straddle price = CE_ltp + PE_ltp at the nearest-to-spot strike.
+
+    For 0-1 DTE Nifty weekly options the straddle price directly equals the
+    market's consensus 1-sigma expected daily range — no scaling needed.
+    Short strikes inside this range are inside the market's own forecast,
+    dramatically increasing assignment risk on trending days.
+    """
+    by_strike: dict[int, dict[str, float]] = {}
+    for q in quotes:
+        k = int(q.strike)
+        if k not in by_strike:
+            by_strike[k] = {}
+        if q.option_type == OptionType.CALL and q.ltp > 0:
+            by_strike[k]["ce"] = q.ltp
+        elif q.option_type == OptionType.PUT and q.ltp > 0:
+            by_strike[k]["pe"] = q.ltp
+    atm_strike = None
+    atm_dist = float("inf")
+    for k, sides in by_strike.items():
+        if "ce" in sides and "pe" in sides:
+            d = abs(k - spot)
+            if d < atm_dist:
+                atm_dist = d
+                atm_strike = k
+    if atm_strike is None:
+        return {"atm_strike": None, "atm_straddle_price": None, "expected_move_pts": None}
+    sides = by_strike[atm_strike]
+    straddle = sides["ce"] + sides["pe"]
+    return {
+        "atm_strike": float(atm_strike),
+        "atm_straddle_price": round(straddle, 2),
+        "expected_move_pts": round(straddle, 2),
+    }
+
+
+def compute_vwap_reclaim(bars: list[OhlcvBar], vwap: float) -> dict[str, bool | float]:
+    """VWAP reclaim: price dipped below VWAP for ≥2 prior bars, now closed above with volume.
+
+    Signals institutional buyers defending the mean — high-quality bullish continuation
+    when paired with positive OI flow.  Returns reclaim=False when VWAP is unknown or bars
+    are insufficient.
+    """
+    if not bars or vwap <= 0 or len(bars) < 3:
+        return {"vwap_reclaim": False, "vwap_reclaim_strength": 0.0}
+    if bars[-1].close <= vwap:
+        return {"vwap_reclaim": False, "vwap_reclaim_strength": 0.0}
+    prior = bars[-4:-1] if len(bars) >= 4 else bars[:-1]
+    below_count = sum(1 for bar in prior if bar.close < vwap)
+    if below_count < min(2, len(prior)):
+        return {"vwap_reclaim": False, "vwap_reclaim_strength": 0.0}
+    avg_prior_vol = sum(b.volume for b in prior) / max(len(prior), 1)
+    vol_ratio = bars[-1].volume / max(avg_prior_vol, 1.0)
+    dist_pct = (bars[-1].close - vwap) / max(vwap, 1.0)
+    strength = round(min(dist_pct * 100 + max(vol_ratio - 1.0, 0.0) * 0.3, 2.0), 3)
+    return {"vwap_reclaim": True, "vwap_reclaim_strength": max(0.0, strength)}
+
+
+def compute_momentum_persistence(bars: list[OhlcvBar], n: int = 6) -> dict[str, float]:
+    """Volume-weighted fraction of last N bars agreeing on direction (green vs red).
+
+    Persistence ≥ 0.70 = institutional trend participation.
+    Persistence ≤ 0.35 = choppy, unreliable candle signals.
+    """
+    if not bars or len(bars) < 2:
+        return {"bullish_persistence": 0.5, "bearish_persistence": 0.5}
+    recent = bars[-min(n, len(bars)):]
+    total_vol = sum(bar.volume for bar in recent)
+    if total_vol <= 0:
+        return {"bullish_persistence": 0.5, "bearish_persistence": 0.5}
+    bull_vol = sum(bar.volume for bar in recent if bar.close >= bar.open)
+    bear_vol = sum(bar.volume for bar in recent if bar.close < bar.open)
+    return {
+        "bullish_persistence": round(bull_vol / total_vol, 3),
+        "bearish_persistence": round(bear_vol / total_vol, 3),
+    }
+
+
+def read_market_context() -> dict:
+    """Read auxiliary market context (VIX, BankNifty) written by DhanLiveMarketDataProvider.
+
+    Returns an empty dict when the file is absent or unreadable — callers must handle missing keys.
+    """
+    try:
+        if _MARKET_CONTEXT_PATH.exists():
+            return json.loads(_MARKET_CONTEXT_PATH.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def read_fii_bias() -> dict:
+    """Read latest FII/DII directional bias from NSE data fetched by the EOD watchdog.
+
+    Returns an empty dict when absent — callers must handle missing keys gracefully.
+    Keys: date, fii_net_crores, dii_net_crores, bias (STRONG_BULLISH/BULLISH/NEUTRAL/BEARISH/STRONG_BEARISH).
+    """
+    try:
+        if _FII_BIAS_PATH.exists():
+            return json.loads(_FII_BIAS_PATH.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+_WIN_PROB_MODEL_PATH = Path(__file__).resolve().parents[1] / "state" / "win_prob_model.json"
+
+# Feature names expected by the ML model — must match what watchdog writes
+_ML_FEATURE_NAMES = [
+    "ml_bearish_entry_score", "ml_bullish_entry_score", "ml_india_vix",
+    "ml_vwap_reclaim", "ml_banknifty_divergence", "ml_days_to_monthly_expiry",
+    "ml_bullish_momentum", "ml_bearish_momentum", "ml_rv30_pct",
+    "ml_order_flow_imbalance",
+]
+
+
+def compute_win_probability(features: dict, direction: str = "BEARISH") -> float:
+    """Apply trained logistic regression to score a setup's win probability.
+
+    Returns 0.5 (neutral — no opinion) when the model is absent or undertrained.
+    direction: 'BEARISH' or 'BULLISH' — selects the appropriate coefficient set.
+    """
+    try:
+        if not _WIN_PROB_MODEL_PATH.exists():
+            return 0.5
+        model = json.loads(_WIN_PROB_MODEL_PATH.read_text())
+        key = "bearish" if direction != "BULLISH" else "bullish"
+        coeffs = model.get(key)
+        # Threshold must match the watchdog's per-direction training floor (8).
+        # `coeffs` is already None for a direction that did not train, so this
+        # only guards against a model written with too few total samples.
+        if not coeffs or int(model.get("samples", 0)) < 8:
+            return 0.5
+        intercept = float(coeffs.get("intercept", 0.0))
+        weights = coeffs.get("weights", {})
+        dot = intercept
+        for feat in _ML_FEATURE_NAMES:
+            raw = features.get(feat)
+            if raw is None:
+                continue
+            val = 1.0 if raw is True else (0.0 if raw is False else float(raw))
+            dot += val * float(weights.get(feat, 0.0))
+        prob = 1.0 / (1.0 + (2.71828 ** (-dot)))
+        return round(prob, 3)
+    except Exception:
+        return 0.5
+
+
+def compute_order_flow_imbalance(
+    quotes: list[OptionsContractQuote],
+    spot: float,
+    atm_width: float = 150.0,
+) -> float:
+    """Snapshot-based order flow imbalance: LTP vs mid for near-ATM options.
+
+    Measures whether call options or put options are being bought more aggressively
+    (LTP close to ask = aggressor buying; LTP close to bid = aggressor selling).
+
+    Returns float in [-1, +1]:
+      +1  = aggressive call buying (bullish institutional demand)
+      -1  = aggressive put buying  (bearish institutional demand)
+       0  = balanced / insufficient data
+    """
+    call_aggression = 0.0
+    put_aggression = 0.0
+    call_count = 0
+    put_count = 0
+
+    for quote in quotes:
+        if quote.ask <= 0 or quote.bid <= 0 or quote.ltp < 0:
+            continue
+        if quote.ask <= quote.bid:
+            continue
+        if abs(quote.strike - spot) > atm_width:
+            continue
+
+        half_spread = (quote.ask - quote.bid) / 2.0
+        if half_spread <= 0:
+            continue
+        mid = (quote.bid + quote.ask) / 2.0
+        # Clamp to [-1, +1]: +1 = LTP at ask (aggressive buy), -1 = LTP at bid (aggressive sell)
+        aggression = max(-1.0, min(1.0, (quote.ltp - mid) / half_spread))
+
+        if quote.option_type == OptionType.CALL:
+            call_aggression += aggression
+            call_count += 1
+        elif quote.option_type == OptionType.PUT:
+            put_aggression += aggression
+            put_count += 1
+
+    if call_count == 0 and put_count == 0:
+        return 0.0
+
+    # Normalize by count so we compare per-strike pressure, not volume
+    avg_call = call_aggression / max(call_count, 1)
+    avg_put = put_aggression / max(put_count, 1)
+
+    # Net: call buying is bullish (+), put buying is bearish (-)
+    net = avg_call - avg_put
+    return round(max(-1.0, min(1.0, net / 2.0)), 3)

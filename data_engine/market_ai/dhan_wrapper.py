@@ -26,6 +26,29 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 _SHARED_WRAPPER: Optional["DhanWrapper"] = None
 _SHARED_WRAPPER_LOCK = threading.Lock()
 
+# Hard-timeout wrapper for Dhan SDK calls that expose no timeout of their own.
+# The Dhan historical-candle / option-chain SDK helpers make blocking HTTP calls
+# with no timeout; when Dhan's API hangs (as on 2026-07-09) the single-threaded
+# live loop froze for ~5 hours. We run each such call in a daemon pool and abandon
+# it after `timeout_s` — the hung thread lingers harmlessly but the LIVE LOOP NEVER
+# BLOCKS, so it keeps polling and auto-resumes the instant Dhan recovers (no restart).
+import concurrent.futures as _futures
+_DHAN_TIMEOUT_POOL = _futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="dhan_to")
+
+
+def _call_with_timeout(fn: Callable[[], Any], timeout_s: float, default: Any, log=None, label: str = "") -> Any:
+    fut = _DHAN_TIMEOUT_POOL.submit(fn)
+    try:
+        return fut.result(timeout=timeout_s)
+    except _futures.TimeoutError:
+        if log:
+            log.error("[timeout] %s exceeded %.0fs — returning default; live loop stays alive", label, timeout_s)
+        return default
+    except Exception as exc:  # noqa: BLE001
+        if log:
+            log.exception("[timeout] %s failed: %s", label, exc)
+        return default
+
 try:
     from zoneinfo import ZoneInfo  # py3.9+
 except Exception:  # pragma: no cover
@@ -718,10 +741,11 @@ class DhanWrapper:
         seen = set()
 
         def _try_fetch(seg: str) -> Optional[Dict[str, Any]]:
-            try:
-                resp = oc.option_chain(underlying_security_id, seg, expiry_str)
-            except Exception as exc:
-                self.log.warning(f"[option_chain] fetch failed seg={seg}: {exc}")
+            resp = _call_with_timeout(
+                lambda: oc.option_chain(underlying_security_id, seg, expiry_str),
+                timeout_s=15.0, default=None, log=self.log, label=f"option_chain seg={seg}",
+            )
+            if resp is None:
                 return None
             if isinstance(resp, dict):
                 status = resp.get("status")
@@ -732,7 +756,12 @@ class DhanWrapper:
                     cooldown = time.time() + 90.0
                     self._chain_cooldown_until = cooldown
                     with self._GLOBAL_CHAIN_LOCK:
-                        self._GLOBAL_CHAIN_COOLDOWN_UNTIL = cooldown
+                        # Write to the CLASS, not self. `self._GLOBAL_..= x` creates an instance
+                        # attribute that shadows the class-level shared marker, so the UI's wrapper
+                        # and the agent's wrapper would each throttle only against themselves and
+                        # both hit the 1/3s endpoint in the same window — the shared throttle was
+                        # silently per-instance. This is the main 429 source.
+                        DhanWrapper._GLOBAL_CHAIN_COOLDOWN_UNTIL = cooldown
                     return None
                 if status == "success" or data:
                     return resp
@@ -741,6 +770,7 @@ class DhanWrapper:
             return None
 
         resp: Optional[Dict[str, Any]] = None
+        hit_429 = False
         for seg in segs:
             if not seg or seg in seen:
                 continue
@@ -753,9 +783,19 @@ class DhanWrapper:
                 resp = _try_fetch(seg)
                 if resp is not None:
                     break
-                # backoff to avoid 429
-                time.sleep(1.5)
-            if resp is not None:
+                # A 429 inside _try_fetch just set a 90s global cooldown. Stop NOW — do not keep
+                # retrying across attempts or segments. That storm (up to segs*attempts = 9 hits)
+                # is what gets the account blocked, and it ignored the very cooldown it had just
+                # set (previously only checked at the method top, never inside the loop).
+                cd = DhanWrapper._GLOBAL_CHAIN_COOLDOWN_UNTIL
+                if cd and time.time() < cd:
+                    hit_429 = True
+                    break
+                # Respect the global 1/3s limit between retries. Was 1.5s — two retries inside one
+                # call meant 3 hits in <3s, which itself tripped 429s.
+                if attempt < max_attempts - 1:
+                    time.sleep(3.0)
+            if resp is not None or hit_429:
                 break
 
         if resp is None:
@@ -765,10 +805,11 @@ class DhanWrapper:
         ts_now = time.time()
         self._last_chain_resp = resp
         self._last_chain_ts = ts_now
-        # update shared markers
+        # update shared markers — class-level writes so the throttle is genuinely shared
+        # across every instance (UI + agent), not shadowed onto this one.
         with self._GLOBAL_CHAIN_LOCK:
-            self._GLOBAL_LAST_CHAIN_TS = ts_now
-            self._GLOBAL_CHAIN_COOLDOWN_UNTIL = None
+            DhanWrapper._GLOBAL_LAST_CHAIN_TS = ts_now
+            DhanWrapper._GLOBAL_CHAIN_COOLDOWN_UNTIL = None
         self._last_chain_key = key
         return resp
 
@@ -789,17 +830,23 @@ class DhanWrapper:
         self._refresh_token_if_stale()
         from_str = (from_date or dt_date.today().isoformat()).strip()
         to_str = (to_date or from_str).strip()
-        try:
-            resp = self._historical.intraday_minute_data(
+        resp = _call_with_timeout(
+            lambda: self._historical.intraday_minute_data(
                 security_id=security_id,
                 exchange_segment=exchange_segment,
                 instrument_type=instrument_type,
                 from_date=from_str,
                 to_date=to_str,
                 interval=interval,
-            )
-        except Exception as exc:
-            self.log.exception("[historical] intraday fetch failed: %s", exc)
+            ),
+            timeout_s=15.0,
+            default=None,
+            log=self.log,
+            label="intraday_minute_data",
+        )
+        if resp is None:
+            # timeout or error — return empty so the loop logs INSUFFICIENT_DATA and
+            # retries next cycle instead of freezing. Auto-recovers when Dhan is back.
             return []
 
         data: Any = resp
@@ -889,17 +936,21 @@ class DhanWrapper:
         Fetch daily OHLCV from /charts/historical via the HistoricalData helper.
         Returns a list of dicts sorted by timestamp with keys: timestamp, open, high, low, close, volume.
         """
-        try:
-            resp = self._historical.historical_daily_data(
+        resp = _call_with_timeout(
+            lambda: self._historical.historical_daily_data(
                 security_id=security_id,
                 exchange_segment=exchange_segment,
                 instrument_type=instrument_type,
                 from_date=from_date,
                 to_date=to_date,
                 expiry_code=0,
-            )
-        except Exception as exc:
-            self.log.exception("[historical] daily fetch failed: %s", exc)
+            ),
+            timeout_s=15.0,
+            default=None,
+            log=self.log,
+            label="historical_daily_data",
+        )
+        if resp is None:
             return []
 
         data: Any = resp
@@ -1116,16 +1167,42 @@ class DhanWrapper:
 
         out: Dict[tuple[str, int], Optional[float]] = {}
         try:
-            resp = mf.ticker_data(payload)
-            if isinstance(resp, dict) and resp.get("status") == "failure":
-                msg = resp.get("remarks", {}).get("error_message")
-                if msg:
-                    self.log.debug(f"[LTP-bulk] status=failure remarks={msg}")
+            # Retry on 429/failure. The UI's live-positions refresher shares Dhan's marketfeed limit
+            # with the agent, so the first call is often rate-limited. Without a retry an empty result
+            # makes callers fall back to a STALE derived LTP (back-computed from a lagging
+            # unrealizedProfit), showing a wrong price and P&L (e.g. 27 when the leg is really ~44).
+            # Callers run this off the UI request path, so the short backoff never blocks the tab.
+            resp = None
+            for _attempt in range(4):
+                try:
+                    resp = mf.ticker_data(payload)
+                except Exception as _e:
+                    self.log.debug(f"[LTP-bulk] ticker attempt {_attempt} error: {_e}")
+                    resp = None
+                if isinstance(resp, dict) and resp.get("status") == "failure":
+                    _msg = (resp.get("remarks") or {}).get("error_message")
+                    self.log.debug(f"[LTP-bulk] status=failure remarks={_msg}; retry {_attempt}")
+                    resp = None
+                    time.sleep(1.2)
+                    continue
+                if resp is not None:
+                    break
+            if resp is None:
                 return out
             data = resp.get("data", resp) if isinstance(resp, dict) else resp
+            # Dhan double-wraps the ticker response: resp['data']['data']['NSE_FNO'][sid].
+            # Unwrap the extra level, else the seg-loop below never finds the segment and every
+            # LTP comes back empty — which is exactly what made callers fall back to a stale
+            # derived LTP (showed 27 when the leg was really ~43).
+            if isinstance(data, dict) and isinstance(data.get("data"), dict):
+                inner = data["data"]
+                if any(isinstance(v, (dict, list)) for k, v in inner.items() if k != "status"):
+                    data = inner
 
             if isinstance(data, dict):
                 for seg, node in data.items():
+                    if seg == "status":
+                        continue
                     # dict-of-dicts: {'NSE_FNO': {'52802': {'last_price': ...}, ...}}
                     if isinstance(node, dict):
                         for k, v in node.items():
@@ -1301,7 +1378,13 @@ class DhanWrapper:
                 ltp_val = candidate_ltp if candidate_ltp is not None else raw.get("ltp") or raw.get("lastPrice") or buy_avg or cost_price
                 ltp_val = self._as_float(ltp_val) or self._as_float(cost_price)
                 avg_val = buy_avg if buy_avg is not None else cost_price
-                pnl_val = unrealized if unrealized is not None else r.get("pnl") or 0.0
+                # Recompute P&L from the FRESH market LTP when we have one, so LTP and P&L agree.
+                # Dhan's unrealizedProfit lags the marketfeed and drove the wrong 27-vs-44 display.
+                _ltp_f = self._as_float(ltp_val); _avg_f = self._as_float(avg_val)
+                if ltp_live is not None and _ltp_f is not None and _avg_f is not None:
+                    pnl_val = (_ltp_f - _avg_f) * abs(int(net_qty or 0))  # LONG: profit as price rises
+                else:
+                    pnl_val = unrealized if unrealized is not None else r.get("pnl") or 0.0
                 r["qty"] = int(qty_disp or 0)
                 r["ltp"] = ltp_val
                 r["pnl"] = pnl_val
@@ -1312,7 +1395,12 @@ class DhanWrapper:
                 ltp_val = candidate_ltp if candidate_ltp is not None else raw.get("ltp") or raw.get("lastPrice") or sell_avg or cost_price
                 ltp_val = self._as_float(ltp_val) or self._as_float(cost_price)
                 avg_val = sell_avg if sell_avg is not None else cost_price
-                pnl_val = unrealized if unrealized is not None else r.get("pnl") or 0.0
+                # SHORT: profit when price falls. Recompute from fresh LTP (see LONG note).
+                _ltp_f = self._as_float(ltp_val); _avg_f = self._as_float(avg_val)
+                if ltp_live is not None and _ltp_f is not None and _avg_f is not None:
+                    pnl_val = (_avg_f - _ltp_f) * abs(int(net_qty or 0))
+                else:
+                    pnl_val = unrealized if unrealized is not None else r.get("pnl") or 0.0
                 r["qty"] = int(qty_disp or 0)
                 r["ltp"] = ltp_val
                 r["pnl"] = pnl_val

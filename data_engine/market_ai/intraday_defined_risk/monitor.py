@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections import Counter
 from datetime import datetime, time as dtime, timedelta, timezone
@@ -14,10 +15,14 @@ from .data_models import (
     DecisionOutput,
     MarketSnapshot,
     OpenPosition,
+    OptionType,
     RegimeLabel,
+    RegimeState,
+    StrategyLeg,
     StrategyType,
+    TradeStructure,
 )
-from .execution import build_no_trade_decision, build_open_position, build_trade_decision, evaluate_exit, validate_entry_context, validate_entry_time
+from .execution import build_no_trade_decision, build_open_position, build_trade_decision, estimate_round_trip_cost_rupees, evaluate_exit, evaluate_hedge_opportunity, validate_entry_context, validate_entry_time
 from .learning import LearningStore
 from .ops_runtime import (
     RuntimeMode,
@@ -64,6 +69,50 @@ PLAYBOOK_BAD_PROFIT_FACTOR = 0.90
 PLAYBOOK_GOOD_PROFIT_FACTOR = 1.20
 STATE_ROOT = Path(__file__).resolve().parents[1] / "state"
 AGENT_HEARTBEAT_PATH = STATE_ROOT / "intraday_v83_heartbeat.json"
+_SELECTION_LOG = STATE_ROOT / "selection_log.jsonl"
+
+
+def _log_selection_outcome(
+    *, snapshot, choice, strategy, outcome: str, reason: str,
+    structure_report=None, risk=None,
+) -> None:
+    """One row per selector decision that reached structure evaluation, so 'why didn't it trade the
+    fly/strangle/bull-put' is answerable from data instead of reconstruction.
+
+    Records the CHOSEN structure, the exact rejection reason with the NUMBERS behind it (the strikes,
+    short delta, credit, width from the candidate report; the lots and max-loss from risk), and the
+    market context (spot, efficiency, walls). This is the intraday twin of weekly_ic_gate_log — built
+    after guessing wrong twice about which gate was blocking the sellers. Never raises.
+    """
+    try:
+        m = getattr(snapshot, "option_chain", None)
+        spot = float(getattr(m, "spot", 0.0) or 0.0)
+        meta = getattr(choice, "read", None)
+        rep = structure_report or {}
+        cand = rep.get("best_candidate") or rep.get("best_failed_candidate") or {}
+        row = {
+            "at": snapshot.timestamp.isoformat(timespec="seconds"),
+            "session_date": snapshot.timestamp.date().isoformat(),
+            "condition": getattr(choice, "condition", None),
+            "family": getattr(choice, "family", None),
+            "strategy": strategy.value if hasattr(strategy, "value") else str(strategy),
+            "outcome": outcome,                       # ENTERED | STRUCTURE_FAIL | RISK_FAIL
+            "reason": reason,
+            "spot": round(spot, 2),
+            # candidate numbers — the strike-selection evidence the retro needs
+            "short_strike": cand.get("short_strike") or cand.get("short_put_strike") or cand.get("short_call_strike"),
+            "long_strike": cand.get("long_strike") or cand.get("long_put_strike") or cand.get("long_call_strike"),
+            "short_delta": cand.get("short_delta") or cand.get("short_delta_abs"),
+            "credit": cand.get("credit") or cand.get("total_credit"),
+            "width": cand.get("width") or cand.get("max_width"),
+            "lots": getattr(risk, "lots", None) if risk is not None else None,
+            "max_loss_per_lot": getattr(risk, "max_loss_rupees_per_lot", None) if risk is not None else None,
+            "risk_reasons": list(getattr(risk, "reasons", []) or []) if risk is not None else None,
+        }
+        with _SELECTION_LOG.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
 
 
 def _write_v83_agent_heartbeat(*, runtime_config: object, phase: str) -> None:
@@ -102,6 +151,32 @@ def _canonical_strategy_rejection(reasons: list[str], *, setup_detected: bool) -
     if "No aligned regime/trigger pair available." in joined:
         return "NO_VALID_STRATEGY"
     return "SETUP_FILTERED"
+
+
+def _ml_feature_snapshot(regime_state) -> dict:
+    """The ml_*-prefixed feature snapshot every entry stores for win-probability training.
+
+    These are just renamed copies of regime_state fields, and BOTH decision paths must
+    attach them. When Stage 3 made the selector the live driver (USE_SELECTOR), only the
+    legacy path still did — so every live PAPER_ENTRY logged all ten ml_* fields as null.
+    Downstream that silently starved the win-prob model (it could only ever train on the
+    stale backfill, producing collinear/dead weights) and made eod_learning's rv30_pct
+    read 0.0. Keep this as the single source so the two paths cannot drift again.
+    """
+    m = regime_state.metadata
+    return {
+        "ml_bearish_entry_score": m.get("bearish_entry_score"),
+        "ml_bullish_entry_score": m.get("bullish_entry_score"),
+        "ml_india_vix": m.get("india_vix"),
+        "ml_session_phase": m.get("session_phase"),
+        "ml_vwap_reclaim": m.get("vwap_reclaim"),
+        "ml_banknifty_divergence": m.get("banknifty_divergence"),
+        "ml_days_to_monthly_expiry": m.get("days_to_monthly_expiry"),
+        "ml_bullish_momentum": m.get("bullish_momentum_persistence"),
+        "ml_bearish_momentum": m.get("bearish_momentum_persistence"),
+        "ml_rv30_pct": regime_state.rv30_pct,
+        "ml_order_flow_imbalance": m.get("order_flow_imbalance"),
+    }
 
 
 def _decision_block_reason(decision: DecisionOutput, explicit: str | None = None) -> str:
@@ -249,11 +324,12 @@ def _shadow_only_failed_breakout_candidate(
         risk_limits=snapshot.risk_limits,
         account_state=snapshot.account_state,
         margin_estimate_per_lot=structure.margin_estimate_per_lot,
+        playbook=str(regime_state.metadata.get("playbook") or ""),
     )
     if not risk.allowed:
         return None
     expected_credit_rupees = max(structure.credit_points - snapshot.slippage_points, 0.0) * snapshot.lot_size * risk.lots
-    expected_round_trip_cost_rupees = ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT * risk.lots
+    expected_round_trip_cost_rupees = estimate_round_trip_cost_rupees(structure, snapshot.option_chain, risk.lots, snapshot.lot_size)
     expected_net_edge_rupees = expected_credit_rupees - expected_round_trip_cost_rupees
     playbook_min_edge = float(regime_state.metadata.get("minimum_net_edge_rupees") or 0.0)
     min_required_edge = max(MIN_NET_EDGE_RUPEES, playbook_min_edge, expected_round_trip_cost_rupees * MIN_NET_EDGE_COST_MULTIPLE)
@@ -532,6 +608,7 @@ def _paper_context_override_candidate(
         risk_limits=snapshot.risk_limits,
         account_state=snapshot.account_state,
         margin_estimate_per_lot=structure.margin_estimate_per_lot,
+        playbook=str(regime_state.metadata.get("playbook") or ""),
     )
     if not risk.allowed:
         info["paper_candidate_reason"] = "RISK_LIMIT"
@@ -543,7 +620,7 @@ def _paper_context_override_candidate(
     capped_lots = max(1, min(risk.lots, ops_max_lots))
 
     expected_credit_rupees = max(structure.credit_points - snapshot.slippage_points, 0.0) * snapshot.lot_size * capped_lots
-    expected_round_trip_cost_rupees = ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT * risk.lots
+    expected_round_trip_cost_rupees = estimate_round_trip_cost_rupees(structure, snapshot.option_chain, risk.lots, snapshot.lot_size)
     expected_net_edge_rupees = expected_credit_rupees - expected_round_trip_cost_rupees
     playbook_min_edge = float(regime_metadata.get("minimum_net_edge_rupees") or 0.0)
     min_required_edge = max(MIN_NET_EDGE_RUPEES, playbook_min_edge, expected_round_trip_cost_rupees * MIN_NET_EDGE_COST_MULTIPLE)
@@ -609,6 +686,17 @@ def _paper_context_override_candidate(
             "paper_override_source_failure_type": failure_type,
             "paper_override_source_market_state": market_state,
             "structure_report": structure_report,
+            "ml_bearish_entry_score": regime_metadata.get("bearish_entry_score"),
+            "ml_bullish_entry_score": regime_metadata.get("bullish_entry_score"),
+            "ml_india_vix": regime_metadata.get("india_vix"),
+            "ml_session_phase": regime_metadata.get("session_phase"),
+            "ml_vwap_reclaim": regime_metadata.get("vwap_reclaim"),
+            "ml_banknifty_divergence": regime_metadata.get("banknifty_divergence"),
+            "ml_days_to_monthly_expiry": regime_metadata.get("days_to_monthly_expiry"),
+            "ml_bullish_momentum": regime_metadata.get("bullish_momentum_persistence"),
+            "ml_bearish_momentum": regime_metadata.get("bearish_momentum_persistence"),
+            "ml_rv30_pct": regime_state.rv30_pct,
+            "ml_order_flow_imbalance": regime_metadata.get("order_flow_imbalance"),
         },
     ), info
 
@@ -673,6 +761,7 @@ def _build_bullish_paper_override(
         risk_limits=snapshot.risk_limits,
         account_state=snapshot.account_state,
         margin_estimate_per_lot=structure.margin_estimate_per_lot,
+        playbook=str(regime_state.metadata.get("playbook") or ""),
     )
     if not risk.allowed:
         info["paper_candidate_reason"] = "RISK_LIMIT"
@@ -683,7 +772,7 @@ def _build_bullish_paper_override(
     capped_lots = max(1, min(risk.lots, ops_max_lots))
 
     expected_credit_rupees = max(structure.credit_points - snapshot.slippage_points, 0.0) * snapshot.lot_size * capped_lots
-    expected_round_trip_cost_rupees = ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT * risk.lots
+    expected_round_trip_cost_rupees = estimate_round_trip_cost_rupees(structure, snapshot.option_chain, risk.lots, snapshot.lot_size)
     expected_net_edge_rupees = expected_credit_rupees - expected_round_trip_cost_rupees
     playbook_min_edge = float(regime_metadata.get("minimum_net_edge_rupees") or 0.0)
     min_required_edge = max(MIN_NET_EDGE_RUPEES, playbook_min_edge, expected_round_trip_cost_rupees * MIN_NET_EDGE_COST_MULTIPLE)
@@ -735,6 +824,17 @@ def _build_bullish_paper_override(
             "v83_rejection_reason": v83_reason,
             "paper_override_source_market_state": market_state,
             "structure_report": structure_report,
+            "ml_bearish_entry_score": regime_metadata.get("bearish_entry_score"),
+            "ml_bullish_entry_score": regime_metadata.get("bullish_entry_score"),
+            "ml_india_vix": regime_metadata.get("india_vix"),
+            "ml_session_phase": regime_metadata.get("session_phase"),
+            "ml_vwap_reclaim": regime_metadata.get("vwap_reclaim"),
+            "ml_banknifty_divergence": regime_metadata.get("banknifty_divergence"),
+            "ml_days_to_monthly_expiry": regime_metadata.get("days_to_monthly_expiry"),
+            "ml_bullish_momentum": regime_metadata.get("bullish_momentum_persistence"),
+            "ml_bearish_momentum": regime_metadata.get("bearish_momentum_persistence"),
+            "ml_rv30_pct": regime_state.rv30_pct,
+            "ml_order_flow_imbalance": regime_metadata.get("order_flow_imbalance"),
         },
     ), info
 
@@ -765,6 +865,9 @@ def _broker_positions_from_executor(executor: object) -> list[dict[str, object]]
     return None
 
 
+logger = logging.getLogger("market_ai.intraday_defined_risk.monitor")
+
+
 class IntradayDefinedRiskAgent:
     def __init__(
         self,
@@ -777,6 +880,8 @@ class IntradayDefinedRiskAgent:
         experimental_policy: dict[str, object] | None = None,
         use_regime_tradability_layer: bool = True,
         use_market_state_engine: bool = False,
+        use_trade_planner: bool | None = None,
+        allow_naked: bool | None = None,
     ) -> None:
         self.learning_store = learning_store or LearningStore()
         self.parameters = (parameters or self.learning_store.active_parameters()).clamped()
@@ -785,15 +890,360 @@ class IntradayDefinedRiskAgent:
         self.experimental_policy = dict(experimental_policy or {})
         self.use_regime_tradability_layer = use_regime_tradability_layer
         self.use_market_state_engine = use_market_state_engine
+        # Market-first trade planner (read -> plan). Off unless explicitly enabled
+        # (arg or USE_TRADE_PLANNER env) so it can be A/B-validated on the backtest
+        # before it ever drives live. allow_naked lets the planner choose naked
+        # selling when conviction is very high (defined-risk otherwise).
+        import os
+        self.use_trade_planner = (
+            bool(os.environ.get("USE_TRADE_PLANNER"))
+            if use_trade_planner is None
+            else bool(use_trade_planner)
+        )
+        self.allow_naked = (
+            bool(os.environ.get("ALLOW_NAKED"))
+            if allow_naked is None
+            else bool(allow_naked)
+        )
+        # Condition-first strategy selector (reads condition -> picks strategy family).
+        # Off unless USE_SELECTOR env set, so it can be A/B-validated on the backtest.
+        self.use_selector = bool(os.environ.get("USE_SELECTOR"))
         self.open_position: OpenPosition | None = None
         self._current_features: dict[str, object] = {}
         self._session_date = None
         self._session_trade_counts: Counter[str] = Counter()
 
+    def _evaluate_via_planner(self, snapshot: MarketSnapshot, regime_state) -> DecisionOutput | None:
+        """Market-first decision: read the signals, form a plan, execute it.
+
+        Reuses the proven execution machinery (select_best_structure ->
+        assess_trade_risk -> build_trade_decision) but replaces the archetype/
+        playbook cascade with the planner's read-then-decide. Returns None to
+        fall back to the legacy path (e.g. unmapped structure).
+        """
+        from .trade_planner import (
+            plan_trade, BEAR_CALL_SPREAD, BULL_PUT_SPREAD, IRON_CONDOR,
+            SHORT_STRANGLE, NAKED_CALL, NAKED_PUT,
+        )
+        spot = float(snapshot.option_chain.spot)
+        meta = regime_state.metadata
+        plan = plan_trade(meta, spot, allow_naked=self.allow_naked)
+        meta["planner_read"] = plan.read.reasoning if plan.read else ""
+        meta["planner_structure"] = plan.structure
+        meta["planner_conviction"] = plan.conviction
+        self._current_features = {
+            "playbook": f"PLANNER_{plan.direction}",
+            "setup_direction": plan.direction,
+            "planner_conviction": plan.conviction,
+            "planner_structure": plan.structure,
+        }
+
+        def _funnel(reason: str, strat: str, result: str) -> dict:
+            return {"canonical_rejection_reason": reason, "selected_strategy": strat,
+                    "final_result": result, "playbook": f"PLANNER_{plan.direction}",
+                    "planner_read": meta.get("planner_read")}
+
+        if not plan.should_trade:
+            return build_no_trade_decision(
+                regime_state.regime.value, plan.rationale,
+                confidence_score=plan.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel("PLANNER_NO_EDGE", "NO_TRADE", "NO_TRADE")},
+            )
+
+        strat_map = {
+            BEAR_CALL_SPREAD: StrategyType.BEAR_CALL_CREDIT_SPREAD,
+            NAKED_CALL: StrategyType.BEAR_CALL_CREDIT_SPREAD,   # execute defined-risk; naked exec is a follow-up
+            BULL_PUT_SPREAD: StrategyType.BULL_PUT_CREDIT_SPREAD,
+            NAKED_PUT: StrategyType.BULL_PUT_CREDIT_SPREAD,
+            IRON_CONDOR: StrategyType.IRON_CONDOR,
+            SHORT_STRANGLE: StrategyType.SHORT_STRANGLE,
+        }
+        strategy = strat_map.get(plan.structure)
+        if strategy is None:
+            return None  # unmapped — fall back to legacy
+
+        # WHAT: do NOT force a strike from the read. The proven delta-band + wall
+        # anchor selector (which produced the profitable legacy trades) picks a safe
+        # OTM short; forcing resistance/spot+60 gave near-ATM, high-delta shorts that
+        # lost. The planner only picks a resistance FLOOR the short must clear.
+        if plan.direction == "BEARISH" and plan.read and plan.read.resistance:
+            meta["min_short_call_strike"] = float(plan.read.resistance)
+        elif plan.direction == "BULLISH" and plan.read and plan.read.support:
+            meta["max_short_put_strike"] = float(plan.read.support)
+        playbook = f"PLANNER_{plan.direction}"
+        meta["playbook"] = playbook
+        meta["setup_direction"] = plan.direction
+        meta["setup_quality_score"] = max(float(meta.get("setup_quality_score") or 0.0), plan.conviction * 20.0)
+
+        entry_allowed, entry_reason = validate_entry_time(strategy, snapshot.timestamp)
+        if not entry_allowed:
+            return build_no_trade_decision(
+                regime_state.regime.value, plan.rationale + ([entry_reason] if entry_reason else []),
+                confidence_score=plan.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel("ENTRY_TIME_INVALID", strategy.value, "NO_TRADE")},
+            )
+
+        # WHEN: enforce the tape discipline the legacy path uses — don't sell calls
+        # into strength (price above VWAP / PCR falling). Plus a symmetric bull-put
+        # check: don't sell puts into weakness (price below VWAP / PCR rising).
+        ctx_ok, ctx_reason = validate_entry_context(strategy, snapshot, regime_state)
+        if not ctx_ok:
+            return build_no_trade_decision(
+                regime_state.regime.value, plan.rationale + [f"Entry context: {ctx_reason}"],
+                confidence_score=plan.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel(str(ctx_reason or "ENTRY_CONTEXT"), strategy.value, "NO_TRADE")},
+            )
+        if strategy == StrategyType.BULL_PUT_CREDIT_SPREAD:
+            from .features import session_bars, compute_vwap
+            _bars = session_bars(snapshot.nifty_5m)
+            _vwap = snapshot.live_vwap or regime_state.vwap or (compute_vwap(_bars) if _bars else None)
+            if _bars and _vwap and _vwap > 0 and _bars[-1].close < _vwap * 0.998:
+                return build_no_trade_decision(
+                    regime_state.regime.value, plan.rationale + ["Entry context: PRICE_BELOW_VWAP_AT_ENTRY"],
+                    confidence_score=plan.conviction,
+                    extra_metadata=dict(meta) | {"trade_funnel": _funnel("PRICE_BELOW_VWAP_AT_ENTRY", strategy.value, "NO_TRADE")},
+                )
+            if str(meta.get("pcr_trend") or "") == "RISING" and False:
+                pass  # (reserved) puts building can still support a bull-put; no veto
+
+        structure, structure_reasons, structure_report = select_best_structure(
+            strategy, snapshot, regime_state, self.parameters,
+            setup_quality_score=float(meta.get("setup_quality_score") or 0.0),
+            playbook_tier="A",
+        )
+        if not structure:
+            return build_no_trade_decision(
+                regime_state.regime.value, plan.rationale + structure_reasons,
+                confidence_score=plan.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel(
+                    str(structure_report.get("canonical_rejection_reason") or "SPREAD_CONSTRUCTION_FAILED"),
+                    strategy.value, "NO_TRADE")},
+            )
+
+        risk = assess_trade_risk(
+            structure=structure, lot_size=snapshot.lot_size,
+            risk_limits=snapshot.risk_limits, account_state=snapshot.account_state,
+            margin_estimate_per_lot=structure.margin_estimate_per_lot, playbook=playbook,
+        )
+        if not risk.allowed:
+            return build_no_trade_decision(
+                regime_state.regime.value, plan.rationale + risk.reasons,
+                confidence_score=plan.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel("RISK_LIMIT", strategy.value, "NO_TRADE")},
+            )
+
+        return build_trade_decision(
+            structure=structure,
+            regime=regime_state.regime,
+            rationale=plan.rationale + structure_reasons,
+            confidence_score=min(1.0, plan.conviction + 0.10),
+            entry_time=snapshot.timestamp,
+            lots=risk.lots,
+            lot_size=snapshot.lot_size,
+            max_loss_rupees_per_lot=risk.max_loss_rupees_per_lot,
+            slippage_points=snapshot.slippage_points,
+            extra_metadata=dict(meta) | {
+                "playbook": playbook,
+                "setup_direction": plan.direction,
+                "planner_read": meta.get("planner_read"),
+                "planner_naked_intent": plan.is_naked,
+                "trade_funnel": _funnel("NONE", strategy.value, "EXECUTED"),
+            },
+        )
+
+    def _evaluate_via_selector(self, snapshot: MarketSnapshot, regime_state) -> DecisionOutput | None:
+        """Condition-first: classify the market condition, pick the strategy family,
+        stand aside in chop. Only trades structures that are executable today
+        (credit spreads / condor / strangle); debit-family selections stand aside
+        until Stage 2 builds them."""
+        from .strategy_selector import select_strategy as _select
+        from .strategy_selector import FAM_STAND_ASIDE
+        spot = float(snapshot.option_chain.spot)
+        meta = regime_state.metadata
+        # Attach the ml_* snapshot on the SELECTOR path too — it is the live decision driver,
+        # and without this every PAPER_ENTRY it wrote logged ml_* as null (see helper docstring).
+        meta.update(_ml_feature_snapshot(regime_state))
+        choice = _select(meta, spot, now_time=snapshot.timestamp.time())
+        meta["selector_condition"] = choice.condition
+        meta["selector_family"] = choice.family
+        meta["selector_iv"] = choice.iv_regime
+        meta["vol_regime"] = choice.vol_regime          # volatility engine read (advisory)
+        meta["vol_notes"] = "; ".join(choice.vol_notes or [])
+        # Attach the full multi-dimensional reasoning (option chain + chart + levels
+        # + confluence) so every decision is auditable — "why did the agent do this?".
+        try:
+            from .decision_justification import build_thesis
+            _thesis = build_thesis(
+                meta, spot,
+                strategy=(choice.structures[0] if choice.structures else "STAND_ASIDE"),
+                strategy_why=choice.rationale,
+            )
+            meta["trade_thesis"] = _thesis.to_text()
+            meta["thesis_confluence"] = _thesis.confluence
+            meta["thesis_net_bias"] = _thesis.net_bias
+        except Exception:  # noqa: BLE001 — reasoning log must never break trading
+            pass
+
+        def _funnel(reason: str, strat: str, result: str) -> dict:
+            return {"canonical_rejection_reason": reason, "selected_strategy": strat,
+                    "final_result": result, "playbook": f"SEL_{choice.condition}",
+                    "selector_condition": choice.condition, "selector_family": choice.family}
+
+        # Stand aside: chop / high-vol-undirected / not-yet-executable structure
+        if choice.family == FAM_STAND_ASIDE or not choice.executable_today or not choice.structures:
+            self._current_features = {"playbook": f"SEL_{choice.condition}", "selector_family": choice.family}
+            return build_no_trade_decision(
+                regime_state.regime.value, [choice.rationale],
+                confidence_score=choice.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel("SELECTOR_STAND_ASIDE", "NO_TRADE", "NO_TRADE")},
+            )
+
+        _strat_map = {
+            "BEAR_CALL_CREDIT_SPREAD": StrategyType.BEAR_CALL_CREDIT_SPREAD,
+            "BULL_PUT_CREDIT_SPREAD": StrategyType.BULL_PUT_CREDIT_SPREAD,
+            "IRON_CONDOR": StrategyType.IRON_CONDOR,
+            "SHORT_STRANGLE": StrategyType.SHORT_STRANGLE,
+            "CALL_DEBIT_SPREAD": StrategyType.CALL_DEBIT_SPREAD,
+            "PUT_DEBIT_SPREAD": StrategyType.PUT_DEBIT_SPREAD,
+            # IRON_FLY and SHORT_STRADDLE exist in StrategyType and the selector already emits
+            # IRON_FLY (RANGE_TIGHT branch), but they were missing here — so every IRON_FLY choice
+            # mapped to None and silently dropped the whole selector path back to legacy. The
+            # theta-collecting structures the shadow book likes most were unreachable.
+            "IRON_FLY": StrategyType.IRON_FLY,
+            "SHORT_STRADDLE": StrategyType.SHORT_STRADDLE,
+        }
+        # choice.structures is a RANKED list, not a single pick — walk it and take the first the
+        # runtime can actually express, so one unmappable structure does not forfeit the day.
+        strategy = next((s for s in (_strat_map.get(n) for n in choice.structures) if s is not None), None)
+        if strategy is None:
+            return None  # fall back to legacy
+
+        _dir_map = {
+            StrategyType.BEAR_CALL_CREDIT_SPREAD: "BEARISH",
+            StrategyType.PUT_DEBIT_SPREAD: "BEARISH",
+            StrategyType.BULL_PUT_CREDIT_SPREAD: "BULLISH",
+            StrategyType.CALL_DEBIT_SPREAD: "BULLISH",
+        }
+        direction = _dir_map.get(strategy, "RANGE")
+        _is_debit = strategy in (StrategyType.CALL_DEBIT_SPREAD, StrategyType.PUT_DEBIT_SPREAD)
+        playbook = f"SEL_{choice.condition}"
+        meta["playbook"] = playbook
+        meta["setup_direction"] = direction
+        meta["setup_quality_score"] = max(float(meta.get("setup_quality_score") or 0.0), choice.conviction * 20.0)
+        # The selector IS the decision brain — express its conviction as the directional
+        # trade score so the live entry gate (which re-checks score vs no_trade + margin)
+        # passes selector trades. ~2-10 scale; above the ~5 threshold at high conviction.
+        _sel_score = round(2.0 + choice.conviction * 8.0, 4)
+        meta["no_trade_score"] = min(float(meta.get("no_trade_score") or 0.0), 0.0)
+        if direction == "BEARISH":
+            meta["bearish_trade_score"] = max(float(meta.get("bearish_trade_score") or 0.0), _sel_score)
+        elif direction == "BULLISH":
+            meta["bullish_trade_score"] = max(float(meta.get("bullish_trade_score") or 0.0), _sel_score)
+        else:
+            # RANGE / neutral premium sellers (IRON_FLY, IRON_CONDOR, SHORT_STRANGLE, SHORT_STRADDLE)
+            # have no directional side. The live entry gate scores RANGE as max(bearish, bullish), so
+            # if we leave both at 0 the gate fails every neutral seller with DIRECTIONAL_SCORE_MARGIN_FAIL
+            # — the fly/strangle would be selected, built, risk-approved, then silently killed here.
+            # (This is why IRON_FLY had 0 live fills even once the selector could choose it.) A neutral
+            # seller's conviction is symmetric, so express it on BOTH sides.
+            meta["bearish_trade_score"] = max(float(meta.get("bearish_trade_score") or 0.0), _sel_score)
+            meta["bullish_trade_score"] = max(float(meta.get("bullish_trade_score") or 0.0), _sel_score)
+        # Credit spreads take a wall/level floor for strike selection; debit spreads
+        # use their own delta-band selection, so no strike guidance is imposed.
+        if not _is_debit:
+            if direction == "BEARISH" and choice.read and choice.read.resistance:
+                meta["min_short_call_strike"] = float(choice.read.resistance)
+            elif direction == "BULLISH" and choice.read and choice.read.support:
+                meta["max_short_put_strike"] = float(choice.read.support)
+
+        entry_allowed, entry_reason = validate_entry_time(strategy, snapshot.timestamp)
+        if not entry_allowed:
+            return build_no_trade_decision(
+                regime_state.regime.value, [choice.rationale] + ([entry_reason] if entry_reason else []),
+                confidence_score=choice.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel("ENTRY_TIME_INVALID", strategy.value, "NO_TRADE")},
+            )
+        ctx_ok, ctx_reason = validate_entry_context(strategy, snapshot, regime_state)
+        if not ctx_ok:
+            return build_no_trade_decision(
+                regime_state.regime.value, [choice.rationale, f"Entry context: {ctx_reason}"],
+                confidence_score=choice.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel(str(ctx_reason or "ENTRY_CONTEXT"), strategy.value, "NO_TRADE")},
+            )
+
+        structure, structure_reasons, structure_report = select_best_structure(
+            strategy, snapshot, regime_state, self.parameters,
+            setup_quality_score=float(meta.get("setup_quality_score") or 0.0), playbook_tier="A",
+        )
+        if not structure:
+            _log_selection_outcome(
+                snapshot=snapshot, choice=choice, strategy=strategy, outcome="STRUCTURE_FAIL",
+                reason=str(structure_report.get("canonical_rejection_reason") or "SPREAD_CONSTRUCTION_FAILED"),
+                structure_report=structure_report,
+            )
+            return build_no_trade_decision(
+                regime_state.regime.value, [choice.rationale] + structure_reasons,
+                confidence_score=choice.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel(
+                    str(structure_report.get("canonical_rejection_reason") or "SPREAD_CONSTRUCTION_FAILED"),
+                    strategy.value, "NO_TRADE")},
+            )
+        risk = assess_trade_risk(
+            structure=structure, lot_size=snapshot.lot_size,
+            risk_limits=snapshot.risk_limits, account_state=snapshot.account_state,
+            margin_estimate_per_lot=structure.margin_estimate_per_lot, playbook=playbook,
+        )
+        if not risk.allowed:
+            _log_selection_outcome(
+                snapshot=snapshot, choice=choice, strategy=strategy, outcome="RISK_FAIL",
+                reason="RISK_LIMIT", structure_report=structure_report, risk=risk,
+            )
+            return build_no_trade_decision(
+                regime_state.regime.value, [choice.rationale] + risk.reasons,
+                confidence_score=choice.conviction,
+                extra_metadata=dict(meta) | {"trade_funnel": _funnel("RISK_LIMIT", strategy.value, "NO_TRADE")},
+            )
+        _log_selection_outcome(
+            snapshot=snapshot, choice=choice, strategy=strategy, outcome="ENTERED",
+            reason="OK", structure_report=structure_report, risk=risk,
+        )
+        self._current_features = {"playbook": playbook, "setup_direction": direction,
+                                  "selector_condition": choice.condition, "selector_family": choice.family}
+        return build_trade_decision(
+            structure=structure, regime=regime_state.regime,
+            rationale=[choice.rationale] + structure_reasons,
+            confidence_score=min(1.0, choice.conviction + 0.10),
+            entry_time=snapshot.timestamp, lots=risk.lots, lot_size=snapshot.lot_size,
+            max_loss_rupees_per_lot=risk.max_loss_rupees_per_lot, slippage_points=snapshot.slippage_points,
+            extra_metadata=dict(meta) | {
+                "playbook": playbook, "setup_direction": direction,
+                "selector_condition": choice.condition, "selector_family": choice.family,
+                "trade_funnel": _funnel("NONE", strategy.value, "EXECUTED"),
+            },
+        )
+
     def evaluate(self, snapshot: MarketSnapshot) -> DecisionOutput:
         self._reset_session(snapshot.timestamp)
         regime_state = classify_regime(snapshot, self.parameters)
         regime_state.metadata["enable_market_state_gating"] = self.use_market_state_engine
+        # Market-first path: the planner reads the fully-computed signal set and
+        # decides the trade directly, bypassing the archetype/playbook cascade.
+        if self.use_trade_planner:
+            try:
+                planned = self._evaluate_via_planner(snapshot, regime_state)
+                if planned is not None:
+                    return planned
+            except Exception as exc:  # noqa: BLE001 — never let the planner crash the loop
+                logger.warning("trade_planner path failed, falling back to legacy: %s", exc)
+        # Condition-first selector path: classify the condition, pick the strategy
+        # family, stand aside in chop. Uses only executable structures for now.
+        if self.use_selector:
+            try:
+                selected = self._evaluate_via_selector(snapshot, regime_state)
+                if selected is not None:
+                    return selected
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("strategy_selector path failed, falling back to legacy: %s", exc)
         rationale = list(regime_state.reasons)
         playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
         regime_tradability, tradability_reason = classify_regime_tradability(regime_state)
@@ -1007,6 +1457,7 @@ class IntradayDefinedRiskAgent:
             risk_limits=snapshot.risk_limits,
             account_state=snapshot.account_state,
             margin_estimate_per_lot=structure.margin_estimate_per_lot,
+            playbook=str(regime_state.metadata.get("playbook") or ""),
         )
         if not risk.allowed:
             decision = build_no_trade_decision(
@@ -1019,7 +1470,7 @@ class IntradayDefinedRiskAgent:
             return decision
 
         expected_credit_rupees = max(structure.credit_points - snapshot.slippage_points, 0.0) * snapshot.lot_size * risk.lots
-        expected_round_trip_cost_rupees = ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT * risk.lots
+        expected_round_trip_cost_rupees = estimate_round_trip_cost_rupees(structure, snapshot.option_chain, risk.lots, snapshot.lot_size)
         expected_net_edge_rupees = expected_credit_rupees - expected_round_trip_cost_rupees
         self._current_features["expected_credit_rupees"] = expected_credit_rupees
         self._current_features["expected_round_trip_cost_rupees"] = expected_round_trip_cost_rupees
@@ -1100,6 +1551,11 @@ class IntradayDefinedRiskAgent:
                 "regime_tradability": regime_tradability,
                 "experimental_policy_name": self.experimental_policy.get("name"),
                 "trade_funnel": trade_funnel,
+                # Phase 8: ML feature snapshot stored at entry for win-probability training
+                **_ml_feature_snapshot(regime_state),
+                # PH 21 early-session gate reads these directly (not ml_-prefixed)
+                "execution_5m": regime_state.execution_5m,
+                "order_flow_imbalance": regime_state.metadata.get("order_flow_imbalance"),
             },
         )
         self.learning_store.log_decision(decision, self._current_features, session_date=snapshot.timestamp.date().isoformat())
@@ -1143,6 +1599,65 @@ class IntradayDefinedRiskAgent:
             current_regime=current_regime,
             now=snapshot.timestamp,
         )
+
+        # ── Condor partial close: close only the threatened side, keep the safe half ──
+        if exit_decision.reason in {"CONDOR_CALL_SIDE_CLOSE", "CONDOR_PUT_SIDE_CLOSE"}:
+            close_option_type = OptionType.CALL if exit_decision.reason == "CONDOR_CALL_SIDE_CLOSE" else OptionType.PUT
+            keep_option_type = OptionType.PUT if close_option_type == OptionType.CALL else OptionType.CALL
+            surviving_legs = [leg for leg in self.open_position.structure.legs if leg.option_type == keep_option_type]
+            if surviving_legs:
+                keep_strategy = StrategyType.BULL_PUT_CREDIT_SPREAD if keep_option_type == OptionType.PUT else StrategyType.BEAR_CALL_CREDIT_SPREAD
+                threatened_side_cost = exit_decision.current_value_points * 0.5  # approx: each side is half
+                surviving_credit = max(self.open_position.entry_credit_points - threatened_side_cost, 0.0)
+                surviving_width = min(
+                    (abs(surviving_legs[0].strike - surviving_legs[-1].strike) if len(surviving_legs) >= 2 else self.open_position.structure.width_points / 2.0),
+                    self.open_position.structure.width_points,
+                )
+                new_structure = TradeStructure(
+                    strategy=keep_strategy,
+                    legs=surviving_legs,
+                    credit_points=surviving_credit,
+                    width_points=surviving_width,
+                    rationale=[f"Condor partial close: {close_option_type.value} side closed due to delta breach. Keeping {keep_option_type.value} spread."],
+                    metadata={**self.open_position.structure.metadata, "partial_close_from_condor": True},
+                )
+                old_meta = dict(self.open_position.metadata)
+                old_meta["condor_partial_close_reason"] = exit_decision.reason
+                old_meta["condor_partial_close_pnl_approx"] = round(exit_decision.pnl_rupees * 0.5, 2)
+                self.open_position = OpenPosition(
+                    structure=new_structure,
+                    lots=self.open_position.lots,
+                    lot_size=self.open_position.lot_size,
+                    entry_time=self.open_position.entry_time,
+                    entry_credit_points=surviving_credit,
+                    target_value_points=surviving_credit * 0.35,
+                    stop_value_points=surviving_credit * 2.0,
+                    max_loss_rupees_per_lot=surviving_width * snapshot.lot_size,
+                    take_profit_capture_pct=0.65,
+                    metadata=old_meta,
+                )
+                return None  # Position adjusted, not closed — continue monitoring
+
+        # ── Hedge opportunity: convert directional spread to Iron Condor ──
+        if not exit_decision.should_exit:
+            hedge = evaluate_hedge_opportunity(
+                self.open_position,
+                current_regime=current_regime,
+                current_snapshot=snapshot,
+                now=snapshot.timestamp,
+            )
+            if hedge["should_hedge"] and not self.open_position.metadata.get("hedge_attempted"):
+                self.open_position.metadata["hedge_attempted"] = True
+                self.open_position.metadata["hedge_reason"] = hedge["reason"]
+                hedge_decision = self._execute_hedge(
+                    hedge_side=str(hedge["hedge_side"]),
+                    snapshot=snapshot,
+                    current_regime=current_regime,
+                )
+                if hedge_decision is not None:
+                    return hedge_decision
+            return None
+
         if not exit_decision.should_exit:
             return None
 
@@ -1168,6 +1683,135 @@ class IntradayDefinedRiskAgent:
             },
         )
 
+    def _execute_hedge(
+        self,
+        hedge_side: str,
+        snapshot: MarketSnapshot,
+        current_regime: RegimeState,
+    ) -> DecisionOutput | None:
+        """
+        Converts an open directional credit spread into an Iron Condor by adding
+        the complementary leg. Finds the optimal strike using select_structure(),
+        then merges the new legs into the existing open position.
+
+        Returns a DecisionOutput with action="TRADE" and is_hedge_addition=True
+        so the runner layer places only the new hedge leg orders.
+        Returns None if no valid hedge structure can be found.
+        """
+        if self.open_position is None:
+            return None
+
+        hedge_strategy = (
+            StrategyType.BULL_PUT_CREDIT_SPREAD
+            if hedge_side == "BULL_PUT"
+            else StrategyType.BEAR_CALL_CREDIT_SPREAD
+        )
+
+        # Build a synthetic regime_state that directs strike selection for the hedge leg.
+        # Use tighter width and lower edge target — this is insurance, not a primary trade.
+        hedge_metadata = dict(current_regime.metadata)
+        hedge_metadata["preferred_width_points"] = 75.0
+        hedge_metadata["allowed_width_points"] = (75.0, 100.0)
+        hedge_metadata["minimum_net_edge_rupees"] = 600.0
+        hedge_metadata["playbook"] = (
+            "SIDEWAYS_TO_BULLISH_RECLAIM" if hedge_side == "BULL_PUT" else "BEARISH_CONTINUATION"
+        )
+        hedge_metadata["bearish_entry_ready"] = True
+        hedge_metadata["bullish_entry_ready"] = True
+        hedge_regime = RegimeState(
+            regime=current_regime.regime,
+            trend_15m=current_regime.trend_15m,
+            execution_5m=current_regime.execution_5m,
+            ema20_15m=current_regime.ema20_15m,
+            ema20_slope_15m=current_regime.ema20_slope_15m,
+            rv30_pct=current_regime.rv30_pct,
+            or_length_minutes=current_regime.or_length_minutes,
+            opening_range_high=current_regime.opening_range_high,
+            opening_range_low=current_regime.opening_range_low,
+            vwap=current_regime.vwap,
+            confidence=current_regime.confidence,
+            reasons=current_regime.reasons,
+            metadata=hedge_metadata,
+        )
+
+        hedge_structure, _, _ = select_best_structure(
+            hedge_strategy,
+            snapshot,
+            hedge_regime,
+            params=self.parameters,
+            playbook_tier="A",
+        )
+        if hedge_structure is None:
+            self.open_position.metadata["hedge_attempted"] = True
+            self.open_position.metadata["hedge_failed_reason"] = "NO_VALID_STRUCTURE_FOUND"
+            return None
+
+        # Merge original legs + hedge legs into a single Iron Condor structure
+        original = self.open_position
+        merged_legs = list(original.structure.legs) + list(hedge_structure.legs)
+        merged_credit = round(original.entry_credit_points + hedge_structure.credit_points, 4)
+        merged_width = max(original.structure.width_points, hedge_structure.width_points)
+        call_legs = [l for l in merged_legs if l.option_type == OptionType.CALL]
+        put_legs = [l for l in merged_legs if l.option_type == OptionType.PUT]
+        call_width = abs(call_legs[0].strike - call_legs[-1].strike) if len(call_legs) >= 2 else merged_width
+        put_width = abs(put_legs[0].strike - put_legs[-1].strike) if len(put_legs) >= 2 else merged_width
+
+        merged_structure = TradeStructure(
+            strategy=StrategyType.IRON_CONDOR,
+            legs=merged_legs,
+            credit_points=merged_credit,
+            width_points=merged_width,
+            call_width_points=call_width,
+            put_width_points=put_width,
+            rationale=list(original.structure.rationale) + [
+                f"Hedge leg added: {hedge_side} spread converted position to Iron Condor. "
+                f"Original credit {original.entry_credit_points:.1f}pt + hedge {hedge_structure.credit_points:.1f}pt = {merged_credit:.1f}pt total."
+            ],
+            metadata={**original.structure.metadata, "hedge_addition": True, "hedge_side": hedge_side},
+        )
+
+        # Rebuild open position as the merged condor
+        merged_max_loss = merged_width * snapshot.lot_size
+        merged_meta = dict(original.metadata)
+        merged_meta["hedge_executed"] = True
+        merged_meta["hedge_side"] = hedge_side
+        merged_meta["hedge_credit_pts"] = hedge_structure.credit_points
+        self.open_position = OpenPosition(
+            structure=merged_structure,
+            lots=original.lots,
+            lot_size=original.lot_size,
+            entry_time=original.entry_time,
+            entry_credit_points=merged_credit,
+            target_value_points=merged_credit * 0.50,  # condor TP = 50% capture
+            stop_value_points=merged_credit * 2.0,
+            max_loss_rupees_per_lot=merged_max_loss,
+            take_profit_capture_pct=0.50,
+            metadata=merged_meta,
+        )
+
+        # Return a TRADE decision for only the new hedge legs so the runner places those orders
+        return build_trade_decision(
+            structure=hedge_structure,
+            regime=current_regime.regime,
+            rationale=[
+                f"Hedge addition: converting {original.structure.strategy.value} to Iron Condor.",
+                f"Market stalled with range_balance_score sufficient for range strategy.",
+                f"Adding {hedge_side} spread to lock in premium on both sides.",
+            ],
+            confidence_score=current_regime.confidence,
+            entry_time=snapshot.timestamp,
+            lots=original.lots,
+            lot_size=original.lot_size,
+            max_loss_rupees_per_lot=hedge_structure.width_points * snapshot.lot_size,
+            slippage_points=snapshot.slippage_points,
+            extra_metadata={
+                "is_hedge_addition": True,
+                "hedge_side": hedge_side,
+                "original_strategy": original.structure.strategy.value,
+                "playbook": hedge_metadata["playbook"],
+            },
+        )
+
     def _reset_session(self, timestamp: datetime) -> None:
         session_date = timestamp.date()
         if self._session_date != session_date:
@@ -1179,6 +1823,23 @@ def load_object(path_spec: str):
     module_name, symbol_name = path_spec.split(":", 1)
     module = import_module(module_name)
     return getattr(module, symbol_name)
+
+
+def _emit_decision(decision) -> None:
+    """Print a per-cycle decision to stdout (the runner log) stamped with the emit time.
+
+    The success path's Decision.to_dict() carries no timestamp — only the INSUFFICIENT_DATA
+    path did (data_readiness.timestamp) — so the watchdog could not date healthy decisions
+    and misjudged a working agent as stale / API-down (the restart-loop + false Telegram
+    alerts). Stamping 'emitted_at' at this single source lets the watchdog see healthy
+    activity and judge liveness/recency correctly.
+    """
+    try:
+        payload = decision.to_dict()
+        payload["emitted_at"] = datetime.now(_IST).isoformat()
+        print(json.dumps(payload, default=str))
+    except Exception:
+        print(decision.to_json())
 
 
 def run_live(config: dict[str, object]) -> None:
@@ -1248,6 +1909,13 @@ def run_live(config: dict[str, object]) -> None:
                         _state = {}
                     _mfe = float(_state.get("mfe_rupees") or 0.0)
                     _mae = float(_state.get("mae_rupees") or 0.0)
+                    # Book the LAST KNOWN mark-to-market PnL rather than None/0.
+                    # Two live trades reached +Rs1,921 / +Rs1,141 MFE and were booked
+                    # at 0 here because the chain feed died before close — erasing
+                    # real profit. last_mark_pnl_rupees is the position's value at the
+                    # last cycle data was available: the best available estimate.
+                    _last_mark = _state.get("last_mark_pnl_rupees")
+                    _booked_pnl = round(float(_last_mark), 2) if _last_mark is not None else None
                     _exit_event = {
                         "event": "PAPER_EXIT",
                         "timestamp": _now_ist.isoformat(),
@@ -1259,10 +1927,10 @@ def run_live(config: dict[str, object]) -> None:
                         "paper_trade_attribution": _stuck_position.metadata.get("paper_trade_attribution"),
                         "paper_candidate_reason": _stuck_position.metadata.get("paper_candidate_reason"),
                         "strategy": _stuck_position.structure.strategy.value,
-                        "realized_paper_pnl": None,
+                        "realized_paper_pnl": _booked_pnl,
                         "mfe_rupees": round(_mfe, 2),
                         "mae_rupees": round(_mae, 2),
-                        "note": "Force-closed at EOD: option chain data unavailable, PnL unknown.",
+                        "note": "Force-closed at EOD on data loss; PnL booked at last-known mark.",
                     }
                     try:
                         with open(_paths.paper_trades, "a") as _f:
@@ -1294,7 +1962,7 @@ def run_live(config: dict[str, object]) -> None:
                 block_reason=reason_code,
                 data_status=data_status,
             )
-            print(decision.to_json())
+            _emit_decision(decision)
             if _should_report:
                 build_operator_status_report()
             sleep(poll_seconds)
@@ -1310,7 +1978,7 @@ def run_live(config: dict[str, object]) -> None:
             )
             log_validation_decision(decision, snapshot=snapshot, block_reason="LIVE_DISABLED")
             _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="LIVE_DISABLED")
-            print(decision.to_json())
+            _emit_decision(decision)
             if _should_report:
                 build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
             sleep(poll_seconds)
@@ -1319,7 +1987,7 @@ def run_live(config: dict[str, object]) -> None:
             decision = agent.evaluate(snapshot)
             log_validation_decision(decision, snapshot=snapshot, block_reason="RESEARCH_MODE")
             _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="RESEARCH_MODE")
-            print(decision.to_json())
+            _emit_decision(decision)
             if _should_report:
                 build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
             sleep(poll_seconds)
@@ -1351,20 +2019,44 @@ def run_live(config: dict[str, object]) -> None:
 
         if agent.open_position:
             current_position = agent.open_position
-            exit_decision = agent.manage_position(snapshot)
-            if exit_decision is not None and current_position is not None:
-                reason = exit_decision.rationale[-2] if len(exit_decision.rationale) >= 2 else "EXIT"
-                if runtime_config.mode == RuntimeMode.MICRO_LIVE and runtime_config.live_arm:
-                    executor.exit_trade(current_position, reason)
-                    record_runtime_trade_exit(
-                        current_position,
-                        snapshot,
-                        pnl_rupees=float(exit_decision.metadata.get("exit_pnl_rupees") or 0.0),
-                        exit_reason=str(exit_decision.metadata.get("exit_reason") or reason),
+            position_decision = agent.manage_position(snapshot)
+            if position_decision is not None and current_position is not None:
+                if position_decision.action == "TRADE" and position_decision.metadata.get("is_hedge_addition"):
+                    # Hedge addition: place the new complementary leg orders
+                    if runtime_config.mode == RuntimeMode.MICRO_LIVE and runtime_config.live_arm:
+                        executor.enter_trade(position_decision)
+                        record_runtime_trade_entry(position_decision, snapshot, decision_origin="HEDGE_ADDITION")
+                    elif runtime_config.mode == RuntimeMode.PAPER_LIVE:
+                        record_paper_entry(
+                            agent.open_position,  # already updated to merged condor
+                            decision=position_decision,
+                            snapshot=snapshot,
+                            gate={"allowed": True, "primary_block_reason": "NONE"},
+                        )
+                    log_validation_decision(
+                        position_decision,
+                        snapshot=snapshot,
+                        block_reason="NONE",
+                        actual_trade_created=True,
+                        event_type="HEDGE_ENTRY",
                     )
-                log_validation_decision(exit_decision, snapshot=snapshot, block_reason="EXIT_DECISION", event_type="EXIT")
-                _update_runtime_decision_state(exit_decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="EXIT_DECISION")
-                print(exit_decision.to_json())
+                    _update_runtime_decision_state(position_decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="NONE")
+                    _emit_decision(position_decision)
+                else:
+                    # Normal exit decision
+                    exit_decision = position_decision
+                    reason = exit_decision.rationale[-2] if len(exit_decision.rationale) >= 2 else "EXIT"
+                    if runtime_config.mode == RuntimeMode.MICRO_LIVE and runtime_config.live_arm:
+                        executor.exit_trade(current_position, reason)
+                        record_runtime_trade_exit(
+                            current_position,
+                            snapshot,
+                            pnl_rupees=float(exit_decision.metadata.get("exit_pnl_rupees") or 0.0),
+                            exit_reason=str(exit_decision.metadata.get("exit_reason") or reason),
+                        )
+                    log_validation_decision(exit_decision, snapshot=snapshot, block_reason="EXIT_DECISION", event_type="EXIT")
+                    _update_runtime_decision_state(exit_decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="EXIT_DECISION")
+                    _emit_decision(exit_decision)
         else:
             decision = agent.evaluate(snapshot)
             # Clamp lots to the operator cap *before* any gate check so that
@@ -1374,7 +2066,7 @@ def run_live(config: dict[str, object]) -> None:
                 ops_max = int(getattr(getattr(runtime_config, "risk", None), "max_lots_per_trade", None) or 6)
                 if decision.lots > ops_max:
                     decision.lots = ops_max
-            print(decision.to_json())
+            _emit_decision(decision)
             if decision.action == "TRADE":
                 if runtime_config.mode == RuntimeMode.SHADOW_LIVE:
                     log_shadow_decision(decision, snapshot=snapshot)
@@ -1389,7 +2081,26 @@ def run_live(config: dict[str, object]) -> None:
                     save_runtime_state(runtime_state)
                 else:
                     gate = evaluate_entry_gate(decision, snapshot, config=runtime_config, health=health)
-                    if gate["allowed"] and runtime_config.mode == RuntimeMode.PAPER_LIVE:
+                    # Entry timing: on a directional DEBIT, don't pay up into the move we are
+                    # reacting to — wait for a retrace to a better price, or for the window to
+                    # expire. Fails open, and the signal stays live while we wait. See entry_timing.
+                    _wait = False
+                    if gate["allowed"]:
+                        from .entry_timing import should_wait
+                        _wait, _wait_why = should_wait(
+                            decision.strategy.value if hasattr(decision.strategy, "value") else str(decision.strategy),
+                            float(snapshot.option_chain.spot), snapshot.timestamp,
+                        )
+                        if _wait:
+                            log_validation_decision(
+                                decision, snapshot=snapshot, block_reason=_wait_why,
+                                actual_trade_created=False, decision_origin="V83_ENTRY_WAIT",
+                            )
+                            _update_runtime_decision_state(decision, runtime_config=runtime_config,
+                                                           snapshot=snapshot, block_reason=_wait_why)
+                    if _wait:
+                        pass          # hold this cycle; re-evaluated next cycle at a fresh price
+                    elif gate["allowed"] and runtime_config.mode == RuntimeMode.PAPER_LIVE:
                         position = open_position_from_decision(decision, snapshot)
                         agent.open_position = position
                         record_paper_entry(position, decision=decision, snapshot=snapshot, gate=gate)
@@ -1402,17 +2113,37 @@ def run_live(config: dict[str, object]) -> None:
                         )
                         _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="NONE")
                     elif gate["allowed"] and runtime_config.mode == RuntimeMode.MICRO_LIVE and runtime_config.live_arm:
-                        executor.enter_trade(decision)
-                        agent.start_position(snapshot, decision)
-                        record_runtime_trade_entry(decision, snapshot, decision_origin="V83_APPROVED")
-                        log_validation_decision(
-                            decision,
-                            snapshot=snapshot,
-                            block_reason="NONE",
-                            actual_trade_created=True,
-                            decision_origin="V83_APPROVED",
-                        )
-                        _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="NONE")
+                        # AUTO-PROMOTION: place a REAL order only if this strategy has cleared the
+                        # promotion gate on the forward shadow record; otherwise keep it PAPER even
+                        # though the runtime is live-armed. Strategies graduate to real money one at a
+                        # time, automatically, as they earn it — an un-vetted structure never reaches
+                        # real capital by accident (fail-closed if promotion_state.json is empty).
+                        from .promotion import real_money_eligible
+                        if real_money_eligible(decision.strategy):
+                            executor.enter_trade(decision)
+                            agent.start_position(snapshot, decision)
+                            record_runtime_trade_entry(decision, snapshot, decision_origin="V83_APPROVED")
+                            log_validation_decision(
+                                decision,
+                                snapshot=snapshot,
+                                block_reason="NONE",
+                                actual_trade_created=True,
+                                decision_origin="V83_APPROVED",
+                            )
+                            _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="NONE")
+                        else:
+                            # Not yet promoted → keep paper (forward-testing) even while live-armed.
+                            position = open_position_from_decision(decision, snapshot)
+                            agent.open_position = position
+                            record_paper_entry(position, decision=decision, snapshot=snapshot, gate=gate)
+                            log_validation_decision(
+                                decision,
+                                snapshot=snapshot,
+                                block_reason="NOT_PROMOTED_KEPT_PAPER",
+                                actual_trade_created=True,
+                                decision_origin="V83_PAPER_PENDING_PROMOTION",
+                            )
+                            _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="NOT_PROMOTED_KEPT_PAPER")
                     else:
                         log_shadow_decision(decision, snapshot=snapshot, block_reason=str(gate.get("primary_block_reason") or "ENTRY_GATE_BLOCKED"))
                         log_validation_decision(

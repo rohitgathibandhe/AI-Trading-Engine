@@ -246,6 +246,15 @@ class IntradayDecisionAgent:
         use_delta = any(self._delta_for(row, side) is not None for row in liquid_rows)
         distance_points = max(spot * rv30_pct / 100.0, atr_5m)
 
+        # Widen minimum distance using the ATM straddle price as the market's own
+        # implied expected-move forecast. Short strikes inside 55% of the straddle
+        # are inside the market's 1-sigma range — a high-risk sell zone on trend days.
+        atm_candidates = [row for row in strikes if row.ce_ltp > 0 and row.pe_ltp > 0]
+        if atm_candidates:
+            atm_row = min(atm_candidates, key=lambda r: abs(r.k - spot))
+            expected_move_pts = atm_row.ce_ltp + atm_row.pe_ltp
+            distance_points = max(distance_points, expected_move_pts * 0.55)
+
         for short_row in liquid_rows:
             short_strike = short_row.k
             if side == OptionType.CALL and short_strike <= spot:
@@ -279,6 +288,10 @@ class IntradayDecisionAgent:
                     if side == OptionType.CALL and (short_strike - spot) < distance_points:
                         continue
                     if side == OptionType.PUT and (spot - short_strike) < distance_points:
+                        continue
+                    # In distance mode (no delta data) enforce a minimum credit so we
+                    # don't select near-worthless far-OTM strikes with negligible theta
+                    if credit < 0.75:
                         continue
                     score = (credit / width) - (width / 1000.0)
 
@@ -384,9 +397,24 @@ class IntradayDecisionAgent:
         ltp = row.ce_ltp if side == OptionType.CALL else row.pe_ltp
         bid = row.ce_bid if side == OptionType.CALL else row.pe_bid
         ask = row.ce_ask if side == OptionType.CALL else row.pe_ask
+        oi = row.oi_ce if side == OptionType.CALL else row.oi_pe
         if ltp <= 0 or bid <= 0 or ask <= 0 or ask < bid:
             return False
-        return ((ask - bid) / ltp) <= 0.15
+        # Minimum viable premium — strikes below 0.5 pts have no meaningful theta to capture
+        if ltp < 0.5:
+            return False
+        spread = ask - bid
+        # Percentage spread check — tighter for small premiums to avoid execution slippage
+        pct = spread / ltp
+        if pct > 0.12:  # 12% max spread (was 15%)
+            return False
+        # Absolute spread cap: max 1.5 pts — prevents wide markets even if % looks ok
+        if spread > 1.5:
+            return False
+        # OI filter: require meaningful open interest to ensure we can get fills
+        if oi is not None and oi < 5_000:
+            return False
+        return True
 
     def _mid(self, row: ChainStrike, side: OptionType) -> float:
         bid = row.ce_bid if side == OptionType.CALL else row.pe_bid

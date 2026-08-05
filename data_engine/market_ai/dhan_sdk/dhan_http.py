@@ -132,7 +132,7 @@ class DhanHTTP:
                 last_error = e
                 break
             if attempt < self.max_retries:
-                sleep_for = min(1.0 * attempt, 3.0)
+                sleep_for = min(2.0 ** (attempt - 1), 8.0)  # 1s, 2s, 4s, 8s max
                 time.sleep(sleep_for)
         if last_error:
             logging.error('Exception in DhanHQConnection.%s: %s', method.value.upper(), last_error)

@@ -22,7 +22,7 @@ from .data_models import (
     TradeStructure,
 )
 from .data_pipeline_health import build_data_freshness_report
-from .execution import build_open_position, evaluate_exit
+from .execution import build_open_position, compute_structure_spread_pts, evaluate_exit
 
 
 STATE_ROOT = Path(__file__).resolve().parents[1] / "state"
@@ -36,6 +36,7 @@ V83_LIVE_PLAYBOOKS = {
     "EARLY_BALANCE_BEARISH_FAILED_RECLAIM",
     "BEARISH_CONTINUATION",
     "BEARISH_FAILED_RECLAIM",
+    "EARLY_STRUCTURE_BEARISH",
     # Bullish playbooks
     "OPEN_DRIVE_BULLISH",
     "GAP_UP_BULLISH_CONTINUATION",
@@ -44,13 +45,19 @@ V83_LIVE_PLAYBOOKS = {
     "HIGH_CONFLUENCE_BULLISH_CONTINUATION",
     "EARLY_BALANCE_BULLISH_RECLAIM",
     "AFTERNOON_TREND_HOLD_BULLISH",
+    "EARLY_STRUCTURE_BULLISH",
+    "SCORE_DRIVEN_BULL",
     # Range / neutral playbooks
     "RANGE_BALANCED_CONDOR",
+    "OI_WALL_CONDOR",
 }
 V83_LIVE_STRATEGIES = {
     StrategyType.BEAR_CALL_CREDIT_SPREAD.value,
     StrategyType.BULL_PUT_CREDIT_SPREAD.value,
     StrategyType.IRON_CONDOR.value,
+    StrategyType.IRON_FLY.value,
+    StrategyType.SHORT_STRANGLE.value,
+    StrategyType.SHORT_STRADDLE.value,
 }
 V83_APPROVED_LIVE_STATES = {"TREND_DOWN", "TREND_UP", "TRANSITION", "DIRECTIONAL_BALANCE", "TRUE_RANGE"}
 # Kept for backward-compat — points to the same set
@@ -131,6 +138,7 @@ class RuntimeConfig:
     health_required_for_paper: bool = True
     health_required_for_micro: bool = True
     allowed_playbook_tiers: tuple[str, ...] = ("A", "B")
+    circuit_breaker_active: bool = False
     risk: RuntimeRiskGovernance = field(default_factory=RuntimeRiskGovernance)
 
     @classmethod
@@ -172,6 +180,7 @@ class RuntimeConfig:
             health_required_for_paper=bool(payload.get("health_required_for_paper", True)),
             health_required_for_micro=bool(payload.get("health_required_for_micro", True)),
             allowed_playbook_tiers=tuple(sorted(set(str(t) for t in payload.get("allowed_playbook_tiers", ["A", "B"])))),
+            circuit_breaker_active=bool(payload.get("circuit_breaker_active", False)),
             risk=RuntimeRiskGovernance.from_payload(payload.get("risk") if isinstance(payload.get("risk"), dict) else payload),
         )
 
@@ -716,6 +725,7 @@ def _is_bullish_context(metadata: dict[str, Any], funnel: dict[str, Any]) -> boo
         or playbook.startswith("HIGH_CONFLUENCE_BULLISH")
         or playbook.startswith("LATE_SESSION_BULLISH")
         or playbook.startswith("SIDEWAYS_TO_BULLISH")
+        or playbook == "SCORE_DRIVEN_BULL"
     )
 
 
@@ -838,11 +848,21 @@ def _score_margin_required(
     config: RuntimeConfig,
     market_state: str,
     no_trade_score: float,
+    setup_direction: str = "BEARISH",
 ) -> float:
     configured = float(config.bearish_score_margin)
+    # Direction-aware: a bullish setup must be gated with the bullish margin the
+    # regime layer computed for it (trade_score_margin_bullish), not the bearish
+    # one. Reading only the bearish key gated bull-put trades against the wrong
+    # (often stricter) margin and silently blocked valid bullish setups.
+    margin_key = (
+        "trade_score_margin_bullish"
+        if str(setup_direction).upper() == "BULLISH"
+        else "trade_score_margin_bearish"
+    )
     dynamic = float(
-        metadata.get("trade_score_margin_bearish")
-        or funnel.get("trade_score_margin_bearish")
+        metadata.get(margin_key)
+        or funnel.get(margin_key)
         or configured
     )
     required = dynamic if dynamic > 0 else configured
@@ -926,6 +946,7 @@ def evaluate_entry_gate(
         config=config,
         market_state=market_state,
         no_trade_score=no_trade_score,
+        setup_direction=setup_direction,
     )
     # Use directional score: bullish strategies use bullish_trade_score, others use bearish_trade_score
     if setup_direction == "BULLISH":
@@ -936,9 +957,13 @@ def evaluate_entry_gate(
         directional_score = bearish_score
     if directional_score <= no_trade_score + score_margin_required:
         reasons.append("DIRECTIONAL_SCORE_MARGIN_FAIL")
+    # Early structure playbooks fire in the 9:20–9:55 window before full confirmation.
+    # They bypass the normal 10:00 bullish start and the 11:00 bearish start.
+    if playbook in {"EARLY_STRUCTURE_BULLISH", "EARLY_STRUCTURE_BEARISH"}:
+        start_t = time(9, 20)
     # Bullish setups use an earlier start time so gap-up continuation plays can
     # be entered from 10:00 AM instead of waiting for the bearish window (11:00).
-    if setup_direction == "BULLISH":
+    elif setup_direction == "BULLISH":
         start_t = _parse_time(config.allowed_bullish_entry_start_hhmm, time(10, 0))
     else:
         start_t = _parse_time(config.allowed_entry_start_hhmm, time(9, 30))
@@ -948,6 +973,31 @@ def evaluate_entry_gate(
     )
     if not (start_t <= snapshot.timestamp.time() <= end_t):
         reasons.append("ENTRY_WINDOW_CLOSED")
+    # PH 21: Early-session confirmation gate.
+    # Directional spreads before 10:15 require 5m execution confirmation IN THE
+    # TRADE DIRECTION, and must not face strongly opposing order flow. This avoids
+    # entering into first-candle noise without blocking genuinely confirmed setups.
+    # EARLY_STRUCTURE_* playbooks are designed for early entries and are exempt.
+    if (
+        snapshot.timestamp.time() < time(10, 15)
+        and strategy in {"BEAR_CALL_CREDIT_SPREAD", "BULL_PUT_CREDIT_SPREAD"}
+        and playbook not in {"EARLY_STRUCTURE_BULLISH", "EARLY_STRUCTURE_BEARISH"}
+    ):
+        _exec_5m = str(metadata.get("execution_5m") or funnel.get("execution_5m") or "")
+        _ofi = float(
+            metadata.get("order_flow_imbalance")
+            or metadata.get("ml_order_flow_imbalance")
+            or funnel.get("order_flow_imbalance")
+            or 0.0
+        )
+        _is_bull = strategy == "BULL_PUT_CREDIT_SPREAD"
+        _confirmed = (
+            (_is_bull and _exec_5m == "UP_CONFIRMED")
+            or (not _is_bull and _exec_5m == "DOWN_CONFIRMED")
+        )
+        _ofi_opposes = (_is_bull and _ofi < -0.30) or (not _is_bull and _ofi > 0.30)
+        if not _confirmed or _ofi_opposes:
+            reasons.append("EARLY_SESSION_UNCONFIRMED")
     daily_lock = state.get("daily_lock") if isinstance(state.get("daily_lock"), dict) else {}
     if bool(daily_lock.get("active")):
         reasons.append(str(daily_lock.get("reason") or "DAILY_LOCK_ACTIVE"))
@@ -966,30 +1016,43 @@ def evaluate_entry_gate(
         reasons.append("DAILY_REALIZED_LOSS_LOCK")
     if float(state.get("total_pnl_rupees") or 0.0) <= -abs(config.risk.max_daily_total_loss_rupees):
         reasons.append("DAILY_TOTAL_LOSS_LOCK")
-    # Expiry-day guard: credit spreads on same-day expiry carry extreme gamma risk
-    # (near-ATM options can move 10–50× in minutes). Block all new entries.
+    # Expiry-day guard: near-ATM options carry extreme gamma on same-day expiry. Block DIRECTIONAL
+    # DEBITS (buying that gamma) and any naked short — but ALLOW defined-risk credit SELLERS
+    # (iron fly/condor, bull-put/bear-call). Their loss is capped by the wings, and expiry day is the
+    # fastest-theta day to sell into. Blocking them cost real money (2026-07-28: iron_fly +3,446
+    # skipped). EXPIRY_ALLOW_DEFINED_SELLERS=0 restores the block-everything behaviour.
+    _EXPIRY_DEFINED_SELLERS = {"IRON_FLY", "IRON_CONDOR", "BULL_PUT_CREDIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD"}
     try:
         chain_expiry = snapshot.option_chain.expiry
-        if isinstance(chain_expiry, date) and chain_expiry == snapshot.timestamp.date():
+        _expiry_today = isinstance(chain_expiry, date) and chain_expiry == snapshot.timestamp.date()
+        _allow = os.environ.get("EXPIRY_ALLOW_DEFINED_SELLERS", "1") == "1" and strategy in _EXPIRY_DEFINED_SELLERS
+        if _expiry_today and not _allow:
             reasons.append("EXPIRY_DAY_BLOCKED")
     except Exception:
         pass
-    if str(health.get("status") or "") == HealthStatus.BLOCKED.value:
-        reasons.append("HEALTH_BLOCKED")
-    components = health.get("components") if isinstance(health.get("components"), dict) else {}
-    required = [
-        "broker_auth_health",
-        "market_feed_health",
-        "option_chain_health",
-        "broker_position_sync_health",
-        "state_store_health",
-        "strategy_engine_health",
-        "data_pipeline_health",
-    ]
-    for name in required:
-        component = components.get(name) if isinstance(components, dict) else None
-        if not isinstance(component, dict) or str(component.get("status") or "") == HealthStatus.BLOCKED.value:
-            reasons.append(f"{name.upper()}_BLOCKED")
+    # Health enforcement: real-money (MICRO_LIVE) always enforces; PAPER_LIVE only
+    # when the operator opts in via health_required_for_paper. Paper trades place no
+    # broker orders, so broker-auth/position-sync flicker (e.g. a Dhan 429 burst)
+    # must not block them. Missing market data is already caught by snapshot
+    # validation upstream, so skipping here cannot trade on absent data.
+    _enforce_health = config.health_required_for_paper or mode == RuntimeMode.MICRO_LIVE
+    if _enforce_health:
+        if str(health.get("status") or "") == HealthStatus.BLOCKED.value:
+            reasons.append("HEALTH_BLOCKED")
+        components = health.get("components") if isinstance(health.get("components"), dict) else {}
+        required = [
+            "broker_auth_health",
+            "market_feed_health",
+            "option_chain_health",
+            "broker_position_sync_health",
+            "state_store_health",
+            "strategy_engine_health",
+            "data_pipeline_health",
+        ]
+        for name in required:
+            component = components.get(name) if isinstance(components, dict) else None
+            if not isinstance(component, dict) or str(component.get("status") or "") == HealthStatus.BLOCKED.value:
+                reasons.append(f"{name.upper()}_BLOCKED")
     recovery_blocked, recovery_reason = _has_recovery_block(paths)
     if recovery_blocked:
         reasons.append(f"RECOVERY_BLOCK:{recovery_reason}")
@@ -1004,6 +1067,7 @@ def evaluate_entry_gate(
         "market_state": market_state,
         "tradability_class": metadata.get("tradability_class") or funnel.get("tradability_class"),
         "bearish_trade_score": round(bearish_score, 4),
+        "bullish_trade_score": round(bullish_score, 4),
         "no_trade_score": round(no_trade_score, 4),
         "score_margin_required": score_margin_required,
     }
@@ -1045,6 +1109,8 @@ def evaluate_paper_context_override_gate(
     no_trade_score = float(metadata.get("no_trade_score") or funnel.get("no_trade_score") or 0.0)
     _active_score = bullish_score if _is_bullish_override else bearish_score
     _score_threshold = float(getattr(config, "paper_override_bullish_score_threshold", config.paper_override_bearish_score_threshold)) if _is_bullish_override else config.paper_override_bearish_score_threshold
+    if config.circuit_breaker_active:
+        _score_threshold += 1.0  # raise bar by 1.0 after 2 consecutive session losses
     if _active_score < _score_threshold:
         reasons.append("PAPER_OVERRIDE_SCORE_TOO_LOW")
     if _active_score <= no_trade_score + config.paper_override_margin:
@@ -1055,6 +1121,29 @@ def evaluate_paper_context_override_gate(
     inside_window = start_t <= snapshot.timestamp.time() <= end_t
     if not inside_window:
         reasons.append("PAPER_EXPERIMENT_WINDOW_CLOSED")
+    # PH 21: Early-session confirmation gate — same rule as evaluate_entry_gate.
+    if (
+        snapshot.timestamp.time() < time(10, 15)
+        and strategy in {"BEAR_CALL_CREDIT_SPREAD", "BULL_PUT_CREDIT_SPREAD"}
+        and str(metadata.get("playbook") or funnel.get("playbook") or "") not in {
+            "EARLY_STRUCTURE_BULLISH", "EARLY_STRUCTURE_BEARISH"
+        }
+    ):
+        _exec_5m = str(metadata.get("execution_5m") or funnel.get("execution_5m") or "")
+        _ofi = float(
+            metadata.get("order_flow_imbalance")
+            or metadata.get("ml_order_flow_imbalance")
+            or funnel.get("order_flow_imbalance")
+            or 0.0
+        )
+        _is_bull = strategy == "BULL_PUT_CREDIT_SPREAD"
+        _confirmed = (
+            (_is_bull and _exec_5m == "UP_CONFIRMED")
+            or (not _is_bull and _exec_5m == "DOWN_CONFIRMED")
+        )
+        _ofi_opposes = (_is_bull and _ofi < -0.30) or (not _is_bull and _ofi > 0.30)
+        if not _confirmed or _ofi_opposes:
+            reasons.append("EARLY_SESSION_UNCONFIRMED")
 
     daily_lock = state.get("daily_lock") if isinstance(state.get("daily_lock"), dict) else {}
     if bool(daily_lock.get("active")):
@@ -1136,6 +1225,7 @@ def evaluate_paper_context_override_gate(
         "tradability_class": metadata.get("tradability_class") or funnel.get("tradability_class"),
         "failure_type": metadata.get("failure_type") or funnel.get("failure_type"),
         "bearish_trade_score": round(bearish_score, 4),
+        "bullish_trade_score": round(bullish_score, 4),
         "no_trade_score": round(no_trade_score, 4),
         "score_threshold_required": config.paper_override_bearish_score_threshold,
         "score_margin_required": config.paper_override_margin,
@@ -1197,6 +1287,16 @@ def structure_from_decision(decision: DecisionOutput) -> TradeStructure:
 
 def open_position_from_decision(decision: DecisionOutput, snapshot: MarketSnapshot) -> OpenPosition:
     structure = structure_from_decision(decision)
+    extra = dict(decision.metadata or {})
+    extra["spot_at_entry"] = snapshot.option_chain.spot
+    # Stamp the traded expiry onto the position so the persisted state — and the UI marking its
+    # live LTP — always know which series each leg belongs to. Without this the legs carried
+    # expiry=None, so on a roll day the UI could not tell the front from the expiring series and
+    # marked entry vs LTP across different expiries (the bad Open-MTM bug, 2026-07-21).
+    try:
+        extra["expiry"] = snapshot.option_chain.expiry.isoformat()
+    except Exception:
+        pass
     return build_open_position(
         structure=structure,
         lots=int(decision.lots or 1),
@@ -1204,11 +1304,14 @@ def open_position_from_decision(decision: DecisionOutput, snapshot: MarketSnapsh
         entry_time=snapshot.timestamp,
         entry_credit_points=float(decision.entry.get("expected_credit_points") or structure.credit_points),
         max_loss_rupees_per_lot=float(decision.max_loss_rupees_per_lot or 0.0),
-        extra_metadata=decision.metadata,
+        extra_metadata=extra,
     )
 
 
 def serialize_open_position(position: OpenPosition) -> dict[str, Any]:
+    # Traded expiry stamped at entry (see open_position_from_decision). Persisted per leg so the
+    # UI marks each leg's live LTP against the exact series it was booked on.
+    _expiry = (position.metadata or {}).get("expiry")
     return {
         "structure": {
             "strategy": position.structure.strategy.value,
@@ -1217,6 +1320,13 @@ def serialize_open_position(position: OpenPosition) -> dict[str, Any]:
                     "action": leg.action,
                     "option_type": leg.option_type.value,
                     "strike": leg.strike,
+                    "expiry": _expiry,
+                    # Real FROZEN entry fill. leg.quote is the entry-time quote on a frozen
+                    # dataclass — it never drifts on re-save — so this is the true entry price,
+                    # not a modelled number (legs previously persisted entry_price=None).
+                    "entry_price": (
+                        leg.quote.mid_price if leg.quote.mid_price is not None else leg.quote.ltp
+                    ),
                     "bid": leg.quote.bid,
                     "ask": leg.quote.ask,
                     "ltp": leg.quote.ltp,
@@ -1614,6 +1724,11 @@ def record_paper_entry(
     paths = paths or OpsPaths()
     save_paper_position(position, paths=paths, extra={"last_entry_gate": gate})
     attribution = str(decision.metadata.get("paper_trade_attribution") or "V83_APPROVED")
+    # Phase 7: compute bid-ask spread from live option chain for fill quality attribution
+    _structure = structure_from_decision(decision)
+    _spread_pts = compute_structure_spread_pts(_structure, snapshot.option_chain)
+    _credit_pts = float(decision.entry.get("expected_credit_points") or 0.0)
+    _fill_quality = round(_credit_pts / (_credit_pts + _spread_pts), 3) if (_credit_pts + _spread_pts) > 0 else 1.0
     event = {
         "event": "PAPER_ENTRY",
         "timestamp": snapshot.timestamp.isoformat(),
@@ -1630,6 +1745,30 @@ def record_paper_entry(
         "realized_paper_pnl": None,
         "mfe_rupees": 0.0,
         "mae_rupees": 0.0,
+        "bid_ask_spread_pts": _spread_pts,
+        "fill_quality_score": _fill_quality,
+        "entry_iv_rank": decision.metadata.get("iv_rank_at_entry"),
+        "india_vix_at_entry": decision.metadata.get("india_vix"),
+        "spot_at_entry": snapshot.option_chain.spot,
+        # Phase 8: ML features — needed by watchdog._train_win_probability_model()
+        "ml_bearish_entry_score":    decision.metadata.get("ml_bearish_entry_score"),
+        "ml_bullish_entry_score":    decision.metadata.get("ml_bullish_entry_score"),
+        "ml_india_vix":              decision.metadata.get("ml_india_vix"),
+        "ml_vwap_reclaim":           decision.metadata.get("ml_vwap_reclaim"),
+        "ml_banknifty_divergence":   decision.metadata.get("ml_banknifty_divergence"),
+        "ml_days_to_monthly_expiry": decision.metadata.get("ml_days_to_monthly_expiry"),
+        "ml_bullish_momentum":       decision.metadata.get("ml_bullish_momentum"),
+        "ml_bearish_momentum":       decision.metadata.get("ml_bearish_momentum"),
+        "ml_rv30_pct":               decision.metadata.get("ml_rv30_pct"),
+        "ml_order_flow_imbalance":   decision.metadata.get("ml_order_flow_imbalance"),
+        "setup_direction":           decision.metadata.get("setup_direction"),
+        # The agent's full reasoning for this trade (option chain + chart + levels +
+        # confluence), so every trade is auditable after the fact — "why did it do this?".
+        "trade_thesis":              decision.metadata.get("trade_thesis"),
+        "thesis_confluence":         decision.metadata.get("thesis_confluence"),
+        "thesis_net_bias":           decision.metadata.get("thesis_net_bias"),
+        "selector_condition":        decision.metadata.get("selector_condition"),
+        "selector_family":           decision.metadata.get("selector_family"),
     }
     _append_jsonl(paths.paper_trades, event)
     record_runtime_trade_entry(decision, snapshot, decision_origin=attribution, paths=paths)
@@ -1661,8 +1800,32 @@ def manage_paper_position(
     mfe = max(float(state.get("mfe_rupees") or 0.0), open_pnl)
     mae = min(float(state.get("mae_rupees") or 0.0), open_pnl)
     save_paper_position(position, paths=paths, extra={"mfe_rupees": mfe, "mae_rupees": mae, "last_mark_pnl_rupees": open_pnl})
+    # Exit shadow book: record this mark so candidate exit rules can be scored against the SAME
+    # real live prices the agent traded on. Pure recorder — it decides nothing. See exit_shadow.py.
+    from . import exit_shadow
+    exit_shadow.record_mark(position, snapshot, open_pnl)
     if not exit_decision.should_exit:
         return position
+    # Phase 7: P&L attribution at exit
+    _spot_at_entry = float(position.metadata.get("spot_at_entry") or 0.0)
+    _spot_at_exit = float(snapshot.option_chain.spot)
+    _spot_move_pts = round(_spot_at_exit - _spot_at_entry, 2) if _spot_at_entry > 0 else 0.0
+    _holding_min = round((snapshot.timestamp - position.entry_time).total_seconds() / 60.0, 1)
+    _max_profit_rupees = round(position.entry_credit_points * position.lot_size * position.lots, 2)
+    # Theta capture is a CREDIT concept (how much of the premium we sold decayed to us). A debit
+    # spread has entry_credit_points <= 0, so this used to fall through to 0.0 and assert
+    # "captured zero theta" — a lie about a metric that simply does not apply. None = N/A.
+    _theta_capture_pct = round(
+        exit_decision.pnl_rupees / _max_profit_rupees, 3
+    ) if _max_profit_rupees > 0 else None
+    # MFE capture = how much of the peak we actually kept (realized / MFE). Strategy-agnostic,
+    # which the old value was NOT: it read position.metadata["mfe_capture_pct"], a trailing-stop
+    # internal written only by _mfe_profit_trail_reason(), which early-returns when
+    # entry_credit_points <= 0 — i.e. never fires for a debit spread, so every put-debit logged
+    # 0.0. On 2026-07-16 MFE was 3,380 and the trade closed at 1,638 (~48% kept) yet still
+    # recorded 0.0, leaving the learning loop unable to see exit quality at all.
+    # A negative value is meaningful (went green, closed red); None only if it never went green.
+    _mfe_capture_pct = round(exit_decision.pnl_rupees / mfe, 3) if mfe > 0 else None
     event = {
         "event": "PAPER_EXIT",
         "timestamp": snapshot.timestamp.isoformat(),
@@ -1680,8 +1843,16 @@ def manage_paper_position(
         "mfe_rupees": round(mfe, 2),
         "mae_rupees": round(mae, 2),
         "legs": serialize_open_position(position)["structure"]["legs"],
+        "holding_minutes": _holding_min,
+        "spot_at_entry": _spot_at_entry,
+        "spot_at_exit": _spot_at_exit,
+        "spot_move_pts": _spot_move_pts,
+        "theta_capture_pct": _theta_capture_pct,
+        "iv_rank_at_entry": position.metadata.get("iv_rank_at_entry"),
+        "mfe_capture_pct": _mfe_capture_pct,
     }
     _append_jsonl(paths.paper_trades, event)
+    exit_shadow.finalize(position, event)   # score every candidate exit rule over this trade's path
     save_paper_position(None, paths=paths, extra={"last_exit": event, "mfe_rupees": 0.0, "mae_rupees": 0.0})
     config = load_runtime_config(paths)
     runtime_state = load_runtime_state(paths, config)

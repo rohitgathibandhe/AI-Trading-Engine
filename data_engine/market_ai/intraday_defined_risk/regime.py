@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import calendar
 from datetime import time
 
 from .data_models import AdaptiveParameters, MarketSnapshot, OhlcvBar, RegimeLabel, RegimeState, ValidationError
+from .day_thesis import get_or_form_day_thesis
 from .features import (
     RANGE_GATE_TIME,
     adaptive_or_length_minutes,
@@ -18,9 +20,14 @@ from .features import (
     bullish_vwap_hold_higher_low_setup,
     closes,
     close_location_value,
+    compute_atm_straddle,
+    compute_daily_trend_features,
+    compute_max_pain,
     compute_pcr_trend,
     compute_opening_range,
     compute_vwap,
+    compute_vwap_bands,
+    compute_volume_spike,
     ema,
     ema_distance_pct,
     ema_value,
@@ -50,7 +57,16 @@ from .features import (
     session_bars,
     sideways_bullish_reclaim_setup,
     put_call_ratio_by_oi,
-    compute_daily_trend_features,
+    early_structure_intent_bearish,
+    early_structure_intent_bullish,
+    compute_vwap_reclaim,
+    compute_momentum_persistence,
+    compute_win_probability,
+    compute_order_flow_imbalance,
+    compute_gamma_concentration,
+    compute_multi_session_oi_walls,
+    read_fii_bias,
+    read_market_context,
 )
 
 
@@ -455,6 +471,81 @@ def _average_chain_iv(snapshot: MarketSnapshot) -> float | None:
     if not ivs:
         return None
     return sum(ivs) / len(ivs)
+
+
+def _atm_chain_iv(snapshot: MarketSnapshot, band_pct: float = 1.0) -> float | None:
+    """Mean IV of NEAR-ATM strikes — an implied-vol read on the same scale as India VIX.
+
+    `_average_chain_iv()` flat-averages every strike in the chain, and the volatility smile
+    drags that mean far above at-the-money IV. Measured live on 2026-07-17: the chain (281
+    legs, out to +/-1200pts) averaged 26.5 while ATM IV and India VIX were both ~11.8 — a
+    2.2x overstatement, on 616 of 616 decisions. Within +/-100pts of spot the same chain read
+    11.74; the inflation is entirely the wings (600-1200pts averaged 20.1).
+
+    This matters because the credit-floor thresholds (15/18/22 in `_iv_adjusted_credit_ratio`)
+    are calibrated on the VIX/ATM scale. Feeding them the smile-inflated mean pinned the agent
+    permanently in the ">= 22 -> tighten x1.15" branch, so it demanded MORE credit exactly when
+    premium was thinnest — blocking every bull-put on low-IV up days (348 CREDIT_TOO_LOW
+    rejections on 07-17, a clean +0.73% trend day on which it took zero trades).
+
+    Restricting to near-ATM strikes puts the metric back on the scale the thresholds expect.
+    Kept separate from avg_chain_iv, which has other callers with their own calibration.
+    """
+    chain = snapshot.option_chain
+    spot = float(chain.spot or 0.0)
+    if spot <= 0:
+        return None
+    usable = [q for q in chain.quotes if q.iv is not None and float(q.iv) > 0 and q.ltp > 0]
+    band = spot * band_pct / 100.0
+    ivs = [float(q.iv) for q in usable if abs(float(q.strike) - spot) <= band]
+    if not ivs:
+        # Wide strike spacing can leave the band empty — fall back to the nearest strikes.
+        ivs = [float(q.iv) for q in sorted(usable, key=lambda q: abs(float(q.strike) - spot))[:8]]
+    if not ivs:
+        return None
+    return sum(ivs) / len(ivs)
+
+
+def _compute_chain_gex(snapshot: MarketSnapshot):
+    """Dealer gamma-exposure read from the chain snapshot. Advisory only — attached to
+    metadata for analysis/validation; does not gate any decision yet."""
+    from .gamma_exposure import compute_gex
+    chain = snapshot.option_chain
+    rows = [
+        {
+            "strike": q.strike,
+            "option_type": q.option_type.value if hasattr(q.option_type, "value") else str(q.option_type),
+            "iv": q.iv,
+            "oi": q.oi,
+        }
+        for q in chain.quotes
+    ]
+    ts = snapshot.timestamp
+    days = (chain.expiry - ts.date()).days
+    # remaining fraction of the current trading session (09:15–15:30 IST)
+    frac = max(0.0, min(1.0, (15.5 - (ts.hour + ts.minute / 60.0)) / 6.25))
+    t_years = max(days + frac, 0.1) / 252.0
+    return compute_gex(rows, chain.spot, t_years)
+
+
+_PREV_DAY_CTX_CACHE: dict[str, dict] = {}
+
+
+def _load_prev_day_context_cached(session_date: str) -> dict:
+    """Yesterday's market character for today's decisions (advisory). Cached per date so
+    the daily_market_study.jsonl is read at most once a session, not every cycle."""
+    if session_date in _PREV_DAY_CTX_CACHE:
+        return _PREV_DAY_CTX_CACHE[session_date]
+    ctx: dict = {}
+    try:
+        from pathlib import Path
+        from .daily_market_study import load_prev_day_context
+        study_path = Path(__file__).resolve().parent.parent / "state" / "daily_market_study.jsonl"
+        ctx = load_prev_day_context(str(study_path), today=session_date) or {}
+    except Exception:
+        ctx = {}
+    _PREV_DAY_CTX_CACHE[session_date] = ctx
+    return ctx
 
 
 def _bullish_shadow_subtype(
@@ -868,10 +959,75 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     previous_pcr = put_call_ratio_by_oi(previous_quotes or [])
     pcr_trend = compute_pcr_trend(snapshot.option_chain.quotes, previous_quotes)
     daily_tf = compute_daily_trend_features(snapshot.nifty_daily)
+    vwap_bands = compute_vwap_bands(bars_5m)
+    vol_spike = compute_volume_spike(bars_5m)
+    max_pain_data = compute_max_pain(snapshot.option_chain.quotes)
+    atm_straddle = compute_atm_straddle(spot, snapshot.option_chain.quotes)
+    # Scalar ATM straddle premium in points, computed once. compute_atm_straddle
+    # returns a dict keyed "atm_straddle_price" — several gates below previously
+    # either crashed (float(dict)) or read a non-existent "atm_straddle" key and
+    # silently got 0.0, killing the condor/HTF-cap premium checks.
+    _atm_straddle_pts = (
+        float(atm_straddle.get("atm_straddle_price") or 0.0)
+        if isinstance(atm_straddle, dict)
+        else float(atm_straddle or 0.0)
+    )
     support_ref = support_5m[0] if support_5m else (support_15m[0] if support_15m else None)
     resistance_ref = resistance_5m[0] if resistance_5m else (resistance_15m[0] if resistance_15m else None)
     session_open = bars_5m[0].open if bars_5m else None
     gap_pct = opening_gap_pct(snapshot.previous_session_close, session_open)
+
+    # Expected-move consumed: fraction of the ATM straddle price already covered by spot's move.
+    # When ≥70% of the market's own 1σ forecast is consumed, entering new premium sales is risky
+    # — the edge is largely gone and continuation risk is high.
+    _session_move_pts = abs(spot - session_open) if session_open is not None else 0.0
+    _expected_move_pts_val = float(atm_straddle.get("expected_move_pts") or 0)
+    _move_consumed_pct = _session_move_pts / _expected_move_pts_val if _expected_move_pts_val > 0 else 0.0
+    _expected_move_consumed = _move_consumed_pct >= 0.70
+
+    # ── Pre-market regime bias ──────────────────────────────────────────────────
+    # Computed before any bar-based analysis using signals that are available from
+    # the moment the chain loads: gap size, IV level, PCR, and OI flow direction.
+    # Result biases strategy selection: TRENDING suppresses condors/strangles,
+    # RANGE lowers the balance threshold for condors.
+    _early_iv = _average_chain_iv(snapshot) or 0.0
+    _gap_abs = abs(gap_pct)
+    _pcr = put_call_ratio_by_oi(snapshot.option_chain.quotes) or 1.0
+    _sm_bias = oi_flow.get("smart_money_bias", "NEUTRAL") if isinstance(oi_flow, dict) else "NEUTRAL"
+    _trending_score = 0.0
+    _range_score = 0.0
+    # Gap signals: large gap = directional conviction from overnight
+    if _gap_abs >= 0.50:
+        _trending_score += 1.5
+    elif _gap_abs >= 0.30:
+        _trending_score += 0.8
+    elif _gap_abs < 0.15:
+        _range_score += 1.0
+    # IV signals: elevated IV = market expects movement
+    if _early_iv >= 22.0:
+        _trending_score += 1.0
+    elif _early_iv >= 18.0:
+        _trending_score += 0.5
+    elif _early_iv < 14.0:
+        _range_score += 1.0
+    # PCR extreme = strong directional conviction in options market
+    if _pcr < 0.80 or _pcr > 1.35:
+        _trending_score += 0.8
+    elif 0.90 <= _pcr <= 1.15:
+        _range_score += 0.8
+    # Smart money bias
+    if _sm_bias != "NEUTRAL":
+        _trending_score += 0.5
+    else:
+        _range_score += 0.5
+    # Determine bias with hysteresis (need clear lead to commit)
+    if _trending_score >= _range_score + 0.8:
+        _premarket_bias = "TRENDING"
+    elif _range_score >= _trending_score + 0.8:
+        _premarket_bias = "RANGE"
+    else:
+        _premarket_bias = "NEUTRAL"
+
     metadata: dict[str, float | str | bool | None] = {
         "day_archetype": "UNCLASSIFIED",
         "opening_gap_pct": gap_pct,
@@ -899,6 +1055,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "call_resistance_strike": oi_flow["call_resistance_strike"],
         "put_support_oi_change": oi_flow["put_support_oi_change"],
         "call_resistance_oi_change": oi_flow["call_resistance_oi_change"],
+        "call_wall_oi_velocity": oi_flow.get("call_wall_oi_velocity", 0.0),
+        "put_wall_oi_velocity": oi_flow.get("put_wall_oi_velocity", 0.0),
         "current_put_wall": wall_migration["current_put_wall"],
         "previous_put_wall": wall_migration["previous_put_wall"],
         "put_wall_shift": wall_migration["put_wall_shift"],
@@ -919,6 +1077,10 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "daily_ema200": daily_tf["daily_ema200"],
         "weekly_high": daily_tf["weekly_high"],
         "weekly_low": daily_tf["weekly_low"],
+        "monthly_high": daily_tf.get("monthly_high"),
+        "monthly_low": daily_tf.get("monthly_low"),
+        "daily_swing_resistance": daily_tf.get("daily_swing_resistance"),
+        "daily_swing_support": daily_tf.get("daily_swing_support"),
         "daily_atr": daily_tf["daily_atr"],
         "price_vs_ema50_pct": daily_tf["price_vs_ema50_pct"],
         "higher_tf_available": daily_tf["higher_tf_available"],
@@ -937,6 +1099,42 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "condor_shape_bias": None,
         "condor_short_delta_band_bias": None,
         "avg_chain_iv": None,
+        # ── Market intelligence signals ────────────────────────────────────────
+        "vwap_upper_1": vwap_bands["upper_1"],
+        "vwap_lower_1": vwap_bands["lower_1"],
+        "vwap_upper_2": vwap_bands["upper_2"],
+        "vwap_lower_2": vwap_bands["lower_2"],
+        "vwap_band_width": vwap_bands["band_width"],
+        "vwap_band_compression_pct": vwap_bands["band_compression_pct"],
+        "volume_ratio": vol_spike["volume_ratio"],
+        "volume_spike": vol_spike["is_spike"],
+        "max_pain_strike": max_pain_data["max_pain_strike"],
+        "atm_strike": atm_straddle["atm_strike"],
+        "atm_straddle_price": atm_straddle["atm_straddle_price"],
+        "expected_move_pts": atm_straddle["expected_move_pts"],
+        "session_move_pts": round(_session_move_pts, 2),
+        "expected_move_consumed_pct": round(_move_consumed_pct * 100, 1),
+        "expected_move_consumed": _expected_move_consumed,
+        "session_phase": "PRIME",
+        "vwap_reclaim": False,
+        "vwap_reclaim_strength": 0.0,
+        "bullish_momentum_persistence": 0.5,
+        "bearish_momentum_persistence": 0.5,
+        "india_vix": 0.0,
+        "banknifty_divergence": 0.0,
+        "days_to_monthly_expiry": 99,
+        "win_probability_bearish": 0.5,
+        "win_probability_bullish": 0.5,
+        "order_flow_imbalance": 0.0,
+        "max_gamma_strike": None,
+        "gamma_concentration": 0.0,
+        "spot_to_pin_pts": None,
+        "pin_risk_active": False,
+        "multi_session_call_wall": None,
+        "multi_session_put_wall": None,
+        "multi_session_oi_days": 0,
+        "fii_bias": "UNKNOWN",
+        "fii_net_crores": 0.0,
         "range_compression_score": 0.0,
         "min_short_call_strike": None,
         "max_short_put_strike": None,
@@ -944,6 +1142,9 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "allowed_width_points": None,
         "target_short_put_buffer_points": None,
         "minimum_net_edge_rupees": None,
+        "premarket_bias": _premarket_bias,
+        "premarket_trending_score": round(_trending_score, 2),
+        "premarket_range_score": round(_range_score, 2),
         "setup_quality_score": 0.0,
         "setup_direction": "NONE",
         "trend_follow_ready_bullish": False,
@@ -1020,8 +1221,31 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     vwap = snapshot.live_vwap if snapshot.live_vwap is not None else compute_vwap(bars_5m)
     metadata["bars_above_vwap"] = sum(1 for bar in bars_5m[-10:] if vwap is not None and bar.close > vwap)
     metadata["bars_below_vwap"] = sum(1 for bar in bars_5m[-10:] if vwap is not None and bar.close < vwap)
-    # Pre-initialize; overwritten at the canonical assignment below (~line 2175).
-    opening_range_break_state = "NONE"
+    # Compute OR-break state and option-chain pressure context EARLY. Several gates
+    # below read these before the old canonical assignment points (~2705 / ~3002),
+    # so they previously saw "NONE"/empty and were dead code: the bullish veto (~2006,
+    # incl. its OR-breakout exemption), the OR-rejection bearish bypass (~2193), and
+    # the VWAP-rejection bearish path (~2850, ~67% historical win rate). All inputs
+    # (bars_5m, opening_range, vwap, walls, option_pressure, oi_flow, wall_migration)
+    # are final by this point, so the later recomputations produce identical values.
+    opening_range_break_state = _opening_range_break_state(
+        bars_5m,
+        opening_range.high if opening_range else None,
+        opening_range.low if opening_range else None,
+        vwap,
+    )
+    metadata["opening_range_break_state"] = opening_range_break_state
+    metadata.update(
+        _option_chain_context(
+            spot=spot,
+            support_ref=support_ref,
+            resistance_ref=resistance_ref,
+            metadata=metadata,
+            option_pressure=option_pressure,
+            oi_flow=oi_flow,
+            wall_migration=wall_migration,
+        )
+    )
     execution_5m = "UNCONFIRMED"
 
     if opening_range and vwap:
@@ -1188,6 +1412,23 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         bearish_trend_score -= 0.50
     elif oi_flow["smart_money_bias"] == "BEARISH":
         bullish_trend_score -= 0.50
+    # Max pain gravitational bias: market makers are net short options so they pin toward
+    # max pain near expiry. Spot above max pain = latent bearish pull; below = bullish pull.
+    _max_pain_strike = max_pain_data.get("max_pain_strike")
+    if _max_pain_strike is not None:
+        _pain_dist_pct = (spot - float(_max_pain_strike)) / max(spot, 1.0) * 100
+        if _pain_dist_pct > 0.3:     # spot meaningfully above max pain → bearish gravity
+            bearish_trend_score += 0.3
+        elif _pain_dist_pct < -0.3:  # spot meaningfully below max pain → bullish gravity
+            bullish_trend_score += 0.3
+    # OI velocity: fast wall buildup = conviction signal from options writers this cycle.
+    # ≥3% OI growth at the dominant wall in a single 30s poll = aggressive positioning.
+    _call_vel = float(oi_flow.get("call_wall_oi_velocity") or 0.0)
+    _put_vel = float(oi_flow.get("put_wall_oi_velocity") or 0.0)
+    if _call_vel >= 3.0:  # fast call writing = resistance hardening, bearish
+        bearish_trend_score += 0.3
+    if _put_vel >= 3.0:   # fast put writing = support flooring, bullish
+        bullish_trend_score += 0.3
     metadata["bullish_trend_score"] = bullish_trend_score
     metadata["bearish_trend_score"] = bearish_trend_score
     metadata["trend_follow_ready_bullish"] = bullish_trend_score >= 3.5
@@ -1243,6 +1484,15 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             bullish_location_score += 0.35
         if spot < opening_range.low:
             bearish_location_score += 0.35
+    # VWAP band positioning: spot at or beyond the 1σ band signals overextension.
+    # Overextended to the upside → bearish location quality; to the downside → bullish.
+    # Also flows into confluence_score, so it influences the full entry decision chain.
+    _vwap_upper_1 = vwap_bands.get("upper_1")
+    _vwap_lower_1 = vwap_bands.get("lower_1")
+    if _vwap_upper_1 is not None and spot >= _vwap_upper_1:
+        bearish_location_score += 0.5  # overextended above 1σ band → fade zone
+    if _vwap_lower_1 is not None and spot <= _vwap_lower_1:
+        bullish_location_score += 0.5  # overextended below 1σ band → bounce zone
     metadata["bullish_location_score"] = round(bullish_location_score, 4)
     metadata["bearish_location_score"] = round(bearish_location_score, 4)
     bullish_confluence_score = (
@@ -1332,8 +1582,214 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         bearish_entry_score -= 0.50
     if resistance_ref is not None and (resistance_ref - spot) / max(spot, 1.0) <= 0.004:
         bearish_entry_score += 0.5
+    # Volume confirmation: a direction-aligned volume spike shows institutional conviction;
+    # thin volume on a candle pattern is a false signal and should be suppressed.
+    _vol_ratio = float(vol_spike.get("volume_ratio") or 1.0)
+    if _vol_ratio >= 1.2 and trend_15m == "TREND_UP":
+        bullish_entry_score += 0.4
+    if _vol_ratio >= 1.2 and trend_15m == "TREND_DOWN":
+        bearish_entry_score += 0.4
+    if _vol_ratio < 0.7:
+        bullish_entry_score -= 0.3   # thin volume = unreliable candle pattern
+        bearish_entry_score -= 0.3
+    # Expected-move consumed: if spot has already covered ≥70% of the ATM straddle price
+    # from the session open, premium has largely decayed and new entries face high risk.
+    if _expected_move_consumed and _expected_move_pts_val > 0:
+        bullish_entry_score -= 1.0
+        bearish_entry_score -= 1.0
+    # VWAP reclaim: dip below VWAP followed by reclaim with volume = strong bullish continuation.
+    # Only meaningful when VWAP is established (after 09:45).
+    _vwap_val = vwap or 0.0
+    _vwap_reclaim = compute_vwap_reclaim(bars_5m, _vwap_val)
+    if _vwap_reclaim["vwap_reclaim"]:
+        bullish_entry_score += 0.5
+        if float(_vwap_reclaim["vwap_reclaim_strength"]) >= 0.5:
+            bullish_entry_score += 0.2  # bonus for distance + volume conviction
+    # Momentum persistence: volume-weighted agreement of last 6 bars on direction.
+    # High persistence = institutional trend participation; low = chop.
+    _momentum = compute_momentum_persistence(bars_5m, n=6)
+    _bull_persist = float(_momentum["bullish_persistence"])
+    _bear_persist = float(_momentum["bearish_persistence"])
+    if _bull_persist >= 0.70 and trend_15m == "TREND_UP":
+        bullish_entry_score += 0.4
+    if _bear_persist >= 0.70 and trend_15m == "TREND_DOWN":
+        bearish_entry_score += 0.4
+    if _bull_persist <= 0.35 and _bear_persist <= 0.35:
+        bullish_entry_score -= 0.2  # genuinely choppy, neither direction has conviction
+        bearish_entry_score -= 0.2
+    # Session-phase score adjustment: entry quality varies predictably by time of day.
+    # OPEN (9:15-10:00): range-setting, wide spreads, wait for OR confirmation → raise bar.
+    # PRIME (10:00-13:30): best theta-decay window, trend established → no adjustment.
+    # LATE (13:30+): less time for theta to accrue, pre-close reversal risk → slight penalty.
+    _now_time = snapshot.timestamp.time()
+    if time(9, 15) <= _now_time < time(10, 0):
+        bullish_entry_score -= 0.5
+        bearish_entry_score -= 0.5
+        metadata["session_phase"] = "OPEN"
+    elif time(10, 0) <= _now_time < time(13, 30):
+        metadata["session_phase"] = "PRIME"
+    else:
+        bullish_entry_score -= 0.3
+        bearish_entry_score -= 0.3
+        metadata["session_phase"] = "LATE"
+    # Phase 6A: India VIX — fear/premium gauge.
+    # VIX > 22: gap risk, wide spreads → raise bar both sides.
+    # VIX 16-22: elevated premium, good theta capture → slight bonus.
+    # VIX < 12: crushed vol, premium barely covers slippage → raise bar.
+    _mkt_ctx = read_market_context()
+    _india_vix = float(_mkt_ctx.get("india_vix") or 0.0)
+    if _india_vix > 22:
+        bullish_entry_score -= 0.4
+        bearish_entry_score -= 0.4
+    elif _india_vix > 16:
+        bullish_entry_score += 0.2
+        bearish_entry_score += 0.2
+    elif 0 < _india_vix < 12:
+        bullish_entry_score -= 0.2
+        bearish_entry_score -= 0.2
+    metadata["india_vix"] = _india_vix
+
+    # Phase 6B: BankNifty divergence — if BankNifty and Nifty moving opposite, reduce conviction.
+    # Significant bank-sector divergence signals sector rotation that undercuts index trend reliability.
+    _bank_now = float(_mkt_ctx.get("banknifty_spot") or 0.0)
+    _bank_prev = float(_mkt_ctx.get("banknifty_spot_prev") or 0.0)
+    _nifty_prev = float(_mkt_ctx.get("nifty_spot_prev") or 0.0)
+    _bank_divergence = 0.0
+    if _bank_now > 0 and _bank_prev > 0 and _nifty_prev > 0:
+        _bank_chg = (_bank_now - _bank_prev) / _bank_prev * 100
+        _nifty_chg = (spot - _nifty_prev) / _nifty_prev * 100
+        if _bank_chg * _nifty_chg < 0 and abs(_bank_chg - _nifty_chg) > 0.5:
+            _bank_divergence = round(min(abs(_bank_chg - _nifty_chg), 2.0) * 0.2, 3)
+            if _bank_chg < 0 <= _nifty_chg:
+                bullish_entry_score -= _bank_divergence
+            elif _bank_chg > 0 >= _nifty_chg:
+                bearish_entry_score -= _bank_divergence
+    metadata["banknifty_divergence"] = _bank_divergence
+
+    # Phase 6C: Monthly expiry gate — last Thursday of month carries extreme gamma risk.
+    _today = snapshot.timestamp.date()
+    _month_weeks = calendar.monthcalendar(_today.year, _today.month)
+    _last_thu = max(w[calendar.THURSDAY] for w in _month_weeks if w[calendar.THURSDAY])
+    _days_to_monthly = _last_thu - _today.day
+    if _days_to_monthly == 0:
+        bullish_entry_score -= 0.8
+        bearish_entry_score -= 0.8
+    elif _days_to_monthly == 1:
+        bullish_entry_score -= 0.4
+        bearish_entry_score -= 0.4
+    metadata["days_to_monthly_expiry"] = _days_to_monthly
+
+    # Phase 8: ML win probability gate.
+    # Scores the current feature vector against a logistic regression trained EOD by the watchdog.
+    # Model absent or under 15 samples → returns 0.5 (neutral, no adjustment).
+    # Low P(win) < 0.42 → raise bar by 0.5 (below-chance setup, skip it).
+    # High P(win) > 0.68 → bonus 0.2 (ML confirms strong edge).
+    _ml_features = {
+        "ml_bearish_entry_score": bearish_entry_score,
+        "ml_bullish_entry_score": bullish_entry_score,
+        "ml_india_vix": _india_vix,
+        "ml_vwap_reclaim": bool(_vwap_reclaim["vwap_reclaim"]),
+        "ml_banknifty_divergence": _bank_divergence,
+        "ml_days_to_monthly_expiry": _days_to_monthly,
+        "ml_bullish_momentum": _bull_persist,
+        "ml_bearish_momentum": _bear_persist,
+        "ml_rv30_pct": rv30_pct,
+    }
+    _wp_bear = compute_win_probability(_ml_features, direction="BEARISH")
+    _wp_bull = compute_win_probability(_ml_features, direction="BULLISH")
+    if _wp_bear < 0.42:
+        bearish_entry_score -= 0.5
+    elif _wp_bear > 0.68:
+        bearish_entry_score += 0.2
+    if _wp_bull < 0.42:
+        bullish_entry_score -= 0.5
+    elif _wp_bull > 0.68:
+        bullish_entry_score += 0.2
+    metadata["win_probability_bearish"] = _wp_bear
+    metadata["win_probability_bullish"] = _wp_bull
+
+    # Phase 9: Order flow imbalance — LTP-vs-midpoint aggression for near-ATM options.
+    # Call buying (LTP near ask) is bullish demand; put buying is bearish demand.
+    # This is the real-time "smart money" tape signal within each 30-second snapshot.
+    _ofi = compute_order_flow_imbalance(snapshot.option_chain.quotes, spot)
+    if _ofi > 0.5:
+        bullish_entry_score += 0.5
+        bearish_entry_score -= 0.2
+    elif _ofi > 0.3:
+        bullish_entry_score += 0.3
+    elif _ofi < -0.5:
+        bearish_entry_score += 0.5
+        bullish_entry_score -= 0.2
+    elif _ofi < -0.3:
+        bearish_entry_score += 0.3
+    metadata["order_flow_imbalance"] = _ofi
+
+    # Phase 13: Gamma/pin risk — penalise entries when spot is near the max-OI strike.
+    # On expiry day (Tuesday), market makers delta-hedge aggressively near this strike,
+    # creating unpredictable whip.  Pre-expiry (Monday) gets a softer penalty.
+    _gamma = compute_gamma_concentration(snapshot.option_chain.quotes, spot)
+    _pin_pts = _gamma.get("spot_to_pin_pts")
+    _pin_risk_active = False
+    if _pin_pts is not None:
+        _weekday_pin = snapshot.timestamp.weekday()
+        _is_expiry_day_pin = (_weekday_pin == 1)   # Tuesday
+        _is_pre_expiry_pin = (_weekday_pin == 0)   # Monday
+        _abs_pin = abs(_pin_pts)
+        if _is_expiry_day_pin and _abs_pin < 30:
+            bullish_entry_score -= 0.5
+            bearish_entry_score -= 0.5
+            _pin_risk_active = True
+        elif _is_expiry_day_pin and _abs_pin < 60:
+            bullish_entry_score -= 0.3
+            bearish_entry_score -= 0.3
+            _pin_risk_active = True
+        elif _is_pre_expiry_pin and _abs_pin < 30:
+            bullish_entry_score -= 0.2
+            bearish_entry_score -= 0.2
+    metadata["max_gamma_strike"] = _gamma.get("max_gamma_strike")
+    metadata["gamma_concentration"] = _gamma.get("gamma_concentration")
+    metadata["spot_to_pin_pts"] = _pin_pts
+    metadata["pin_risk_active"] = _pin_risk_active
+
+    # Phase 12: Multi-session OI walls — 3-day accumulated CE/PE walls are institutional.
+    # A wall that persists across sessions carries more weight than a single-day build-up.
+    _ms_oi = compute_multi_session_oi_walls(spot)
+    _ms_call_wall = _ms_oi.get("multi_session_call_wall")
+    _ms_put_wall = _ms_oi.get("multi_session_put_wall")
+    if _ms_call_wall is not None and spot >= _ms_call_wall - 30:
+        # Approaching multi-session call wall from below → confirmed bearish resistance
+        bearish_entry_score += 0.4
+    if _ms_put_wall is not None and spot <= _ms_put_wall + 30:
+        # Holding above multi-session put wall → confirmed bullish support
+        bullish_entry_score += 0.4
+    metadata["multi_session_call_wall"] = _ms_call_wall
+    metadata["multi_session_put_wall"] = _ms_put_wall
+    metadata["multi_session_oi_days"] = _ms_oi.get("multi_session_days", 0)
+
+    # Phase 14: FII/DII institutional flow overlay — T-1 net buy/sell from NSE.
+    # FIIs are the dominant price-setters in Nifty; their direction from yesterday
+    # provides a credible next-session bias overlay.  Modest scoring — T-1 lag limits precision.
+    _fii = read_fii_bias()
+    _fii_bias = str(_fii.get("bias", ""))
+    if _fii_bias == "STRONG_BULLISH":
+        bullish_entry_score += 0.3
+        bearish_entry_score -= 0.2
+    elif _fii_bias == "BULLISH":
+        bullish_entry_score += 0.2
+    elif _fii_bias == "STRONG_BEARISH":
+        bearish_entry_score += 0.3
+        bullish_entry_score -= 0.2
+    elif _fii_bias == "BEARISH":
+        bearish_entry_score += 0.2
+    metadata["fii_bias"] = _fii_bias or "UNKNOWN"
+    metadata["fii_net_crores"] = float(_fii.get("fii_net_crores") or 0.0)
+
     metadata["bullish_entry_score"] = bullish_entry_score
     metadata["bearish_entry_score"] = bearish_entry_score
+    metadata["vwap_reclaim"] = bool(_vwap_reclaim["vwap_reclaim"])
+    metadata["vwap_reclaim_strength"] = float(_vwap_reclaim["vwap_reclaim_strength"])
+    metadata["bullish_momentum_persistence"] = _bull_persist
+    metadata["bearish_momentum_persistence"] = _bear_persist
     bullish_planner_alignment = (
         oi_flow["smart_money_bias"] == "BULLISH"
         or wall_migration["wall_migration_bias"] == "BULLISH"
@@ -1668,6 +2124,71 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                 f"historically yields ~18% win for bull-put spreads (need "
                 f"NEUTRAL or OVERHEAD_CALL_PRESSURE)."
             )
+    # ── Early structure intent (9:20–9:55 window) ──────────────────────────────
+    # Fires before trend_15m and execution_5m confirm, using EMA20 position,
+    # LH/LL market structure, candle quality, OR location, and chain pressure.
+    # Allows the agent to enter at the start of a move rather than after it.
+    EARLY_INTENT_START = time(9, 20)
+    EARLY_INTENT_END = time(9, 55)
+    _now_time = snapshot.timestamp.time()
+    _early_window = EARLY_INTENT_START <= _now_time <= EARLY_INTENT_END
+    early_structure_bearish_intent = False
+    early_structure_bullish_intent = False
+    if _early_window and execution_5m != "UP_CONFIRMED":
+        _ei_bear = early_structure_intent_bearish(
+            bars_5m=bars_5m,
+            ema20_5m=ema20_5m_value,
+            vwap=vwap,
+            opening_range_high=opening_range.high if opening_range else None,
+            opening_range_low=opening_range.low if opening_range else None,
+            bearish_chain_pressure=float(option_pressure.get("bearish_pressure") or 0.0),
+        )
+        if _ei_bear["triggered"]:
+            early_structure_bearish_intent = True
+            metadata["bearish_entry_ready"] = True
+            metadata["bearish_setup"] = "EARLY_STRUCTURE_INTENT"
+            metadata["playbook"] = "EARLY_STRUCTURE_BEARISH"
+            metadata["preferred_width_points"] = 75.0
+            metadata["allowed_width_points"] = (75.0, 100.0)
+            metadata["minimum_net_edge_rupees"] = 850.0
+            metadata["early_intent_strength"] = _ei_bear["strength"]
+            metadata["early_intent_signals"] = _ei_bear["signals"]
+            metadata["early_structure_bearish_intent"] = True
+            # Early structure enters before full score confirmation — lower threshold
+            metadata["bearish_trade_score_threshold"] = 3.0
+            reasons.append(
+                f"Early structure bearish intent detected (strength={_ei_bear['strength']:.2f}): "
+                f"EMA20 position, LH/LL structure, and chain pressure aligned in the "
+                f"opening window before trend labels confirmed."
+            )
+    if _early_window and execution_5m != "DOWN_CONFIRMED" and not early_structure_bearish_intent:
+        _ei_bull = early_structure_intent_bullish(
+            bars_5m=bars_5m,
+            ema20_5m=ema20_5m_value,
+            vwap=vwap,
+            opening_range_high=opening_range.high if opening_range else None,
+            opening_range_low=opening_range.low if opening_range else None,
+            bullish_chain_pressure=float(option_pressure.get("bullish_pressure") or 0.0),
+        )
+        if _ei_bull["triggered"]:
+            early_structure_bullish_intent = True
+            metadata["bullish_entry_ready"] = True
+            metadata["bullish_setup"] = "EARLY_STRUCTURE_INTENT"
+            metadata["playbook"] = "EARLY_STRUCTURE_BULLISH"
+            metadata["preferred_width_points"] = 75.0
+            metadata["allowed_width_points"] = (75.0, 100.0)
+            metadata["minimum_net_edge_rupees"] = 850.0
+            metadata["early_intent_strength"] = _ei_bull["strength"]
+            metadata["early_intent_signals"] = _ei_bull["signals"]
+            metadata["early_structure_bullish_intent"] = True
+            # Early structure enters before full score confirmation — lower threshold
+            metadata["bullish_trade_score_threshold"] = 3.0
+            reasons.append(
+                f"Early structure bullish intent detected (strength={_ei_bull['strength']:.2f}): "
+                f"EMA20 position, HL/HH structure, and chain pressure aligned in the "
+                f"opening window before trend labels confirmed."
+            )
+
     if bearish_entry_score >= 3.0 and (bearish_pullback or bearish_shallow) and (bearish_planner_alignment or bearish_entry_score >= 4.0):
         metadata["bearish_entry_ready"] = True
         metadata["bearish_setup"] = "PULLBACK_REJECTION" if bearish_pullback else "SHALLOW_CONTINUATION"
@@ -1726,18 +2247,12 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["is_post_expiry_day"] = _is_post_expiry_day
     metadata["weekly_series_day"] = _weekday
     # Post-expiry Wednesday: relax balance requirement — fresh series, clean slate, full premium
-    _range_balance_min = 3.0 if _is_post_expiry_day else 3.5
+    _range_balance_min = 3.0
     metadata["range_entry_ready"] = bool(
         execution_5m == "RANGE_CONFIRMED"
         and snapshot.timestamp.time() >= RANGE_GATE_TIME
         and range_balance_score >= _range_balance_min
         and abs(gap_pct) <= 0.15
-        and balanced_range_condor_setup(
-            bars_5m,
-            opening_range,
-            vwap,
-            rv30_pct=rv30_pct,
-        )
     )
     # Post-expiry Wednesday: more generous credit ratio — 7DTE options are premium-rich
     metadata["range_condor_credit_ratio"] = 0.13 if _is_post_expiry_day else 0.16
@@ -1788,21 +2303,33 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             and bool(metadata.get("bearish_entry_ready"))
             and oi_flow["smart_money_bias"] != "BULLISH"
         )
+        or (
+            # Early structure intent: EMA20 + LH/LL structure + chain pressure aligned
+            # in the opening window before trend_15m and execution_5m confirm.
+            # Lower score threshold because structural signals ARE the confirmation.
+            early_structure_bearish_intent
+            and execution_5m != "UP_CONFIRMED"
+            and bearish_trend_score >= 1.5
+        )
     ):
         regime = RegimeLabel.DOWN_TREND
         metadata["day_archetype"] = (
             "EARLY_BALANCE_TO_BEARISH"
             if metadata.get("playbook") == "EARLY_BALANCE_BEARISH_FAILED_RECLAIM"
             else (
-                "GAP_DOWN_CONTINUATION"
-                if gap_down_bearish_continuation_ready
+                "EARLY_STRUCTURE_BEARISH"
+                if early_structure_bearish_intent
                 else (
-                    "GAP_UP_FAILURE"
-                    if gap_up_bearish_failure_ready
+                    "GAP_DOWN_CONTINUATION"
+                    if gap_down_bearish_continuation_ready
                     else (
-                        "HIGH_CONFLUENCE_BEARISH"
-                        if high_confluence_bearish_ready
-                        else ("OPEN_DRIVE_BEARISH" if open_drive_bearish else ("SIDEWAYS_TO_BEARISH" if sideways_to_bearish else "TREND_BEARISH"))
+                        "GAP_UP_FAILURE"
+                        if gap_up_bearish_failure_ready
+                        else (
+                            "HIGH_CONFLUENCE_BEARISH"
+                            if high_confluence_bearish_ready
+                            else ("OPEN_DRIVE_BEARISH" if open_drive_bearish else ("SIDEWAYS_TO_BEARISH" if (sideways_to_bearish and metadata.get("bearish_setup") == "PULLBACK_REJECTION") else "TREND_BEARISH"))
+                        )
                     )
                 )
             )
@@ -1975,27 +2502,78 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                 or high_confluence_bullish_ready
             )
         )
+        or (
+            # Early structure intent: EMA20 + HL/HH structure + chain pressure aligned
+            # in the opening window before trend_15m and execution_5m confirm.
+            early_structure_bullish_intent
+            and execution_5m != "DOWN_CONFIRMED"
+            and bullish_trend_score >= 1.5
+        )
+        or (
+            # Score-driven bypass: mirrors the DOWN_TREND bypass at line 2184.
+            # Fires when execution confirmed UP and scores show directional
+            # consensus, WITHOUT requiring trend_15m flip or specific patterns.
+            # Sets its own entry_ready + playbook in the block below.
+            execution_5m == "UP_CONFIRMED"
+            and bullish_entry_score >= 2.5
+            and bullish_trend_score >= 3.0
+            and not (bearish_entry_score >= 3.0 and bearish_trend_score > bullish_trend_score)
+        )
     ):
         regime = RegimeLabel.UP_TREND
+        # Score bypass: no specific pattern matched but entry/trend scores show
+        # directional consensus. Set a first-class SCORE_DRIVEN_BULL playbook so
+        # no downstream gate blocks it with setup-mismatch or adaptive threshold.
+        if (
+            not metadata.get("bullish_entry_ready")
+            and execution_5m == "UP_CONFIRMED"
+            and bullish_entry_score >= 2.5
+            and bullish_trend_score >= 3.0
+        ):
+            metadata["bullish_entry_ready"] = True
+            metadata["bullish_setup"] = "SCORE_DRIVEN"
+            metadata["playbook"] = "SCORE_DRIVEN_BULL"
+            metadata.setdefault("preferred_width_points", 100.0)
+            metadata.setdefault("allowed_width_points", (100.0,))
+            metadata.setdefault("target_short_put_buffer_points", 30.0)
+            metadata.setdefault("minimum_net_edge_rupees", 900.0)
+            reasons.append(
+                f"Score-driven bullish entry: entry_score={bullish_entry_score:.1f}, "
+                f"trend_score={bullish_trend_score:.1f}, execution UP_CONFIRMED "
+                "— directional consensus without specific pattern requirement."
+            )
         metadata["day_archetype"] = (
-            "EARLY_BALANCE_TO_BULLISH"
-            if metadata.get("playbook") == "EARLY_BALANCE_BULLISH_RECLAIM"
+            "SCORE_DRIVEN_BULL"
+            if metadata.get("playbook") == "SCORE_DRIVEN_BULL"
             else (
-                "GAP_UP_CONTINUATION"
-                if gap_up_bullish_ready
+                "EARLY_BALANCE_TO_BULLISH"
+                if metadata.get("playbook") == "EARLY_BALANCE_BULLISH_RECLAIM"
                 else (
-                    "GAP_DOWN_RECOVERY"
-                    if gap_down_bullish_recovery_ready
+                    "EARLY_STRUCTURE_BULLISH"
+                    if early_structure_bullish_intent
                     else (
-                        "HIGH_CONFLUENCE_BULLISH"
-                        if high_confluence_bullish_ready
-                        else ("OPEN_DRIVE_BULLISH" if open_drive_bullish else ("SIDEWAYS_TO_BULLISH" if sideways_to_bullish else "TREND_BULLISH"))
+                        "GAP_UP_CONTINUATION"
+                        if gap_up_bullish_ready
+                        else (
+                            "GAP_DOWN_RECOVERY"
+                            if gap_down_bullish_recovery_ready
+                            else (
+                                "HIGH_CONFLUENCE_BULLISH"
+                                if high_confluence_bullish_ready
+                                else ("OPEN_DRIVE_BULLISH" if open_drive_bullish else ("SIDEWAYS_TO_BULLISH" if sideways_to_bullish else "TREND_BULLISH"))
+                            )
+                        )
                     )
                 )
             )
         )
         confidence += 0.15
-        if metadata["playbook"] == "GAP_UP_BULLISH_CONTINUATION":
+        if metadata["playbook"] == "SCORE_DRIVEN_BULL":
+            confidence += 0.08
+            reasons.append(
+                "Score-driven bullish routing confirmed: entry and trend scores show directional consensus without requiring a specific candle pattern."
+            )
+        elif metadata["playbook"] == "GAP_UP_BULLISH_CONTINUATION":
             confidence += 0.12
             reasons.append("Gap-up continuation playbook confirmed: the gap held above VWAP / OR-high support, pullback demand stayed firm, and smart-money flow remained supportive.")
         elif metadata["playbook"] == "GAP_DOWN_BULLISH_RECOVERY":
@@ -2063,6 +2641,45 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             reasons.append("Range playbook confirmed: price is balanced around VWAP, opening range is intact, and option-chain pressure is neutral.")
         else:
             metadata["playbook"] = "RANGE_NO_TRADE"
+    elif (
+        # OI-wall condor: spot sandwiched between major institutional OI walls, no confirmed
+        # directional trend. Uses accumulated OI positioning rather than price-action RANGE_CONFIRMED.
+        # Fires only when execution_5m is ambiguous (UNCONFIRMED) — not during confirmed trends.
+        float(metadata.get("multi_session_call_wall") or 0) > 0
+        and float(metadata.get("multi_session_put_wall") or 0) > 0
+        and (
+            float(metadata.get("multi_session_call_wall") or 0)
+            - float(metadata.get("multi_session_put_wall") or 0)
+        ) >= 75.0
+        and (float(metadata.get("multi_session_call_wall") or 0) - spot) >= 40.0
+        and (spot - float(metadata.get("multi_session_put_wall") or 0)) >= 40.0
+        and abs(float(metadata.get("order_flow_imbalance") or 0.0)) < 0.45
+        and float(metadata.get("range_balance_score") or 0.0) >= 2.0
+        and float(metadata.get("atm_straddle_price") or 0.0) >= 80.0
+        and not bool(metadata.get("pin_risk_active"))
+        and metadata.get("session_phase") == "PRIME"
+        and snapshot.timestamp.time() >= RANGE_GATE_TIME
+        and not _is_expiry_day
+    ):
+        _oi_call_wall = float(metadata.get("multi_session_call_wall"))
+        _oi_put_wall = float(metadata.get("multi_session_put_wall"))
+        _wall_spread = _oi_call_wall - _oi_put_wall
+        regime = RegimeLabel.RANGE
+        confidence += 0.12
+        metadata["day_archetype"] = "OI_WALL_BOUNDED_RANGE"
+        metadata["playbook"] = "OI_WALL_CONDOR"
+        metadata["range_entry_ready"] = True
+        metadata["condor_short_call_anchor"] = _oi_call_wall + 25.0
+        metadata["condor_short_put_anchor"] = _oi_put_wall - 25.0
+        metadata["condor_wall_spread"] = _wall_spread
+        metadata["preferred_width_points"] = 75.0
+        metadata["allowed_width_points"] = (75.0, 100.0)
+        metadata["minimum_net_edge_rupees"] = 700.0
+        reasons.append(
+            f"OI wall sandwich: call wall {_oi_call_wall:.0f}, put wall {_oi_put_wall:.0f}; "
+            f"spot ({spot:.0f}) is {(spot - _oi_put_wall):.0f}/{(_oi_call_wall - spot):.0f} pts "
+            "from put/call walls. Institutional OI bounds define a tradeable range — OI-anchored condor."
+        )
     else:
         reasons.append("Multi-timeframe regime remains unclear; defaulting to NO TRADE.")
         if any("event risk" in reason.lower() for reason in reasons):
@@ -2074,7 +2691,28 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     avg_chain_iv = _average_chain_iv(snapshot)
     range_compression_score = max(0.0, min(2.0, (params.rv_mid_cutoff - rv30_pct) / max(params.rv_mid_cutoff, 0.05))) if rv30_pct <= params.rv_mid_cutoff else 0.0
     metadata["avg_chain_iv"] = round(avg_chain_iv, 4) if avg_chain_iv is not None else None
+    _atm_iv = _atm_chain_iv(snapshot)
+    metadata["atm_chain_iv"] = round(_atm_iv, 4) if _atm_iv is not None else None
     metadata["range_compression_score"] = round(range_compression_score, 4)
+
+    # Dealer gamma exposure (advisory) — pin vs trend regime, for GEX validation.
+    try:
+        _gex = _compute_chain_gex(snapshot)
+        metadata["gex_regime"] = _gex.regime
+        metadata["gex_net"] = _gex.net_gex
+        metadata["gex_flip_strike"] = _gex.flip_strike
+        metadata["gex_dist_to_flip_pct"] = _gex.distance_to_flip_pct
+    except Exception:
+        metadata["gex_regime"] = None
+
+    # Yesterday's character from the daily-study loop (advisory context, not a gate) —
+    # closes the write-only silo: the premium-crush lesson now reaches each decision.
+    try:
+        _pdc = _load_prev_day_context_cached(snapshot.timestamp.date().isoformat())
+        for _k, _v in _pdc.items():
+            metadata[_k] = _v
+    except Exception:
+        pass
 
     bullish_shadow_subtype = _bullish_shadow_subtype(
         playbook=str(metadata.get("playbook") or "NO_TRADE"),
@@ -2171,6 +2809,24 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             metadata["preferred_width_points"] = 100.0
             metadata["allowed_width_points"] = (100.0,)
             metadata["minimum_net_edge_rupees"] = 1050.0
+
+    # IV-aware width upgrade for bearish trending days.
+    # High IV means options are expensive — a wider spread captures more premium
+    # for the same structure. Only fires when a bearish trade is live and IV ≥ 22%.
+    # Does not downgrade any width already set to 150pt by a specific subtype.
+    _HIGH_IV_WIDTH_THRESHOLD = 22.0
+    _is_bearish_trending = (
+        metadata.get("bearish_entry_ready")
+        and regime == RegimeLabel.DOWN_TREND
+    )
+    if _is_bearish_trending and avg_chain_iv is not None and avg_chain_iv >= _HIGH_IV_WIDTH_THRESHOLD:
+        _current_pref = float(metadata.get("preferred_width_points") or 0.0)
+        if _current_pref < 150.0:
+            metadata["preferred_width_points"] = 150.0
+            _current_allowed = tuple(metadata.get("allowed_width_points") or (100.0,))
+            if 150.0 not in _current_allowed:
+                metadata["allowed_width_points"] = _current_allowed + (150.0,)
+            metadata["high_iv_width_upgrade"] = True
 
     path_quality = _recent_path_quality(bars_5m)
     metadata.update(path_quality)
@@ -2354,8 +3010,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     if or_breakout_bullish_ready:
         regime = RegimeLabel.UP_TREND
         metadata["bullish_entry_ready"] = True
-        metadata["bullish_setup"] = "OR_BREAKOUT"
-        metadata["playbook"] = "EARLY_BALANCE_BULLISH_RECLAIM"
+        metadata["bullish_setup"] = "SCORE_DRIVEN"
+        metadata["playbook"] = "SCORE_DRIVEN_BULL"
         metadata["day_archetype"] = "OR_BREAKOUT_BULLISH"
         metadata["preferred_width_points"] = 100.0
         metadata["allowed_width_points"] = (100.0,)
@@ -2365,11 +3021,27 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             "OR breakout bullish: price cleared opening range high with bullish bias, "
             "spot above VWAP, trend and support scores confirmed."
         )
+        # OR_BREAKOUT fires after the main UP_TREND routing block (because
+        # opening_range_break_state is computed at line ~2706). It misses the
+        # confidence bonuses from that block. Add them here explicitly so the
+        # 0.65 confidence gate in strategy.py can be cleared.
+        confidence += 0.15  # UP_TREND routing bonus
+        confidence += 0.08  # SCORE_DRIVEN_BULL path bonus
+        if metadata.get("trend_follow_ready_bullish"):
+            confidence += 0.10
+            reasons.append("Bullish trend-follow confirmed on the OR breakout path: continuation into primary trend.")
+        if oi_flow["smart_money_bias"] == "BULLISH":
+            confidence += 0.05
+            reasons.append(f"Smart money flow supports the OR breakout: put support building near {oi_flow['put_support_strike']}.")
+        if bullish_planner_alignment:
+            confidence += 0.04
+        if bullish_support_quality >= 3.5:
+            confidence += 0.04
 
     if snapshot.timestamp.time() >= time(14, 0):
         confidence = max(0.0, confidence - 0.05)
 
-    if metadata.get("playbook") == "RANGE_BALANCED_CONDOR":
+    if metadata.get("playbook") in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR"}:
         if avg_chain_iv is not None and avg_chain_iv >= 22.0 and range_compression_score >= 0.75:
             metadata["condor_profile"] = "COMPRESSED_HIGH_IV"
             metadata["condor_short_delta_band_bias"] = "10_16"
@@ -2499,6 +3171,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         for level in [
             resistance_ref,
             option_context.get("nearest_call_wall"),
+            daily_tf.get("daily_swing_resistance"),  # nearest monthly pivot high above spot
+            daily_tf.get("weekly_high"),              # max of last 5 completed trading days
         ]
         if isinstance(level, (int, float))
     ]
@@ -2507,6 +3181,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         for level in [
             support_ref,
             option_context.get("nearest_put_wall"),
+            daily_tf.get("daily_swing_support"),  # nearest monthly pivot low below spot
+            daily_tf.get("weekly_low"),            # min of last 5 completed trading days
         ]
         if isinstance(level, (int, float))
     ]
@@ -2516,9 +3192,107 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     distance_to_support = max((spot - nearest_support_level), 0.0) if nearest_support_level is not None else 999.0
     metadata["distance_to_resistance"] = round(distance_to_resistance, 2)
     metadata["distance_to_support"] = round(distance_to_support, 2)
-    metadata["open_space_up"] = round(min(distance_to_resistance, float(option_context.get("distance_to_call_wall") or distance_to_resistance)), 2)
-    metadata["open_space_down"] = round(min(distance_to_support, float(option_context.get("distance_to_put_wall") or distance_to_support)), 2)
+    # open_space uses structural levels only (≥30 pts away) so intraday micro-highs
+    # (just 5-15 pts above spot in an uptrend) don't mask the real HTF resistance wall.
+    _MICRO_RESISTANCE_THRESHOLD = 30.0
+    structural_resistance = [l for l in resistance_candidates if float(l) - spot >= _MICRO_RESISTANCE_THRESHOLD]
+    structural_support = [l for l in support_candidates if spot - float(l) >= _MICRO_RESISTANCE_THRESHOLD]
+    structural_nearest_res = min((float(l) for l in structural_resistance if float(l) > spot), default=nearest_resistance_level)
+    structural_nearest_sup = max((float(l) for l in structural_support if float(l) < spot), default=nearest_support_level)
+    structural_dist_up = max((structural_nearest_res - spot), 0.0) if structural_nearest_res is not None else 999.0
+    structural_dist_dn = max((spot - structural_nearest_sup), 0.0) if structural_nearest_sup is not None else 999.0
+    metadata["open_space_up"] = round(min(structural_dist_up, float(option_context.get("distance_to_call_wall") or structural_dist_up)), 2)
+    metadata["open_space_down"] = round(min(structural_dist_dn, float(option_context.get("distance_to_put_wall") or structural_dist_dn)), 2)
     metadata["inside_balance_zone"] = bool(metadata["inside_opening_range"] and abs(float(metadata.get("price_vs_vwap") or 0.0)) <= 20.0)
+
+    # HTF cap: when price is close to a daily/weekly resistance wall and the session
+    # is not in a confirmed uptrend, the correct play is range (theta), not direction.
+    # A bullish spread needs 120+ pts of clear upside; less than that means we're
+    # trading INTO resistance — a losing edge. Pivot to RANGE/CONDOR instead.
+    htf_resistance_cap = bool(
+        (regime in {RegimeLabel.UP_TREND, RegimeLabel.NO_TRADE}
+         or (regime == RegimeLabel.RANGE and metadata.get("playbook") == "RANGE_NO_TRADE"))
+        and float(metadata["open_space_up"]) < 90.0
+        and float(metadata["open_space_down"]) > 40.0      # floor below for condor safety
+        and trend_15m != "TREND_UP"                        # not a confirmed daily trend day
+        and market_state in {"DIRECTIONAL_BALANCE", "TRANSITION", "TRUE_RANGE"}
+        and _atm_straddle_pts >= 60.0  # enough premium
+        and metadata.get("session_phase") in {"PRIME", "MIDDAY"}
+        and snapshot.timestamp.time() >= time(10, 0)
+        and not bool(metadata.get("pin_risk_active"))
+    )
+    metadata["htf_resistance_cap"] = htf_resistance_cap
+    if htf_resistance_cap:
+        regime = RegimeLabel.RANGE
+        metadata["range_entry_ready"] = True
+        metadata["playbook"] = "RANGE_BALANCED_CONDOR"
+        metadata["day_archetype"] = "HTF_CAP_RANGE"
+        # Anchor the condor strikes to the detected resistance/support walls
+        htf_short_call = round((nearest_resistance_level - 25.0) / 50.0) * 50.0 if nearest_resistance_level else spot + 75.0
+        htf_short_put = round((nearest_support_level + 25.0) / 50.0) * 50.0 if nearest_support_level else spot - 75.0
+        metadata.setdefault("condor_short_call_anchor", htf_short_call)
+        metadata.setdefault("condor_short_put_anchor", htf_short_put)
+        _res_lvl_str = f"{nearest_resistance_level:.0f}" if nearest_resistance_level is not None else "n/a"
+        reasons.append(
+            f"HTF resistance cap: open_space_up={float(metadata['open_space_up']):.0f}pts "
+            f"(daily/weekly resistance at {_res_lvl_str}), "
+            f"trend_15m=NEUTRAL — deploying range CONDOR instead of directional spread."
+        )
+        confidence = max(confidence, 0.60)
+
+    # ── Day Thesis Engine ────────────────────────────────────────────────────
+    # Forms ONE clear market view per session (10:00-10:45 AM).
+    # A professional trader reads the market once, then trades from that view.
+    # The thesis anchors regime routing — if it says RANGE_PREMIUM when the
+    # scoring path classified UP_TREND, override to RANGE.
+    # _atm_straddle_pts computed once near the top (correct "atm_straddle_price" key).
+    _oi_flow_smbias = oi_flow.get("smart_money_bias", "NEUTRAL") if isinstance(oi_flow, dict) else "NEUTRAL"
+    day_thesis = get_or_form_day_thesis(
+        spot=spot,
+        trend_15m=trend_15m,
+        execution_5m=execution_5m,
+        daily_tf=daily_tf,
+        option_context=option_context,
+        atm_straddle_pts=_atm_straddle_pts,
+        premarket_bias=str(metadata.get("premarket_bias") or "NEUTRAL"),
+        smart_money_bias=_oi_flow_smbias,
+        open_space_up=float(metadata["open_space_up"]),
+        open_space_down=float(metadata["open_space_down"]),
+        now=snapshot.timestamp,
+    )
+    metadata["day_thesis_type"] = day_thesis.get("day_type", "UNFORMED")
+    metadata["day_thesis_conviction"] = day_thesis.get("conviction", 0.0)
+    metadata["day_thesis_preferred_strategy"] = day_thesis.get("preferred_strategy", "")
+    metadata["day_thesis_reasoning"] = day_thesis.get("reasoning", "")
+    metadata["day_thesis_invalidated"] = day_thesis.get("invalidated", False)
+
+    # Thesis-driven routing override:
+    # If the thesis says RANGE_PREMIUM (price near HTF wall, IV elevated) but
+    # the scoring path landed on UP_TREND without htf_resistance_cap, pivot to RANGE.
+    # Conviction threshold: 0.65 — thesis must be convincing before overriding scoring.
+    _thesis_type = day_thesis.get("day_type", "UNFORMED")
+    _thesis_conv = float(day_thesis.get("conviction", 0.0))
+    _thesis_valid = not bool(day_thesis.get("invalidated", False))
+    if (
+        _thesis_type == "RANGE_PREMIUM"
+        and _thesis_valid
+        and _thesis_conv >= 0.65
+        and regime in {RegimeLabel.UP_TREND, RegimeLabel.NO_TRADE}
+        and not metadata.get("htf_resistance_cap")
+        and metadata.get("session_phase") in {"PRIME", "MIDDAY"}
+        and snapshot.timestamp.time() >= time(10, 0)
+        and not bool(metadata.get("pin_risk_active"))
+        and _atm_straddle_pts >= 60.0
+    ):
+        regime = RegimeLabel.RANGE
+        metadata["range_entry_ready"] = True
+        metadata["playbook"] = "RANGE_BALANCED_CONDOR"
+        metadata["day_archetype"] = "THESIS_RANGE"
+        reasons.append(
+            f"Day thesis RANGE_PREMIUM (conviction={_thesis_conv:.2f}): "
+            f"{day_thesis.get('reasoning', '')} — routing to range strategy."
+        )
+        confidence = max(confidence, 0.60)
 
     failed_breakout = bool(
         opening_range_break_state == "FAILED_UP"
@@ -3042,7 +3816,11 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["trade_score_margin_bearish"] = round(effective_bearish_margin, 4)
     metadata["trade_score_margin_bullish"] = round(effective_bullish_margin, 4)
     metadata["bearish_trade_score_threshold"] = round(effective_bearish_threshold, 4)
-    metadata["bullish_trade_score_threshold"] = round(effective_bullish_threshold, 4)
+    # Preserve early-structure overrides — they set a lower threshold before full confirmation
+    if not metadata.get("early_structure_bullish_intent"):
+        metadata["bullish_trade_score_threshold"] = round(effective_bullish_threshold, 4)
+    if not metadata.get("early_structure_bearish_intent"):
+        metadata["bearish_trade_score_threshold"] = round(effective_bearish_threshold, 4)
     metadata["state_confidence"] = state_confidence_score
     if tradability_class == "TRADABLE":
         reasons.append(tradability_reason)

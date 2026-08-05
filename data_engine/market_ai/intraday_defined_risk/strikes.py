@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from math import inf
 
@@ -43,6 +44,41 @@ def select_structure(
     return structure, reasons
 
 
+def _vertical_with_anchor_fallback(
+    *, strategy, snapshot, regime_state, option_type, short_delta_band, long_delta_band,
+    params, setup_quality, playbook_tier, anchor_kw: str, anchor_val,
+):
+    """Select a credit vertical (bull-put / bear-call), and if the OI-wall/support ANCHOR leaves no
+    delta-valid strike, retry WITHOUT the anchor so the delta band picks the strike.
+
+    Why this exists (2026-07-31): on an up-trend the support anchor capped the short put ~400pts OTM
+    (delta 0.08, ~4% credit), while the 0.18-0.30 delta band wants ~ATM-100..ATM-200 (delta 0.19-0.30,
+    ~14-18% credit — a proper sell strike). The anchor and the band were mutually exclusive, so 294/294
+    bull-puts were rejected and the agent could not sell puts on the exact up-days it wanted to.
+
+    The fallback does NOT loosen risk: the delta band still caps the short at 0.30 (~ATM-100), a
+    standard OTM credit strike. It only stops the anchor from vetoing the band's own legitimate strikes.
+    The anchor is still PREFERRED — we fall back only when it would otherwise build nothing.
+    """
+    common = dict(
+        strategy=strategy, snapshot=snapshot, regime_state=regime_state, option_type=option_type,
+        short_delta_band=short_delta_band, long_delta_band=long_delta_band, params=params,
+        setup_quality_score=setup_quality, playbook_tier=playbook_tier,
+        allow_distance_fallback_when_deltas_present=False,
+    )
+    structure, reasons, report = _evaluate_vertical_candidates(**common, **{anchor_kw: anchor_val})
+    if structure is not None or anchor_val is None:
+        return structure, reasons, report
+    # Anchored pass built nothing and an anchor was set — let the delta band pick the strike.
+    s2, r2, rep2 = _evaluate_vertical_candidates(**common, **{anchor_kw: None})
+    if s2 is not None:
+        rep2["anchor_relaxed"] = True
+        note = ("Support/OI anchor relaxed: no delta-valid strike on the anchored side; sold the "
+                "delta-band strike (<=0.30, ~ATM-100) instead of standing aside.")
+        return s2, [*r2, note], rep2
+    return structure, reasons, report   # neither worked — keep the original (anchored) report
+
+
 def select_best_structure(
     strategy: StrategyType,
     snapshot: MarketSnapshot,
@@ -58,25 +94,37 @@ def select_best_structure(
         if setup_quality_score is not None
         else regime_state.metadata.get("setup_quality_score") or 0.0
     )
+    is_expiry_day = bool(regime_state.metadata.get("is_expiry_day"))
+    if strategy in (StrategyType.CALL_DEBIT_SPREAD, StrategyType.PUT_DEBIT_SPREAD):
+        return _select_debit_spread(
+            strategy, snapshot, regime_state, params,
+            setup_quality_score=setup_quality, playbook_tier=playbook_tier,
+        )
     if strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD:
-        return _evaluate_vertical_candidates(
-            strategy=strategy,
-            snapshot=snapshot,
-            regime_state=regime_state,
-            option_type=OptionType.CALL,
-            short_delta_band=(0.18, 0.38),
-            long_delta_band=(0.05, 0.22),
-            params=params,
-            setup_quality_score=setup_quality,
-            playbook_tier=playbook_tier,
-            allow_distance_fallback_when_deltas_present=False,
-            min_short_strike=regime_state.metadata.get("min_short_call_strike"),
+        # Tighter delta band on expiry day — gamma spikes make 0.18-0.25 deltas dangerous
+        if is_expiry_day:
+            bc_short_band = (0.08, 0.15)
+            bc_long_band = (0.03, 0.08)
+        else:
+            # Upper bound 0.30 (was 0.25): when the OI-wall/anchor floor pushes the
+            # short strike toward a still-0.26-0.30-delta level, a 0.25 cap rejected
+            # every candidate with DELTA_TOO_HIGH and built no spread. 0.30 short is
+            # still a defensible OTM credit-spread strike for a directional bear view.
+            bc_short_band = (0.18, 0.30)
+            bc_long_band = (0.05, 0.15)
+        return _vertical_with_anchor_fallback(
+            strategy=strategy, snapshot=snapshot, regime_state=regime_state,
+            option_type=OptionType.CALL, short_delta_band=bc_short_band, long_delta_band=bc_long_band,
+            params=params, setup_quality=setup_quality, playbook_tier=playbook_tier,
+            anchor_kw="min_short_strike", anchor_val=regime_state.metadata.get("min_short_call_strike"),
         )
     if strategy == StrategyType.BULL_PUT_CREDIT_SPREAD:
         playbook = regime_state.metadata.get("playbook")
-        short_delta_band = (0.18, 0.25)
-        long_delta_band = (0.05, 0.10)
-        if (
+        # Tighter delta band on expiry day — gamma spikes make 0.18-0.25 deltas dangerous
+        if is_expiry_day:
+            short_delta_band = (0.08, 0.15)
+            long_delta_band = (0.03, 0.08)
+        elif (
             playbook == "SIDEWAYS_TO_BULLISH_RECLAIM"
             and regime_state.metadata.get("bullish_setup") == "VWAP_HOLD_HIGHER_LOW"
             and bool(regime_state.metadata.get("early_sideways_bullish_ready"))
@@ -84,17 +132,19 @@ def select_best_structure(
         ):
             short_delta_band = (0.10, 0.25)
             long_delta_band = (0.0, 0.10)
-        return _evaluate_vertical_candidates(
-            strategy=strategy,
-            snapshot=snapshot,
-            regime_state=regime_state,
-            option_type=OptionType.PUT,
-            short_delta_band=short_delta_band,
-            long_delta_band=long_delta_band,
-            params=params,
-            setup_quality_score=setup_quality,
-            playbook_tier=playbook_tier,
-            max_short_strike=regime_state.metadata.get("max_short_put_strike"),
+        else:
+            # Upper bound 0.30 (was 0.25) — mirrors the bear-call fix above. On BREAKOUT_UP
+            # the OI-wall/anchor floor pushes the short put toward a 0.26-0.30-delta strike, so
+            # a 0.25 cap rejected EVERY candidate with DELTA_TOO_HIGH and built nothing (live
+            # 2026-07-15: 996 BREAKOUT_UP decisions, 0 bull-puts built — a Δ0.29 short was
+            # buildable and would have been +Rs1,393/lot). 0.30 is a defensible OTM credit strike.
+            short_delta_band = (0.18, 0.30)
+            long_delta_band = (0.05, 0.15)
+        return _vertical_with_anchor_fallback(
+            strategy=strategy, snapshot=snapshot, regime_state=regime_state,
+            option_type=OptionType.PUT, short_delta_band=short_delta_band, long_delta_band=long_delta_band,
+            params=params, setup_quality=setup_quality, playbook_tier=playbook_tier,
+            anchor_kw="max_short_strike", anchor_val=regime_state.metadata.get("max_short_put_strike"),
         )
     if strategy == StrategyType.IRON_CONDOR:
         return _select_condor_candidates(
@@ -104,8 +154,24 @@ def select_best_structure(
             setup_quality_score=setup_quality,
             playbook_tier=playbook_tier,
         )
+    if strategy == StrategyType.IRON_FLY:
+        return _select_iron_fly_candidates(
+            snapshot=snapshot,
+            regime_state=regime_state,
+            params=params,
+            setup_quality_score=setup_quality,
+            playbook_tier=playbook_tier,
+        )
     if strategy == StrategyType.SHORT_STRANGLE:
         return _select_strangle_candidates(
+            snapshot=snapshot,
+            regime_state=regime_state,
+            params=params,
+            setup_quality_score=setup_quality,
+            playbook_tier=playbook_tier,
+        )
+    if strategy == StrategyType.SHORT_STRADDLE:
+        return _select_straddle_candidates(
             snapshot=snapshot,
             regime_state=regime_state,
             params=params,
@@ -158,6 +224,16 @@ def _effective_directional_credit_ratio(
 ) -> float:
     playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
     base_ratio = params.directional_credit_width_ratio
+    # Research override: the 0.26 credit-ratio floor rejects ~99.9% of bull-puts on up-days
+    # (OTM puts too cheap to hit 26% of width). A put SELLER legitimately runs ~10-15% credit
+    # at high win-rate. Env-gated so we can test whether unblocking put-selling actually pays.
+    import os as _os
+    _ov = _os.environ.get("SEL_CREDIT_RATIO_OVERRIDE")
+    if _ov:
+        try:
+            return float(_ov)
+        except ValueError:
+            pass
     if (
         playbook in {"SIDEWAYS_TO_BULLISH_RECLAIM", "SIDEWAYS_TO_BEARISH_REJECTION", "GAP_DOWN_BEARISH_CONTINUATION", "GAP_UP_BEARISH_FAILURE"}
         and setup_quality_score >= params.strong_setup_quality_threshold
@@ -274,6 +350,138 @@ def _score_candidate(
     return round(score, 4)
 
 
+def _select_debit_spread(
+    strategy: StrategyType,
+    snapshot: MarketSnapshot,
+    regime_state: RegimeState,
+    params: AdaptiveParameters,
+    *,
+    setup_quality_score: float,
+    playbook_tier: str,
+) -> tuple[TradeStructure | None, list[str], dict[str, object]]:
+    """Directional debit spread: BUY near-ATM (~0.45 delta), SELL further-OTM
+    (~0.25 delta), same option type. Net DEBIT paid = max loss; max profit =
+    width - debit. Positive skew (small capped loss, larger win) for trend days
+    where selling premium has poor risk/reward. credit_points is stored NEGATIVE
+    to signal a debit to the downstream engine."""
+    option_type = OptionType.CALL if strategy == StrategyType.CALL_DEBIT_SPREAD else OptionType.PUT
+    spot = snapshot.option_chain.spot
+    quotes = _liquid_otm_quotes(snapshot.option_chain.quotes, option_type=option_type, spot=spot)
+    report: dict[str, object] = {
+        "strategy": strategy.value,
+        "setup_quality_score": round(setup_quality_score, 4),
+        "passed_spread_construction": False,
+        "passed_delta_band": False,
+        "passed_liquidity": bool(quotes),
+        "canonical_rejection_reason": "LIQUIDITY_BAD",
+        "candidate_evaluations": [],
+        "best_candidate": None,
+    }
+    if len(quotes) < 2:
+        return None, ["Debit spread: fewer than 2 liquid quotes."], report
+
+    long_band = (0.40, 0.55)    # near-ATM long leg (the directional engine)
+    short_band = (0.20, 0.32)   # further-OTM short leg (finances the long, caps profit)
+    widths = regime_state.metadata.get("allowed_width_points") or (100.0, 150.0)
+    widths = {float(w) for w in widths}
+    # On expiry / low-IV days the delta-appropriate strikes cluster ~50pt apart, so a rigid
+    # 100/150 width made the debit UN-buildable (blocked our edge on all 17 down-trend cycles
+    # on 2026-07-14 expiry). Allowing a 50pt width is VALIDATED on the ordering-robust harness:
+    # median 82,662 -> 108,284 (+25.6k) and worst-case 56,462 -> 64,920 (+8.5k), all orderings up.
+    widths.add(50.0)
+    # On high-IV big-down days the skew flattens the delta curve, so the short-band strike
+    # (delta 0.20-0.32) sits >150pt from the long-band strike and NO width in {50,100,150} can
+    # span the gap -> NO_DEBIT_STRUCTURE on exactly the days we most want (e.g. 2026-03-11 -1.58%
+    # was skipped entirely). Allowing a 200pt width is VALIDATED on the ordering-robust harness
+    # (10 grids, dense 7mo, condor off): median 109,529 -> 141,523 (+32k), worst-case 66,135 ->
+    # 91,368 (+25k), EVERY grid up +20-43k, PF up on all. Gain = 22 newly-unblocked genuine
+    # down-day setups (45% win, +38k net); existing trades ~unchanged (200 only wins when the
+    # bands are >150pt apart — i.e. only on the high-IV days it's meant for). See
+    # [[project_ordering_robustness]].
+    widths.add(200.0)
+    # Env hook for probing still-wider widths (e.g. "250") in research; unset in production.
+    _extra_widths = os.environ.get("SEL_DEBIT_EXTRA_WIDTHS")
+    if _extra_widths:
+        for _w in _extra_widths.split(","):
+            try:
+                widths.add(float(_w))
+            except ValueError:
+                pass
+
+    best = None
+    best_score = -inf
+    for long_q in quotes:
+        if long_q.delta is None or long_q.mid_price is None:
+            continue
+        if not (long_band[0] <= abs(long_q.delta) <= long_band[1]):
+            continue
+        for short_q in quotes:
+            if short_q.delta is None or short_q.mid_price is None:
+                continue
+            if not (short_band[0] <= abs(short_q.delta) <= short_band[1]):
+                continue
+            # Long is the closer-to-money strike; short is further OTM.
+            if option_type == OptionType.CALL and short_q.strike <= long_q.strike:
+                continue
+            if option_type == OptionType.PUT and short_q.strike >= long_q.strike:
+                continue
+            width = abs(short_q.strike - long_q.strike)
+            if width not in widths:
+                continue
+            debit = long_q.mid_price - short_q.mid_price
+            if debit <= 0:
+                continue                       # must be a net debit
+            if debit >= width * 0.70:
+                continue                       # poor R:R — paying too much of the width
+            max_profit = width - debit
+            rr = max_profit / debit
+            score = rr - long_q.spread_ratio - short_q.spread_ratio
+            if score > best_score:
+                best_score = score
+                best = (long_q, short_q, width, debit, max_profit, rr)
+
+    if best is None:
+        report["canonical_rejection_reason"] = "NO_DEBIT_STRUCTURE"
+        return None, ["Debit spread: no long/short pair met delta/width/RR rules."], report
+
+    long_q, short_q, width, debit, max_profit, rr = best
+    legs = [
+        StrategyLeg(action="BUY", option_type=option_type, strike=long_q.strike, quote=long_q),
+        StrategyLeg(action="SELL", option_type=option_type, strike=short_q.strike, quote=short_q),
+    ]
+    structure = TradeStructure(
+        strategy=strategy,
+        legs=legs,
+        credit_points=-round(debit, 4),  # NEGATIVE = debit paid
+        width_points=round(width, 2),
+        margin_estimate_per_lot=round(debit * snapshot.lot_size, 2),  # debit paid = max loss = margin
+        rationale=[
+            f"Directional {option_type.value} debit: buy {long_q.strike:.0f} (~{abs(long_q.delta):.2f}d) / "
+            f"sell {short_q.strike:.0f} (~{abs(short_q.delta):.2f}d).",
+            f"Debit {debit:.1f}pts, width {width:.0f}, max profit {max_profit:.1f}pts, R:R {rr:.2f}.",
+        ],
+        metadata={
+            "debit_points": round(debit, 4),
+            "max_profit_points": round(max_profit, 4),
+            "risk_reward": round(rr, 2),
+            "structure_credit_points": -round(debit, 4),
+            "is_debit": True,
+        },
+    )
+    report.update({
+        "passed_spread_construction": True,
+        "passed_delta_band": True,
+        "passed_credit_width": True,
+        "passed_anchor_distance": True,
+        "canonical_rejection_reason": "NONE",
+        "monetization_score": round(rr, 4),
+        "final_trade_score": round(setup_quality_score + rr, 4),
+        "best_candidate": {"long_strike": long_q.strike, "short_strike": short_q.strike,
+                           "debit_points": round(debit, 4), "risk_reward": round(rr, 2)},
+    })
+    return structure, list(structure.rationale), report
+
+
 def _evaluate_vertical_candidates(
     strategy: StrategyType,
     snapshot: MarketSnapshot,
@@ -322,11 +530,20 @@ def _evaluate_vertical_candidates(
         setup_quality_score=setup_quality_score,
         playbook_tier=playbook_tier,
     )
-    avg_chain_iv = (
-        float(regime_state.metadata.get("avg_chain_iv"))
-        if regime_state.metadata.get("avg_chain_iv") is not None
-        else None
-    )
+    # Classify the vol regime on NEAR-ATM IV, not the whole-chain mean. The thresholds inside
+    # _iv_adjusted_credit_ratio (15/18/22) are on the VIX/ATM scale, but avg_chain_iv is a flat
+    # average across every strike, which the volatility smile inflates ~2.2x (live 2026-07-17:
+    # avg_chain_iv 26.5 vs ATM IV / India VIX ~11.8, on 616/616 decisions). That units mismatch
+    # pinned the floor in the ">= 22 -> x1.15 TIGHTEN" branch forever, so the agent demanded
+    # 0.299 credit/width instead of the intended 0.187 in a low-IV market — needing 59.8pts on a
+    # 200pt width when only 44.45 was available. Result: every bull-put blocked on low-IV up days
+    # (348 rejections on 07-17, a +0.73% trend day with zero trades taken). Set
+    # IV_FLOOR_USE_ATM=0 to fall back to the old whole-chain behaviour.
+    _iv_key = "avg_chain_iv" if os.environ.get("IV_FLOOR_USE_ATM") == "0" else "atm_chain_iv"
+    _iv_raw = regime_state.metadata.get(_iv_key)
+    if _iv_raw is None:
+        _iv_raw = regime_state.metadata.get("avg_chain_iv")
+    avg_chain_iv = float(_iv_raw) if _iv_raw is not None else None
     required_credit_ratio, iv_adjusted_credit_floor_active = _iv_adjusted_credit_ratio(
         base_required_credit_ratio,
         avg_chain_iv,
@@ -938,6 +1155,8 @@ def _select_strangle_candidates(
     avg_chain_iv = float(regime_state.metadata.get("avg_chain_iv") or 0.0)
     call_quotes = _liquid_otm_quotes(snapshot.option_chain.quotes, OptionType.CALL, spot)
     put_quotes = _liquid_otm_quotes(snapshot.option_chain.quotes, OptionType.PUT, spot)
+    call_delta_band = (0.15, 0.25)   # target 0.20-0.25 OTM — professional standard
+    put_delta_band = (0.15, 0.25)
 
     _empty_report: dict[str, object] = {
         "strategy": StrategyType.SHORT_STRANGLE.value,
@@ -958,8 +1177,6 @@ def _select_strangle_candidates(
     if not call_quotes or not put_quotes:
         return None, ["Short strangle: no liquid OTM calls or puts found."], _empty_report
 
-    # Target delta: 0.15-0.28 per side — enough OTM to survive intraday noise
-    short_delta_band = (0.15, 0.28)
     min_total_credit = max(60.0, spot * 0.0025)  # at least 60pts or 0.25% of spot
 
     candidate_evaluations: list[dict[str, object]] = []
@@ -970,13 +1187,13 @@ def _select_strangle_candidates(
         if short_call.delta is None:
             continue
         call_delta = abs(short_call.delta)
-        if not (short_delta_band[0] <= call_delta <= short_delta_band[1]):
+        if not (call_delta_band[0] <= call_delta <= call_delta_band[1]):
             continue
         for short_put in put_quotes:
             if short_put.delta is None:
                 continue
             put_delta = abs(short_put.delta)
-            if not (short_delta_band[0] <= put_delta <= short_delta_band[1]):
+            if not (put_delta_band[0] <= put_delta <= put_delta_band[1]):
                 continue
             call_credit = short_call.mid_price or short_call.ltp or 0.0
             put_credit = short_put.mid_price or short_put.ltp or 0.0
@@ -1073,6 +1290,291 @@ def _select_strangle_candidates(
             "short_put_strike": short_put_q.strike,
             "avg_chain_iv": avg_chain_iv,
             "monetization_score": best_valid["monetization_score"],
+        },
+    )
+    return structure, rationale, report
+
+
+def _select_straddle_candidates(
+    snapshot: MarketSnapshot,
+    regime_state: RegimeState,
+    params: AdaptiveParameters,
+    *,
+    setup_quality_score: float,
+    playbook_tier: str,
+) -> tuple[TradeStructure | None, list[str], dict[str, object]]:
+    """Select a short straddle: sell ATM call + sell ATM put.
+
+    Fires on extreme-IV balanced range days where selling both ATM options
+    captures maximum premium. Risk is managed via 2x-credit stop (same as strangle).
+    """
+    spot = snapshot.option_chain.spot
+    avg_chain_iv = float(regime_state.metadata.get("avg_chain_iv") or 0.0)
+    all_quotes = snapshot.option_chain.quotes
+
+    _empty_report: dict[str, object] = {
+        "strategy": StrategyType.SHORT_STRADDLE.value,
+        "setup_quality_score": round(setup_quality_score, 4),
+        "monetization_score": 0.0,
+        "final_trade_score": 0.0,
+        "passed_spread_construction": False,
+        "passed_liquidity": False,
+        "passed_credit_width": False,
+        "passed_delta_band": False,
+        "passed_anchor_distance": True,
+        "canonical_rejection_reason": "LIQUIDITY_BAD",
+        "best_candidate": None,
+        "best_failed_candidate": None,
+        "candidate_evaluations": [],
+    }
+
+    call_quotes = [q for q in all_quotes if q.option_type == OptionType.CALL and q.strike >= spot]
+    put_quotes = [q for q in all_quotes if q.option_type == OptionType.PUT and q.strike <= spot]
+    if not call_quotes or not put_quotes:
+        return None, ["Short straddle: no call or put quotes near ATM."], _empty_report
+
+    # Find nearest ATM call and put (closest strike to spot on each side)
+    atm_call = min(call_quotes, key=lambda q: abs(q.strike - spot))
+    atm_put = min(put_quotes, key=lambda q: abs(q.strike - spot))
+
+    call_credit = atm_call.mid_price or atm_call.ltp or 0.0
+    put_credit = atm_put.mid_price or atm_put.ltp or 0.0
+    total_credit = call_credit + put_credit
+    min_total_credit = max(120.0, spot * 0.005)  # straddle needs at least 0.5% of spot
+
+    avg_spread_ratio = ((atm_call.spread_ratio or 0.0) + (atm_put.spread_ratio or 0.0)) / 2.0
+    passed_liquidity = avg_spread_ratio <= params.liquidity_spread_ratio_cap
+    passed_credit = total_credit >= min_total_credit
+
+    if not passed_liquidity or not passed_credit:
+        reason = "LIQUIDITY_BAD" if not passed_liquidity else "CREDIT_TOO_LOW"
+        failed_entry: dict[str, object] = {
+            "short_call_strike": atm_call.strike,
+            "short_put_strike": atm_put.strike,
+            "call_credit": round(call_credit, 4),
+            "put_credit": round(put_credit, 4),
+            "total_credit": round(total_credit, 4),
+            "avg_spread_ratio": round(avg_spread_ratio, 4),
+            "canonical_rejection_reason": reason,
+        }
+        _empty_report["canonical_rejection_reason"] = reason
+        _empty_report["best_failed_candidate"] = failed_entry
+        return None, [f"Short straddle: {reason} (credit={total_credit:.1f}, spread_ratio={avg_spread_ratio:.3f})."], _empty_report
+
+    monetization_score = round(
+        (total_credit / max(spot * 0.01, 1.0)) * 10.0
+        + max(0.0, 1.0 - avg_spread_ratio / max(params.liquidity_spread_ratio_cap, 0.01)) * 0.5,
+        4,
+    )
+    best_valid: dict[str, object] = {
+        "short_call_strike": atm_call.strike,
+        "short_put_strike": atm_put.strike,
+        "call_credit": round(call_credit, 4),
+        "put_credit": round(put_credit, 4),
+        "total_credit": round(total_credit, 4),
+        "avg_spread_ratio": round(avg_spread_ratio, 4),
+        "monetization_score": monetization_score,
+        "canonical_rejection_reason": "NONE",
+    }
+    report: dict[str, object] = {
+        "strategy": StrategyType.SHORT_STRADDLE.value,
+        "setup_quality_score": round(setup_quality_score, 4),
+        "monetization_score": monetization_score,
+        "final_trade_score": round(setup_quality_score + monetization_score, 4),
+        "passed_spread_construction": True,
+        "passed_liquidity": True,
+        "passed_credit_width": True,
+        "passed_delta_band": True,
+        "passed_anchor_distance": True,
+        "canonical_rejection_reason": "NONE",
+        "best_candidate": best_valid,
+        "best_failed_candidate": None,
+        "candidate_evaluations": [best_valid],
+    }
+    rationale = [
+        f"Short straddle: sell {atm_call.strike} call + sell {atm_put.strike} put (ATM).",
+        f"Total credit {total_credit:.2f} pts, avg IV {avg_chain_iv:.1f}%. Stop at 2x credit.",
+        f"ATM strikes chosen for maximum premium on extreme-IV balanced session.",
+    ]
+    structure = TradeStructure(
+        strategy=StrategyType.SHORT_STRADDLE,
+        legs=[
+            StrategyLeg(action="SELL", option_type=OptionType.CALL, strike=atm_call.strike, quote=atm_call),
+            StrategyLeg(action="SELL", option_type=OptionType.PUT, strike=atm_put.strike, quote=atm_put),
+        ],
+        credit_points=total_credit,
+        width_points=atm_call.strike - atm_put.strike,
+        call_width_points=0.0,
+        put_width_points=0.0,
+        margin_estimate_per_lot=snapshot.option_chain.margin_estimate_per_lot,
+        rationale=rationale,
+        metadata={
+            "selection_mode": "STRADDLE",
+            "short_call_strike": atm_call.strike,
+            "short_put_strike": atm_put.strike,
+            "avg_chain_iv": avg_chain_iv,
+            "monetization_score": monetization_score,
+        },
+    )
+    return structure, rationale, report
+
+
+def _select_iron_fly_candidates(
+    snapshot: MarketSnapshot,
+    regime_state: RegimeState,
+    params: AdaptiveParameters,
+    *,
+    setup_quality_score: float,
+    playbook_tier: str,
+) -> tuple[TradeStructure | None, list[str], dict[str, object]]:
+    """Select a short IRON FLY: SELL ATM call + SELL ATM put (max premium at the pin), BUY OTM call +
+    BUY OTM put wings for DEFINED risk. This is the seller's expression of a tight long-gamma pin —
+    higher premium than a condor because the shorts sit at the ATM where price is glued. Defined risk
+    (capped loss = wing width - credit) means it can be held into the pin / to expiry safely."""
+    spot = snapshot.option_chain.spot
+    avg_chain_iv = float(regime_state.metadata.get("avg_chain_iv") or 0.0)
+    quotes = snapshot.option_chain.quotes
+
+    _empty_report: dict[str, object] = {
+        "strategy": StrategyType.IRON_FLY.value,
+        "setup_quality_score": round(setup_quality_score, 4),
+        "monetization_score": 0.0, "final_trade_score": 0.0,
+        "passed_spread_construction": False, "passed_liquidity": False,
+        "passed_credit_width": False, "passed_delta_band": False, "passed_anchor_distance": True,
+        "canonical_rejection_reason": "LIQUIDITY_BAD",
+        "best_candidate": None, "best_failed_candidate": None, "candidate_evaluations": [],
+    }
+    calls = [q for q in quotes if q.option_type == OptionType.CALL]
+    puts = [q for q in quotes if q.option_type == OptionType.PUT]
+    if not calls or not puts:
+        return None, ["Iron fly: no call/put quotes near ATM."], _empty_report
+
+    # Shorts: nearest strike to spot (the ATM / pin) on each side.
+    atm_call = min([q for q in calls if q.strike >= spot] or calls, key=lambda q: abs(q.strike - spot))
+    atm_put = min([q for q in puts if q.strike <= spot] or puts, key=lambda q: abs(q.strike - spot))
+    # ── Wings: buy the WIDEST protection the risk budget can actually carry ──────────────────
+    # A fixed 200pt wing is expensive protection you rarely need. Measured on the live 2026-07-23
+    # chain (ATM straddle credit 270.65):
+    #     wing  cost   % of credit kept   max loss/lot
+    #      200  119.70      56%              3,188
+    #      400   48.15      82%             11,538
+    #     1000    7.25      97%             47,879
+    # The 200pt wings hand back 44% of the premium — on a theta trade that IS the edge. But the far
+    # cheap wings are not free either: the agent sizes on MAX LOSS (not broker margin), so 1000pt
+    # wings push max loss past the per-trade risk cap and the trade is refused entirely.
+    #
+    # So neither a fixed narrow nor a fixed wide wing is right — the correct wing is the widest one
+    # whose max loss still lets us trade our baseline size. Widen while (width - credit) * lot_size
+    # * min_lots stays inside max_risk_rupees_per_trade, then stop. That keeps as much premium as
+    # the risk budget allows, and self-adjusts with IV, credit and the configured risk limits
+    # instead of being a hardcoded number that silently stops fitting.
+    _explicit_wing = regime_state.metadata.get("iron_fly_wing_pts")
+
+    def _wing_pair(w: float):
+        lc_q = min([q for q in calls if q.strike >= atm_call.strike + w] or calls,
+                   key=lambda q: abs(q.strike - (atm_call.strike + w)))
+        lp_q = min([q for q in puts if q.strike <= atm_put.strike - w] or puts,
+                   key=lambda q: abs(q.strike - (atm_put.strike - w)))
+        return lc_q, lp_q
+
+    if _explicit_wing is not None:
+        wing_pts = float(_explicit_wing)
+        long_call, long_put = _wing_pair(wing_pts)
+    else:
+        _risk_cap = float(getattr(snapshot.risk_limits, "max_risk_rupees_per_trade", 0.0) or 0.0)
+        _min_lots = max(int(getattr(snapshot.risk_limits, "min_lots_per_trade", 1) or 1), 1)
+        wing_pts, long_call, long_put = 200.0, *_wing_pair(200.0)
+        _lot_size = int(snapshot.lot_size or 0)
+        if _risk_cap > 0 and _lot_size > 0:
+            for _w in (200.0, 250.0, 300.0, 350.0, 400.0, 500.0, 600.0, 800.0, 1000.0):
+                _lc, _lp = _wing_pair(_w)
+                _net = ((atm_call.mid_price or atm_call.ltp or 0.0) + (atm_put.mid_price or atm_put.ltp or 0.0)
+                        - (_lc.mid_price or _lc.ltp or 0.0) - (_lp.mid_price or _lp.ltp or 0.0))
+                _w_actual = max(_lc.strike - atm_call.strike, atm_put.strike - _lp.strike)
+                _max_loss = (_w_actual - _net) * _lot_size
+                if _max_loss <= 0 or _max_loss * _min_lots > _risk_cap:
+                    break                      # this width no longer fits the budget — keep the last
+                wing_pts, long_call, long_put = _w, _lc, _lp
+
+    sc = atm_call.mid_price or atm_call.ltp or 0.0
+    sp = atm_put.mid_price or atm_put.ltp or 0.0
+    lc = long_call.mid_price or long_call.ltp or 0.0
+    lp = long_put.mid_price or long_put.ltp or 0.0
+    total_credit = (sc + sp) - (lc + lp)                       # net credit received
+    call_width = long_call.strike - atm_call.strike
+    put_width = atm_put.strike - long_put.strike
+    max_width = max(call_width, put_width)
+
+    spread_ratio = sum((q.spread_ratio or 0.0) for q in (atm_call, atm_put, long_call, long_put)) / 4.0
+    min_credit = max(80.0, spot * 0.003)                        # fly needs meaningful premium to be worth the pin risk
+    if bool(regime_state.metadata.get("is_expiry_day")):
+        # Same-day expiry: the credit is 100% theta by 15:30, so a thinner premium is still worth
+        # selling — the multi-day floor over-rejects the fastest-theta day. 2026-08-04: a low-vol
+        # expiry offered an ~83pt ATM straddle -> net fly credit 77-81, right on the 80 floor, so the
+        # agent could build nothing on the best theta day of the week. A lower floor lets it trade.
+        min_credit = max(55.0, spot * 0.002)
+    passed_liquidity = spread_ratio <= params.liquidity_spread_ratio_cap
+    # An iron fly's two shorts sit at the ATM (often the SAME strike), so the middle is <= not <:
+    # long_put < short_put <= short_call < long_call.
+    ordered = long_put.strike < atm_put.strike <= atm_call.strike < long_call.strike
+    passed_credit = total_credit >= min_credit and max_width > 0 and ordered
+
+    if not passed_liquidity or not passed_credit:
+        reason = "LIQUIDITY_BAD" if not passed_liquidity else "CREDIT_TOO_LOW"
+        _empty_report["canonical_rejection_reason"] = reason
+        _empty_report["best_failed_candidate"] = {
+            "short_call_strike": atm_call.strike, "short_put_strike": atm_put.strike,
+            "long_call_strike": long_call.strike, "long_put_strike": long_put.strike,
+            "total_credit": round(total_credit, 4), "avg_spread_ratio": round(spread_ratio, 4),
+            "canonical_rejection_reason": reason,
+        }
+        return None, [f"Iron fly: {reason} (credit={total_credit:.1f}, width={max_width:.0f}, spread_ratio={spread_ratio:.3f})."], _empty_report
+
+    monetization_score = round((total_credit / max(max_width, 1.0)) * 20.0
+                               + max(0.0, 1.0 - spread_ratio / max(params.liquidity_spread_ratio_cap, 0.01)) * 0.5, 4)
+    best_valid: dict[str, object] = {
+        "short_call_strike": atm_call.strike, "short_put_strike": atm_put.strike,
+        "long_call_strike": long_call.strike, "long_put_strike": long_put.strike,
+        "total_credit": round(total_credit, 4), "max_width": max_width,
+        "avg_spread_ratio": round(spread_ratio, 4), "monetization_score": monetization_score,
+        "canonical_rejection_reason": "NONE",
+    }
+    report: dict[str, object] = {
+        "strategy": StrategyType.IRON_FLY.value,
+        "setup_quality_score": round(setup_quality_score, 4),
+        "monetization_score": monetization_score,
+        "final_trade_score": round(setup_quality_score + monetization_score, 4),
+        "passed_spread_construction": True, "passed_liquidity": True,
+        "passed_credit_width": True, "passed_delta_band": True, "passed_anchor_distance": True,
+        "canonical_rejection_reason": "NONE",
+        "best_candidate": best_valid, "best_failed_candidate": None, "candidate_evaluations": [best_valid],
+    }
+    rationale = [
+        f"Iron fly: SELL {atm_call.strike:.0f}C + {atm_put.strike:.0f}P (ATM/pin), "
+        f"BUY {long_call.strike:.0f}C + {long_put.strike:.0f}P wings ({wing_pts:.0f}pt).",
+        f"Net credit {total_credit:.2f} pts, max loss {max(max_width - total_credit, 0.0):.2f} pts, avg IV {avg_chain_iv:.1f}%.",
+        "Max premium at the pin with defined risk — harvest the suppressed long-gamma range.",
+    ]
+    derived_margin = max(max_width - total_credit, 0.0) * snapshot.lot_size
+    structure = TradeStructure(
+        strategy=StrategyType.IRON_FLY,
+        legs=[
+            StrategyLeg(action="SELL", option_type=OptionType.CALL, strike=atm_call.strike, quote=atm_call),
+            StrategyLeg(action="SELL", option_type=OptionType.PUT, strike=atm_put.strike, quote=atm_put),
+            StrategyLeg(action="BUY", option_type=OptionType.CALL, strike=long_call.strike, quote=long_call),
+            StrategyLeg(action="BUY", option_type=OptionType.PUT, strike=long_put.strike, quote=long_put),
+        ],
+        credit_points=total_credit,
+        width_points=max_width,
+        call_width_points=call_width,
+        put_width_points=put_width,
+        margin_estimate_per_lot=snapshot.option_chain.margin_estimate_per_lot or derived_margin,
+        rationale=rationale,
+        metadata={
+            "selection_mode": "IRON_FLY",
+            "short_call_strike": atm_call.strike, "short_put_strike": atm_put.strike,
+            "long_call_strike": long_call.strike, "long_put_strike": long_put.strike,
+            "wing_pts": wing_pts, "avg_chain_iv": avg_chain_iv, "monetization_score": monetization_score,
         },
     )
     return structure, rationale, report
@@ -1217,6 +1719,22 @@ def _shortlist_condor_quotes(
     quotes = _liquid_otm_quotes(snapshot.option_chain.quotes, option_type=option_type, spot=snapshot.option_chain.spot)
     if not quotes:
         return []
+    # OI-wall anchors: regime sets condor_short_call_anchor = call_wall+25 and
+    # condor_short_put_anchor = put_wall-25. Prefer short strikes OUTSIDE the walls
+    # so the condor doesn't sell into the dominant institutional OI. Soft filter —
+    # fall back to all quotes if the anchor leaves nothing tradable (no deadlock).
+    if option_type == OptionType.CALL:
+        _call_anchor = regime_state.metadata.get("condor_short_call_anchor")
+        if _call_anchor is not None:
+            _respecting = [q for q in quotes if q.strike >= float(_call_anchor)]
+            if _respecting:
+                quotes = _respecting
+    else:
+        _put_anchor = regime_state.metadata.get("condor_short_put_anchor")
+        if _put_anchor is not None:
+            _respecting = [q for q in quotes if q.strike <= float(_put_anchor)]
+            if _respecting:
+                quotes = _respecting
     target_delta = sum(short_delta_band) / 2.0
     rv_points = snapshot.option_chain.spot * regime_state.rv30_pct / 100.0
     target_distance = max(40.0, min(120.0, rv_points * 1.2))
