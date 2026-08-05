@@ -142,6 +142,7 @@ _ORB_MIN_RANGE_PTS = _sel_env_float("SEL_ORB_MIN_RANGE_PTS")
 if _ORB_MIN_RANGE_PTS is None:
     _ORB_MIN_RANGE_PTS = 40.0        # skip tiny opening ranges — they break falsely (ORB backtest)
 _ORB_FORMED_AFTER = time(9, 45)      # first two 15-min candles = the opening range
+_ORB_EFF_CONFIRM = _sel_env_float("SEL_ORB_EFF_CONFIRM") or 0.50   # a move this efficient IS confirmed even w/o an accepted OR break
 
 # ── ZONE CONFLUENCE — the big-player range trade (default ON) ──────────────────────────────────
 # Root cause (5-whys, 2026-08): the agent has only two modes — trend-follow (needs a confirmed
@@ -235,15 +236,23 @@ def _orb_confirms_trend(m: dict, now_time, direction: str) -> bool:
     # (a) the 30-min opening range must have formed
     if now_time is not None and now_time < _ORB_FORMED_AFTER:
         return False
-    # (b) the breakout must be ACCEPTED (price closed beyond the OR and held — not a fakeout)
-    if not bool(m.get("accepted_breakout")):
+    # (b) CONFIRMATION: an accepted OR-breakout, OR the move actually FOLLOWING THROUGH (realized
+    # trend_efficiency). accepted_breakout ALONE is too strict — 2026-08-04 a real -1.04% down move
+    # had accepted_breakout=False ALL day, so the gate blocked a genuine trend: the agent missed the
+    # put-debit (+2,985) and would have sold a losing fly (-3,431). Realized efficiency is the honest
+    # confirmation the move is real (NOT lookahead — it is efficiency up to NOW), and it is exactly
+    # what distinguishes 08-04 (eff -> 1.0) from 07-23's fake early trend (eff 0.04 at the 09:48 entry).
+    _accepted = bool(m.get("accepted_breakout"))
+    if not (_accepted or _trend_efficiency(m) >= _ORB_EFF_CONFIRM):
         return False
-    # (c) and in the trend's direction (FAILED_UP is a down-rejection, valid for a down trend)
-    orb = str(m.get("opening_range_break_state") or "NONE")
-    if direction == "UP" and orb != "UP":
-        return False
-    if direction == "DOWN" and orb not in ("DOWN", "FAILED_UP"):
-        return False
+    # (c) if the confirmation is an accepted OR-break, its direction must match; when confirmation is
+    # efficiency-based, a trend can develop without a clean OR break, so we trust the read's bias.
+    if _accepted:
+        orb = str(m.get("opening_range_break_state") or "NONE")
+        if direction == "UP" and orb != "UP":
+            return False
+        if direction == "DOWN" and orb not in ("DOWN", "FAILED_UP"):
+            return False
     # (d) opening range wide enough to be meaningful
     orh, orl = _f(m, "or_high", 0.0), _f(m, "or_low", 0.0)
     if orh > 0 and orl > 0 and (orh - orl) < _ORB_MIN_RANGE_PTS:
