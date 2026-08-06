@@ -80,7 +80,17 @@ def _tail_lines(path: Path, n_bytes: int = 200_000) -> list[str]:
         return []
 
 
-def _latest_decision() -> dict | None:
+# A decision is a DATA-FAILURE only if it says so explicitly. A NORMAL strategic decision
+# (BREAKOUT_DOWN, ZONE_DEMAND, RANGE_WIDE, ...) carries NO data_readiness block at all — the agent
+# only emits data_readiness on the failure path. So "no option_chain_available field" means the chain
+# WAS available, not that it was missing. Reading a healthy decision as unhealthy is exactly the
+# false-positive that would restart a working agent, so classification is failure-explicit.
+_DATA_FAIL_MARKERS = ("unavailable", "cannot be empty", "min_5m", "insufficient_data",
+                      "snapshot is empty", "no option chain")
+
+
+def _recent_decisions(n: int = 14) -> list[dict]:
+    out: list[dict] = []
     for line in reversed(_tail_lines(RUNNER_LOG)):
         line = line.strip()
         if not line.startswith("{"):
@@ -90,8 +100,24 @@ def _latest_decision() -> dict | None:
         except json.JSONDecodeError:
             continue
         if "emitted_at" in j or (j.get("metadata") or {}).get("data_readiness"):
-            return j
-    return None
+            out.append(j)
+            if len(out) >= n:
+                break
+    out.reverse()
+    return out
+
+
+def _is_data_failure(j: dict) -> bool:
+    dr = (j.get("metadata") or {}).get("data_readiness") or {}
+    rats = j.get("rationale") or []
+    rat0 = (rats[0] if rats else "") or ""
+    return (any(m in rat0.lower() for m in _DATA_FAIL_MARKERS)
+            or dr.get("snapshot_status") in ("INSUFFICIENT_DATA", "UNAVAILABLE"))
+
+
+def _emitted_of(j: dict):
+    dr = (j.get("metadata") or {}).get("data_readiness") or {}
+    return j.get("emitted_at") or dr.get("timestamp")
 
 
 def _process_alive() -> bool:
@@ -104,38 +130,41 @@ def _process_alive() -> bool:
 
 
 def assess(now: datetime) -> dict:
-    """Return {healthy: bool, reason: str, detail: {...}}. Only meaningful during market hours."""
+    """Return {healthy: bool, reason: str, detail: {...}}. Only meaningful during market hours.
+
+    Health is judged over a WINDOW of recent decisions, not one line: the live chain is intermittent
+    (the odd 'snapshot cannot be empty' cycle is normal), so a single failed cycle must NOT be read as
+    a fault. The agent is healthy as long as it is (a) emitting fresh decisions and (b) producing at
+    least one real strategic analysis in the recent window. It is unhealthy only on a TRUE blackout —
+    every recent cycle is a data-failure — or when it stops emitting at all (hung)."""
     alive = _process_alive()
-    dec = _latest_decision()
     detail: dict = {"process_alive": alive}
     if not alive:
         return {"healthy": False, "reason": "PROCESS_DEAD", "detail": detail}
-    if dec is None:
+
+    decs = _recent_decisions(14)
+    if not decs:
         return {"healthy": False, "reason": "NO_DECISIONS_IN_LOG", "detail": detail}
 
-    dr = (dec.get("metadata") or {}).get("data_readiness") or {}
-    emitted = dec.get("emitted_at") or dr.get("timestamp")
-    detail.update({
-        "emitted_at": emitted,
-        "option_chain_available": dr.get("option_chain_available"),
-        "option_quote_count": dr.get("option_quote_count"),
-        "spot_available": dr.get("spot_available"),
-    })
+    real = sum(1 for d in decs if not _is_data_failure(d))
+    fail = len(decs) - real
+    newest_em = _emitted_of(decs[-1])
+    detail.update({"emitted_at": newest_em, "real_analyses": real, "data_fails": fail,
+                   "window": len(decs)})
 
-    # Freshness — a live agent emits a decision every ~30s. Silence = hung.
-    if emitted:
+    # Freshness — a live agent emits a decision every ~30s. Prolonged silence = hung.
+    if newest_em:
         try:
-            age = (now - datetime.fromisoformat(str(emitted)).replace(tzinfo=None)).total_seconds()
+            age = (now - datetime.fromisoformat(str(newest_em)).replace(tzinfo=None)).total_seconds()
             detail["decision_age_secs"] = round(age)
             if age > STALE_DECISION_SECS:
                 return {"healthy": False, "reason": "STALE_DECISIONS", "detail": detail}
         except Exception:  # noqa: BLE001
             pass
 
-    # Data health — only enforce chain availability once past the warm-up grace window.
-    if _hhmm(now) >= CHAIN_GRACE_HHMM:
-        if dr.get("option_chain_available") is not True or (dr.get("option_quote_count") or 0) <= 0:
-            return {"healthy": False, "reason": "CHAIN_UNAVAILABLE", "detail": detail}
+    # Data health (past warm-up grace): a TRUE blackout = zero real analyses in the whole window.
+    if _hhmm(now) >= CHAIN_GRACE_HHMM and real == 0:
+        return {"healthy": False, "reason": "CHAIN_BLACKOUT", "detail": detail}
 
     return {"healthy": True, "reason": "OK", "detail": detail}
 
@@ -217,9 +246,9 @@ def main() -> int:
         state["consecutive_unhealthy"] = 0
         state["escalated"] = False
         _save_state(state)
-        if not state.get("_printed_ok"):
-            print(f"self-heal: HEALTHY ({result['detail'].get('option_quote_count')} quotes, "
-                  f"decision age {result['detail'].get('decision_age_secs','?')}s)")
+        d = result["detail"]
+        print(f"self-heal: HEALTHY ({d.get('real_analyses')}/{d.get('window')} recent cycles are real "
+              f"analyses, newest {d.get('decision_age_secs','?')}s ago)")
         return 0
 
     # Unhealthy path
