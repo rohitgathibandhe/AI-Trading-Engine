@@ -1778,16 +1778,40 @@ def record_paper_entry(
     save_runtime_state(state, paths=paths)
 
 
+def _ghost_mark_pnl(position: OpenPosition, snapshot: MarketSnapshot) -> float | None:
+    """Reprice a closed position against the current snapshot with the SAME math the live loop uses,
+    returning its mark-to-market P&L in rupees (None if the chain can't price it this cycle). Used by
+    the exit-shadow ghost tracker to build a true hold-to-close path. Never raises."""
+    try:
+        from .regime import classify_regime
+        dec = evaluate_exit(
+            position,
+            current_snapshot=snapshot,
+            current_regime=classify_regime(snapshot),
+            now=snapshot.timestamp,
+        )
+        return dec.pnl_rupees
+    except Exception:
+        return None
+
+
 def manage_paper_position(
     snapshot: MarketSnapshot,
     *,
     paths: OpsPaths | None = None,
 ) -> OpenPosition | None:
     paths = paths or OpsPaths()
+    from .regime import classify_regime
+    # Extend any ghost of a just-closed position to the close so the exit-shadow can score
+    # "hold longer" (see exit_shadow._TOCLOSE_LEDGER). Runs every cycle, incl. when flat. Guarded.
+    try:
+        from . import exit_shadow
+        exit_shadow.reprice_ghosts(snapshot, lambda pos: _ghost_mark_pnl(pos, snapshot))
+    except Exception:
+        pass
     position = load_paper_position(paths)
     if position is None:
         return None
-    from .regime import classify_regime
 
     exit_decision = evaluate_exit(
         position,

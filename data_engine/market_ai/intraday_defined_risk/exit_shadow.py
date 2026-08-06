@@ -34,6 +34,14 @@ from typing import Any
 _STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 _PATH_FILE = _STATE_DIR / "exit_shadow_path.json"
 _LEDGER = _STATE_DIR / "exit_shadow.jsonl"
+# The to-close ledger is the FIX for the blind spot: exit_shadow.jsonl stops at the live exit, so
+# RIDE_TO_CLOSE there == the live exit and no rule can be scored against "hold longer". A ghost of
+# each closed position keeps being repriced (same live math as the trading loop) until this cutoff,
+# and one enriched row per trade lands here with the true hold-to-close path. Non-destructive: the
+# original ledger is untouched, so nothing regresses if the ghost path fails.
+_TOCLOSE_LEDGER = _STATE_DIR / "exit_shadow_toclose.jsonl"
+_GHOST_CLOSE_HHMM = (15, 15)          # stop ghost-marking at 15:15 IST (last reliable marks pre-close)
+_GHOSTS: list[dict] = []              # in-memory, one per closed-but-still-tracking trade this session
 
 # Spot-reversal thresholds to evaluate, in index points retraced from the favourable extreme.
 _REVERSAL_PTS = (15.0, 25.0, 40.0)
@@ -137,6 +145,113 @@ def _evaluate(buf: dict, lot_value: float) -> dict[str, Any]:
     return {name: {"exit_at": t, "pnl_rupees": round(p, 2)} for name, (t, p) in rules.items()}
 
 
+def _past_close(ts) -> bool:
+    try:
+        return (ts.hour, ts.minute) >= _GHOST_CLOSE_HHMM
+    except Exception:
+        return False
+
+
+def _write_toclose_row(g: dict) -> None:
+    """Score every candidate over the FULL entry->close path and append one enriched row. The row
+    quantifies the exact thing the truncated ledger cannot: how much the live exit gave up vs holding
+    (exit_cost_rupees = actual - hold_to_close; negative = the live exit bled money)."""
+    try:
+        marks = g.get("marks") or []
+        if not marks:
+            return
+        buf = {"strategy": g.get("strategy"), "entry_debit_points": g.get("entry_debit_points"),
+               "marks": marks}
+        candidates = _evaluate(buf, g.get("lot_value") or 0.0)
+        hold_to_close = candidates.get("RIDE_TO_CLOSE", {}).get("pnl_rupees")
+        actual_pnl = (g.get("actual") or {}).get("pnl_rupees")
+        exit_cost = (round(actual_pnl - hold_to_close, 2)
+                     if actual_pnl is not None and hold_to_close is not None else None)
+        row = {
+            "session_date": g.get("session_date"),
+            "strategy": g.get("strategy"),
+            "entry_timestamp": g.get("entry_timestamp"),
+            "entry_debit_points": g.get("entry_debit_points"),
+            "lot_value": g.get("lot_value"),
+            "n_marks_toclose": len(marks),
+            "spot_at_entry": marks[0]["spot"],
+            "spot_at_close": marks[-1]["spot"],
+            "spot_extreme": (min(m["spot"] for m in marks) if _favourable_direction(g.get("strategy", "")) < 0
+                             else max(m["spot"] for m in marks)),
+            "actual": g.get("actual"),
+            "hold_to_close_rupees": hold_to_close,
+            "exit_cost_rupees": exit_cost,     # actual - hold_to_close; < 0 means the exit gave up money
+            "mfe_rupees_toclose": round(max(m["pnl"] for m in marks), 2),
+            "candidates": candidates,
+        }
+        with _TOCLOSE_LEDGER.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
+
+
+def start_ghost(position, exit_event: dict, marks: list[dict]) -> None:
+    """Register a just-closed position to keep marking to the close. `marks` is the live path so far
+    (entry -> live exit); reprice_ghosts() extends it each cycle. Never raises."""
+    try:
+        ghost = {
+            "position": position,       # live object; repriced in-process each cycle (lost on restart, ok)
+            "session_date": exit_event.get("session_date"),
+            "strategy": position.structure.strategy.value,
+            "entry_timestamp": position.entry_time.isoformat(),
+            "entry_debit_points": abs(float(position.entry_credit_points)),
+            "lot_value": float(position.lot_size) * float(position.lots),
+            "actual": {"exit_at": exit_event.get("exit_timestamp"),
+                       "exit_reason": exit_event.get("exit_reason"),
+                       "pnl_rupees": exit_event.get("realized_paper_pnl")},
+            "marks": list(marks),
+        }
+        # If the live exit already happened at/after the cutoff there is nothing left to hold — write
+        # the row now (hold_to_close == the last mark we have) instead of tracking a dead ghost.
+        exit_ts = exit_event.get("exit_timestamp")
+        past = False
+        try:
+            from datetime import datetime
+            past = _past_close(datetime.fromisoformat(exit_ts)) if exit_ts else False
+        except Exception:
+            past = False
+        if past or not marks:
+            _write_toclose_row(ghost)
+        else:
+            _GHOSTS.append(ghost)
+    except Exception:
+        pass
+
+
+def reprice_ghosts(snapshot, pnl_fn) -> None:
+    """Called every monitor cycle (open OR flat). Extends each ghost's path with one fresh mark using
+    the SAME live repricing the trading loop uses, and finalizes to the to-close ledger at the cutoff.
+    Pure recorder, fully guarded — it must never be able to break the trading loop."""
+    if not _GHOSTS:
+        return
+    try:
+        ts = snapshot.timestamp
+        spot = float(snapshot.option_chain.spot)
+    except Exception:
+        return
+    survivors: list[dict] = []
+    for g in _GHOSTS:
+        try:
+            pnl = pnl_fn(g["position"])
+            if pnl is not None:
+                g["marks"].append({"t": ts.isoformat(timespec="seconds"),
+                                   "spot": round(spot, 2), "pnl": round(float(pnl), 2)})
+        except Exception:
+            pass
+        # Finalize at the close cutoff, or if the session has rolled to a new day (safety).
+        new_day = str(getattr(ts, "date", lambda: None)()) != str(g.get("session_date"))
+        if _past_close(ts) or new_day:
+            _write_toclose_row(g)
+        else:
+            survivors.append(g)
+    _GHOSTS[:] = survivors
+
+
 def finalize(position, exit_event: dict) -> None:
     """Called once at exit: score every candidate rule over the recorded path, append one ledger
     row, clear the buffer. Never raises — this must not be able to break the trading loop."""
@@ -167,6 +282,9 @@ def finalize(position, exit_event: dict) -> None:
         }
         with _LEDGER.open("a") as f:
             f.write(json.dumps(row) + "\n")
+        # Keep marking a ghost of this position to the close so RIDE_TO_CLOSE becomes real (the row
+        # above is truncated at the live exit by construction). Non-destructive: separate ledger.
+        start_ghost(position, exit_event, marks)
     except Exception:
         pass
     finally:
