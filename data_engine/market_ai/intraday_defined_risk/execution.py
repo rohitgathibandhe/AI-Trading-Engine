@@ -678,8 +678,13 @@ def _regime_invalidation_reason(
         if closed_bar_check_allowed and spot > vwap and last_n_closes_above(vwap, bars, n=2):
             return "VWAP_INVALIDATION"
     elif strategy in {StrategyType.IRON_CONDOR, StrategyType.IRON_FLY, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE}:
-        # Regime change is a live signal, not a bar check — fire immediately.
-        if current_regime is not None and current_regime.regime != RegimeLabel.RANGE:
+        # A theta structure must BREATHE before a momentary regime flicker evicts it. Firing the
+        # instant the classifier reads non-RANGE killed two iron-flies at 0.6 and 1.2 minutes on
+        # 2026-08-06 (mfe never left 0) that decayed to +812 and +770 by close — ~Rs 1,644 handed
+        # back, measured by exit_shadow_toclose. Gate it behind the SAME one-candle min-hold every
+        # other invalidation path already uses; a genuine regime break still exits once the fly has
+        # had a candle to settle, and defined-risk wings cap the interim.
+        if closed_bar_check_allowed and current_regime is not None and current_regime.regime != RegimeLabel.RANGE:
             return "RANGE_INVALIDATION"
     return None
 

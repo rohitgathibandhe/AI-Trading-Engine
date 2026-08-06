@@ -42,6 +42,7 @@ DEFINED = ("put_debit", "call_debit", "bull_put", "bear_call", "iron_fly", "iron
 GOOD_TRADE_RUPEES = 500.0      # a defined-risk structure clearing this = a trade worth having taken
 BAD_LOSS_RUPEES = -4000.0      # traded and lost worse than this -> flag for retro
 SUBOPTIMAL_GAP_RUPEES = 2500.0 # traded, but best-available beat what we took by more than this
+EXIT_GIVEBACK_RUPEES = -1200.0 # total handed back by exiting early vs holding to close -> flag
 
 
 def _jsonl(p: Path) -> list[dict]:
@@ -148,6 +149,29 @@ def _diagnose(day: str, structures: dict) -> list[dict]:
     return findings
 
 
+def _exit_giveback(day: str) -> list[dict]:
+    """From exit_shadow_toclose.jsonl: did the agent's exits hand back money vs holding to close?
+    exit_cost_rupees = actual - hold_to_close (< 0 = gave up money). This is the give-back the raw
+    P&L hides — 2026-08-06 netted -62 but handed back ~1,644 by exiting two flies in <1.2 min."""
+    rows = [r for r in _jsonl(STATE / "exit_shadow_toclose.jsonl") if str(r.get("session_date")) == day]
+    costs = [float(r.get("exit_cost_rupees")) for r in rows if r.get("exit_cost_rupees") is not None]
+    given_back = sum(c for c in costs if c < 0)
+    if given_back <= EXIT_GIVEBACK_RUPEES:
+        worst = min(rows, key=lambda r: (r.get("exit_cost_rupees") or 0), default={})
+        wr = worst.get("exit_cost_rupees")
+        detail = f"exits handed back {given_back:+,.0f} vs holding to close across {len(costs)} trade(s)"
+        if wr is not None:
+            detail += (f"; worst: {worst.get('strategy')} exited on "
+                       f"{(worst.get('actual') or {}).get('exit_reason')} gave up {wr:+,.0f}")
+        return [{
+            "kind": "EXIT_GIVEBACK",
+            "detail": detail,
+            "guard": "exit timing — a stop fired too early on a trade that would have won held",
+            "cost_rupees": round(given_back),
+        }]
+    return []
+
+
 def _load_creds() -> dict:
     try:
         return json.loads(CREDS.read_text()) if CREDS.exists() else {}
@@ -185,6 +209,7 @@ def main() -> int:
     by_date = {str(r.get("date")): (r.get("structures") or {}) for r in shadow}
     day = args.date or max(by_date)
     findings = _diagnose(day, by_date.get(day, {}))
+    findings += _exit_giveback(day)   # independent of the shadow book (reads the to-close ledger)
 
     stamp = datetime.now(timezone.utc).isoformat()
     record = {"ts": stamp, "date": day, "clean": not findings, "findings": findings}
