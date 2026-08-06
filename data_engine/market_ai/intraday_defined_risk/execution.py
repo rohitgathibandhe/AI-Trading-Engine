@@ -338,6 +338,10 @@ def mark_to_market_value_points(position: OpenPosition, quotes_by_leg: list[Stra
 DEBIT_TP_CAPTURE = 0.60       # take profit at 60% of max profit
 DEBIT_STOP_FRAC = 0.50        # stop when 50% of the debit is lost
 DEBIT_MIN_HOLD = 10           # min minutes before the stop can fire (noise guard)
+# A neutral theta structure is entered when trend_efficiency < this (low follow-through = range-like).
+# Its RANGE_INVALIDATION exit must use the SAME bar, so it only fires when real follow-through returns
+# — mirrors the selector's _BUY_MIN_EFFICIENCY so entry and exit agree on what "not a range" means.
+_THETA_INVALIDATION_MIN_EFF = 0.50
 DEBIT_TRAIL_ARM = 0.40        # once 40% of max profit is captured, trail
 DEBIT_TRAIL_GIVEBACK = 0.35   # exit if the trade gives back 35% of its peak profit
 
@@ -678,13 +682,28 @@ def _regime_invalidation_reason(
         if closed_bar_check_allowed and spot > vwap and last_n_closes_above(vwap, bars, n=2):
             return "VWAP_INVALIDATION"
     elif strategy in {StrategyType.IRON_CONDOR, StrategyType.IRON_FLY, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE}:
-        # A theta structure must BREATHE before a momentary regime flicker evicts it. Firing the
-        # instant the classifier reads non-RANGE killed two iron-flies at 0.6 and 1.2 minutes on
-        # 2026-08-06 (mfe never left 0) that decayed to +812 and +770 by close — ~Rs 1,644 handed
-        # back, measured by exit_shadow_toclose. Gate it behind the SAME one-candle min-hold every
-        # other invalidation path already uses; a genuine regime break still exits once the fly has
-        # had a candle to settle, and defined-risk wings cap the interim.
-        if closed_bar_check_allowed and current_regime is not None and current_regime.regime != RegimeLabel.RANGE:
+        # Two reasons these flies died at 0.6-1.2 min on 2026-08-06 (mfe never left 0, then decayed
+        # to +812/+770 by close — ~Rs 1,644 handed back, seen in exit_shadow_toclose):
+        #   (a) NO min-hold: every other invalidation path waits one candle; this one fired instantly.
+        #   (b) CLASSIFIER MISMATCH: the fly is *entered* on a low-efficiency BREAKOUT_DOWN that the
+        #       SELECTOR reads as range-like ("the tape retraces what it gives, sell neutral premium",
+        #       trend_efficiency < 0.50). But the EXIT here used a DIFFERENT test — classify_regime !=
+        #       RANGE — which is TRUE the instant it enters, so the fly was dead on arrival. A min-hold
+        #       alone only delays that to +5 min; it does not reconcile the two views.
+        # Fix: gate on one candle AND on the SAME signal the entry used. Only invalidate when genuine
+        # follow-through has RETURNED (trend_efficiency >= the entry threshold) — i.e. a real breakout
+        # the neutral structure can't hold. While the low-efficiency chop that justified the fly
+        # persists, keep collecting decay. Missing efficiency -> treat as high (allow exit) so a data
+        # gap never traps a position. Defined-risk wings cap the interim either way.
+        _eff = 1.0
+        if current_regime is not None:
+            try:
+                _eff = float((current_regime.metadata or {}).get("trend_efficiency_ratio", 1.0))
+            except (TypeError, ValueError):
+                _eff = 1.0
+        if (closed_bar_check_allowed and current_regime is not None
+                and current_regime.regime != RegimeLabel.RANGE
+                and _eff >= _THETA_INVALIDATION_MIN_EFF):
             return "RANGE_INVALIDATION"
     return None
 
