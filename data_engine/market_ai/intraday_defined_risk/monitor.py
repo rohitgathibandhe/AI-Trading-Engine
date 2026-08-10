@@ -1112,115 +1112,133 @@ class IntradayDefinedRiskAgent:
             "IRON_FLY": StrategyType.IRON_FLY,
             "SHORT_STRADDLE": StrategyType.SHORT_STRADDLE,
         }
-        # choice.structures is a RANKED list, not a single pick — walk it and take the first the
-        # runtime can actually express, so one unmappable structure does not forfeit the day.
-        strategy = next((s for s in (_strat_map.get(n) for n in choice.structures) if s is not None), None)
-        if strategy is None:
-            return None  # fall back to legacy
+        # choice.structures is a RANKED list. BUILD each in turn and enter the first that actually
+        # constructs and passes risk — so when the primary (e.g. a with-drift bear-call) can't be
+        # built because a wall sits overhead, a defined-risk fallback (e.g. a neutral condor on the
+        # same rich premium) still gets its shot instead of forfeiting the day. Previously only the
+        # first mappable name was tried; a build failure there stood the whole day aside.
+        def _try_structure(strategy):
+            """Attempt one structure end-to-end. Returns (decision, entered: bool). Operates on the
+            shared regime_state.metadata (`meta`) that select_best_structure reads — so the strike
+            floors below actually reach the builder. Floors are cleared first so a prior candidate's
+            floor (e.g. the bear-call's min_short_call_strike) can't contaminate the condor fallback."""
+            meta.pop("min_short_call_strike", None)
+            meta.pop("max_short_put_strike", None)
+            _dir_map = {
+                StrategyType.BEAR_CALL_CREDIT_SPREAD: "BEARISH",
+                StrategyType.PUT_DEBIT_SPREAD: "BEARISH",
+                StrategyType.BULL_PUT_CREDIT_SPREAD: "BULLISH",
+                StrategyType.CALL_DEBIT_SPREAD: "BULLISH",
+            }
+            direction = _dir_map.get(strategy, "RANGE")
+            _is_debit = strategy in (StrategyType.CALL_DEBIT_SPREAD, StrategyType.PUT_DEBIT_SPREAD)
+            playbook = f"SEL_{choice.condition}"
+            meta["playbook"] = playbook
+            meta["setup_direction"] = direction
+            meta["setup_quality_score"] = max(float(meta.get("setup_quality_score") or 0.0), choice.conviction * 20.0)
+            # The selector IS the decision brain — express its conviction as the directional
+            # trade score so the live entry gate (which re-checks score vs no_trade + margin)
+            # passes selector trades. ~2-10 scale; above the ~5 threshold at high conviction.
+            _sel_score = round(2.0 + choice.conviction * 8.0, 4)
+            meta["no_trade_score"] = min(float(meta.get("no_trade_score") or 0.0), 0.0)
+            if direction == "BEARISH":
+                meta["bearish_trade_score"] = max(float(meta.get("bearish_trade_score") or 0.0), _sel_score)
+            elif direction == "BULLISH":
+                meta["bullish_trade_score"] = max(float(meta.get("bullish_trade_score") or 0.0), _sel_score)
+            else:
+                # RANGE / neutral premium sellers (IRON_FLY, IRON_CONDOR, SHORT_STRANGLE, SHORT_STRADDLE)
+                # have no directional side. The live entry gate scores RANGE as max(bearish, bullish), so
+                # if we leave both at 0 the gate fails every neutral seller with DIRECTIONAL_SCORE_MARGIN_FAIL
+                # — the fly/strangle would be selected, built, risk-approved, then silently killed here.
+                # (This is why IRON_FLY had 0 live fills even once the selector could choose it.) A neutral
+                # seller's conviction is symmetric, so express it on BOTH sides.
+                meta["bearish_trade_score"] = max(float(meta.get("bearish_trade_score") or 0.0), _sel_score)
+                meta["bullish_trade_score"] = max(float(meta.get("bullish_trade_score") or 0.0), _sel_score)
+            # Credit spreads take a wall/level floor for strike selection; debit spreads
+            # use their own delta-band selection, so no strike guidance is imposed.
+            if not _is_debit:
+                if direction == "BEARISH" and choice.read and choice.read.resistance:
+                    meta["min_short_call_strike"] = float(choice.read.resistance)
+                elif direction == "BULLISH" and choice.read and choice.read.support:
+                    meta["max_short_put_strike"] = float(choice.read.support)
 
-        _dir_map = {
-            StrategyType.BEAR_CALL_CREDIT_SPREAD: "BEARISH",
-            StrategyType.PUT_DEBIT_SPREAD: "BEARISH",
-            StrategyType.BULL_PUT_CREDIT_SPREAD: "BULLISH",
-            StrategyType.CALL_DEBIT_SPREAD: "BULLISH",
-        }
-        direction = _dir_map.get(strategy, "RANGE")
-        _is_debit = strategy in (StrategyType.CALL_DEBIT_SPREAD, StrategyType.PUT_DEBIT_SPREAD)
-        playbook = f"SEL_{choice.condition}"
-        meta["playbook"] = playbook
-        meta["setup_direction"] = direction
-        meta["setup_quality_score"] = max(float(meta.get("setup_quality_score") or 0.0), choice.conviction * 20.0)
-        # The selector IS the decision brain — express its conviction as the directional
-        # trade score so the live entry gate (which re-checks score vs no_trade + margin)
-        # passes selector trades. ~2-10 scale; above the ~5 threshold at high conviction.
-        _sel_score = round(2.0 + choice.conviction * 8.0, 4)
-        meta["no_trade_score"] = min(float(meta.get("no_trade_score") or 0.0), 0.0)
-        if direction == "BEARISH":
-            meta["bearish_trade_score"] = max(float(meta.get("bearish_trade_score") or 0.0), _sel_score)
-        elif direction == "BULLISH":
-            meta["bullish_trade_score"] = max(float(meta.get("bullish_trade_score") or 0.0), _sel_score)
-        else:
-            # RANGE / neutral premium sellers (IRON_FLY, IRON_CONDOR, SHORT_STRANGLE, SHORT_STRADDLE)
-            # have no directional side. The live entry gate scores RANGE as max(bearish, bullish), so
-            # if we leave both at 0 the gate fails every neutral seller with DIRECTIONAL_SCORE_MARGIN_FAIL
-            # — the fly/strangle would be selected, built, risk-approved, then silently killed here.
-            # (This is why IRON_FLY had 0 live fills even once the selector could choose it.) A neutral
-            # seller's conviction is symmetric, so express it on BOTH sides.
-            meta["bearish_trade_score"] = max(float(meta.get("bearish_trade_score") or 0.0), _sel_score)
-            meta["bullish_trade_score"] = max(float(meta.get("bullish_trade_score") or 0.0), _sel_score)
-        # Credit spreads take a wall/level floor for strike selection; debit spreads
-        # use their own delta-band selection, so no strike guidance is imposed.
-        if not _is_debit:
-            if direction == "BEARISH" and choice.read and choice.read.resistance:
-                meta["min_short_call_strike"] = float(choice.read.resistance)
-            elif direction == "BULLISH" and choice.read and choice.read.support:
-                meta["max_short_put_strike"] = float(choice.read.support)
+            entry_allowed, entry_reason = validate_entry_time(strategy, snapshot.timestamp)
+            if not entry_allowed:
+                return build_no_trade_decision(
+                    regime_state.regime.value, [choice.rationale] + ([entry_reason] if entry_reason else []),
+                    confidence_score=choice.conviction,
+                    extra_metadata=dict(meta) | {"trade_funnel": _funnel("ENTRY_TIME_INVALID", strategy.value, "NO_TRADE")},
+                ), False
+            ctx_ok, ctx_reason = validate_entry_context(strategy, snapshot, regime_state)
+            if not ctx_ok:
+                return build_no_trade_decision(
+                    regime_state.regime.value, [choice.rationale, f"Entry context: {ctx_reason}"],
+                    confidence_score=choice.conviction,
+                    extra_metadata=dict(meta) | {"trade_funnel": _funnel(str(ctx_reason or "ENTRY_CONTEXT"), strategy.value, "NO_TRADE")},
+                ), False
 
-        entry_allowed, entry_reason = validate_entry_time(strategy, snapshot.timestamp)
-        if not entry_allowed:
-            return build_no_trade_decision(
-                regime_state.regime.value, [choice.rationale] + ([entry_reason] if entry_reason else []),
-                confidence_score=choice.conviction,
-                extra_metadata=dict(meta) | {"trade_funnel": _funnel("ENTRY_TIME_INVALID", strategy.value, "NO_TRADE")},
+            structure, structure_reasons, structure_report = select_best_structure(
+                strategy, snapshot, regime_state, self.parameters,
+                setup_quality_score=float(meta.get("setup_quality_score") or 0.0), playbook_tier="A",
             )
-        ctx_ok, ctx_reason = validate_entry_context(strategy, snapshot, regime_state)
-        if not ctx_ok:
-            return build_no_trade_decision(
-                regime_state.regime.value, [choice.rationale, f"Entry context: {ctx_reason}"],
-                confidence_score=choice.conviction,
-                extra_metadata=dict(meta) | {"trade_funnel": _funnel(str(ctx_reason or "ENTRY_CONTEXT"), strategy.value, "NO_TRADE")},
+            if not structure:
+                _log_selection_outcome(
+                    snapshot=snapshot, choice=choice, strategy=strategy, outcome="STRUCTURE_FAIL",
+                    reason=str(structure_report.get("canonical_rejection_reason") or "SPREAD_CONSTRUCTION_FAILED"),
+                    structure_report=structure_report,
+                )
+                return build_no_trade_decision(
+                    regime_state.regime.value, [choice.rationale] + structure_reasons,
+                    confidence_score=choice.conviction,
+                    extra_metadata=dict(meta) | {"trade_funnel": _funnel(
+                        str(structure_report.get("canonical_rejection_reason") or "SPREAD_CONSTRUCTION_FAILED"),
+                        strategy.value, "NO_TRADE")},
+                ), False
+            risk = assess_trade_risk(
+                structure=structure, lot_size=snapshot.lot_size,
+                risk_limits=snapshot.risk_limits, account_state=snapshot.account_state,
+                margin_estimate_per_lot=structure.margin_estimate_per_lot, playbook=playbook,
             )
-
-        structure, structure_reasons, structure_report = select_best_structure(
-            strategy, snapshot, regime_state, self.parameters,
-            setup_quality_score=float(meta.get("setup_quality_score") or 0.0), playbook_tier="A",
-        )
-        if not structure:
+            if not risk.allowed:
+                _log_selection_outcome(
+                    snapshot=snapshot, choice=choice, strategy=strategy, outcome="RISK_FAIL",
+                    reason="RISK_LIMIT", structure_report=structure_report, risk=risk,
+                )
+                return build_no_trade_decision(
+                    regime_state.regime.value, [choice.rationale] + risk.reasons,
+                    confidence_score=choice.conviction,
+                    extra_metadata=dict(meta) | {"trade_funnel": _funnel("RISK_LIMIT", strategy.value, "NO_TRADE")},
+                ), False
             _log_selection_outcome(
-                snapshot=snapshot, choice=choice, strategy=strategy, outcome="STRUCTURE_FAIL",
-                reason=str(structure_report.get("canonical_rejection_reason") or "SPREAD_CONSTRUCTION_FAILED"),
-                structure_report=structure_report,
+                snapshot=snapshot, choice=choice, strategy=strategy, outcome="ENTERED",
+                reason="OK", structure_report=structure_report, risk=risk,
             )
-            return build_no_trade_decision(
-                regime_state.regime.value, [choice.rationale] + structure_reasons,
-                confidence_score=choice.conviction,
-                extra_metadata=dict(meta) | {"trade_funnel": _funnel(
-                    str(structure_report.get("canonical_rejection_reason") or "SPREAD_CONSTRUCTION_FAILED"),
-                    strategy.value, "NO_TRADE")},
-            )
-        risk = assess_trade_risk(
-            structure=structure, lot_size=snapshot.lot_size,
-            risk_limits=snapshot.risk_limits, account_state=snapshot.account_state,
-            margin_estimate_per_lot=structure.margin_estimate_per_lot, playbook=playbook,
-        )
-        if not risk.allowed:
-            _log_selection_outcome(
-                snapshot=snapshot, choice=choice, strategy=strategy, outcome="RISK_FAIL",
-                reason="RISK_LIMIT", structure_report=structure_report, risk=risk,
-            )
-            return build_no_trade_decision(
-                regime_state.regime.value, [choice.rationale] + risk.reasons,
-                confidence_score=choice.conviction,
-                extra_metadata=dict(meta) | {"trade_funnel": _funnel("RISK_LIMIT", strategy.value, "NO_TRADE")},
-            )
-        _log_selection_outcome(
-            snapshot=snapshot, choice=choice, strategy=strategy, outcome="ENTERED",
-            reason="OK", structure_report=structure_report, risk=risk,
-        )
-        self._current_features = {"playbook": playbook, "setup_direction": direction,
-                                  "selector_condition": choice.condition, "selector_family": choice.family}
-        return build_trade_decision(
-            structure=structure, regime=regime_state.regime,
-            rationale=[choice.rationale] + structure_reasons,
-            confidence_score=min(1.0, choice.conviction + 0.10),
-            entry_time=snapshot.timestamp, lots=risk.lots, lot_size=snapshot.lot_size,
-            max_loss_rupees_per_lot=risk.max_loss_rupees_per_lot, slippage_points=snapshot.slippage_points,
-            extra_metadata=dict(meta) | {
-                "playbook": playbook, "setup_direction": direction,
-                "selector_condition": choice.condition, "selector_family": choice.family,
-                "trade_funnel": _funnel("NONE", strategy.value, "EXECUTED"),
-            },
-        )
+            self._current_features = {"playbook": playbook, "setup_direction": direction,
+                                      "selector_condition": choice.condition, "selector_family": choice.family}
+            return build_trade_decision(
+                structure=structure, regime=regime_state.regime,
+                rationale=[choice.rationale] + structure_reasons,
+                confidence_score=min(1.0, choice.conviction + 0.10),
+                entry_time=snapshot.timestamp, lots=risk.lots, lot_size=snapshot.lot_size,
+                max_loss_rupees_per_lot=risk.max_loss_rupees_per_lot, slippage_points=snapshot.slippage_points,
+                extra_metadata=dict(meta) | {
+                    "playbook": playbook, "setup_direction": direction,
+                    "selector_condition": choice.condition, "selector_family": choice.family,
+                    "trade_funnel": _funnel("NONE", strategy.value, "EXECUTED"),
+                },
+            ), True
+
+        _candidates = [_strat_map[n] for n in choice.structures if n in _strat_map]
+        if not _candidates:
+            return None  # nothing mappable -> fall back to legacy
+        _first_reject = None
+        for strategy in _candidates:
+            _decision, _entered = _try_structure(strategy)
+            if _entered:
+                return _decision
+            if _first_reject is None:
+                _first_reject = _decision   # report the PRIMARY structure's reason if all fail
+        return _first_reject
 
     def evaluate(self, snapshot: MarketSnapshot) -> DecisionOutput:
         self._reset_session(snapshot.timestamp)

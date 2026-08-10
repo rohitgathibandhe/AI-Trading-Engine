@@ -652,19 +652,27 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         _range_formed = now_time is None or now_time >= _CHOP_SELL_AFTER
         _drift_ok = now_time is None or now_time >= _CHOP_DRIFT_AFTER
         _lean = read.bias in ("BULLISH", "BEARISH") and read.conviction >= _CHOP_DRIFT_MIN_CONV
+        # When the directional vertical can't be BUILT (e.g. an overhead wall forces the short too
+        # far OTM to earn its width), fall back to a defined-risk NEUTRAL condor that harvests the
+        # SAME premium — but only under the neutral path's own preconditions (premium sellable AND the
+        # range has formed), so we never sell a neutral structure into an unformed range. The executor
+        # walks this ranked list and only reaches the condor if the vertical fails to construct.
+        _neutral_fallback = ["IRON_CONDOR"] if (_prem_ok and _range_formed) else []
         if _SELL_CHOP and _lean and _drift_ok and read.bias == "BULLISH":
             # Mild UP-DRIFT (not a confirmed trend) — SELL a WITH-DRIFT bull-put. It leans with the
             # bias AND collects theta (wins on up OR sideways), sells an OTM short (less IV-sensitive
             # than the ATM fly, so it works when ATM premium is thin), and is a high-win-rate seller.
             # The shadow book shows bull_put +1,072/+1,084/+630 on exactly the mild-drift days the
             # agent stood aside on — this converts those MISSES into trades and lifts the win rate.
-            choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
+            choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"] + _neutral_fallback
             choice.rationale = (f"CHOP but mild BULLISH drift (conviction {read.conviction:.2f}) — SELL a "
-                                f"with-drift bull-put (theta + lean; high-win seller), not stand aside.")
+                                f"with-drift bull-put (theta + lean; high-win seller), not stand aside."
+                                + (" Neutral condor fallback if the vertical can't be built." if _neutral_fallback else ""))
         elif _SELL_CHOP and _lean and _drift_ok and read.bias == "BEARISH":
-            choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BEAR_CALL_CREDIT_SPREAD"]
+            choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BEAR_CALL_CREDIT_SPREAD"] + _neutral_fallback
             choice.rationale = (f"CHOP but mild BEARISH drift (conviction {read.conviction:.2f}) — SELL a "
-                                f"with-drift bear-call (theta + lean), not stand aside.")
+                                f"with-drift bear-call (theta + lean), not stand aside."
+                                + (" Neutral condor fallback if the vertical can't be built." if _neutral_fallback else ""))
         elif _SELL_CHOP and _prem_ok and _range_formed:
             # Genuinely NEUTRAL chop with sellable premium — neutral defined-risk fly, collect theta.
             choice.family = FAM_PREMIUM_SELL
