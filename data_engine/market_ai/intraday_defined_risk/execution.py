@@ -342,6 +342,9 @@ DEBIT_MIN_HOLD = 10           # min minutes before the stop can fire (noise guar
 # Its RANGE_INVALIDATION exit must use the SAME bar, so it only fires when real follow-through returns
 # — mirrors the selector's _BUY_MIN_EFFICIENCY so entry and exit agree on what "not a range" means.
 _THETA_INVALIDATION_MIN_EFF = 0.50
+# ...and the breakout must PERSIST this many consecutive cycles (~30s each) before the exit fires, so a
+# one-cycle head-fake across the 0.50 line can't evict a theta trade that then reverts. See the exit.
+_THETA_INVALIDATION_MIN_STREAK = 2
 DEBIT_TRAIL_ARM = 0.40        # once 40% of max profit is captured, trail
 DEBIT_TRAIL_GIVEBACK = 0.35   # exit if the trade gives back 35% of its peak profit
 
@@ -701,9 +704,22 @@ def _regime_invalidation_reason(
                 _eff = float((current_regime.metadata or {}).get("trend_efficiency_ratio", 1.0))
             except (TypeError, ValueError):
                 _eff = 1.0
-        if (closed_bar_check_allowed and current_regime is not None
-                and current_regime.regime != RegimeLabel.RANGE
-                and _eff >= _THETA_INVALIDATION_MIN_EFF):
+        _breaking = bool(
+            closed_bar_check_allowed and current_regime is not None
+            and current_regime.regime != RegimeLabel.RANGE
+            and _eff >= _THETA_INVALIDATION_MIN_EFF
+        )
+        # PERSISTENCE: even with the efficiency gate, RANGE_INVALIDATION still handed back winners on
+        # 2026-08-10 (condor +182 vs +741 held; fly -221 at 5.9min vs +1,206 held) because a HEAD-FAKE
+        # breakout crosses trend_efficiency 0.50 for a single cycle, trips the exit, then reverts. A
+        # real breakout PERSISTS across consecutive reads; a fake does not. So require the break to
+        # hold for _THETA_INVALIDATION_MIN_STREAK consecutive cycles before evicting. The streak lives
+        # on position.metadata (round-trips through save/load); it resets the moment the tape calms, so
+        # a genuine sustained trend still exits within ~a minute while a one-candle fake no longer can.
+        _streak = int(position.metadata.get("_range_inval_streak") or 0)
+        _streak = _streak + 1 if _breaking else 0
+        position.metadata["_range_inval_streak"] = _streak
+        if _streak >= _THETA_INVALIDATION_MIN_STREAK:
             return "RANGE_INVALIDATION"
     return None
 
