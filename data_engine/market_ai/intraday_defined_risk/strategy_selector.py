@@ -621,21 +621,26 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         if _too_early:
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = "RANGE_WIDE but before 11:30 — range not yet formed (morning condors lose); wait."
-        elif iv in (IV_RICH, IV_NORMAL):
+        elif iv in (IV_RICH, IV_NORMAL) or vol.regime == RICH_SELL:
             # SEL_NO_CONDOR drops the CONDOR specifically (its P&L is order-noise on the ordering-robust
             # harness) — but that should NOT mean standing aside on a formed range, which cost real
             # money: on range/stand-aside days the live shadow made strangle +2,723 / fly +4,053. So
             # sell the range with a NEUTRAL structure the record likes (fly first, strangle fallback),
             # only adding the condor when it is not disabled.
-            # NOTE: the volatility engine is ADVISORY here — its rich/cheap read is attached but does
-            # NOT yet gate (a "stand aside when vol cheap" rule was REJECTED: 7mo +104,858 -> +84,945).
+            # VRP reconciliation: the crude iv gate calls VIX<11 "cheap", but that is an ABSOLUTE-level
+            # proxy — the real question is IV vs REALIZED. The volatility engine measures exactly that,
+            # and RICH_SELL means IV > realized (a genuine selling edge) even at low absolute VIX. On
+            # 2026-08-11 (VIX 10.25 -> iv=CHEAP) the tape pinned a tight range all day and iron_fly made
+            # +3,398 in the shadow, yet the agent stood aside every cycle on "IV CHEAP". Trusting the
+            # VRP read is also what the prior 7mo sweep supports: adding a stand-aside-when-cheap rule
+            # made it WORSE (+104,858 -> +84,945), i.e. trading low-vol days was the better policy.
             choice.family = FAM_PREMIUM_SELL
             choice.structures = ["IRON_FLY", "IRON_CONDOR"] if _NO_CONDOR else ["IRON_CONDOR", "IRON_FLY"]
             _rich = " (vol RICH)" if vol.regime == RICH_SELL else (" (vol CHEAP — watch)" if vol.regime == CHEAP_BUY else "")
             choice.rationale = f"RANGE_WIDE / mid-day{_rich}: two-sided walls, balanced tape — sell NEUTRAL premium inside the formed range{' (condor off: fly/strangle)' if _NO_CONDOR else ''}."
         else:
             choice.family, choice.structures = FAM_STAND_ASIDE, []
-            choice.rationale = "RANGE_WIDE but IV CHEAP: premium too thin to sell; stand aside."
+            choice.rationale = "RANGE_WIDE but premium thin on BOTH reads (iv cheap AND vol not rich) — stand aside."
 
     elif condition == RANGE_TIGHT:
         choice.family, choice.structures = FAM_STAND_ASIDE, []
@@ -648,7 +653,10 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         choice.rationale = "HIGH_VOL_UNDIRECTED: elevated vol without direction = whipsaw risk — stand aside."
 
     else:  # CHOP
-        _prem_ok = iv in (IV_RICH, IV_NORMAL)
+        # Premium is sellable if EITHER the iv-level read is rich/normal OR the VRP engine says
+        # RICH_SELL (IV > realized). VIX<11 alone ("iv cheap") must not veto a genuine selling edge —
+        # it cost a +3,398 iron_fly on 2026-08-11. See the matching RANGE_WIDE gate above.
+        _prem_ok = iv in (IV_RICH, IV_NORMAL) or vol.regime == RICH_SELL
         _range_formed = now_time is None or now_time >= _CHOP_SELL_AFTER
         _drift_ok = now_time is None or now_time >= _CHOP_DRIFT_AFTER
         _lean = read.bias in ("BULLISH", "BEARISH") and read.conviction >= _CHOP_DRIFT_MIN_CONV
