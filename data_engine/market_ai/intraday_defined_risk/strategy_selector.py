@@ -242,7 +242,8 @@ def _orb_confirms_trend(m: dict, now_time, direction: str) -> bool:
     # put-debit (+2,985) and would have sold a losing fly (-3,431). Realized efficiency is the honest
     # confirmation the move is real (NOT lookahead — it is efficiency up to NOW), and it is exactly
     # what distinguishes 08-04 (eff -> 1.0) from 07-23's fake early trend (eff 0.04 at the 09:48 entry).
-    _accepted = bool(m.get("accepted_breakout"))
+    # Direction-appropriate: a DOWN trend is confirmed by accepted_breakdown, not the upside flag.
+    _accepted = bool(m.get("accepted_breakout")) if direction == "UP" else bool(m.get("accepted_breakdown"))
     if not (_accepted or _trend_efficiency(m) >= _ORB_EFF_CONFIRM):
         return False
     # (c) if the confirmation is an accepted OR-break, its direction must match; when confirmation is
@@ -440,10 +441,15 @@ def classify_condition(read: MarketRead, metadata: dict[str, Any], now_time=None
     # Breakout: OR break with directional consensus — but a fresh UP/DOWN break must be ACCEPTED
     # (held past retest), not a fakeout that immediately reverts. FAILED_UP is a rejection signal and
     # is exempt. An un-accepted fresh break falls through to STRONG_TREND / CHOP below.
-    accepted = bool(m.get("accepted_breakout")) or not _REQUIRE_ACCEPTED_BREAKOUT
-    if orb == "UP" and read.bias == "BULLISH" and accepted:
+    # Direction-appropriate acceptance: a DOWN break is confirmed by accepted_breakdown, an UP break by
+    # accepted_breakout. Checking only accepted_breakout for BOTH threw away 2026-08-12's clean ORB
+    # breakdown (accepted_breakdown=True, accepted_breakout=False) — it fell to CHOP and the agent sold
+    # a losing -2,291 with-drift bear-call instead of trading the confirmed downtrend (put-debit +570).
+    accepted_up = bool(m.get("accepted_breakout")) or not _REQUIRE_ACCEPTED_BREAKOUT
+    accepted_dn = bool(m.get("accepted_breakdown")) or not _REQUIRE_ACCEPTED_BREAKOUT
+    if orb == "UP" and read.bias == "BULLISH" and accepted_up:
         return BREAKOUT_UP
-    if orb == "DOWN" and read.bias == "BEARISH" and accepted:
+    if orb == "DOWN" and read.bias == "BEARISH" and accepted_dn:
         return BREAKOUT_DOWN
     if orb == "FAILED_UP" and read.bias == "BEARISH":
         return BREAKOUT_DOWN
