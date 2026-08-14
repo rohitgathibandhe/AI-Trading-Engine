@@ -120,6 +120,20 @@ def _emitted_of(j: dict):
     return j.get("emitted_at") or dr.get("timestamp")
 
 
+def _data_fault_hint() -> str:
+    """Scan the recent runner log for the ACTUAL cause of a data blackout so the alert names the right
+    fix. A lapsed Dhan DATA API subscription (DH-902 / 'not subscribed to Data APIs') is NOT a token
+    problem — the trading token still authenticates, so 'refresh the token' sends the user down the
+    wrong path (this cost 2026-08-13 and 08-14)."""
+    tail = "\n".join(_tail_lines(RUNNER_LOG, 120_000)).lower()
+    if "dh-902" in tail or "not subscribed to data" in tail or "subscribe to data api" in tail:
+        return ("Dhan DATA API SUBSCRIPTION has lapsed (DH-902 / HTTP 451). The trading token is fine — "
+                "refreshing it will NOT help. Renew the Dhan 'Data APIs' plan to restore live data.")
+    if "dh-901" in tail or "invalid token" in tail or "token expired" in tail or "unauthorized" in tail:
+        return "DHAN access token looks expired/invalid — refresh the token in state/creds.json."
+    return "No live data (candles/chain). Check the Dhan data feed: token validity AND Data API subscription."
+
+
 def _process_alive() -> bool:
     try:
         out = subprocess.run(["pgrep", "-f", "intraday_defined_risk.cli run_live"],
@@ -261,13 +275,12 @@ def main() -> int:
         _log({**base, "action": "DRY_RUN_WOULD_REMEDIATE", "consecutive_unhealthy": consec})
         return 0
 
-    # Escalate rather than restart-loop forever: a persistent fault after N restarts is almost
-    # always an expired token / broker-side issue that a human must clear.
+    # Escalate rather than restart-loop forever: a persistent fault after N restarts is a broker-side
+    # issue a human must clear. Name the ACTUAL cause (data-API subscription vs token) — see _data_fault_hint.
     if restarts >= MAX_RESTARTS_BEFORE_ESCALATE:
         if not state.get("escalated"):
             _alert(f"🚑 SELF-HEAL: agent still NOT trading-capable after {restarts} auto-restarts "
-                   f"today ({result['reason']}). Most likely an EXPIRED DHAN TOKEN — please refresh "
-                   f"the token in state/creds.json. Auto-restarts paused to avoid a loop.")
+                   f"today ({result['reason']}). {_data_fault_hint()} Auto-restarts paused to avoid a loop.")
             state["escalated"] = True
         _save_state(state)
         _log({**base, "action": "ESCALATED_MANUAL", "restarts_today": restarts})
