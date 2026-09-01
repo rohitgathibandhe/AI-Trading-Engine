@@ -124,6 +124,12 @@ _SELL_CHOP = os.environ.get("SEL_SELL_CHOP", "1") == "1"
 _CHOP_SELL_AFTER = time(11, 0)   # let the range form before selling the ATM
 _CHOP_DRIFT_MIN_CONV = _sel_env_float("SEL_CHOP_DRIFT_MIN_CONV") or 0.40   # min lean to sell a with-drift spread in chop
 _CHOP_DRIFT_AFTER = time(10, 0)   # with-drift spread can enter earlier than the neutral fly (it leans with an established bias, needs less range-formation)
+# EXHAUSTION guard for with-drift entries. The drift is BACKWARD-looking, so fading a move that is
+# already extended AND stalling at its extreme sells into a reversal — the single most repeated loss:
+# bear-calls entered at the low on 08-05/08-12/08-31 (-1,160 / -2,291 / -2,428), each right before the
+# bounce. Skip the directional lean when the move is both extended and has stalled.
+_DRIFT_EXHAUST_MOVE_PTS = _sel_env_float("SEL_DRIFT_EXHAUST_MOVE_PTS") or 70.0   # ~0.3% of Nifty = a big directional move
+_DRIFT_STALL_PCT = _sel_env_float("SEL_DRIFT_STALL_PCT") or 0.15                 # last-hour move smaller than this (in drift dir) = stalled
 
 # ── ORB-GATED TREND (default ON) ──────────────────────────────────────────────────────────────
 # Verification 2026-08 found the agent calls STRONG_TREND on choppy days: it fired STRONG_TREND_DOWN
@@ -672,7 +678,21 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         # range has formed), so we never sell a neutral structure into an unformed range. The executor
         # walks this ranked list and only reaches the condor if the vertical fails to construct.
         _neutral_fallback = ["IRON_CONDOR"] if (_prem_ok and _range_formed) else []
-        if _SELL_CHOP and _lean and _drift_ok and read.bias == "BULLISH":
+        # Exhaustion: is the drift move already extended AND stalled at its extreme? A bearish drift is
+        # stalled when the last hour is no longer falling; a bullish drift when it is no longer rising.
+        _sess_move = abs(_f(metadata, "session_move_pts", 0.0))
+        _last_hr = _f(metadata, "last_hour_change_pct", 0.0)
+        _stalled = (_last_hr >= -_DRIFT_STALL_PCT) if read.bias == "BEARISH" else (_last_hr <= _DRIFT_STALL_PCT)
+        _exhausted = _lean and _sess_move >= _DRIFT_EXHAUST_MOVE_PTS and _stalled
+        if _SELL_CHOP and _exhausted:
+            # Don't fade an exhausted move: extended + stalled at the extreme = reversal risk, not drift.
+            choice.family, choice.structures = FAM_STAND_ASIDE, []
+            choice.rationale = (
+                f"CHOP {read.bias} drift but the move is EXHAUSTED (session {_sess_move:.0f}pts, last hour "
+                f"{_last_hr:+.2f}% — extended and stalled at the extreme). Fading it sells into a reversal "
+                f"(the repeated -1,160/-2,291/-2,428 bear-call-at-the-low loss). Stand aside."
+            )
+        elif _SELL_CHOP and _lean and _drift_ok and read.bias == "BULLISH":
             # Mild UP-DRIFT (not a confirmed trend) — SELL a WITH-DRIFT bull-put. It leans with the
             # bias AND collects theta (wins on up OR sideways), sells an OTM short (less IV-sensitive
             # than the ATM fly, so it works when ATM premium is thin), and is a high-win-rate seller.
