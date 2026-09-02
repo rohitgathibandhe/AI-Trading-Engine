@@ -44,18 +44,61 @@ def _s(m: dict[str, Any], k: str, d: str = "") -> str:
     return str(m.get(k) or d).upper()
 
 
+def _b(m: dict[str, Any], k: str) -> bool:
+    v = m.get(k)
+    return bool(v) and str(v).lower() not in ("false", "0", "none", "")
+
+
+def _ema20_bias(m: dict[str, Any]) -> str:
+    """The 20-EMA trend filter: price ABOVE the 20-EMA = bullish, BELOW = bearish. Prefers the explicit
+    price_vs_ema20 read, else compares spot to the 15m/daily/5m EMA20."""
+    pv = _s(m, "price_vs_ema20").upper()
+    if pv in ("ABOVE", "BULLISH"):
+        return BULLISH
+    if pv in ("BELOW", "BEARISH"):
+        return BEARISH
+    spot = _f(m, "atm_strike") or _f(m, "spot_price") or _f(m, "spot")
+    for ek in ("ema20_15m", "daily_ema20", "ema20_5m"):
+        e = _f(m, ek)
+        if spot > 0 and e > 0:
+            return BULLISH if spot >= e else BEARISH
+    return NEUTRAL
+
+
+def _w_pattern_at_support(m: dict[str, Any]) -> bool:
+    """W / double-bottom reversal at support: a higher low or a rejected breakdown, with a rejection wick."""
+    return ((_b(m, "higher_low_confirmed") or _b(m, "failed_breakdown"))
+            and (_f(m, "wick_rejection_score") >= 1.0 or _b(m, "failed_breakdown")))
+
+
+def _m_pattern_at_resistance(m: dict[str, Any]) -> bool:
+    """M / double-top reversal at resistance: a lower high or a rejected breakout, with a rejection wick."""
+    return ((_b(m, "lower_high_confirmed") or _b(m, "failed_breakout"))
+            and (_f(m, "wick_rejection_score") >= 1.0 or _b(m, "failed_breakout")))
+
+
 def _bias(m: dict[str, Any]) -> str:
-    """Net directional lean from the strongest available signals."""
+    """Net directional lean. The 20-EMA is the PRIMARY trend filter (above=bullish, below=bearish); the
+    sentiment/flow signals (smart-money, OI, thesis) must AGREE with it, else we stay NEUTRAL rather
+    than fight the trend — 'don't be bullish below the 20-EMA'."""
+    ema = _ema20_bias(m)
+    signal = NEUTRAL
     for k in ("thesis_net_bias", "setup_direction", "smart_money_bias", "oi_pressure_bias"):
         v = _s(m, k)
         if v in (BULLISH, BEARISH):
-            return v
-    bq, sq = _f(m, "bullish_trend_quality_score"), _f(m, "bearish_trend_quality_score")
-    if bq - sq >= 1.5:
-        return BULLISH
-    if sq - bq >= 1.5:
-        return BEARISH
-    return NEUTRAL
+            signal = v
+            break
+    if signal == NEUTRAL:
+        bq, sq = _f(m, "bullish_trend_quality_score"), _f(m, "bearish_trend_quality_score")
+        if bq - sq >= 1.5:
+            signal = BULLISH
+        elif sq - bq >= 1.5:
+            signal = BEARISH
+    if signal == NEUTRAL:
+        return ema                       # flow is silent -> the 20-EMA sets the bias
+    if ema in (NEUTRAL, signal):
+        return signal                    # flow agrees with (or no) EMA trend -> take it
+    return NEUTRAL                        # flow fights the 20-EMA -> stay neutral, don't fight the trend
 
 
 def _iv_rich(m: dict[str, Any]) -> bool:
@@ -131,7 +174,11 @@ def _pc_bull_put(m):  # BULL PUT SPREAD (sell) — theta with an up/sideways lea
         and _s(m, "opening_range_break_state") != "DOWN"    # not actively breaking down
     )
     score = 4.0 + _f(m, "bullish_option_chain_pressure_score")
-    return ok, score, "up/neutral + rich IV + put-wall support below (sell puts, collect theta)"
+    why = "up/neutral + rich IV + put-wall support below (sell puts, collect theta)"
+    if _w_pattern_at_support(m):
+        score += 2.0                                       # W/double-bottom at support confirms the bull lean
+        why += " + W-pattern reversal at support"
+    return ok, score, why
 
 
 def _pc_bear_call(m):  # BEAR CALL SPREAD (sell) — theta with a down/sideways lean, resistance above
@@ -142,7 +189,11 @@ def _pc_bear_call(m):  # BEAR CALL SPREAD (sell) — theta with a down/sideways 
         and _s(m, "opening_range_break_state") != "UP"
     )
     score = 4.0 + _f(m, "overhead_call_pressure_score") + _f(m, "bearish_option_chain_pressure_score")
-    return ok, score, "down/neutral + rich IV + overhead call resistance (sell calls, collect theta)"
+    why = "down/neutral + rich IV + overhead call resistance (sell calls, collect theta)"
+    if _m_pattern_at_resistance(m):
+        score += 2.0                                       # M/double-top at resistance confirms the bear lean
+        why += " + M-pattern reversal at resistance"
+    return ok, score, why
 
 
 def _pc_iron_condor(m):  # SHORT IRON CONDOR (sell) — neutral, WIDE two-sided range, rich IV
