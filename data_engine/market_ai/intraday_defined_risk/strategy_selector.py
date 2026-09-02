@@ -130,6 +130,11 @@ _CHOP_DRIFT_AFTER = time(10, 0)   # with-drift spread can enter earlier than the
 # bounce. Skip the directional lean when the move is both extended and has stalled.
 _DRIFT_EXHAUST_MOVE_PTS = _sel_env_float("SEL_DRIFT_EXHAUST_MOVE_PTS") or 70.0   # ~0.3% of Nifty = a big directional move
 _DRIFT_STALL_PCT = _sel_env_float("SEL_DRIFT_STALL_PCT") or 0.15                 # last-hour move smaller than this (in drift dir) = stalled
+# A neutral fly needs a RANGE. Don't sell one into a tape that is moving efficiently — it gets
+# whipsawed out in minutes (09-01: two flies sold at trend_eff 0.70/0.55, both cut on RANGE_INVALIDATION
+# in 5.6 min, net churn). Mirrors the exit's _THETA_INVALIDATION_MIN_EFF so entry and exit agree on the
+# range/trend boundary: sell the fly only when efficiency is BELOW this; above it the tape is trending.
+_RANGE_FLY_MAX_EFF = _sel_env_float("SEL_RANGE_FLY_MAX_EFF") or 0.50
 
 # ── ORB-GATED TREND (default ON) ──────────────────────────────────────────────────────────────
 # Verification 2026-08 found the agent calls STRONG_TREND on choppy days: it fired STRONG_TREND_DOWN
@@ -633,7 +638,7 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         if _too_early:
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = "RANGE_WIDE but before 11:30 — range not yet formed (morning condors lose); wait."
-        elif iv in (IV_RICH, IV_NORMAL) or vol.regime == RICH_SELL:
+        elif (iv in (IV_RICH, IV_NORMAL) or vol.regime == RICH_SELL) and _trend_efficiency(metadata) < _RANGE_FLY_MAX_EFF:
             # SEL_NO_CONDOR drops the CONDOR specifically (its P&L is order-noise on the ordering-robust
             # harness) — but that should NOT mean standing aside on a formed range, which cost real
             # money: on range/stand-aside days the live shadow made strangle +2,723 / fly +4,053. So
@@ -650,6 +655,14 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
             choice.structures = ["IRON_FLY", "IRON_CONDOR"] if _NO_CONDOR else ["IRON_CONDOR", "IRON_FLY"]
             _rich = " (vol RICH)" if vol.regime == RICH_SELL else (" (vol CHEAP — watch)" if vol.regime == CHEAP_BUY else "")
             choice.rationale = f"RANGE_WIDE / mid-day{_rich}: two-sided walls, balanced tape — sell NEUTRAL premium inside the formed range{' (condor off: fly/strangle)' if _NO_CONDOR else ''}."
+        elif iv in (IV_RICH, IV_NORMAL) or vol.regime == RICH_SELL:
+            # Premium is sellable but the tape is MOVING (trend_efficiency high) — a neutral fly gets
+            # whipsawed out in minutes (09-01 churn). A range structure needs an actual range; don't
+            # sell one into a trending tape. Stand aside rather than churn.
+            choice.family, choice.structures = FAM_STAND_ASIDE, []
+            choice.rationale = (f"RANGE_WIDE walls but trend_efficiency {_trend_efficiency(metadata):.2f} "
+                                f">= {_RANGE_FLY_MAX_EFF:.2f} — the tape is MOVING, not ranging; a fly would be "
+                                f"whipsawed (the 09-01 5.6-min churn). Stand aside.")
         else:
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = "RANGE_WIDE but premium thin on BOTH reads (iv cheap AND vol not rich) — stand aside."
