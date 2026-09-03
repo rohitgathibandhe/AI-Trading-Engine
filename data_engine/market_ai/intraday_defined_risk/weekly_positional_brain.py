@@ -56,8 +56,12 @@ PROFIT_TARGET_FRAC   = _env_f("WK_PROFIT_TARGET_FRAC", 0.50)   # close at 50% of
 STOP_LOSS_MULT       = _env_f("WK_STOP_LOSS_MULT", 2.0)        # close if loss reaches 2x the credit
 GAMMA_CLIFF_DAYS     = _env_f("WK_GAMMA_CLIFF_DAYS", 2.0)      # exit this many trading days before expiry
 DEFENSE_SHORT_DELTA  = _env_f("WK_DEFENSE_SHORT_DELTA", 0.30)  # a short leg tested when |delta| >= this
-MIN_CREDIT_RATIO     = _env_f("WK_MIN_CREDIT_RATIO", 0.15)     # net credit / wing width floor (worth the risk)
-GAP_ATR_BUFFER       = _env_f("WK_GAP_ATR_BUFFER", 1.0)        # short beyond expected_move + this * daily ATR
+MIN_CREDIT_RATIO     = _env_f("WK_MIN_CREDIT_RATIO", 0.10)     # net credit / wing width floor (worth the risk)
+# Gap-safety comes from FOUR layers — trend-alignment (primary), the 0.18-delta short (~82% OTM), this
+# expected-move floor, and the defined-risk wing. The short is placed BY DELTA (see the executor); this
+# is only the MINIMUM distance so it can't sit too close. A full extra ATR on top double-counted with
+# delta and pushed the short so far OTM it collected no premium (2026-09-03: credit ratio 0.01).
+GAP_ATR_BUFFER       = _env_f("WK_GAP_ATR_BUFFER", 0.0)        # short beyond expected_move + this * daily ATR
 
 
 # ── Broader trend (the HIGHER timeframe read — daily/weekly, not intraday) ────────────────────

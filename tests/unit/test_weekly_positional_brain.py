@@ -12,7 +12,7 @@ def _entry(**m):
 def test_entry_uptrend_sells_bull_put():
     p = _entry(daily_trend="BULLISH")
     assert p["action"] == "TRADE" and p["structure"] == "BULL_PUT_CREDIT_SPREAD"
-    assert p["min_short_distance_pts"] == 450  # expected_move 300 + 1*ATR 150 (gap-safe)
+    assert p["min_short_distance_pts"] == 300  # expected_move floor (delta-placement handles the rest)
 
 
 def test_entry_downtrend_sells_bear_call():
