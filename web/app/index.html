@@ -463,6 +463,20 @@
         </div>
       </div>
 
+      <!-- ── Weekly Positional (defined-risk selling) ── -->
+      <div class="card" id="weekly-positional-pnl-card" style="margin-top:16px; border-left:4px solid #8b5cf6;">
+        <div class="card-header">
+          <div style="font-weight:700;">Weekly Positional (defined-risk selling)</div>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span class="chip" id="wkpos-pnl-open-mtm">Open MTM: —</span>
+            <span class="chip" id="wkpos-pnl-realized">Realized: —</span>
+            <button id="wkpos-pnl-refresh" style="background:#0f172a; color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:8px; cursor:pointer; font-size:12px;">Refresh</button>
+          </div>
+        </div>
+        <div id="wkpos-pnl-body" style="margin-top:10px; font-size:13px;">—</div>
+        <div class="hint" id="wkpos-pnl-updated" style="margin-top:8px;">—</div>
+      </div>
+
       <!-- ── Open Position ── -->
       <div class="card" style="margin-top:16px;">
         <div class="card-header">
@@ -2399,36 +2413,43 @@
     }
 
     async function loadWeeklyPositional() {
-      const body = document.getElementById("wkpos-body");
-      if (!body) return;
+      // Renders into BOTH the Control-tab card and the Paper-P&L-tab card (whichever are present).
+      if (!document.getElementById("wkpos-body") && !document.getElementById("wkpos-pnl-body")) return;
+      let bodyHTML = '<div class="muted">—</div>', openMtm = 0, realized = 0, updated = "—";
       try {
         const d = await fetchJSON("/api/weekly_positional");
-        document.getElementById("wkpos-open-mtm").textContent = "Open MTM: ₹" + (d.open_mtm_rupees || 0).toLocaleString();
-        document.getElementById("wkpos-realized").textContent = "Realized: ₹" + (d.realized_rupees || 0).toLocaleString();
+        openMtm = d.open_mtm_rupees || 0; realized = d.realized_rupees || 0;
         const positions = (d.snapshot && d.snapshot.positions) || [];
         if (!positions.length) {
           const entries = (d.ledger || []).filter(r => r.event === "PAPER_ENTRY");
-          body.innerHTML = entries.length ? entries.map(r =>
+          bodyHTML = entries.length ? entries.map(r =>
             '<div style="padding:6px 8px;border:1px solid var(--border);border-radius:8px;background:#0b1224;margin-bottom:6px;"><b>'
             + r.structure + '</b> (' + r.direction + ') exp ' + r.expiry + ' — credit ₹' + (r.credit_rupees || 0).toLocaleString()
             + ' <span class="muted">(awaiting monitor snapshot)</span></div>').join("")
             : '<div class="muted">No weekly positional trades yet.</div>';
-          document.getElementById("wkpos-updated").textContent = "—";
-          return;
+        } else {
+          bodyHTML = positions.map(p => {
+            const pnl = p.mtm_rupees || 0, col = pnl >= 0 ? "#22c55e" : "#ef4444";
+            const legs = (p.legs || []).map(l => l.action + " " + l.opt + " " + l.strike).join(" / ");
+            return '<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:#0b1224;margin-bottom:6px;">'
+              + '<div style="display:flex;justify-content:space-between;"><b>' + p.structure + '</b> <span style="color:' + col + ';font-weight:700;">₹' + pnl.toLocaleString() + '</span></div>'
+              + '<div class="muted" style="font-size:12px;">' + p.direction + ' · exp ' + p.expiry + ' · ' + p.days_to_expiry + 'd left · short Δ ' + p.short_delta + ' · trend ' + p.trend_now + '</div>'
+              + '<div class="muted" style="font-size:11px;">' + legs + '</div>'
+              + '<div style="font-size:12px;margin-top:4px;">Ladder: <b>' + p.ladder_action + '</b> — ' + p.ladder_reason + '</div></div>';
+          }).join("");
+          updated = "Snapshot " + ((d.snapshot && d.snapshot.updated) || "—");
         }
-        body.innerHTML = positions.map(p => {
-          const pnl = p.mtm_rupees || 0, col = pnl >= 0 ? "#22c55e" : "#ef4444";
-          const legs = (p.legs || []).map(l => l.action + " " + l.opt + " " + l.strike).join(" / ");
-          return '<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:#0b1224;margin-bottom:6px;">'
-            + '<div style="display:flex;justify-content:space-between;"><b>' + p.structure + '</b> <span style="color:' + col + ';font-weight:700;">₹' + pnl.toLocaleString() + '</span></div>'
-            + '<div class="muted" style="font-size:12px;">' + p.direction + ' · exp ' + p.expiry + ' · ' + p.days_to_expiry + 'd left · short Δ ' + p.short_delta + ' · trend ' + p.trend_now + '</div>'
-            + '<div class="muted" style="font-size:11px;">' + legs + '</div>'
-            + '<div style="font-size:12px;margin-top:4px;">Ladder: <b>' + p.ladder_action + '</b> — ' + p.ladder_reason + '</div></div>';
-        }).join("");
-        document.getElementById("wkpos-updated").textContent = "Snapshot " + ((d.snapshot && d.snapshot.updated) || "—");
       } catch (e) {
-        body.innerHTML = '<div class="muted">Weekly positional unavailable: ' + (e && e.message ? e.message : e) + '</div>';
+        bodyHTML = '<div class="muted">Weekly positional unavailable: ' + (e && e.message ? e.message : e) + '</div>';
       }
+      [["wkpos-body", "wkpos-open-mtm", "wkpos-realized", "wkpos-updated"],
+       ["wkpos-pnl-body", "wkpos-pnl-open-mtm", "wkpos-pnl-realized", "wkpos-pnl-updated"]].forEach(([b, om, rz, up]) => {
+        const be = document.getElementById(b); if (!be) return;
+        be.innerHTML = bodyHTML;
+        const ome = document.getElementById(om); if (ome) ome.textContent = "Open MTM: ₹" + openMtm.toLocaleString();
+        const rze = document.getElementById(rz); if (rze) rze.textContent = "Realized: ₹" + realized.toLocaleString();
+        const upe = document.getElementById(up); if (upe) upe.textContent = updated;
+      });
     }
 
     async function loadControl() {
@@ -2456,7 +2477,7 @@
       if (tab === "control") {
         await loadControl();
       } else if (tab === "pnl") {
-        await loadPnl();
+        await Promise.all([loadPnl(), loadWeeklyPositional()]);
       } else if (tab === "live") {
         await loadLive();
       } else if (tab === "state") {
@@ -2490,6 +2511,7 @@
     document.getElementById("test-telegram").addEventListener("click", testTelegram);
     document.getElementById("preflight-refresh").addEventListener("click", () => loadPreflight().catch(() => {}));
     document.getElementById("wkpos-refresh").addEventListener("click", () => loadWeeklyPositional().catch(() => {}));
+    document.getElementById("wkpos-pnl-refresh").addEventListener("click", () => loadWeeklyPositional().catch(() => {}));
     document.getElementById("start-agent").addEventListener("click", startAgent);
     document.getElementById("stop-agent").addEventListener("click", stopAgent);
     document.getElementById("bkm-ai-clear-lock").addEventListener("click", toggleBkmAiProtection);
