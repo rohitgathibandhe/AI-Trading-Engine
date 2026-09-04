@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
@@ -345,6 +346,9 @@ _THETA_INVALIDATION_MIN_EFF = 0.50
 # ...and the breakout must PERSIST this many consecutive cycles (~30s each) before the exit fires, so a
 # one-cycle head-fake across the 0.50 line can't evict a theta trade that then reverts. See the exit.
 _THETA_INVALIDATION_MIN_STREAK = 2
+# A credit spread's momentum exits (EMA20/VWAP invalidation) only fire once the SHORT leg is genuinely
+# tested — |delta| >= this. Below it the short is safe and the trade holds for theta (seller discipline).
+_CREDIT_EXIT_MIN_SHORT_DELTA = float(os.environ.get("CREDIT_EXIT_MIN_SHORT_DELTA", "0.30") or 0.30)
 DEBIT_TRAIL_ARM = 0.40        # once 40% of max profit is captured, trail
 DEBIT_TRAIL_GIVEBACK = 0.35   # exit if the trade gives back 35% of its peak profit
 
@@ -637,6 +641,31 @@ def _current_position_mark(
     return None, []
 
 
+def _credit_short_tested(position, snapshot, min_delta: float) -> bool:
+    """True if a credit spread's SHORT leg is genuinely tested (|delta| >= min_delta). While False, the
+    short is safe and the seller should HOLD for theta rather than cut on a momentum blip. Missing
+    delta -> treat as tested (fail safe: don't trap a position we can't measure)."""
+    try:
+        legs = position.structure.legs
+    except AttributeError:
+        return True
+    saw_short = False
+    for leg in legs:
+        if getattr(leg, "action", "") != "SELL":
+            continue
+        saw_short = True
+        try:
+            q = snapshot.option_chain.find_quote(leg.strike, leg.option_type)
+        except Exception:  # noqa: BLE001
+            return True
+        d = getattr(q, "delta", None) if q is not None else None
+        if d is None:
+            return True
+        if abs(float(d)) >= min_delta:
+            return True
+    return False if saw_short else True
+
+
 def _regime_invalidation_reason(
     position: OpenPosition,
     current_snapshot: MarketSnapshot | None,
@@ -664,25 +693,32 @@ def _regime_invalidation_reason(
     # one complete 5-minute candle (5 minutes) to have formed since entry before
     # triggering these — this prevents the thesis being invalidated by stale bars.
     closed_bar_check_allowed = minutes_since_entry >= 5
+    # SELLER DISCIPLINE: a credit spread is SOLD to collect theta — it must be HELD while its short is
+    # safe, and defended/exited only when the short is genuinely threatened. Firing a momentum
+    # invalidation (EMA20/VWAP) at t+5min while the short is far OTM is a scalper's cut, not a seller's:
+    # it captures ~zero decay (2026-09-04: bear-call cut at 5.1min for a scrap; 08-05/08-31 the same cut
+    # cost -1,160/-2,428). Gate these exits on the short leg actually being tested (|delta| >= threshold);
+    # while the short is safe, hold for theta. Defined-risk wings cap the interim.
+    short_tested = _credit_short_tested(position, current_snapshot, _CREDIT_EXIT_MIN_SHORT_DELTA)
     if strategy == StrategyType.BULL_PUT_CREDIT_SPREAD:
-        if closed_bar_check_allowed and spot < vwap and last_n_closes_below(vwap, bars, n=2):
+        if closed_bar_check_allowed and short_tested and spot < vwap and last_n_closes_below(vwap, bars, n=2):
             return "VWAP_INVALIDATION"
     elif strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD:
         ema20_5m = ema_value(closes(bars), period=20)
-        if closed_bar_check_allowed and (
+        if closed_bar_check_allowed and short_tested and (
             ema20_5m is not None
             and last_n_closes_above(ema20_5m, bars, n=2)
             and (vwap is None or last_n_closes_above(vwap, bars, n=2))
         ):
             return "EMA20_INVALIDATION"
-        if closed_bar_check_allowed and (
+        if closed_bar_check_allowed and short_tested and (
             bullish_reversal_structure(bars)
             and ema20_5m is not None
             and bars[-1].close > ema20_5m
             and (vwap is None or last_n_closes_above(vwap, bars, n=2))
         ):
             return "REVERSAL_STRUCTURE"
-        if closed_bar_check_allowed and spot > vwap and last_n_closes_above(vwap, bars, n=2):
+        if closed_bar_check_allowed and short_tested and spot > vwap and last_n_closes_above(vwap, bars, n=2):
             return "VWAP_INVALIDATION"
     elif strategy in {StrategyType.IRON_CONDOR, StrategyType.IRON_FLY, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE}:
         # Two reasons these flies died at 0.6-1.2 min on 2026-08-06 (mfe never left 0, then decayed
