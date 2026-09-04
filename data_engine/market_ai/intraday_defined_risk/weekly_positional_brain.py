@@ -57,6 +57,8 @@ STOP_LOSS_MULT       = _env_f("WK_STOP_LOSS_MULT", 2.0)        # close if loss r
 GAMMA_CLIFF_DAYS     = _env_f("WK_GAMMA_CLIFF_DAYS", 2.0)      # exit this many trading days before expiry
 DEFENSE_SHORT_DELTA  = _env_f("WK_DEFENSE_SHORT_DELTA", 0.30)  # a short leg tested when |delta| >= this
 MIN_CREDIT_RATIO     = _env_f("WK_MIN_CREDIT_RATIO", 0.10)     # net credit / wing width floor (worth the risk)
+MAX_ADJUSTMENTS      = int(_env_f("WK_MAX_ADJUSTMENTS", 2))    # after this many rolls, stop defending -> close
+UNTESTED_HARVEST_PCT = _env_f("WK_UNTESTED_HARVEST_PCT", 0.80) # close the untested side once it has decayed this far
 # Gap-safety comes from FOUR layers — trend-alignment (primary), the 0.18-delta short (~82% OTM), this
 # expected-move floor, and the defined-risk wing. The short is placed BY DELTA (see the executor); this
 # is only the MINIMUM distance so it can't sit too close. A full extra ATR on top double-counted with
@@ -144,20 +146,30 @@ def _trend_flipped(direction: str, current_bias: str) -> bool:
 
 
 def evaluate_management(position: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
-    """Walk the defense ladder. Returns {action, reason}. Actions:
-        HOLD, TAKE_PROFIT, STOP_CLOSE, GAMMA_EXIT, LEG_INTO_CONDOR, ROLL_OUT, CLOSE_THESIS_BROKEN.
-    position: {direction, structure, credit_rupees, adjusted(bool)}
-    current : {mtm_rupees(+profit/-loss), max_short_delta(abs), days_to_expiry, broader_trend}
+    """Walk the mature defense ladder. Returns {action, reason, tested_side?}. Actions:
+        HOLD, TAKE_PROFIT, STOP_CLOSE, GAMMA_EXIT, CLOSE_THESIS_BROKEN,
+        HARVEST_UNTESTED, LEG_INTO_CONDOR, ROLL_OUT, CLOSE_MAX_ADJUSTED.
+
+    Maturity: thresholds use the CUMULATIVE credit (initial + every adjustment credit), so each defensive
+    roll that collects credit correctly widens the profit target and the loss cap. Adjustments are
+    CAPPED (after MAX_ADJUSTMENTS rolls, stop defending and close), and a condor's untested side is
+    harvested once it decays to near-worthless (locks that credit, frees the risk).
+
+    position: {direction, structure, credit_rupees, total_credit_rupees?, adjusted?, adjustments?}
+    current : {mtm_rupees, max_short_delta, days_to_expiry, broader_trend,
+               tested_side('CALL'/'PUT')?, untested_decay_pct?}
     """
-    credit = _f(position, "credit_rupees")
+    credit = _f(position, "total_credit_rupees") or _f(position, "credit_rupees")   # CUMULATIVE
     direction = _s(position, "direction")
     already_condor = bool(position.get("adjusted")) or _s(position, "structure") == "IRON_CONDOR"
+    adjustments = int(position.get("adjustments") or 0)
     mtm = _f(current, "mtm_rupees")
     short_delta = abs(_f(current, "max_short_delta"))
     dte = _f(current, "days_to_expiry")
     cur_bias = _s(current, "broader_trend")
+    untested_decay = _f(current, "untested_decay_pct")
 
-    # 1) WINNER — bank at 50% of the credit (research: the last 50% isn't worth the gamma/time).
+    # 1) WINNER — bank at 50% of the CUMULATIVE credit (the last 50% isn't worth the gamma/time).
     if credit > 0 and mtm >= PROFIT_TARGET_FRAC * credit:
         return {"action": "TAKE_PROFIT", "reason": f"hit {PROFIT_TARGET_FRAC:.0%} of credit ({mtm:+,.0f} of {credit:,.0f})"}
 
@@ -165,7 +177,7 @@ def evaluate_management(position: dict[str, Any], current: dict[str, Any]) -> di
     if dte <= GAMMA_CLIFF_DAYS:
         return {"action": "GAMMA_EXIT", "reason": f"{dte:.0f} trading days to expiry — off before the gamma cliff"}
 
-    # 3) HARD STOP — loss reached 2x the credit (caps the realized loss inside the defined-risk max).
+    # 3) HARD STOP — loss reached 2x the CUMULATIVE credit.
     if credit > 0 and mtm <= -STOP_LOSS_MULT * credit:
         return {"action": "STOP_CLOSE", "reason": f"loss hit {STOP_LOSS_MULT:.0f}x credit ({mtm:+,.0f} vs {credit:,.0f})"}
 
@@ -173,15 +185,24 @@ def evaluate_management(position: dict[str, Any], current: dict[str, Any]) -> di
     if _trend_flipped(direction, cur_bias):
         return {"action": "CLOSE_THESIS_BROKEN", "reason": f"daily trend flipped to {cur_bias} against a {direction} position"}
 
-    # 5) SHORT TESTED — walk the credit-only, defined-risk defense.
+    # 5) HARVEST the untested side of a condor once it is near-worthless — lock the credit, drop the risk.
+    if already_condor and untested_decay >= UNTESTED_HARVEST_PCT:
+        return {"action": "HARVEST_UNTESTED",
+                "reason": f"untested side decayed {untested_decay:.0%} (>= {UNTESTED_HARVEST_PCT:.0%}) — buy it back cheap, lock the credit"}
+
+    # 6) SHORT TESTED — the credit-only, defined-risk defense, now CAPPED.
     if short_delta >= DEFENSE_SHORT_DELTA:
+        if adjustments >= MAX_ADJUSTMENTS:
+            return {"action": "CLOSE_MAX_ADJUSTED",
+                    "reason": f"short tested (delta {short_delta:.2f}) after {adjustments} adjustments — stop "
+                              f"defending, take the defined loss (don't roll forever)"}
         if not already_condor:
-            return {"action": "LEG_INTO_CONDOR",
+            return {"action": "LEG_INTO_CONDOR", "tested_side": _s(current, "tested_side"),
                     "reason": f"short tested (delta {short_delta:.2f}) — sell the opposite spread for a credit "
                               f"(widen the tested breakeven, stay defined-risk)"}
-        return {"action": "ROLL_OUT",
-                "reason": f"short tested (delta {short_delta:.2f}) and already a condor — roll the tested spread "
-                          f"out to next week for a NET CREDIT ONLY (else close)"}
+        return {"action": "ROLL_OUT", "tested_side": _s(current, "tested_side"),
+                "reason": f"short tested (delta {short_delta:.2f}), adjustment {adjustments+1}/{MAX_ADJUSTMENTS} — "
+                          f"roll the tested spread out to next week for a NET CREDIT ONLY (else close)"}
 
-    # 6) Otherwise let theta work.
+    # 7) Otherwise let theta work.
     return {"action": "HOLD", "reason": f"thesis intact (short delta {short_delta:.2f}, mtm {mtm:+,.0f}) — hold for decay"}

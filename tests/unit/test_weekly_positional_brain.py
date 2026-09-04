@@ -73,3 +73,30 @@ def test_short_tested_legs_into_condor_then_rolls_out():
 
 def test_quiet_position_holds_for_theta():
     assert _mgmt(mtm_rupees=800, max_short_delta=0.18) == "HOLD"
+
+
+# ── Maturity: cumulative credit, adjustment cap, untested harvest ─────────────────────────────
+def test_thresholds_use_cumulative_credit():
+    # a leg-in added credit: total 9000. 50% target is now 4500, not 3000.
+    pos = dict(POS, total_credit_rupees=9000, adjusted=True)
+    r = wb.evaluate_management(pos, {"mtm_rupees": 3200, "max_short_delta": 0.15,
+                                     "days_to_expiry": 6, "broader_trend": "BULLISH"})
+    assert r["action"] == "HOLD"                      # 3200 < 50% of 9000
+    r2 = wb.evaluate_management(pos, {"mtm_rupees": 4600, "max_short_delta": 0.15,
+                                      "days_to_expiry": 6, "broader_trend": "BULLISH"})
+    assert r2["action"] == "TAKE_PROFIT"              # 4600 >= 4500
+
+
+def test_adjustment_cap_closes_instead_of_rolling_forever():
+    pos = dict(POS, adjusted=True, adjustments=wb.MAX_ADJUSTMENTS)
+    r = wb.evaluate_management(pos, {"mtm_rupees": -1000, "max_short_delta": 0.34,
+                                     "days_to_expiry": 6, "broader_trend": "BULLISH"})
+    assert r["action"] == "CLOSE_MAX_ADJUSTED"
+
+
+def test_untested_side_is_harvested_when_near_worthless():
+    pos = dict(POS, adjusted=True, adjustments=1)
+    r = wb.evaluate_management(pos, {"mtm_rupees": 500, "max_short_delta": 0.20,
+                                     "days_to_expiry": 6, "broader_trend": "BULLISH",
+                                     "untested_decay_pct": 0.85})
+    assert r["action"] == "HARVEST_UNTESTED"
