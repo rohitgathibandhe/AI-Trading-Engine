@@ -74,6 +74,7 @@ def main() -> int:
     creds = wx._load_creds()
     m = wp._latest_metadata()
     cur_trend = brain.broader_trend(m)
+    snapshot = []
 
     for pos in positions:
         expiry = pos["expiry"]
@@ -97,6 +98,13 @@ def main() -> int:
         print(f"  credit Rs {pos['credit_rupees']:,.0f} | now MTM Rs {mtm_rupees:+,.0f} "
               f"({mtm_pts:+.1f} pts) | short delta {max_sd:.2f} | {dte} trading days left | trend now {cur_trend}")
         print(f"  DEFENSE LADDER -> {decision['action']}: {decision['reason']}")
+        snapshot.append({
+            "structure": pos["structure"], "direction": pos["direction"], "expiry": expiry,
+            "legs": pos["legs"], "credit_rupees": pos["credit_rupees"], "max_loss_rupees": pos["max_loss_rupees"],
+            "mtm_rupees": mtm_rupees, "short_delta": round(max_sd, 3), "days_to_expiry": dte,
+            "trend_now": cur_trend, "ladder_action": decision["action"], "ladder_reason": decision["reason"],
+            "entry_ts": pos.get("ts"),
+        })
 
         if not args.report and decision["action"] != "HOLD":
             evt = {"event": "PAPER_EXIT" if decision["action"] in
@@ -109,6 +117,10 @@ def main() -> int:
             with LEDGER.open("a") as f:
                 f.write(json.dumps(evt) + "\n")
             print(f"  -> recorded {evt['event']} ({decision['action']}).")
+
+    # Persist a snapshot the dashboard serves (avoids a broker fetch in the UI request path).
+    (STATE / "weekly_positional_snapshot.json").write_text(json.dumps(
+        {"updated": datetime.now().isoformat(timespec="seconds"), "positions": snapshot}, indent=2))
     return 0
 
 

@@ -4622,6 +4622,28 @@ class PaperHandler(SimpleHTTPRequestHandler):
         return super().do_POST()
 
     def do_GET(self) -> None:  # type: ignore[override]
+        if self.path.startswith("/api/weekly_positional"):
+            # The weekly positional book lives in its own ledger (separate from the intraday book the
+            # rest of this dashboard reads). Serve the ledger + the monitor's latest live snapshot.
+            try:
+                led = STATE_DIR / "weekly_positional_paper.jsonl"
+                snap = STATE_DIR / "weekly_positional_snapshot.json"
+                rows = []
+                if led.exists():
+                    for _l in led.read_text().splitlines():
+                        if _l.strip():
+                            try:
+                                rows.append(json.loads(_l))
+                            except Exception:
+                                pass
+                snapshot = _json_read(snap) if snap.exists() else {}
+                realized = sum(float(r.get("realized_rupees") or 0) for r in rows if r.get("event") == "PAPER_EXIT")
+                open_mtm = sum(float(p.get("mtm_rupees") or 0) for p in (snapshot.get("positions") or []))
+                self._send_json({"ledger": rows, "snapshot": snapshot,
+                                 "realized_rupees": round(realized, 0), "open_mtm_rupees": round(open_mtm, 0)})
+            except Exception as exc:  # pragma: no cover - defensive
+                self._send_json({"error": str(exc)}, status=500)
+            return
         if self.path.startswith("/api/preflight"):
             try:
                 self._send_json(_preflight_status())

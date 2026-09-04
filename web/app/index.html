@@ -181,6 +181,18 @@
         </div>
         <div class="hint" id="preflight-updated" style="margin-top:8px;">—</div>
       </div>
+      <div class="card" id="weekly-positional-card" style="margin-bottom:12px; border-left:4px solid #8b5cf6;">
+        <div class="card-header">
+          <div style="font-weight:700;">Weekly Positional (defined-risk selling)</div>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span class="chip" id="wkpos-open-mtm">Open MTM: —</span>
+            <span class="chip" id="wkpos-realized">Realized: —</span>
+            <button id="wkpos-refresh" style="background:#0f172a; color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:8px; cursor:pointer; font-size:12px;">Refresh</button>
+          </div>
+        </div>
+        <div id="wkpos-body" style="margin-top:10px; font-size:13px;">—</div>
+        <div class="hint" id="wkpos-updated" style="margin-top:8px;">—</div>
+      </div>
       <div class="grid">
         <div class="card">
           <div class="card-header"><div style="font-weight:700;">Credentials</div></div>
@@ -2386,12 +2398,46 @@
       }
     }
 
+    async function loadWeeklyPositional() {
+      const body = document.getElementById("wkpos-body");
+      if (!body) return;
+      try {
+        const d = await fetchJSON("/api/weekly_positional");
+        document.getElementById("wkpos-open-mtm").textContent = "Open MTM: ₹" + (d.open_mtm_rupees || 0).toLocaleString();
+        document.getElementById("wkpos-realized").textContent = "Realized: ₹" + (d.realized_rupees || 0).toLocaleString();
+        const positions = (d.snapshot && d.snapshot.positions) || [];
+        if (!positions.length) {
+          const entries = (d.ledger || []).filter(r => r.event === "PAPER_ENTRY");
+          body.innerHTML = entries.length ? entries.map(r =>
+            '<div style="padding:6px 8px;border:1px solid var(--border);border-radius:8px;background:#0b1224;margin-bottom:6px;"><b>'
+            + r.structure + '</b> (' + r.direction + ') exp ' + r.expiry + ' — credit ₹' + (r.credit_rupees || 0).toLocaleString()
+            + ' <span class="muted">(awaiting monitor snapshot)</span></div>').join("")
+            : '<div class="muted">No weekly positional trades yet.</div>';
+          document.getElementById("wkpos-updated").textContent = "—";
+          return;
+        }
+        body.innerHTML = positions.map(p => {
+          const pnl = p.mtm_rupees || 0, col = pnl >= 0 ? "#22c55e" : "#ef4444";
+          const legs = (p.legs || []).map(l => l.action + " " + l.opt + " " + l.strike).join(" / ");
+          return '<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:#0b1224;margin-bottom:6px;">'
+            + '<div style="display:flex;justify-content:space-between;"><b>' + p.structure + '</b> <span style="color:' + col + ';font-weight:700;">₹' + pnl.toLocaleString() + '</span></div>'
+            + '<div class="muted" style="font-size:12px;">' + p.direction + ' · exp ' + p.expiry + ' · ' + p.days_to_expiry + 'd left · short Δ ' + p.short_delta + ' · trend ' + p.trend_now + '</div>'
+            + '<div class="muted" style="font-size:11px;">' + legs + '</div>'
+            + '<div style="font-size:12px;margin-top:4px;">Ladder: <b>' + p.ladder_action + '</b> — ' + p.ladder_reason + '</div></div>';
+        }).join("");
+        document.getElementById("wkpos-updated").textContent = "Snapshot " + ((d.snapshot && d.snapshot.updated) || "—");
+      } catch (e) {
+        body.innerHTML = '<div class="muted">Weekly positional unavailable: ' + (e && e.message ? e.message : e) + '</div>';
+      }
+    }
+
     async function loadControl() {
       if (inflight.control) return;
       inflight.control = true;
       try {
         await Promise.all([
           loadPreflight(),
+          loadWeeklyPositional(),
           loadCreds(),
           loadStrategy(),
           refreshAgentStatus(),
@@ -2443,6 +2489,7 @@
     document.getElementById("save-creds").addEventListener("click", saveCreds);
     document.getElementById("test-telegram").addEventListener("click", testTelegram);
     document.getElementById("preflight-refresh").addEventListener("click", () => loadPreflight().catch(() => {}));
+    document.getElementById("wkpos-refresh").addEventListener("click", () => loadWeeklyPositional().catch(() => {}));
     document.getElementById("start-agent").addEventListener("click", startAgent);
     document.getElementById("stop-agent").addEventListener("click", stopAgent);
     document.getElementById("bkm-ai-clear-lock").addEventListener("click", toggleBkmAiProtection);
