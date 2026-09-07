@@ -264,16 +264,62 @@ def recommend_hold(spec: StratSpec, m: dict[str, Any]) -> str:
     return spec.default_hold
 
 
+# ── AUTONOMY: let the FORWARD record tilt selection ───────────────────────────────────────────
+# The precondition score says how well a structure FITS the tape. The forward record (promotion_state,
+# built from the shadow book) says whether that structure has actually been WINNING lately. Blend them:
+# a structure with a proven positive forward edge gets boosted, a proven loser penalised, and anything
+# without enough sample stays neutral. The tilt STRENGTHENS as the sample grows toward the 20-day
+# promotion bar — so selection is increasingly driven by the agent's own record, not just fixed rules.
+# Deliberately conservative + per-STRUCTURE (not per-regime — intraday regime isn't predictable, a
+# validated-negative; structure-level edge is what the forward record can actually establish).
+import json as _json
+import os as _os
+from pathlib import Path as _Path
+
+_PROMO_PATH = _Path(__file__).resolve().parent.parent / "state" / "promotion_state.json"
+_FWD_MIN_DAYS  = float(_os.environ.get("MATRIX_FWD_MIN_DAYS", "5"))     # need this many forward days before tilting
+_FWD_MAX_TILT  = float(_os.environ.get("MATRIX_FWD_MAX_TILT", "2.0"))   # cap the tilt (scores run ~4-10)
+_FWD_AVG_SCALE = float(_os.environ.get("MATRIX_FWD_AVG_SCALE", "1500")) # avg daily P&L that maps to a full tilt
+
+
+def _forward_report() -> dict[str, Any]:
+    try:
+        d = _json.loads(_PROMO_PATH.read_text())
+        return {r.get("strategy"): r for r in (d.get("report") or [])}
+    except Exception:
+        return {}
+
+
+def forward_tilt(strategy_name: str, report: dict | None = None) -> tuple[float, str]:
+    """(score_tilt, why) from the forward record. 0 with an explanation when the sample is too thin."""
+    report = _forward_report() if report is None else report
+    r = report.get(strategy_name)
+    if not r:
+        return 0.0, "no forward data"
+    n, avg, wr = _f(r, "qualifying_days"), r.get("avg"), r.get("win_rate")
+    if n < _FWD_MIN_DAYS or avg is None:
+        return 0.0, f"forward {int(n)}d (<{int(_FWD_MIN_DAYS)}) — neutral"
+    conf = min(1.0, n / 20.0)                                   # confidence grows toward the promotion bar
+    raw = max(-1.0, min(1.0, float(avg) / _FWD_AVG_SCALE))
+    tilt = round(raw * _FWD_MAX_TILT * conf, 2)
+    lbl = "FAVORED" if tilt > 0 else "AVOID" if tilt < 0 else "neutral"
+    return tilt, f"forward {lbl}: avg Rs{float(avg):+.0f}/{int(n)}d, win {wr}% -> tilt {tilt:+.2f}"
+
+
 def evaluate_matrix(m: dict[str, Any]) -> list[dict[str, Any]]:
-    """Score every structure's precondition against the tape; return the eligible ones, best-first."""
+    """Score every structure's precondition against the tape, then TILT by its forward record; return
+    the eligible ones, best-first."""
+    report = _forward_report()
     out = []
     for spec in SPECS:
         ok, score, why = spec.precondition(m)
         if ok:
+            tilt, fwd_why = forward_tilt(spec.name, report)
             out.append({
                 "strategy": spec.name, "family": spec.family, "is_credit": spec.is_credit,
                 "defined_risk": spec.defined_risk, "built": spec.built,
-                "hold": recommend_hold(spec, m), "score": round(score, 3), "why": why,
+                "hold": recommend_hold(spec, m), "fit_score": round(score, 3), "forward_tilt": tilt,
+                "score": round(score + tilt, 3), "why": why + " | " + fwd_why,
             })
     out.sort(key=lambda x: x["score"], reverse=True)
     return out

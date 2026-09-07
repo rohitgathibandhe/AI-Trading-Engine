@@ -4622,6 +4622,15 @@ class PaperHandler(SimpleHTTPRequestHandler):
         return super().do_POST()
 
     def do_GET(self) -> None:  # type: ignore[override]
+        if self.path.startswith("/api/strategy_scorecard"):
+            # The desk-brain's structure ranking (fit + forward-record tilt) and each structure's
+            # forward track record. Served from the snapshot strategy_scorecard.py writes.
+            try:
+                snap = STATE_DIR / "strategy_scorecard.json"
+                self._send_json(_json_read(snap) if snap.exists() else {"note": "scorecard not generated yet"})
+            except Exception as exc:  # pragma: no cover - defensive
+                self._send_json({"error": str(exc)}, status=500)
+            return
         if self.path.startswith("/api/weekly_positional"):
             # The weekly positional book lives in its own ledger (separate from the intraday book the
             # rest of this dashboard reads). Serve the ledger + the monitor's latest live snapshot.

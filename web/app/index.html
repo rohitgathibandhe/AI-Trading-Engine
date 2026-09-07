@@ -193,6 +193,17 @@
         <div id="wkpos-body" style="margin-top:10px; font-size:13px;">—</div>
         <div class="hint" id="wkpos-updated" style="margin-top:8px;">—</div>
       </div>
+      <div class="card" id="scorecard-card" style="margin-bottom:12px; border-left:4px solid #14b8a6;">
+        <div class="card-header">
+          <div style="font-weight:700;">Strategy Selection &amp; Forward Scorecard</div>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span class="chip" id="scorecard-pick">Pick: —</span>
+            <button id="scorecard-refresh" style="background:#0f172a; color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:8px; cursor:pointer; font-size:12px;">Refresh</button>
+          </div>
+        </div>
+        <div id="scorecard-body" style="margin-top:10px; font-size:12px;">—</div>
+        <div class="hint" id="scorecard-updated" style="margin-top:8px;">selection = how well it FITS the tape + how it has PERFORMED forward (tilt engages at 5+ days)</div>
+      </div>
       <div class="grid">
         <div class="card">
           <div class="card-header"><div style="font-weight:700;">Credentials</div></div>
@@ -2452,6 +2463,43 @@
       });
     }
 
+    async function loadScorecard() {
+      const body = document.getElementById("scorecard-body");
+      if (!body) return;
+      try {
+        const d = await fetchJSON("/api/strategy_scorecard");
+        document.getElementById("scorecard-pick").textContent = "Pick: " + (d.picked || "—") + (d.bias ? " (" + d.bias + ")" : "");
+        const ranked = d.ranked || [];
+        let html = "";
+        if (ranked.length) {
+          html += '<table style="width:100%;border-collapse:collapse;"><tr style="color:var(--muted);text-align:left;font-size:11px;"><th>structure</th><th>fit</th><th>fwd</th><th>score</th><th>why</th></tr>';
+          html += ranked.map(r => {
+            const t = r.forward_tilt || 0, tc = t > 0 ? "#22c55e" : (t < 0 ? "#ef4444" : "var(--muted)");
+            return '<tr style="border-top:1px solid var(--border);">'
+              + '<td style="padding:4px 0;font-weight:' + (r.picked ? "700" : "400") + ';">' + (r.picked ? "★ " : "") + r.strategy + '</td>'
+              + '<td>' + (r.fit_score != null ? r.fit_score.toFixed(1) : "—") + '</td>'
+              + '<td style="color:' + tc + ';">' + (t >= 0 ? "+" : "") + t.toFixed(2) + '</td>'
+              + '<td style="font-weight:700;">' + (r.score != null ? r.score.toFixed(1) : "—") + '</td>'
+              + '<td style="color:var(--muted);font-size:11px;">' + (r.why || "").slice(0, 70) + '</td></tr>';
+          }).join("");
+          html += '</table>';
+        } else {
+          html += '<div class="muted">No structure fits the current tape — stand aside.</div>';
+        }
+        const fwd = d.forward || [];
+        if (fwd.length) {
+          html += '<div style="margin-top:10px;font-weight:600;">Forward record (drives the tilt as it grows to 20 days):</div>';
+          html += fwd.filter(f => f.qualifying_days).sort((a, b) => (b.avg || -1e9) - (a.avg || -1e9)).map(f => {
+            const c = (f.avg || 0) >= 0 ? "#22c55e" : "#ef4444";
+            return '<div style="font-size:11px;color:var(--muted);">' + f.strategy + ': ' + f.qualifying_days + 'd, avg <span style="color:' + c + ';">₹' + (f.avg != null ? f.avg : "—") + '</span>, win ' + (f.win_rate != null ? f.win_rate + "%" : "—") + ' — ' + (f.status || "") + '</div>';
+          }).join("");
+        }
+        body.innerHTML = html;
+      } catch (e) {
+        body.innerHTML = '<div class="muted">Scorecard unavailable: ' + (e && e.message ? e.message : e) + '</div>';
+      }
+    }
+
     async function loadControl() {
       if (inflight.control) return;
       inflight.control = true;
@@ -2459,6 +2507,7 @@
         await Promise.all([
           loadPreflight(),
           loadWeeklyPositional(),
+          loadScorecard(),
           loadCreds(),
           loadStrategy(),
           refreshAgentStatus(),
@@ -2512,6 +2561,7 @@
     document.getElementById("preflight-refresh").addEventListener("click", () => loadPreflight().catch(() => {}));
     document.getElementById("wkpos-refresh").addEventListener("click", () => loadWeeklyPositional().catch(() => {}));
     document.getElementById("wkpos-pnl-refresh").addEventListener("click", () => loadWeeklyPositional().catch(() => {}));
+    document.getElementById("scorecard-refresh").addEventListener("click", () => loadScorecard().catch(() => {}));
     document.getElementById("start-agent").addEventListener("click", startAgent);
     document.getElementById("stop-agent").addEventListener("click", stopAgent);
     document.getElementById("bkm-ai-clear-lock").addEventListener("click", toggleBkmAiProtection);

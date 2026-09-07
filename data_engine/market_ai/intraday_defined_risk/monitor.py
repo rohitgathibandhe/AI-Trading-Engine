@@ -1231,6 +1231,17 @@ class IntradayDefinedRiskAgent:
         _candidates = [_strat_map[n] for n in choice.structures if n in _strat_map]
         if not _candidates:
             return None  # nothing mappable -> fall back to legacy
+        # AUTONOMY: among the structures that FIT the tape, prefer the one with the better FORWARD
+        # record (proven winners first, proven losers last). Conservative — it only REORDERS the
+        # already-eligible candidates, never forces a stand-aside; and it is dormant until a structure
+        # has enough forward sample (tilt 0 below the threshold), so selection is increasingly driven
+        # by the agent's own record as it accumulates. Per-STRUCTURE (regime isn't predictable).
+        if len(_candidates) > 1:
+            try:
+                from .strategy_matrix import forward_tilt as _fwd_tilt
+                _candidates.sort(key=lambda s: _fwd_tilt(getattr(s, "value", str(s)))[0], reverse=True)
+            except Exception:  # noqa: BLE001 — never let the forward hook break selection
+                pass
         _first_reject = None
         for strategy in _candidates:
             _decision, _entered = _try_structure(strategy)
