@@ -4648,7 +4648,9 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 snapshot = _json_read(snap) if snap.exists() else {}
                 realized = sum(float(r.get("realized_rupees") or 0) for r in rows if r.get("event") == "PAPER_EXIT")
                 open_mtm = sum(float(p.get("mtm_rupees") or 0) for p in (snapshot.get("positions") or []))
-                self._send_json({"ledger": rows, "snapshot": snapshot,
+                gate_f = STATE_DIR / "weekly_promotion_state.json"
+                gate = _json_read(gate_f) if gate_f.exists() else {}
+                self._send_json({"ledger": rows, "snapshot": snapshot, "go_live_gate": gate,
                                  "realized_rupees": round(realized, 0), "open_mtm_rupees": round(open_mtm, 0)})
             except Exception as exc:  # pragma: no cover - defensive
                 self._send_json({"error": str(exc)}, status=500)

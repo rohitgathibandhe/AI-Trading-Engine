@@ -187,6 +187,13 @@ _PRECOND_KEYS = [
     "call_resistance_strike", "opening_range_break_state", "accepted_breakout", "inside_opening_range",
     "smart_money_bias", "oi_pressure_bias", "overhead_call_pressure_score", "india_vix",
     "expected_move_pts", "daily_trend", "opening_gap_pct",
+    # Fields the ENHANCED matrix preconditions need but the shadow book was NOT recording — their
+    # absence made _bias()/preconditions mis-evaluate on shadow rows, so structures (esp. bear-call)
+    # qualified on ~0 days and the forward record never accumulated. Record the full signal set.
+    "thesis_net_bias", "setup_direction", "atm_strike", "daily_ema20", "daily_ema50", "price_vs_ema20",
+    "ema20_15m", "ema20_5m", "bullish_option_chain_pressure_score", "bearish_option_chain_pressure_score",
+    "lower_high_confirmed", "higher_low_confirmed", "failed_breakout", "failed_breakdown",
+    "wick_rejection_score", "accepted_breakdown",
 ]
 
 

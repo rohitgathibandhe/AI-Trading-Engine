@@ -2450,6 +2450,15 @@
           }).join("");
           updated = "Snapshot " + ((d.snapshot && d.snapshot.updated) || "—");
         }
+        const g = d.go_live_gate || {};
+        if (g.status) {
+          const ok = g.eligible, col = ok ? "#22c55e" : "#f59e0b";
+          bodyHTML = '<div style="padding:6px 8px;border:1px dashed ' + col + ';border-radius:8px;margin-bottom:8px;font-size:12px;">'
+            + '<b style="color:' + col + ';">Go-live: ' + (ok ? "✅ ELIGIBLE" : "not ready") + '</b> — '
+            + (g.n_trades || 0) + ' trades (need 15), ' + (g.tested_trades || 0) + ' tested (need 3, defense proven), '
+            + 'win ' + (g.win_rate != null ? g.win_rate + "%" : "—") + ', avg ₹' + (g.avg != null ? g.avg : "—")
+            + '</div>' + bodyHTML;
+        }
       } catch (e) {
         bodyHTML = '<div class="muted">Weekly positional unavailable: ' + (e && e.message ? e.message : e) + '</div>';
       }
