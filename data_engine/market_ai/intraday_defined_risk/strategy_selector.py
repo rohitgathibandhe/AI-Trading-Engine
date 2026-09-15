@@ -41,6 +41,12 @@ from .trade_planner import assess_market, MarketRead, _f
 # PUT_DEBIT is the robust edge. This flag lets us validate whether cutting the
 # noisy condor (and freeing the slot for the robust edge) helps across orderings.
 _NO_CONDOR = os.environ.get("SEL_NO_CONDOR") == "1"
+# VWAP-SELLER routing (validated on real option fills, 2026-09-15): read the regime the VWAP/OR way and
+# SELL with it — TREND -> directional credit with the trend, RANGE -> iron-fly. Selling the regime read
+# made +5,475 on the shadow fills; buying it lost -2,015. Env-gated (default on) so it forward-tests on
+# paper. Only overrides on a CONFIDENT trend; RANGE falls through to the guarded range/fly logic.
+_VWAP_SELLER = os.environ.get("SEL_VWAP_SELLER", "1") == "1"
+_VWAP_TREND_EFF = float(os.environ.get("SEL_VWAP_TREND_EFF", "0.35") or 0.35)  # efficiency for a confident trend
 
 # Selection-skill filter (VALIDATED, default ON): the agent's entry SCORE does not separate
 # put-debit winners from losers (7.15 vs 7.09). The one signal that DOES: option_chain_pressure_state.
@@ -498,6 +504,17 @@ def classify_condition(read: MarketRead, metadata: dict[str, Any], now_time=None
     return CHOP
 
 
+def _vwap_regime(read, m: dict[str, Any]) -> str:
+    """The validated VWAP/OR regime read. A CONFIDENT trend needs realized efficiency AND an accepted
+    opening-range break in the bias direction; everything else is RANGE (handled by the range logic)."""
+    eff = _trend_efficiency(m)
+    if eff >= _VWAP_TREND_EFF and read.bias == "BULLISH" and bool(m.get("accepted_breakout")):
+        return "TREND_UP"
+    if eff >= _VWAP_TREND_EFF and read.bias == "BEARISH" and bool(m.get("accepted_breakdown")):
+        return "TREND_DOWN"
+    return "RANGE"
+
+
 def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> StrategyChoice:
     """Read the market, name the condition, and choose the strategy family + structures.
 
@@ -512,6 +529,24 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     choice = StrategyChoice(condition=condition, iv_regime=iv, read=read, conviction=read.conviction)
     choice.vol_regime = vol.regime
     choice.vol_notes = vol.notes
+
+    # VWAP-SELLER override: on a CONFIDENT trend, SELL a directional credit WITH the trend (the validated
+    # seller edge). RANGE falls through to the existing guarded range/fly logic. Env-gated forward test.
+    if _VWAP_SELLER and vol.regime != CHEAP_BUY:
+        _reg = _vwap_regime(read, metadata)
+        if _reg == "TREND_UP":
+            choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
+            choice.rationale = ("VWAP-seller: TREND_UP (efficient + accepted OR break) — SELL a bull-put "
+                                "WITH the trend (validated: selling the regime read made +5,475 on shadow fills).")
+            choice.executable_today = all(s in _EXECUTABLE for s in choice.structures)
+            return choice
+        if _reg == "TREND_DOWN":
+            choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BEAR_CALL_CREDIT_SPREAD"]
+            choice.rationale = ("VWAP-seller: TREND_DOWN (efficient + accepted OR break) — SELL a bear-call "
+                                "WITH the trend (validated seller edge).")
+            choice.executable_today = all(s in _EXECUTABLE for s in choice.structures)
+            return choice
+        # RANGE -> fall through to the range/chop logic (routes to IRON_FLY with its guards).
 
     # Pinned long-gamma range detected (see _pinned_range_veto): DON'T buy a directional debit into it.
     # Think like a SELLER — this is the best premium-harvest condition, so SELL a defined-risk iron
@@ -739,5 +774,17 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     # 7mo WORSE (+84,945 -> +8,877). Reason = PATH DEPENDENCE — in a one-position system,
     # cutting trades frees the slot for other (worse) trades, so bucket edges don't
     # transfer. Lesson recorded; vol stays advisory until a rule survives full re-sim.
+
+    # CONDOR only on/near expiry. A non-expiry condor carries little theta, has wide strikes, and gets
+    # run over — the iron-FLY beats it on range days (+5,475 vs +1,060 on the shadow fills), and the
+    # user flagged low confidence in non-expiry condors. Off expiry, swap any IRON_CONDOR -> IRON_FLY.
+    if choice.structures and not bool(metadata.get("is_expiry_day")):
+        _swapped, _seen = [], set()
+        for s in choice.structures:
+            s2 = "IRON_FLY" if s == "IRON_CONDOR" else s
+            if s2 not in _seen:
+                _seen.add(s2); _swapped.append(s2)
+        choice.structures = _swapped
+
     choice.executable_today = bool(choice.structures) and all(s in _EXECUTABLE for s in choice.structures)
     return choice
