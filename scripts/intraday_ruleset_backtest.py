@@ -110,6 +110,23 @@ def backtest_day(cs):
     return None
 
 
+def day_signal(cs):
+    """The ruleset's DAY-LEVEL read at ~09:45 (after the OR forms): 'TREND_UP' / 'TREND_DOWN' / 'RANGE'.
+    Used to pick the option structure to score against the shadow book's real fills."""
+    if len(cs) < ENTER_AFTER + 2:
+        return None
+    highs = [c["high"] for c in cs]; lows = [c["low"] for c in cs]; closes = [c["close"] for c in cs]
+    vwap = _vwap_series(cs)
+    i = ENTER_AFTER
+    or_hi = max(highs[:OR_BARS]); or_lo = min(lows[:OR_BARS])
+    slope = vwap[i] - vwap[i - VWAP_SLOPE_LB]
+    if slope >= TREND_SLOPE_PTS and closes[i] > vwap[i] and closes[i] > or_hi:
+        return "TREND_UP"
+    if slope <= -TREND_SLOPE_PTS and closes[i] < vwap[i] and closes[i] < or_lo:
+        return "TREND_DOWN"
+    return "RANGE"
+
+
 def main():
     files = sorted(glob.glob(str(STATE / "candle_cache_*_5m.json")))
     results = []
