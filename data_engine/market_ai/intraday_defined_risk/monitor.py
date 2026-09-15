@@ -71,6 +71,24 @@ STATE_ROOT = Path(__file__).resolve().parents[1] / "state"
 AGENT_HEARTBEAT_PATH = STATE_ROOT / "intraday_v83_heartbeat.json"
 _SELECTION_LOG = STATE_ROOT / "selection_log.jsonl"
 
+# When the selector's TOP pick is a directional structure (it read a trend and wants to sell/buy
+# WITH it), do NOT let a build/risk failure on that directional trade silently fall through to a
+# NEUTRAL structure (iron fly/condor/strangle/straddle). Deploying a market-neutral trade against a
+# directional read is thesis-contradicting — and on 2026-09-15 (expiry) it produced exactly the churn
+# the desk flagged: the selector wanted BEAR_CALL 648:2 all day, the tight expiry delta gate blocked
+# it, and the fallback iron-flies got whipsawed out (DELTA_STOP/RANGE_INVALIDATION) in ~20 min. If the
+# directional trade can't be built within risk, STAND ASIDE. Neutral is still free to trade when the
+# selector's own top pick is neutral (a genuine RANGE day). Env-gated so we can A/B it forward.
+_SUPPRESS_NEUTRAL_FALLBACK = os.environ.get("SEL_NO_NEUTRAL_FALLBACK", "1") == "1"
+_DIRECTIONAL_STRUCTURES = frozenset({
+    StrategyType.BEAR_CALL_CREDIT_SPREAD, StrategyType.BULL_PUT_CREDIT_SPREAD,
+    StrategyType.CALL_DEBIT_SPREAD, StrategyType.PUT_DEBIT_SPREAD,
+})
+_NEUTRAL_STRUCTURES = frozenset({
+    StrategyType.IRON_FLY, StrategyType.IRON_CONDOR,
+    StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE,
+})
+
 
 def _log_selection_outcome(
     *, snapshot, choice, strategy, outcome: str, reason: str,
@@ -1231,6 +1249,10 @@ class IntradayDefinedRiskAgent:
         _candidates = [_strat_map[n] for n in choice.structures if n in _strat_map]
         if not _candidates:
             return None  # nothing mappable -> fall back to legacy
+        # DIRECTIONAL-READ GUARD: capture whether the selector's TOP pick (before any forward reorder)
+        # is directional. If it is, a failure to build that directional trade must NOT flip to a neutral
+        # structure — stand aside instead (see _SUPPRESS_NEUTRAL_FALLBACK note above).
+        _primary_directional = _candidates[0] in _DIRECTIONAL_STRUCTURES
         # AUTONOMY: among the structures that FIT the tape, prefer the one with the better FORWARD
         # record (proven winners first, proven losers last). Conservative — it only REORDERS the
         # already-eligible candidates, never forces a stand-aside; and it is dormant until a structure
@@ -1242,6 +1264,12 @@ class IntradayDefinedRiskAgent:
                 _candidates.sort(key=lambda s: _fwd_tilt(getattr(s, "value", str(s)))[0], reverse=True)
             except Exception:  # noqa: BLE001 — never let the forward hook break selection
                 pass
+        # Drop neutral fallbacks when the read is directional: better to stand aside than sell a
+        # market-neutral fly/condor into a trend the agent itself just identified.
+        if _primary_directional and _SUPPRESS_NEUTRAL_FALLBACK:
+            _directional_only = [s for s in _candidates if s not in _NEUTRAL_STRUCTURES]
+            if _directional_only:                    # always true (primary itself is directional)
+                _candidates = _directional_only
         _first_reject = None
         for strategy in _candidates:
             _decision, _entered = _try_structure(strategy)
