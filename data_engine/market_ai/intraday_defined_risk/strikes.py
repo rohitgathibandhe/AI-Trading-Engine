@@ -17,6 +17,27 @@ from .data_models import (
 
 
 DIRECTIONAL_WIDTH_CHOICES = (50.0, 75.0, 100.0, 150.0)
+
+# EXPIRY-DAY DIRECTIONAL RELIEF: on expiry the credit-spread short-delta band is tightened to
+# (0.08, 0.15) because gamma near the money is dangerous. But when the tape has a STRONG, clean trend
+# (high trend-efficiency), that tight cap starves the with-trend directional spread — on 2026-09-15 the
+# selector wanted BEAR_CALL 648x, every candidate came in >0.15 delta -> DELTA_TOO_HIGH, and the day
+# stood aside / fell to a whipsawed fly. When the trend is genuinely strong we let the short reach a
+# slightly higher delta AND pull the long wing IN (higher long delta) so the spread WIDTH — and thus
+# the defined max-loss — does not grow versus the baseline tight band. Env-gated so we can A/B it.
+_EXPIRY_TREND_RELIEF = os.environ.get("SEL_EXPIRY_TREND_RELIEF", "1") == "1"
+_EXPIRY_TREND_EFF_MIN = float(os.environ.get("SEL_EXPIRY_TREND_EFF_MIN", "0.35") or 0.35)
+_EXPIRY_TREND_SHORT_BAND = (0.08, float(os.environ.get("SEL_EXPIRY_TREND_SHORT_MAX", "0.18") or 0.18))
+_EXPIRY_TREND_LONG_BAND = (0.06, 0.12)   # wing pulled IN vs baseline (0.03,0.08) -> width stays bounded
+
+
+def _expiry_trend_strength(metadata: dict) -> float:
+    """Follow-through of the move (|net displacement| / path travelled). ~1.0 clean trend, ~0.1 chop."""
+    for k in ("trend_efficiency_ratio", "trend_efficiency", "efficiency_ratio"):
+        v = metadata.get(k)
+        if isinstance(v, (int, float)):
+            return float(v)
+    return 0.0
 CANDIDATE_REJECTION_PRIORITY = (
     "LIQUIDITY_BAD",
     "OI_WALL_BELOW_SHORT_STRIKE",
@@ -103,8 +124,13 @@ def select_best_structure(
     if strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD:
         # Tighter delta band on expiry day — gamma spikes make 0.18-0.25 deltas dangerous
         if is_expiry_day:
-            bc_short_band = (0.08, 0.15)
-            bc_long_band = (0.03, 0.08)
+            if _EXPIRY_TREND_RELIEF and _expiry_trend_strength(regime_state.metadata) >= _EXPIRY_TREND_EFF_MIN:
+                # strong clean trend: let the short reach ~0.18 and pull the long wing in so max-loss holds
+                bc_short_band = _EXPIRY_TREND_SHORT_BAND
+                bc_long_band = _EXPIRY_TREND_LONG_BAND
+            else:
+                bc_short_band = (0.08, 0.15)
+                bc_long_band = (0.03, 0.08)
         else:
             # Upper bound 0.30 (was 0.25): when the OI-wall/anchor floor pushes the
             # short strike toward a still-0.26-0.30-delta level, a 0.25 cap rejected
@@ -122,8 +148,13 @@ def select_best_structure(
         playbook = regime_state.metadata.get("playbook")
         # Tighter delta band on expiry day — gamma spikes make 0.18-0.25 deltas dangerous
         if is_expiry_day:
-            short_delta_band = (0.08, 0.15)
-            long_delta_band = (0.03, 0.08)
+            if _EXPIRY_TREND_RELIEF and _expiry_trend_strength(regime_state.metadata) >= _EXPIRY_TREND_EFF_MIN:
+                # strong clean trend: mirror the bear-call relief (short ~0.18, wing pulled in)
+                short_delta_band = _EXPIRY_TREND_SHORT_BAND
+                long_delta_band = _EXPIRY_TREND_LONG_BAND
+            else:
+                short_delta_band = (0.08, 0.15)
+                long_delta_band = (0.03, 0.08)
         elif (
             playbook == "SIDEWAYS_TO_BULLISH_RECLAIM"
             and regime_state.metadata.get("bullish_setup") == "VWAP_HOLD_HIGHER_LOW"
