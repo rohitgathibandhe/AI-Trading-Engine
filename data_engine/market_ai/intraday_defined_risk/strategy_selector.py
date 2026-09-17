@@ -515,6 +515,51 @@ def _vwap_regime(read, m: dict[str, Any]) -> str:
     return "RANGE"
 
 
+# ── HIGH-PROBABILITY CONFLUENCE GATE (default ON) ──────────────────────────────────────────────
+# The desk mandate: intraday takes ONLY high-probability directional trades — PRICE ACTION (higher-
+# timeframe S/R, M/W reversal patterns, opening-range-break acceptance) that is CONFIRMED by the
+# OPTION CHAIN (smart-money OI bias, change-in-OI at the call/put walls, PCR trend, pressure scores),
+# with the move showing real follow-through (trend_efficiency) and the 20-EMA not fighting it. When
+# those DON'T align, there is NO high-probability trade -> STAND ASIDE (the seat stays empty).
+# This makes stand-aside the default and removes the premium-selling paths (chop/range -> iron fly)
+# that produced the whipsaw churn. Env SEL_CONFLUENCE_ONLY=0 restores the legacy condition cascade.
+_CONFLUENCE_ONLY = os.environ.get("SEL_CONFLUENCE_ONLY", "1") == "1"
+_CONF_MIN_EFF = _sel_env_float("SEL_CONF_MIN_EFF") or 0.35
+
+
+def _chain_confirms(m: dict[str, Any], direction: str) -> bool:
+    """Option-chain agreement for a direction: smart-money / OI-pressure / thesis bias OR a clear
+    pressure-score tilt (change-in-OI at the walls). One independent chain confirmation is enough."""
+    want = direction
+    votes = [str(m.get(k, "")).upper() for k in ("smart_money_bias", "oi_pressure_bias", "thesis_net_bias")]
+    if any(v == want for v in votes):
+        return True
+    bull = _f(m, "bullish_option_chain_pressure_score", 0.0)
+    bear = _f(m, "bearish_option_chain_pressure_score", 0.0)
+    return (bull - bear) >= 1.0 if direction == "BULLISH" else (bear - bull) >= 1.0
+
+
+def _high_prob_confluence(read, m: dict[str, Any]) -> tuple[str | None, str]:
+    """(direction, why). direction in {BULLISH, BEARISH} only when PRICE-ACTION and OPTION-CHAIN
+    confluence align with follow-through; else (None, why) -> stand aside."""
+    from .strategy_matrix import _ema20_bias, _m_pattern_at_resistance, _w_pattern_at_support
+    eff = _trend_efficiency(m)
+    ema = _ema20_bias(m)  # BULLISH / BEARISH / NEUTRAL from spot vs 20-EMA (the primary trend filter)
+    # PRICE ACTION: a directional break that was ACCEPTED, or an M/W reversal at the HTF level.
+    pa_bear = (bool(m.get("accepted_breakdown")) or _m_pattern_at_resistance(m)) and ema in ("BEARISH", "NEUTRAL")
+    pa_bull = (bool(m.get("accepted_breakout")) or _w_pattern_at_support(m)) and ema in ("BULLISH", "NEUTRAL")
+    if eff < _CONF_MIN_EFF:
+        return None, f"no follow-through (efficiency {eff:.2f} < {_CONF_MIN_EFF:.2f}) — chop, stand aside"
+    if pa_bear and read.bias == "BEARISH" and _chain_confirms(m, "BEARISH"):
+        return "BEARISH", (f"HIGH-PROB BEARISH: price action (breakdown/M-top @ resistance, spot≤20EMA) "
+                           f"+ option-chain (OI/PCR bearish) + follow-through eff{eff:.2f}")
+    if pa_bull and read.bias == "BULLISH" and _chain_confirms(m, "BULLISH"):
+        return "BULLISH", (f"HIGH-PROB BULLISH: price action (breakout/W-bottom @ support, spot≥20EMA) "
+                           f"+ option-chain (OI/PCR bullish) + follow-through eff{eff:.2f}")
+    return None, (f"no confluence (eff {eff:.2f}, ema {ema}, bias {read.bias}, "
+                  f"pa_bull={pa_bull}, pa_bear={pa_bear}) — stand aside")
+
+
 def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> StrategyChoice:
     """Read the market, name the condition, and choose the strategy family + structures.
 
@@ -529,6 +574,25 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     choice = StrategyChoice(condition=condition, iv_regime=iv, read=read, conviction=read.conviction)
     choice.vol_regime = vol.regime
     choice.vol_notes = vol.notes
+
+    # HIGH-PROBABILITY CONFLUENCE GATE (default ON): intraday trades ONLY when price action and the
+    # option chain agree on a directional, high-probability setup. No confluence -> NO TRADE. This is
+    # the top-priority decision: it short-circuits the entire legacy condition cascade (incl. every
+    # premium-selling iron-fly/condor path), so the seat stays empty on uncommitted days. Seller-first:
+    # a confluence direction sells the WITH-TREND defined-risk credit spread (bull-put / bear-call).
+    if _CONFLUENCE_ONLY:
+        _dir, _why = _high_prob_confluence(read, metadata)
+        if _dir == "BULLISH":
+            choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
+            choice.rationale = _why + " — SELL a with-trend bull-put (defined risk, theta)."
+        elif _dir == "BEARISH":
+            choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BEAR_CALL_CREDIT_SPREAD"]
+            choice.rationale = _why + " — SELL a with-trend bear-call (defined risk, theta)."
+        else:
+            choice.family, choice.structures = FAM_STAND_ASIDE, []
+            choice.rationale = "NO high-probability confluence — stand aside (no trade is a position). " + _why
+        choice.executable_today = bool(choice.structures) and all(s in _EXECUTABLE for s in choice.structures)
+        return choice
 
     # VWAP-SELLER override: on a CONFIDENT trend, SELL a directional credit WITH the trend (the validated
     # seller edge). RANGE falls through to the existing guarded range/fly logic. Env-gated forward test.
