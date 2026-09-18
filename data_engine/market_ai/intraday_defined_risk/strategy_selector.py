@@ -525,39 +525,53 @@ def _vwap_regime(read, m: dict[str, Any]) -> str:
 # that produced the whipsaw churn. Env SEL_CONFLUENCE_ONLY=0 restores the legacy condition cascade.
 _CONFLUENCE_ONLY = os.environ.get("SEL_CONFLUENCE_ONLY", "1") == "1"
 _CONF_MIN_EFF = _sel_env_float("SEL_CONF_MIN_EFF") or 0.35
+_CONF_STRONG_EFF = _sel_env_float("SEL_CONF_STRONG_EFF") or 0.55   # eff alone confirms a clean trend
+# Up-side is stood aside by default: on the shadow book every bullish structure was ~breakeven-to-
+# negative (Nifty intraday has no validated up-side edge — [[project_ordering_robustness]]). Set
+# SEL_CONF_ALLOW_BULLISH=1 to also trade a CALL_DEBIT on high-conviction up days.
+_CONF_ALLOW_BULLISH = os.environ.get("SEL_CONF_ALLOW_BULLISH", "0") == "1"
 
 
-def _chain_confirms(m: dict[str, Any], direction: str) -> bool:
-    """Option-chain agreement for a direction: smart-money / OI-pressure / thesis bias OR a clear
-    pressure-score tilt (change-in-OI at the walls). One independent chain confirmation is enough."""
-    want = direction
+def _chain_opposes(m: dict[str, Any], direction: str) -> bool:
+    """Veto only when the option chain CONTRADICTS the direction (smart-money/OI/thesis explicitly the
+    other way, or a strong opposite pressure tilt). smart_money_bias is UNKNOWN most days, so we require
+    the chain not to FIGHT us rather than to positively confirm — else the gate never fires."""
+    opp = "BULLISH" if direction == "BEARISH" else "BEARISH"
     votes = [str(m.get(k, "")).upper() for k in ("smart_money_bias", "oi_pressure_bias", "thesis_net_bias")]
-    if any(v == want for v in votes):
+    if opp in votes and direction not in votes:
         return True
     bull = _f(m, "bullish_option_chain_pressure_score", 0.0)
     bear = _f(m, "bearish_option_chain_pressure_score", 0.0)
-    return (bull - bear) >= 1.0 if direction == "BULLISH" else (bear - bull) >= 1.0
+    return (bull - bear) >= 1.5 if direction == "BEARISH" else (bear - bull) >= 1.5
 
 
 def _high_prob_confluence(read, m: dict[str, Any]) -> tuple[str | None, str]:
-    """(direction, why). direction in {BULLISH, BEARISH} only when PRICE-ACTION and OPTION-CHAIN
-    confluence align with follow-through; else (None, why) -> stand aside."""
-    from .strategy_matrix import _ema20_bias, _m_pattern_at_resistance, _w_pattern_at_support
+    """(direction, why). Fires on a high-conviction DIRECTIONAL setup built from the signals that
+    actually populate: directional bias + real follow-through (trend_efficiency) + an opening-range
+    break in that direction OR a strong clean trend, with the option chain not fighting it. BEARISH ->
+    buy a PUT-DEBIT (the validated convex edge); BULLISH stands aside by default. None -> stand aside.
+
+    Calibrated on the shadow book (scripts/confluence_gate_backtest.py): the price-action FLAGS the
+    first version used (accepted_breakout/breakdown, M/W patterns) were DEAD — 0-2 firings in 32 days —
+    so the gate never traded. Bias+efficiency+ORB are populated and select the high-conviction days;
+    routing those to a put-debit made +2,787 over 10 days (vs -1,241 for the bear-call credit)."""
     eff = _trend_efficiency(m)
-    ema = _ema20_bias(m)  # BULLISH / BEARISH / NEUTRAL from spot vs 20-EMA (the primary trend filter)
-    # PRICE ACTION: a directional break that was ACCEPTED, or an M/W reversal at the HTF level.
-    pa_bear = (bool(m.get("accepted_breakdown")) or _m_pattern_at_resistance(m)) and ema in ("BEARISH", "NEUTRAL")
-    pa_bull = (bool(m.get("accepted_breakout")) or _w_pattern_at_support(m)) and ema in ("BULLISH", "NEUTRAL")
+    orb = str(m.get("opening_range_break_state") or "").upper()
+    bias = getattr(read, "bias", "NEUTRAL")
     if eff < _CONF_MIN_EFF:
         return None, f"no follow-through (efficiency {eff:.2f} < {_CONF_MIN_EFF:.2f}) — chop, stand aside"
-    if pa_bear and read.bias == "BEARISH" and _chain_confirms(m, "BEARISH"):
-        return "BEARISH", (f"HIGH-PROB BEARISH: price action (breakdown/M-top @ resistance, spot≤20EMA) "
-                           f"+ option-chain (OI/PCR bearish) + follow-through eff{eff:.2f}")
-    if pa_bull and read.bias == "BULLISH" and _chain_confirms(m, "BULLISH"):
-        return "BULLISH", (f"HIGH-PROB BULLISH: price action (breakout/W-bottom @ support, spot≥20EMA) "
-                           f"+ option-chain (OI/PCR bullish) + follow-through eff{eff:.2f}")
-    return None, (f"no confluence (eff {eff:.2f}, ema {ema}, bias {read.bias}, "
-                  f"pa_bull={pa_bull}, pa_bear={pa_bear}) — stand aside")
+    _bear_confirm = (orb == "DOWN") or eff >= _CONF_STRONG_EFF
+    _bull_confirm = (orb == "UP") or eff >= _CONF_STRONG_EFF
+    if bias == "BEARISH" and _bear_confirm and not _chain_opposes(m, "BEARISH"):
+        return "BEARISH", (f"HIGH-PROB BEARISH: bias down + follow-through eff{eff:.2f} + "
+                           f"{'opening-range break DOWN' if orb == 'DOWN' else 'strong clean trend'} "
+                           f"(chain not fighting) — BUY a put-debit (convex: small loss, big win).")
+    if bias == "BULLISH" and _bull_confirm and not _chain_opposes(m, "BULLISH"):
+        if _CONF_ALLOW_BULLISH:
+            return "BULLISH", (f"HIGH-PROB BULLISH: bias up + follow-through eff{eff:.2f} — BUY a call-debit.")
+        return None, ("bullish setup but intraday UP-SIDE has no validated edge (every up-structure "
+                      "~breakeven-to-negative on the record) — stand aside.")
+    return None, (f"no confluence (eff {eff:.2f}, orb {orb}, bias {bias}) — stand aside")
 
 
 def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> StrategyChoice:
@@ -582,12 +596,23 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     # a confluence direction sells the WITH-TREND defined-risk credit spread (bull-put / bear-call).
     if _CONFLUENCE_ONLY:
         _dir, _why = _high_prob_confluence(read, metadata)
-        if _dir == "BULLISH":
-            choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
-            choice.rationale = _why + " — SELL a with-trend bull-put (defined risk, theta)."
+        # The validated STRUCTURE for a high-conviction directional leg is a DEBIT, not a credit spread:
+        # on the shadow book the bear-call CREDIT lost -1,241 (71% win, capped winner / big loser) while
+        # the PUT-DEBIT made +2,787 (50% win, convex — small losses, big wins). So confluence -> BUY the
+        # directional debit. Debits leak in the post-open-drive window, so honour the debit blackout.
+        _in_blackout = (_DEBIT_BLACKOUT is not None and now_time is not None
+                        and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1])
+        if _dir in ("BULLISH", "BEARISH") and _in_blackout:
+            choice.family, choice.structures = FAM_STAND_ASIDE, []
+            choice.rationale = (f"{_dir} confluence but inside the {_DEBIT_BLACKOUT[0].strftime('%H:%M')}-"
+                                f"{_DEBIT_BLACKOUT[1].strftime('%H:%M')} debit blackout (post-open-drive "
+                                f"exhaustion — debit entries leak here) — wait for a fresh leg.")
         elif _dir == "BEARISH":
-            choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BEAR_CALL_CREDIT_SPREAD"]
-            choice.rationale = _why + " — SELL a with-trend bear-call (defined risk, theta)."
+            choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
+            choice.rationale = _why
+        elif _dir == "BULLISH":
+            choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["CALL_DEBIT_SPREAD"]
+            choice.rationale = _why
         else:
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = "NO high-probability confluence — stand aside (no trade is a position). " + _why
