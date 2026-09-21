@@ -530,6 +530,11 @@ _CONF_STRONG_EFF = _sel_env_float("SEL_CONF_STRONG_EFF") or 0.55   # eff alone c
 # negative (Nifty intraday has no validated up-side edge — [[project_ordering_robustness]]). Set
 # SEL_CONF_ALLOW_BULLISH=1 to also trade a CALL_DEBIT on high-conviction up days.
 _CONF_ALLOW_BULLISH = os.environ.get("SEL_CONF_ALLOW_BULLISH", "0") == "1"
+# Structure for a BULLISH confluence day. BUYING up (CALL_DEBIT) is validated-negative — up-moves
+# grind, a long debit whipsaws (real data: -16k / 16 tr). SELLING up (BULL_PUT credit) fits the grind
+# (theta, wins on up OR sideways) and the synthetic dense set was BIASED AGAINST selling (5x-wide
+# spreads), so it deserves a re-test on the REAL live-capture data. Default BULL_PUT.
+_CONF_UP_STRUCT = os.environ.get("SEL_CONF_UP_STRUCT", "BULL_PUT").upper()
 # When ON, require the option chain to POSITIVELY CONFIRM the direction (change-in-OI / smart-money /
 # pressure agreeing), not merely not-oppose. Live the chain computes real values ~98% of polls (the
 # shadow book showed UNKNOWN only because the replay doesn't thread the previous chain), so this is a
@@ -619,9 +624,13 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         # on the shadow book the bear-call CREDIT lost -1,241 (71% win, capped winner / big loser) while
         # the PUT-DEBIT made +2,787 (50% win, convex — small losses, big wins). So confluence -> BUY the
         # directional debit. Debits leak in the post-open-drive window, so honour the debit blackout.
+        _bull_is_debit = _CONF_UP_STRUCT == "CALL_DEBIT"
+        # The debit blackout only applies to DEBIT entries (post-open-drive exhaustion). A BEARISH day
+        # always buys a put-debit; a BULLISH day buys a call-debit only if SEL_CONF_UP_STRUCT=CALL_DEBIT.
+        _is_debit_entry = (_dir == "BEARISH") or (_dir == "BULLISH" and _bull_is_debit)
         _in_blackout = (_DEBIT_BLACKOUT is not None and now_time is not None
                         and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1])
-        if _dir in ("BULLISH", "BEARISH") and _in_blackout:
+        if _is_debit_entry and _in_blackout:
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = (f"{_dir} confluence but inside the {_DEBIT_BLACKOUT[0].strftime('%H:%M')}-"
                                 f"{_DEBIT_BLACKOUT[1].strftime('%H:%M')} debit blackout (post-open-drive "
@@ -629,9 +638,12 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         elif _dir == "BEARISH":
             choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
             choice.rationale = _why
-        elif _dir == "BULLISH":
+        elif _dir == "BULLISH" and _bull_is_debit:
             choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["CALL_DEBIT_SPREAD"]
             choice.rationale = _why
+        elif _dir == "BULLISH":
+            choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
+            choice.rationale = _why + " [SELL a bull-put: theta fits the grinding up-move — wins up or sideways]"
         else:
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = "NO high-probability confluence — stand aside (no trade is a position). " + _why
