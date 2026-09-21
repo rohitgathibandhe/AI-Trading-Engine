@@ -43,7 +43,14 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-_STATE = Path(__file__).resolve().parent.parent / "state" / "entry_pending.json"
+_DEFAULT_STATE = Path(__file__).resolve().parent.parent / "state" / "entry_pending.json"
+
+
+def _state_path() -> Path:
+    """The pending-entry state file. Overridable via ENTRY_PENDING_PATH so a backtest can use an
+    ISOLATED file and never clobber the LIVE agent's in-flight entry-wait state (they share a host)."""
+    p = os.environ.get("ENTRY_PENDING_PATH")
+    return Path(p) if p else _DEFAULT_STATE
 
 # Retrace required before entering, as a FRACTION OF SPOT so it scales with the index level and
 # volatility regime rather than being a hardcoded point count. 0.0009 ~= 21pts at Nifty 24,000,
@@ -74,21 +81,21 @@ _SELL_WAIT_DOWN = {"BEAR_CALL_CREDIT_SPREAD"}   # bearish seller — confirm dow
 
 def _read() -> dict:
     try:
-        return json.loads(_STATE.read_text())
+        return json.loads(_state_path().read_text())
     except (OSError, ValueError):
         return {}
 
 
 def _write(d: dict) -> None:
     try:
-        _STATE.write_text(json.dumps(d))
+        _state_path().write_text(json.dumps(d))
     except OSError:
         pass
 
 
 def clear() -> None:
     try:
-        _STATE.unlink()
+        _state_path().unlink()
     except OSError:
         pass
 
