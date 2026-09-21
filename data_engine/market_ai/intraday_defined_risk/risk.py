@@ -160,20 +160,29 @@ def compute_max_loss_rupees_per_lot(structure: TradeStructure, lot_size: int) ->
 def _has_unhedged_short(structure: TradeStructure) -> bool:
     """True if any SHORT leg lacks a protective long wing on the same option type.
 
-    A short put at K is hedged only by a long put at a strike < K; a short call at K only by a long
-    call at a strike > K. A naked short (short strangle/straddle with no wings) has an unhedged short
-    and — on an overnight gap, the primary tail of a Nifty short-premium book — unbounded loss with no
-    exit until 09:15. This is the one rule that must be NON-OVERRIDABLE in code (per the Nifty
-    option-selling architecture), so it lives in the risk gate every structure passes through.
+    A short leg is DEFINED-RISK as long as it is paired with a long of the same option type — the long
+    caps the loss regardless of which side it sits on:
+      • CREDIT-spread geometry — long FURTHER OTM than the short (long put below / long call above):
+        caps the loss to the strike width.
+      • DEBIT-spread geometry — long CLOSER to money than the short (long put ABOVE / long call BELOW):
+        the deeper long over-covers the short, so max loss is the net debit paid.
+    Only a short with NO long of the same option type (short strangle/straddle) is truly naked —
+    unbounded loss on an overnight gap, the primary tail of a Nifty short-premium book. That is the
+    one NON-OVERRIDABLE rule, so it lives in the risk gate every structure passes through.
+
+    (BUG FIX: the original check recognized ONLY the credit geometry — long put strictly BELOW the short
+    — so it rejected every PUT_DEBIT spread (protective long ABOVE the short) as 'naked', silently
+    disconnecting the validated put-debit engine from 2026-07-31 until this fix. See risk retro.)
     """
     longs_put = [l.strike for l in structure.legs if l.action == "BUY" and l.option_type == OptionType.PUT]
     longs_call = [l.strike for l in structure.legs if l.action == "BUY" and l.option_type == OptionType.CALL]
     for leg in structure.legs:
         if leg.action != "SELL":
             continue
-        if leg.option_type == OptionType.PUT and not any(lp < leg.strike for lp in longs_put):
+        # Hedged if ANY long of the same type sits at a different strike (either spread geometry).
+        if leg.option_type == OptionType.PUT and not any(lp != leg.strike for lp in longs_put):
             return True
-        if leg.option_type == OptionType.CALL and not any(lc > leg.strike for lc in longs_call):
+        if leg.option_type == OptionType.CALL and not any(lc != leg.strike for lc in longs_call):
             return True
     return False
 

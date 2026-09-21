@@ -530,6 +530,22 @@ _CONF_STRONG_EFF = _sel_env_float("SEL_CONF_STRONG_EFF") or 0.55   # eff alone c
 # negative (Nifty intraday has no validated up-side edge — [[project_ordering_robustness]]). Set
 # SEL_CONF_ALLOW_BULLISH=1 to also trade a CALL_DEBIT on high-conviction up days.
 _CONF_ALLOW_BULLISH = os.environ.get("SEL_CONF_ALLOW_BULLISH", "0") == "1"
+# When ON, require the option chain to POSITIVELY CONFIRM the direction (change-in-OI / smart-money /
+# pressure agreeing), not merely not-oppose. Live the chain computes real values ~98% of polls (the
+# shadow book showed UNKNOWN only because the replay doesn't thread the previous chain), so this is a
+# real filter live. Default OFF until the dense-dataset backtest shows it sharpens selection.
+_CONF_REQUIRE_CHAIN = os.environ.get("SEL_CONF_REQUIRE_CHAIN", "0") == "1"
+
+
+def _chain_confirms(m: dict[str, Any], direction: str) -> bool:
+    """Positive option-chain agreement: smart-money / OI-pressure bias equals the direction, OR a clear
+    same-side pressure tilt (change-in-OI at the walls). Used only when SEL_CONF_REQUIRE_CHAIN is on."""
+    votes = [str(m.get(k, "")).upper() for k in ("smart_money_bias", "oi_pressure_bias")]
+    if direction in votes:
+        return True
+    bull = _f(m, "bullish_option_chain_pressure_score", 0.0)
+    bear = _f(m, "bearish_option_chain_pressure_score", 0.0)
+    return (bear - bull) >= 1.0 if direction == "BEARISH" else (bull - bear) >= 1.0
 
 
 def _chain_opposes(m: dict[str, Any], direction: str) -> bool:
@@ -562,6 +578,9 @@ def _high_prob_confluence(read, m: dict[str, Any]) -> tuple[str | None, str]:
         return None, f"no follow-through (efficiency {eff:.2f} < {_CONF_MIN_EFF:.2f}) — chop, stand aside"
     _bear_confirm = (orb == "DOWN") or eff >= _CONF_STRONG_EFF
     _bull_confirm = (orb == "UP") or eff >= _CONF_STRONG_EFF
+    if _CONF_REQUIRE_CHAIN:  # stricter: chain must positively AGREE, not merely not-oppose
+        _bear_confirm = _bear_confirm and _chain_confirms(m, "BEARISH")
+        _bull_confirm = _bull_confirm and _chain_confirms(m, "BULLISH")
     if bias == "BEARISH" and _bear_confirm and not _chain_opposes(m, "BEARISH"):
         return "BEARISH", (f"HIGH-PROB BEARISH: bias down + follow-through eff{eff:.2f} + "
                            f"{'opening-range break DOWN' if orb == 'DOWN' else 'strong clean trend'} "
