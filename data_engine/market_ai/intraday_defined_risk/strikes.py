@@ -31,6 +31,19 @@ _EXPIRY_TREND_SHORT_BAND = (0.08, float(os.environ.get("SEL_EXPIRY_TREND_SHORT_M
 _EXPIRY_TREND_LONG_BAND = (0.06, 0.12)   # wing pulled IN vs baseline (0.03,0.08) -> width stays bounded
 
 
+def _parse_band(s: str, default: tuple[float, float]) -> tuple[float, float]:
+    try:
+        a, b = (float(x) for x in s.split(","))
+        return (a, b)
+    except Exception:
+        return default
+
+
+# Bull-put short-delta band (non-expiry). Widened from (0.18,0.30) so the confluence up-day bull-put
+# can construct where the tighter band left no valid pair (DELTA_TOO_HIGH blocked the whole path).
+_BULLPUT_SHORT_BAND = _parse_band(os.environ.get("SEL_BULLPUT_SHORT_BAND", ""), (0.14, 0.34))
+
+
 def _expiry_trend_strength(metadata: dict) -> float:
     """Follow-through of the move (|net displacement| / path travelled). ~1.0 clean trend, ~0.1 chop."""
     for k in ("trend_efficiency_ratio", "trend_efficiency", "efficiency_ratio"):
@@ -168,8 +181,11 @@ def select_best_structure(
             # the OI-wall/anchor floor pushes the short put toward a 0.26-0.30-delta strike, so
             # a 0.25 cap rejected EVERY candidate with DELTA_TOO_HIGH and built nothing (live
             # 2026-07-15: 996 BREAKOUT_UP decisions, 0 bull-puts built — a Δ0.29 short was
-            # buildable and would have been +Rs1,393/lot). 0.30 is a defensible OTM credit strike.
-            short_delta_band = (0.18, 0.30)
+            # buildable and would have been +Rs1,393/lot). Widened lower bound 0.18->0.14 and upper
+            # 0.30->0.34 (env SEL_BULLPUT_SHORT_BAND) so the confluence bull-put — the up-day engine —
+            # can actually construct across chains where 0.18-0.30 left no valid pair (DELTA_TOO_HIGH
+            # was blocking the whole bullish path). Still a defined-risk OTM credit strike.
+            short_delta_band = _BULLPUT_SHORT_BAND
             long_delta_band = (0.05, 0.15)
         return _vertical_with_anchor_fallback(
             strategy=strategy, snapshot=snapshot, regime_state=regime_state,
