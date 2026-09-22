@@ -139,6 +139,10 @@ def main() -> int:
     positions = _open_positions()
     if not positions:
         print("No open weekly positional paper positions.")
+        # Clear the snapshot when flat — otherwise the last position lingers as a phantom "open" with a
+        # stale MTM (it double-counted +2,867 in the dashboard's combined P&L, already booked in realized).
+        (STATE / "weekly_positional_snapshot.json").write_text(json.dumps(
+            {"updated": datetime.now().isoformat(timespec="seconds"), "positions": []}, indent=2))
         return 0
 
     creds = wx._load_creds()

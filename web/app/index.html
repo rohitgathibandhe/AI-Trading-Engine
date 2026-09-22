@@ -447,6 +447,11 @@
 
       <!-- ── Top summary bar ── -->
       <div class="summary-bar">
+        <div class="summary-card" style="border:1px solid #8b5cf6;">
+          <div class="summary-title">Combined P&L (both books)</div>
+          <div class="summary-value" id="combined-pnl">₹ 0.00</div>
+          <div class="summary-sub" id="combined-pnl-sub">intraday + weekly</div>
+        </div>
         <div class="summary-card">
           <div class="summary-title">Open MTM</div>
           <div class="summary-value" id="total-pnl">₹ 0.00</div>
@@ -1521,12 +1526,15 @@
 
       // ── Realized P&L — from v83 intraday_performance (NOT blotter) ───────
       const realizedEl = document.getElementById("paper-realized-pnl");
+      const intradayRealized = Number((data.intraday_performance || {}).realized_pnl_rs ?? 0);
       if (realizedEl) {
-        const realized = Number((data.intraday_performance || {}).realized_pnl_rs ?? 0);
-        realizedEl.textContent = fmtMoney(realized);
-        realizedEl.classList.toggle("pos", realized > 0);
-        realizedEl.classList.toggle("neg", realized < 0);
+        realizedEl.textContent = fmtMoney(intradayRealized);
+        realizedEl.classList.toggle("pos", intradayRealized > 0);
+        realizedEl.classList.toggle("neg", intradayRealized < 0);
       }
+      // Feed the COMBINED (both-books) P&L: intraday realized + intraday open MTM
+      window.__pnlParts = Object.assign(window.__pnlParts || {}, { iRealized: intradayRealized, iOpen: v83OpenMtm });
+      updateCombinedPnl();
 
       document.getElementById("last-refresh").textContent = "Updated: " + new Date().toLocaleTimeString();
 
@@ -2470,6 +2478,26 @@
         const rze = document.getElementById(rz); if (rze) rze.textContent = "Realized: ₹" + realized.toLocaleString();
         const upe = document.getElementById(up); if (upe) upe.textContent = updated;
       });
+      // Feed the COMBINED (both-books) P&L: weekly realized + weekly open MTM
+      window.__pnlParts = Object.assign(window.__pnlParts || {}, { wRealized: realized, wOpen: openMtm });
+      updateCombinedPnl();
+    }
+
+    // Combined P&L across BOTH books (intraday + weekly positional). Each loader feeds its parts into
+    // window.__pnlParts and calls this; the headline shows the grand total = realized + open, both books.
+    function updateCombinedPnl() {
+      const p = window.__pnlParts || {};
+      const iR = Number(p.iRealized || 0), iO = Number(p.iOpen || 0);
+      const wR = Number(p.wRealized || 0), wO = Number(p.wOpen || 0);
+      const total = iR + iO + wR + wO;
+      const el = document.getElementById("combined-pnl");
+      if (el) {
+        el.textContent = fmtMoney(total);
+        el.classList.toggle("pos", total > 0);
+        el.classList.toggle("neg", total < 0);
+      }
+      const sub = document.getElementById("combined-pnl-sub");
+      if (sub) sub.textContent = "intraday ₹" + Math.round(iR + iO).toLocaleString() + " + weekly ₹" + Math.round(wR + wO).toLocaleString();
     }
 
     async function loadScorecard() {
