@@ -120,12 +120,26 @@ def _emitted_of(j: dict):
     return j.get("emitted_at") or dr.get("timestamp")
 
 
+def _is_rate_limited() -> bool:
+    """A CHAIN_BLACKOUT caused by a 429 rate-limit must NOT be 'healed' by restarting — each restart
+    fires a burst of chain requests and DEEPENS the throttle, turning a transient 429 into a long
+    outage (2026-09-22: 2 restarts spiralled a rate-limit into a 15-min blackout during an open,
+    winning trade). On a 429 the right action is to BACK OFF and let it cool. Detect it from the
+    recent runner log."""
+    tail = "\n".join(_tail_lines(RUNNER_LOG, 40_000)).lower()
+    return ("429" in tail or "too many requests" in tail or '"805"' in tail
+            or "may result in the user being blocked" in tail)
+
+
 def _data_fault_hint() -> str:
     """Scan the recent runner log for the ACTUAL cause of a data blackout so the alert names the right
     fix. A lapsed Dhan DATA API subscription (DH-902 / 'not subscribed to Data APIs') is NOT a token
     problem — the trading token still authenticates, so 'refresh the token' sends the user down the
     wrong path (this cost 2026-08-13 and 08-14)."""
     tail = "\n".join(_tail_lines(RUNNER_LOG, 120_000)).lower()
+    if "429" in tail or "too many requests" in tail or "may result in the user being blocked" in tail:
+        return ("Dhan is RATE-LIMITING the chain (HTTP 429). The token is fine — do NOT restart "
+                "(restarts burst more requests and worsen it). Let polling idle for a few minutes to cool.")
     if "dh-902" in tail or "not subscribed to data" in tail or "subscribe to data api" in tail:
         return ("Dhan DATA API SUBSCRIPTION has lapsed (DH-902 / HTTP 451). The trading token is fine — "
                 "refreshing it will NOT help. Renew the Dhan 'Data APIs' plan to restore live data.")
@@ -259,6 +273,7 @@ def main() -> int:
             _log({**base, "action": "RECOVERED"})
         state["consecutive_unhealthy"] = 0
         state["escalated"] = False
+        state["rl_alerted"] = False          # recovered — re-arm the rate-limit alert for next time
         _save_state(state)
         d = result["detail"]
         print(f"self-heal: HEALTHY ({d.get('real_analyses')}/{d.get('window')} recent cycles are real "
@@ -295,6 +310,19 @@ def main() -> int:
             cooldown_ok = (now - datetime.fromisoformat(last_restart)).total_seconds() >= RESTART_COOLDOWN_SECS
         except Exception:  # noqa: BLE001
             cooldown_ok = True
+
+    # RATE-LIMIT BACK-OFF: never restart into a 429 — it bursts more requests and deepens the throttle.
+    # Back off (idle poll) and let it cool; the running agent recovers on its own once the limit lifts.
+    if result["reason"] == "CHAIN_BLACKOUT" and _is_rate_limited():
+        state["consecutive_unhealthy"] = 0    # don't let a rate-limit accrue toward the restart trigger
+        _save_state(state)
+        if not state.get("rl_alerted"):
+            _alert("⏳ SELF-HEAL: chain blackout is a Dhan RATE-LIMIT (429), not a fault — backing off "
+                   "(no restart; restarts make it worse). Agent keeps polling; will recover when it cools.")
+            state["rl_alerted"] = True
+            _save_state(state)
+        _log({**base, "action": "RATE_LIMIT_BACKOFF"})
+        return 0
 
     if consec >= 2 and cooldown_ok:
         ok = _restart_agent()
