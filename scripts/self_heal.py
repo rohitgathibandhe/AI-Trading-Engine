@@ -128,7 +128,11 @@ def _is_rate_limited() -> bool:
     recent runner log."""
     tail = "\n".join(_tail_lines(RUNNER_LOG, 40_000)).lower()
     return ("429" in tail or "too many requests" in tail or '"805"' in tail
-            or "may result in the user being blocked" in tail)
+            or "may result in the user being blocked" in tail
+            # the chain fetcher's 429 circuit-breaker (dhan_api) logs these instead of a raw 429 once
+            # armed — self-heal must recognize them or it falls through to a needless restart.
+            or "circuit-breaker" in tail or "circuit breaker" in tail
+            or "cooldown" in tail or "backing off" in tail or "rate-limit" in tail or "ratelimitcooldown" in tail)
 
 
 def _data_fault_hint() -> str:
