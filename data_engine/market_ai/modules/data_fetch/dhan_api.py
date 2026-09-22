@@ -54,9 +54,52 @@ _MIN_SEC_BETWEEN_OC = float(os.environ.get("MARKET_AI_OC_RATE_LIMIT_S", "3.2"))
 _last_post_ts_lock = threading.Lock()
 _last_post_ts = 0.0
 
+# ---------- 429 CIRCUIT-BREAKER ----------
+# A 429 means "stop sending requests." The old code did the opposite: it retried 5x per call, and the
+# main loop re-fired every ~43s, hammering Dhan ~7-10 req/min WHILE rate-limited — which keeps the
+# block alive and can escalate it to a longer ban (2026-09-22: a transient 429 became a 3.5h outage).
+# The breaker imposes an ESCALATING cooldown after a 429 during which NO chain request is sent at all,
+# so Dhan's limit can actually reset. Cleared on the first success.
+_OC_429_BASE_COOLDOWN_S = float(os.environ.get("MARKET_AI_OC_429_COOLDOWN_S", "60") or 60)
+_OC_429_MAX_COOLDOWN_S = float(os.environ.get("MARKET_AI_OC_429_MAX_COOLDOWN_S", "300") or 300)
+_oc_429_lock = threading.Lock()
+_oc_429_cooldown_until = 0.0
+_oc_429_streak = 0
+
+
+class RateLimitCooldown(DhanError):
+    """Raised (without hitting Dhan) while inside the 429 cooldown window."""
+
+
+def _oc_cooldown_remaining() -> float:
+    with _oc_429_lock:
+        return max(0.0, _oc_429_cooldown_until - time.time())
+
+
+def _note_429() -> float:
+    """Record a 429 and arm/extend the cooldown (escalating). Returns the cooldown seconds set."""
+    global _oc_429_cooldown_until, _oc_429_streak
+    with _oc_429_lock:
+        _oc_429_streak += 1
+        cd = min(_OC_429_BASE_COOLDOWN_S * (2 ** (_oc_429_streak - 1)), _OC_429_MAX_COOLDOWN_S)
+        _oc_429_cooldown_until = time.time() + cd
+        return cd
+
+
+def _clear_429() -> None:
+    global _oc_429_cooldown_until, _oc_429_streak
+    with _oc_429_lock:
+        _oc_429_cooldown_until = 0.0
+        _oc_429_streak = 0
+
+
 def _respect_throttle_if_needed(path: str):
     if not path.endswith("/optionchain"):
         return
+    remaining = _oc_cooldown_remaining()
+    if remaining > 0:
+        # Do NOT send a request while cooling down — that is what deepens the ban.
+        raise RateLimitCooldown(f"optionchain in 429 cooldown for {remaining:.0f}s (backing off, not sending)")
     global _last_post_ts
     with _last_post_ts_lock:
         now = time.time()
@@ -79,23 +122,30 @@ def _post_json_with_backoff(client: SimpleDhanClient, path: str, payload: Dict[s
     last = None
     for i in range(attempts):
         try:
-            _respect_throttle_if_needed(path)
+            _respect_throttle_if_needed(path)   # raises RateLimitCooldown while cooling down (no request sent)
             resp = client.post(path, payload)
-            if resp.status_code == 429:
-                LOG.warning("429 Too Many Requests; cooling down 3.2s")
-                time.sleep(3.2)
-                last = RuntimeError("429 Too Many Requests")
-                continue
+            # 429 = "stop sending." Do NOT keep retrying (each retry deepens the ban). Arm the escalating
+            # cooldown and bail immediately so no further requests go out until Dhan resets.
+            if resp.status_code == 429 or (400 <= resp.status_code < 500 and "805" in (getattr(resp, "text", "") or "")):
+                cd = _note_429()
+                LOG.warning("429/rate-limit on %s — CIRCUIT-BREAKER armed, backing off %.0fs (no more requests)", path, cd)
+                raise RateLimitCooldown(f"429 on {path}; cooling down {cd:.0f}s")
             if 400 <= resp.status_code < 500:
-                # surface body for DHAN error codes (811, 805, etc.)
                 body = resp.text[:800] if hasattr(resp, "text") else ""
                 raise DhanError(f"HTTP {resp.status_code}: {body}")
             _raise_for_status(resp)
             data = resp.json()
-            # Many DHAN errors also arrive as {"status":"failed","data":{...}}
             if isinstance(data, dict) and data.get("status") == "failed":
+                # a 'failed' body may also be a rate-limit (code 805) — treat those as a 429, else surface
+                if "805" in json.dumps(data) or "too many requests" in json.dumps(data).lower():
+                    cd = _note_429()
+                    LOG.warning("rate-limit (805) on %s — CIRCUIT-BREAKER armed, backing off %.0fs", path, cd)
+                    raise RateLimitCooldown(f"805 on {path}; cooling down {cd:.0f}s")
                 raise DhanError(json.dumps(data)[:800])
+            _clear_429()                          # a clean response ends any cooldown
             return data
+        except RateLimitCooldown:
+            raise                                 # don't retry a rate-limit — propagate up, loop skips this cycle
         except Exception as e:
             last = e
             sleep = backoff_sec * (2 ** i) + random.uniform(0, 0.25)

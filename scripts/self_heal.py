@@ -290,6 +290,19 @@ def main() -> int:
         _log({**base, "action": "DRY_RUN_WOULD_REMEDIATE", "consecutive_unhealthy": consec})
         return 0
 
+    # RATE-LIMIT BACK-OFF (checked FIRST): a 429 blackout must never restart OR escalate — it is not a
+    # fault, and restarting bursts requests that deepen the throttle. Back off and let it cool; the
+    # running agent (now with its own 429 circuit-breaker) recovers on its own once the limit lifts.
+    if result["reason"] == "CHAIN_BLACKOUT" and _is_rate_limited():
+        state["consecutive_unhealthy"] = 0
+        if not state.get("rl_alerted"):
+            _alert("⏳ SELF-HEAL: chain blackout is a Dhan RATE-LIMIT (429), not a fault — backing off "
+                   "(no restart; restarts make it worse). Agent keeps polling; will recover when it cools.")
+            state["rl_alerted"] = True
+        _save_state(state)
+        _log({**base, "action": "RATE_LIMIT_BACKOFF"})
+        return 0
+
     # Escalate rather than restart-loop forever: a persistent fault after N restarts is a broker-side
     # issue a human must clear. Name the ACTUAL cause (data-API subscription vs token) — see _data_fault_hint.
     if restarts >= MAX_RESTARTS_BEFORE_ESCALATE:
@@ -310,19 +323,6 @@ def main() -> int:
             cooldown_ok = (now - datetime.fromisoformat(last_restart)).total_seconds() >= RESTART_COOLDOWN_SECS
         except Exception:  # noqa: BLE001
             cooldown_ok = True
-
-    # RATE-LIMIT BACK-OFF: never restart into a 429 — it bursts more requests and deepens the throttle.
-    # Back off (idle poll) and let it cool; the running agent recovers on its own once the limit lifts.
-    if result["reason"] == "CHAIN_BLACKOUT" and _is_rate_limited():
-        state["consecutive_unhealthy"] = 0    # don't let a rate-limit accrue toward the restart trigger
-        _save_state(state)
-        if not state.get("rl_alerted"):
-            _alert("⏳ SELF-HEAL: chain blackout is a Dhan RATE-LIMIT (429), not a fault — backing off "
-                   "(no restart; restarts make it worse). Agent keeps polling; will recover when it cools.")
-            state["rl_alerted"] = True
-            _save_state(state)
-        _log({**base, "action": "RATE_LIMIT_BACKOFF"})
-        return 0
 
     if consec >= 2 and cooldown_ok:
         ok = _restart_agent()
