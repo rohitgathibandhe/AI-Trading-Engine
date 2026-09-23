@@ -40,8 +40,16 @@ def _parse_band(s: str, default: tuple[float, float]) -> tuple[float, float]:
 
 
 # Bull-put short-delta band (non-expiry). Widened from (0.18,0.30) so the confluence up-day bull-put
-# can construct where the tighter band left no valid pair (DELTA_TOO_HIGH blocked the whole path).
+# can construct where the tighter band left no valid pair (DELTA_OUT_OF_BAND blocked the whole path).
 _BULLPUT_SHORT_BAND = _parse_band(os.environ.get("SEL_BULLPUT_SHORT_BAND", ""), (0.14, 0.34))
+# CONFLUENCE bull-put (strong bullish conviction): sell CLOSER to money (higher delta) for REAL credit.
+# On low-VIX days the far-OTM 0.14-0.34 band lands ~0.15 delta = ~Rs1k credit / 1:11 R/R = correctly
+# rejected as thin. A 0.25-0.40 short collects ~Rs3-4k at VIX 9 (1:2.5-3.8 R/R). Only used when the
+# gate has CONFIRMED strong bullish confluence (metadata conf_bull_sell_closer); defined-risk wing
+# pulled in to keep max-loss bounded. Env SEL_CONF_BULLPUT_SHORT_BAND.
+_CONF_BULLPUT_CLOSER = os.environ.get("SEL_CONF_BULLPUT_CLOSER", "1") == "1"
+_BULLPUT_CONF_SHORT_BAND = _parse_band(os.environ.get("SEL_CONF_BULLPUT_SHORT_BAND", ""), (0.25, 0.40))
+_BULLPUT_CONF_LONG_BAND = (0.08, 0.18)
 
 
 def _expiry_trend_strength(metadata: dict) -> float:
@@ -168,6 +176,10 @@ def select_best_structure(
             else:
                 short_delta_band = (0.08, 0.15)
                 long_delta_band = (0.03, 0.08)
+        elif _CONF_BULLPUT_CLOSER and regime_state.metadata.get("conf_bull_sell_closer"):
+            # CONFLUENCE-confirmed strong bullish: sell CLOSER for real credit at low VIX (see note above).
+            short_delta_band = _BULLPUT_CONF_SHORT_BAND
+            long_delta_band = _BULLPUT_CONF_LONG_BAND
         elif (
             playbook == "SIDEWAYS_TO_BULLISH_RECLAIM"
             and regime_state.metadata.get("bullish_setup") == "VWAP_HOLD_HIGHER_LOW"

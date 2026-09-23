@@ -643,8 +643,12 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
             choice.rationale = _why
         elif _dir == "BULLISH":
             choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
-            choice.rationale = _why + " [SELL a bull-put: theta fits the grinding up-move — wins up or sideways]"
+            # Strong bullish conviction -> sell the put CLOSER (higher delta) for real credit even at low
+            # VIX; strikes.py reads this flag. Far-OTM would collect peanuts and get rejected as thin.
+            metadata["conf_bull_sell_closer"] = True
+            choice.rationale = _why + " [SELL a bull-put CLOSER (higher-delta short) — theta fits the grind, real credit at low VIX]"
         else:
+            metadata.pop("conf_bull_sell_closer", None)
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = "NO high-probability confluence — stand aside (no trade is a position). " + _why
         choice.executable_today = bool(choice.structures) and all(s in _EXECUTABLE for s in choice.structures)
