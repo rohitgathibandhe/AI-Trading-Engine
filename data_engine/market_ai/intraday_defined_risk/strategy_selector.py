@@ -598,6 +598,40 @@ def _high_prob_confluence(read, m: dict[str, Any]) -> tuple[str | None, str]:
     return None, (f"no confluence (eff {eff:.2f}, orb {orb}, bias {bias}) — stand aside")
 
 
+# ── RANGE-FADE (mean reversion — the 80% engine) ───────────────────────────────────────────────
+# Most sessions are sideways-but-volatile: price oscillates between S/R and each swing is worth
+# 20-30+ pts. FADE the edges — short a confirmed M-top rejection AT resistance, long a confirmed
+# W-bottom rejection AT support — targeting the opposite edge. Validated live (2026-09-23): the
+# M-pattern fired with spot ON resistance 23,388 / 6-11pt under the call wall 23,400, wick 1.1-1.37.
+# The ONE discipline that keeps this from being a falling knife: only fade a CONFIRMED rejection AT a
+# real level (not blindly), with a tight stop just beyond it — if the level breaks (the 20% trend
+# day) you're out cheap. Env-gated (SEL_RANGE_FADE, default OFF until the fade-exit is built+proven).
+_RANGE_FADE = os.environ.get("SEL_RANGE_FADE", "0") == "1"
+_FADE_EDGE_PTS = _sel_env_float("SEL_FADE_EDGE_PTS") or 15.0      # spot must be within this of the level
+_FADE_MAX_EFF = _sel_env_float("SEL_FADE_MAX_EFF") or 0.55         # don't fade a strong trend (it'll break)
+
+
+def _range_fade_signal(read, m: dict[str, Any], spot: float) -> tuple[str | None, str]:
+    """(direction, why). FADE_SHORT at a confirmed M-top on resistance; FADE_LONG at a confirmed
+    W-bottom on support; else None. Only in a NON-trending tape (eff < _FADE_MAX_EFF) — fading a real
+    trend is how range-traders blow up. Proximity to a REAL level + the rejection wick are the gate."""
+    from .strategy_matrix import _m_pattern_at_resistance, _w_pattern_at_support
+    eff = _trend_efficiency(m)
+    if eff >= _FADE_MAX_EFF:
+        return None, f"tape is trending (eff {eff:.2f}) — don't fade, it'll break the level"
+    resist = _f(m, "resistance_5m") or _f(m, "resistance_15m") or _f(m, "current_call_wall")
+    support = _f(m, "support_5m") or _f(m, "support_15m") or _f(m, "current_put_wall")
+    at_resist = resist > 0 and abs(spot - resist) <= _FADE_EDGE_PTS
+    at_support = support > 0 and abs(spot - support) <= _FADE_EDGE_PTS
+    if at_resist and _m_pattern_at_resistance(m):
+        return "FADE_SHORT", (f"RANGE-FADE SHORT: M-top rejection AT resistance {resist:.0f} "
+                              f"(spot {spot:.0f}, eff {eff:.2f}) — short into the range, target the low.")
+    if at_support and _w_pattern_at_support(m):
+        return "FADE_LONG", (f"RANGE-FADE LONG: W-bottom rejection AT support {support:.0f} "
+                             f"(spot {spot:.0f}, eff {eff:.2f}) — long into the range, target the high.")
+    return None, (f"no fade setup (eff {eff:.2f}, at_resist {at_resist}, at_support {at_support})")
+
+
 def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> StrategyChoice:
     """Read the market, name the condition, and choose the strategy family + structures.
 
