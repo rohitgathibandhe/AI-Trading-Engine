@@ -54,7 +54,7 @@ def _expiry_trend_strength(metadata: dict) -> float:
 CANDIDATE_REJECTION_PRIORITY = (
     "LIQUIDITY_BAD",
     "OI_WALL_BELOW_SHORT_STRIKE",
-    "DELTA_TOO_HIGH",
+    "DELTA_OUT_OF_BAND",
     "INVALIDATION_TOO_CLOSE",
     "CREDIT_TOO_LOW_IV_ADJUSTED",
     "CREDIT_TOO_LOW",
@@ -738,7 +738,7 @@ def _evaluate_vertical_candidates(
             rejection_flags = {
                 "LIQUIDITY_BAD": passed_liquidity,
                 "OI_WALL_BELOW_SHORT_STRIKE": True,
-                "DELTA_TOO_HIGH": passed_delta or (selection_mode == "STRUCTURE_DISTANCE_FALLBACK"),
+                "DELTA_OUT_OF_BAND": passed_delta or (selection_mode == "STRUCTURE_DISTANCE_FALLBACK"),
                 "INVALIDATION_TOO_CLOSE": passed_anchor_distance,
                 "CREDIT_TOO_LOW_IV_ADJUSTED": (passed_credit_width or not iv_adjusted_credit_floor_active),
                 "CREDIT_TOO_LOW": passed_credit_width,
@@ -1063,7 +1063,7 @@ def _select_condor_candidates(
                             monetization_score = round(monetization_score - 0.20, 4)
                         rejection_flags = {
                             "LIQUIDITY_BAD": passed_liquidity,
-                            "DELTA_TOO_HIGH": passed_delta,
+                            "DELTA_OUT_OF_BAND": passed_delta,
                             "INVALIDATION_TOO_CLOSE": True,
                             "CREDIT_TOO_LOW": passed_credit,
                             "HEDGE_TOO_EXPENSIVE": passed_hedge_cost,
@@ -1267,7 +1267,7 @@ def _select_strangle_candidates(
             rejection_flags = {
                 "LIQUIDITY_BAD": passed_liquidity,
                 "CREDIT_TOO_LOW": passed_credit,
-                "DELTA_TOO_HIGH": passed_delta,
+                "DELTA_OUT_OF_BAND": passed_delta,
             }
             entry = {
                 "short_call_strike": short_call.strike,

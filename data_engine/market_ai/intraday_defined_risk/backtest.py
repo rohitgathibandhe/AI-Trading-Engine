@@ -45,7 +45,7 @@ _BACKTEST_ENTRY_WAIT = False  # set per-run from BACKTEST_ENTRY_WAIT in run_back
 MONETIZATION_REJECTION_REASONS = {
     "CREDIT_TOO_LOW",
     "WIDTH_TOO_LARGE",
-    "DELTA_TOO_HIGH",
+    "DELTA_OUT_OF_BAND",
     "HEDGE_TOO_EXPENSIVE",
     "LIQUIDITY_BAD",
     "INVALIDATION_TOO_CLOSE",
@@ -145,7 +145,7 @@ def _build_funnel_report(decisions: list[dict[str, object]], trades: list[dict[s
             if reason == "LIQUIDITY_BAD":
                 rejected_liquidity += 1
                 monthly[month]["rejected_liquidity"] += 1
-            if reason == "DELTA_TOO_HIGH":
+            if reason == "DELTA_OUT_OF_BAND":
                 rejected_delta += 1
                 monthly[month]["rejected_delta"] += 1
             if reason == "INVALIDATION_TOO_CLOSE":
