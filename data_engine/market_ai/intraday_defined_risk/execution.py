@@ -383,6 +383,47 @@ def _current_debit_value(
     return max(long_mark - short_mark, 0.0)
 
 
+_FADE_MIN_HOLD_MIN = 3   # small breathe so a rejection wick's own noise doesn't insta-stop the fade
+
+
+def _evaluate_fade_exit(
+    position: OpenPosition,
+    current_snapshot: MarketSnapshot | None,
+    current_structure: TradeStructure | None,
+    now: datetime,
+) -> ExitDecision:
+    """Range-fade scalp exit — SPOT-based, not option-value based. Take the swing at the target (into
+    the range interior) or cut cheap at the stop (the faded level broke the wrong way). A PUT_DEBIT is
+    a FADE-SHORT (profit as spot falls); a CALL_DEBIT is a FADE-LONG (profit as spot rises)."""
+    md = position.metadata or {}
+    target = md.get("fade_target_spot")
+    stop = md.get("fade_stop_spot")
+    entry_debit = abs(position.entry_credit_points)
+    value = _current_debit_value(position, current_snapshot, current_structure)
+    if value is None:
+        value = entry_debit
+    pnl = (value - entry_debit) * position.lot_size * position.lots
+    if now.time() >= TIME_EXIT:
+        return ExitDecision(True, "FADE_TIME_EXIT", value, pnl)
+    spot = float(current_snapshot.option_chain.spot) if current_snapshot else None
+    if spot is None or target is None or stop is None:
+        return ExitDecision(False, "HOLD", value, pnl)
+    if _elapsed_minutes(now, position.entry_time) < _FADE_MIN_HOLD_MIN:
+        return ExitDecision(False, "HOLD", value, pnl)
+    is_short = position.structure.strategy == StrategyType.PUT_DEBIT_SPREAD
+    if is_short:                                   # fade-short: target is BELOW, stop is ABOVE the level
+        if spot <= float(target):
+            return ExitDecision(True, "FADE_TARGET", value, pnl)
+        if spot >= float(stop):
+            return ExitDecision(True, "FADE_STOP", value, pnl)
+    else:                                          # fade-long: target ABOVE, stop BELOW
+        if spot >= float(target):
+            return ExitDecision(True, "FADE_TARGET", value, pnl)
+        if spot <= float(stop):
+            return ExitDecision(True, "FADE_STOP", value, pnl)
+    return ExitDecision(False, "HOLD", value, pnl)
+
+
 def _evaluate_debit_exit(
     position: OpenPosition,
     current_snapshot: MarketSnapshot | None,
@@ -436,6 +477,13 @@ def evaluate_exit(
     now: datetime,
 ) -> ExitDecision:
     if position.structure.strategy in {StrategyType.CALL_DEBIT_SPREAD, StrategyType.PUT_DEBIT_SPREAD}:
+        # RANGE-FADE positions are scalps, not fat-tail rides: exit on a SPOT target (the swing) or a
+        # SPOT stop just beyond the faded level. This is the make-or-break discipline — a break of the
+        # level cuts cheap. Falls through to the normal debit exit only if the fade exit says HOLD.
+        if position.metadata.get("is_fade"):
+            _fade = _evaluate_fade_exit(position, current_snapshot, current_structure, now)
+            if _fade.should_exit:
+                return _fade
         return _evaluate_debit_exit(position, current_snapshot, current_structure, now)
     current_value_points, current_legs = _current_position_mark(position, current_snapshot, current_structure)
     if now.time() >= TIME_EXIT:

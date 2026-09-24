@@ -609,6 +609,8 @@ def _high_prob_confluence(read, m: dict[str, Any]) -> tuple[str | None, str]:
 _RANGE_FADE = os.environ.get("SEL_RANGE_FADE", "0") == "1"
 _FADE_EDGE_PTS = _sel_env_float("SEL_FADE_EDGE_PTS") or 15.0      # spot must be within this of the level
 _FADE_MAX_EFF = _sel_env_float("SEL_FADE_MAX_EFF") or 0.55         # don't fade a strong trend (it'll break)
+_FADE_TARGET_PTS = _sel_env_float("SEL_FADE_TARGET_PTS") or 30.0   # take the swing into the range interior
+_FADE_STOP_PTS = _sel_env_float("SEL_FADE_STOP_PTS") or 12.0       # cut fast if the level breaks the wrong way
 
 
 def _range_fade_signal(read, m: dict[str, Any], spot: float) -> tuple[str | None, str]:
@@ -683,8 +685,29 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
             choice.rationale = _why + " [SELL a bull-put CLOSER (higher-delta short) — theta fits the grind, real credit at low VIX]"
         else:
             metadata.pop("conf_bull_sell_closer", None)
-            choice.family, choice.structures = FAM_STAND_ASIDE, []
-            choice.rationale = "NO high-probability confluence — stand aside (no trade is a position). " + _why
+            # No directional confluence. Before standing aside, try a RANGE FADE (the 80% engine):
+            # fade a confirmed M/W rejection AT a real S/R edge in a non-trending tape. Uses a cheap
+            # directional debit with a FADE exit (tight target + stop just beyond the level — set here
+            # so execution can manage it as a scalp, not a fat-tail hold). Env-gated (default off).
+            _fdir, _fwhy = _range_fade_signal(read, metadata, spot) if _RANGE_FADE else (None, "")
+            if _fdir == "FADE_SHORT":
+                choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
+                metadata["is_fade"] = True
+                metadata["fade_entry_spot"] = spot
+                metadata["fade_target_spot"] = spot - _FADE_TARGET_PTS   # target the range interior (down)
+                metadata["fade_stop_spot"] = spot + _FADE_STOP_PTS       # cut if it breaks back UP through the level
+                choice.rationale = _fwhy
+            elif _fdir == "FADE_LONG":
+                choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["CALL_DEBIT_SPREAD"]
+                metadata["is_fade"] = True
+                metadata["fade_entry_spot"] = spot
+                metadata["fade_target_spot"] = spot + _FADE_TARGET_PTS
+                metadata["fade_stop_spot"] = spot - _FADE_STOP_PTS
+                choice.rationale = _fwhy
+            else:
+                metadata.pop("is_fade", None)
+                choice.family, choice.structures = FAM_STAND_ASIDE, []
+                choice.rationale = "NO high-probability confluence — stand aside (no trade is a position). " + _why
         choice.executable_today = bool(choice.structures) and all(s in _EXECUTABLE for s in choice.structures)
         return choice
 
