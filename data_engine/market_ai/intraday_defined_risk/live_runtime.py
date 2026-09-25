@@ -569,10 +569,24 @@ class DhanLiveMarketDataProvider:
             if "banknifty_spot" in _ctx:
                 _ctx["banknifty_spot_prev"] = _ctx["banknifty_spot"]
             _ctx["nifty_spot"] = spot
+            # India VIX realistically sits ~8-40 (never >100). A read outside that is a bad tick — the
+            # LTP fetch for sec-id 1 intermittently returns a SPOT-like value (~22,436 seen 2026-09-25),
+            # which as 'VIX' corrupts every VIX-gated rule (lot scale, credit floor, IV branches). Reject
+            # insane reads: fall through to the chain-IV proxy, else keep the prior good VIX.
+            _vix_ok = False
             if _vix_ltp:
-                _ctx["india_vix"] = float(_vix_ltp)
-                _ctx["india_vix_source"] = "dhan_api"
-            elif quotes:
+                try:
+                    _v = float(_vix_ltp)
+                    if 5.0 <= _v <= 100.0:
+                        _ctx["india_vix"] = _v
+                        _ctx["india_vix_source"] = "dhan_api"
+                        _vix_ok = True
+                    else:
+                        logging.getLogger("intraday_defined_risk.v83").warning(
+                            "[vix] rejecting insane India VIX read %.1f (out of 5-100) — using proxy/prior", _v)
+                except (TypeError, ValueError):
+                    pass
+            if (not _vix_ok) and quotes:
                 # Dhan API for VIX returns None — derive proxy from option chain ATM IV.
                 # ATM ± 200pts = near-money options that dominate VIX calculation.
                 _atm_ivs = [
@@ -583,8 +597,9 @@ class DhanLiveMarketDataProvider:
                 ]
                 if _atm_ivs:
                     _vix_proxy = round(sum(_atm_ivs) / len(_atm_ivs), 2)
-                    _ctx["india_vix"] = _vix_proxy
-                    _ctx["india_vix_source"] = "chain_iv_proxy"
+                    if 5.0 <= _vix_proxy <= 100.0:      # same sanity gate — never publish a junk proxy
+                        _ctx["india_vix"] = _vix_proxy
+                        _ctx["india_vix_source"] = "chain_iv_proxy"
             if _bank_ltp:
                 _ctx["banknifty_spot"] = float(_bank_ltp)
                 if "banknifty_spot_prev" not in _ctx:
