@@ -617,27 +617,46 @@ _FADE_EDGE_PTS = _sel_env_float("SEL_FADE_EDGE_PTS") or 15.0      # spot must be
 _FADE_MAX_EFF = _sel_env_float("SEL_FADE_MAX_EFF") or 0.55         # don't fade a strong trend (it'll break)
 _FADE_TARGET_PTS = _sel_env_float("SEL_FADE_TARGET_PTS") or 30.0   # take the swing into the range interior
 _FADE_STOP_PTS = _sel_env_float("SEL_FADE_STOP_PTS") or 12.0       # cut fast if the level breaks the wrong way
+# TREND-ALIGN the fade (default on): in a DOWNtrend only SELL THE RISE (fade short at resistance); in an
+# UPtrend only BUY THE DIP (fade long at support). Counter-trend fades are the low-prob ones that break.
+_FADE_TREND_ALIGN = os.environ.get("SEL_FADE_TREND_ALIGN", "1") == "1"
+# OI-STRENGTH veto (default on): don't fade a level that is being ABANDONED — if the OI at the faded
+# strike is UNWINDING (change < -threshold), the level is weakening and likely to break, so skip.
+_FADE_OI_CONFIRM = os.environ.get("SEL_FADE_OI_CONFIRM", "1") == "1"
+_FADE_OI_UNWIND = _sel_env_float("SEL_FADE_OI_UNWIND") or 5000.0   # ΔOI more negative than this = abandoned
 
 
 def _range_fade_signal(read, m: dict[str, Any], spot: float) -> tuple[str | None, str]:
     """(direction, why). FADE_SHORT at a confirmed M-top on resistance; FADE_LONG at a confirmed
-    W-bottom on support; else None. Only in a NON-trending tape (eff < _FADE_MAX_EFF) — fading a real
-    trend is how range-traders blow up. Proximity to a REAL level + the rejection wick are the gate."""
+    W-bottom on support; else None. Gates, in order: non-trending tape (fading a trend blows up);
+    TREND-ALIGN (down->sell-rise only, up->buy-dip only); level proximity + rejection wick; and the
+    OI-STRENGTH check (skip a level whose OI is unwinding = being abandoned = about to break)."""
     from .strategy_matrix import _m_pattern_at_resistance, _w_pattern_at_support
     eff = _trend_efficiency(m)
     if eff >= _FADE_MAX_EFF:
         return None, f"tape is trending (eff {eff:.2f}) — don't fade, it'll break the level"
+    daily = str(m.get("daily_trend") or "").upper()
+    allow_short = not (_FADE_TREND_ALIGN and daily == "BULLISH")   # sell-rise: skip in an uptrend
+    allow_long = not (_FADE_TREND_ALIGN and daily == "BEARISH")    # buy-dip: skip in a downtrend
     resist = _f(m, "resistance_5m") or _f(m, "resistance_15m") or _f(m, "current_call_wall")
     support = _f(m, "support_5m") or _f(m, "support_15m") or _f(m, "current_put_wall")
     at_resist = resist > 0 and abs(spot - resist) <= _FADE_EDGE_PTS
     at_support = support > 0 and abs(spot - support) <= _FADE_EDGE_PTS
-    if at_resist and _m_pattern_at_resistance(m):
-        return "FADE_SHORT", (f"RANGE-FADE SHORT: M-top rejection AT resistance {resist:.0f} "
-                              f"(spot {spot:.0f}, eff {eff:.2f}) — short into the range, target the low.")
-    if at_support and _w_pattern_at_support(m):
-        return "FADE_LONG", (f"RANGE-FADE LONG: W-bottom rejection AT support {support:.0f} "
-                             f"(spot {spot:.0f}, eff {eff:.2f}) — long into the range, target the high.")
-    return None, (f"no fade setup (eff {eff:.2f}, at_resist {at_resist}, at_support {at_support})")
+    # OI-strength: resistance is defended by CALL OI; support by PUT OI. Unwinding = abandoned = skip.
+    call_oi_chg = _f(m, "call_resistance_oi_change")
+    put_oi_chg = _f(m, "put_support_oi_change")
+    resist_weak = _FADE_OI_CONFIRM and call_oi_chg < -_FADE_OI_UNWIND
+    support_weak = _FADE_OI_CONFIRM and put_oi_chg < -_FADE_OI_UNWIND
+    if at_resist and allow_short and not resist_weak and _m_pattern_at_resistance(m):
+        _s = "strengthening" if call_oi_chg > 0 else "holding"
+        return "FADE_SHORT", (f"RANGE-FADE SHORT: M-top rejection AT resistance {resist:.0f} ({_s} call OI "
+                              f"{call_oi_chg:+.0f}), daily {daily or 'NEUTRAL'} — SELL THE RISE, target the low.")
+    if at_support and allow_long and not support_weak and _w_pattern_at_support(m):
+        _s = "strengthening" if put_oi_chg > 0 else "holding"
+        return "FADE_LONG", (f"RANGE-FADE LONG: W-bottom rejection AT support {support:.0f} ({_s} put OI "
+                             f"{put_oi_chg:+.0f}), daily {daily or 'NEUTRAL'} — BUY THE DIP, target the high.")
+    return None, (f"no fade setup (eff {eff:.2f}, daily {daily}, at_R {at_resist}/{allow_short}, "
+                  f"at_S {at_support}/{allow_long}, R_weak {resist_weak}, S_weak {support_weak})")
 
 
 def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> StrategyChoice:
