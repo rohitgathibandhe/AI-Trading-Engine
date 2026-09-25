@@ -736,11 +736,21 @@ def _active_paper_position_count(paths: OpsPaths) -> int:
 
 
 def _has_recovery_block(paths: OpsPaths) -> tuple[bool, str | None]:
-    recovery = _read_json(paths.recovery_state)
-    if bool(recovery.get("active")):
-        return True, str(recovery.get("reason") or "RECOVERY_ACTIVE")
     reconcile = _read_json(paths.reconciliation_status)
     status = str(reconcile.get("status") or ReconciliationStatus.UNKNOWN.value)
+    _clean = status in {ReconciliationStatus.MATCHED.value, ReconciliationStatus.NO_POSITIONS.value}
+    recovery = _read_json(paths.recovery_state)
+    if bool(recovery.get("active")):
+        # AUTO-STALE: a recovery flag set by a routine flatten (e.g. stale-position cleanup) must not
+        # lock the agent out all day. If reconciliation is CLEAN (no mismatch/orphan), the flag is stale
+        # — clear it and let trading resume. A REAL broker mismatch shows as ORPHAN/MISMATCH below.
+        if _clean:
+            recovery["active"] = False
+            recovery["cleared_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+            recovery["cleared_by"] = "auto_stale_reconciliation_clean"
+            _write_json(paths.recovery_state, recovery)
+        else:
+            return True, str(recovery.get("reason") or "RECOVERY_ACTIVE")
     if status in {
         ReconciliationStatus.POSITION_MISMATCH.value,
         ReconciliationStatus.ORPHAN_POSITION.value,
