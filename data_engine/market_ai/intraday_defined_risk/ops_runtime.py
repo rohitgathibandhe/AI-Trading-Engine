@@ -1400,7 +1400,22 @@ def load_paper_position(paths: OpsPaths | None = None) -> OpenPosition | None:
     paths = paths or OpsPaths()
     state = _read_json(paths.paper_state)
     active = state.get("active_position") if isinstance(state, dict) else None
-    return deserialize_open_position(active if isinstance(active, dict) else {})
+    position = deserialize_open_position(active if isinstance(active, dict) else {})
+    # STALE-POSITION GUARD: an intraday position must close by 15:15 same day. If the agent was
+    # interrupted at EoD (restart + a Dhan connection drop, 2026-09-24) the 15:15 close can miss and the
+    # position gets stranded OVERNIGHT — then it blocks the whole next session (ACTIVE_STRUCTURE_EXISTS).
+    # On load, drop any position whose entry day is before today; it should never be carried over.
+    if position is not None:
+        try:
+            entry = getattr(position, "entry_time", None)
+            if entry is not None and entry.date() < datetime.now().date():
+                print(f"[stale-guard] Dropping STALE overnight paper position (entry {entry.isoformat()} "
+                      f"< today) — clearing so the new session is not blocked.")
+                save_paper_position(None, paths=paths)   # clear it from state
+                return None
+        except Exception:  # noqa: BLE001 — the guard must never break startup
+            pass
+    return position
 
 
 def save_paper_position(
