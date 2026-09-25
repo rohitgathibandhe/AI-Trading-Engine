@@ -933,6 +933,44 @@ def nearest_resistance(bars: list[OhlcvBar], spot: float, count: int = 1) -> lis
     return sorted(pivots)[:count]
 
 
+def compute_volume_signals(bars: list[OhlcvBar], bucket: float = 25.0) -> dict[str, float | None]:
+    """Volume‑profile + order‑flow signals from intraday bars (the one real data gap in the audit):
+      - relative_volume: current bar volume / avg of the prior bars (>1.3 = conviction, <0.7 = apathy)
+      - cumulative_volume_delta (CVD): running sum of signed volume (up bar +vol, down bar −vol) — a
+        proxy for net buying vs selling pressure; a RISING CVD at a support = real buyers stepping in.
+      - cvd_slope: recent CVD direction (>0 buyers in control, <0 sellers).
+      - vpoc: volume Point Of Control — the price bucket where the most volume traded = the strongest
+        S/R (where price was ACCEPTED, often stronger than an OI wall).
+    Returns None fields when there isn't enough data (the caller merges into metadata as-is)."""
+    out: dict[str, float | None] = {
+        "relative_volume": None, "cumulative_volume_delta": None, "cvd_slope": None, "vpoc": None,
+    }
+    vols = [float(b.volume or 0.0) for b in bars]
+    if len(bars) < 3 or sum(vols) <= 0:
+        return out
+    avg_prior = (sum(vols[:-1]) / max(len(vols) - 1, 1)) or 1.0
+    out["relative_volume"] = round(vols[-1] / avg_prior, 3)
+    # CVD: sign each bar's volume by its close-vs-open direction
+    signed = [(v if b.close >= b.open else -v) for b, v in zip(bars, vols)]
+    cvd_series = []
+    _run = 0.0
+    for s in signed:
+        _run += s
+        cvd_series.append(_run)
+    out["cumulative_volume_delta"] = round(cvd_series[-1], 0)
+    if len(cvd_series) >= 4:
+        out["cvd_slope"] = round(cvd_series[-1] - cvd_series[-4], 0)   # last ~3-bar CVD change
+    # VPOC: bucket each bar's typical price by `bucket` pts, accumulate volume, pick the heaviest bucket
+    buckets: dict[float, float] = {}
+    for b, v in zip(bars, vols):
+        tp = (b.high + b.low + b.close) / 3.0
+        key = round(tp / bucket) * bucket
+        buckets[key] = buckets.get(key, 0.0) + v
+    if buckets:
+        out["vpoc"] = max(buckets, key=buckets.get)
+    return out
+
+
 def latest_pivot_low(bars: list[OhlcvBar], *, lookback: int = 12) -> float | None:
     recent = bars[-lookback:] if lookback > 0 else bars
     pivots = _pivot_lows(recent)
