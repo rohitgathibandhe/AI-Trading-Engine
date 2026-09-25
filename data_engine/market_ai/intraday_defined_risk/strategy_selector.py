@@ -536,6 +536,34 @@ _CONF_STRONG_EFF = _sel_env_float("SEL_CONF_STRONG_EFF") or 0.55   # eff alone c
 # negative (Nifty intraday has no validated up-side edge — [[project_ordering_robustness]]). Set
 # SEL_CONF_ALLOW_BULLISH=1 to also trade a CALL_DEBIT on high-conviction up days.
 _CONF_ALLOW_BULLISH = os.environ.get("SEL_CONF_ALLOW_BULLISH", "0") == "1"
+# MOMENTUM GATE for BUYING (default on): the desk principle — "option BUYING needs MOMENTUM; option
+# SELLING needs trend + conviction." A debit only pays if the move is FAST (theta works against a
+# buyer), so a put/call-debit fires only when momentum confirms: volume expanding (relative_volume) AND
+# CVD pushing the trade's way (buyers for up, sellers for down). A slow grind with a directional bias is
+# NOT a buy — it's a sell (bull-put) or a stand-aside. Env SEL_MOMENTUM_GATE / thresholds.
+_MOMENTUM_GATE = os.environ.get("SEL_MOMENTUM_GATE", "1") == "1"
+_MOM_MIN_RVOL = _sel_env_float("SEL_MOM_MIN_RVOL") or 1.05        # volume at/above average = participation
+_MOM_MIN_CVD = _sel_env_float("SEL_MOM_MIN_CVD_SLOPE") or 1.0     # |CVD slope| this side = real pressure
+
+
+def _has_momentum(m: dict[str, Any], direction: str) -> tuple[bool, str]:
+    """(ok, why). Momentum confirms a DEBIT buy: volume expanding AND cumulative-volume-delta pushing
+    the trade's way. BEARISH wants sellers in control (CVD slope < 0); BULLISH wants buyers (>0). If the
+    volume signals aren't available yet, fail OPEN (don't block the validated put-debit on missing data)."""
+    if not _MOMENTUM_GATE:
+        return True, "momentum gate off"
+    rvol = m.get("relative_volume")
+    cvd_slope = m.get("cvd_slope")
+    if rvol is None or cvd_slope is None:
+        return True, "volume signals unavailable — momentum gate skipped (fail-open)"
+    rvol = float(rvol); cvd_slope = float(cvd_slope)
+    vol_ok = rvol >= _MOM_MIN_RVOL
+    flow_ok = (cvd_slope <= -_MOM_MIN_CVD) if direction == "BEARISH" else (cvd_slope >= _MOM_MIN_CVD)
+    if vol_ok and flow_ok:
+        return True, f"momentum OK (rvol {rvol:.2f}, CVD slope {cvd_slope:+.0f})"
+    return False, (f"NO momentum for a buy (rvol {rvol:.2f}{'<' if not vol_ok else '>='}{_MOM_MIN_RVOL}, "
+                   f"CVD slope {cvd_slope:+.0f} {'not ' if not flow_ok else ''}{direction.lower()}) — a debit "
+                   f"needs a fast move; a slow grind is a SELL or a stand-aside, not a buy")
 # Structure for a BULLISH confluence day. BUYING up (CALL_DEBIT) is validated-negative — up-moves
 # grind, a long debit whipsaws (real data: -16k / 16 tr). SELLING up (BULL_PUT credit) fits the grind
 # (theta, wins on up OR sideways) and the synthetic dense set was BIASED AGAINST selling (5x-wide
@@ -697,11 +725,24 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
                                 f"{_DEBIT_BLACKOUT[1].strftime('%H:%M')} debit blackout (post-open-drive "
                                 f"exhaustion — debit entries leak here) — wait for a fresh leg.")
         elif _dir == "BEARISH":
-            choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
-            choice.rationale = _why
+            _mom_ok, _mom_why = _has_momentum(metadata, "BEARISH")
+            if _mom_ok:
+                choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
+                choice.rationale = _why + f" [BUY put-debit — {_mom_why}]"
+            else:
+                # Bearish but NO momentum: a debit would bleed theta on the grind, and selling calls
+                # (bear-call) is the validated loser — so stand aside (or the range-fade below catches it).
+                choice.family, choice.structures = FAM_STAND_ASIDE, []
+                choice.rationale = "BEARISH but " + _mom_why
         elif _dir == "BULLISH" and _bull_is_debit:
-            choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["CALL_DEBIT_SPREAD"]
-            choice.rationale = _why
+            _mom_ok, _mom_why = _has_momentum(metadata, "BULLISH")
+            if _mom_ok:
+                choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["CALL_DEBIT_SPREAD"]
+                choice.rationale = _why + f" [BUY call-debit — {_mom_why}]"
+            else:   # bullish but no momentum -> SELL the grind (bull-put), don't buy
+                choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
+                metadata["conf_bull_sell_closer"] = True
+                choice.rationale = _why + f" [no momentum for a call-buy ({_mom_why}) -> SELL a bull-put instead]"
         elif _dir == "BULLISH":
             choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
             # Strong bullish conviction -> sell the put CLOSER (higher delta) for real credit even at low
