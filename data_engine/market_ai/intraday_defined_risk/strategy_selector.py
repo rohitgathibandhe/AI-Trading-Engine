@@ -419,6 +419,12 @@ IV_NORMAL = "NORMAL"
 # Executable today (Stage 2 added the directional debit spreads).
 _EXECUTABLE = {"BEAR_CALL_CREDIT_SPREAD", "BULL_PUT_CREDIT_SPREAD", "IRON_CONDOR", "IRON_FLY",
                "SHORT_STRANGLE", "SHORT_STRADDLE", "CALL_DEBIT_SPREAD", "PUT_DEBIT_SPREAD"}
+# HARD BAN (desk conviction): the operator does not trade IRON_FLY (nor the naked ATM SHORT_STRADDLE) —
+# a good strategy in theory, but no conviction in it, so it must never fire. Removed from the executable
+# set so any path that ever selects one is stood aside. Env SEL_BANNED_STRUCTURES to change the list.
+_BANNED_STRUCTURES = {s.strip().upper() for s in
+                      os.environ.get("SEL_BANNED_STRUCTURES", "IRON_FLY,SHORT_STRADDLE").split(",") if s.strip()}
+_EXECUTABLE = _EXECUTABLE - _BANNED_STRUCTURES
 
 
 @dataclass
