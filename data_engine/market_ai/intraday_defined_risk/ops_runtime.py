@@ -1396,16 +1396,17 @@ def deserialize_open_position(payload: dict[str, Any]) -> OpenPosition | None:
     )
 
 
-def load_paper_position(paths: OpsPaths | None = None) -> OpenPosition | None:
+def load_paper_position(paths: OpsPaths | None = None, *, drop_stale: bool = False) -> OpenPosition | None:
     paths = paths or OpsPaths()
     state = _read_json(paths.paper_state)
     active = state.get("active_position") if isinstance(state, dict) else None
     position = deserialize_open_position(active if isinstance(active, dict) else {})
-    # STALE-POSITION GUARD: an intraday position must close by 15:15 same day. If the agent was
-    # interrupted at EoD (restart + a Dhan connection drop, 2026-09-24) the 15:15 close can miss and the
-    # position gets stranded OVERNIGHT — then it blocks the whole next session (ACTIVE_STRUCTURE_EXISTS).
-    # On load, drop any position whose entry day is before today; it should never be carried over.
-    if position is not None:
+    # STALE-POSITION GUARD (opt-in via drop_stale, used at LIVE agent startup only — off by default so
+    # pure loads/tests are unaffected): an intraday position must close by 15:15 same day. If the agent
+    # was interrupted at EoD (restart + a Dhan connection drop, 2026-09-24) the 15:15 close can miss and
+    # the position is stranded OVERNIGHT, then blocks the whole next session (ACTIVE_STRUCTURE_EXISTS).
+    # Drop any position whose entry day is before today; it must never be carried over.
+    if drop_stale and position is not None:
         try:
             entry = getattr(position, "entry_time", None)
             if entry is not None and entry.date() < datetime.now().date():
@@ -1824,7 +1825,7 @@ def manage_paper_position(
         exit_shadow.reprice_ghosts(snapshot, lambda pos: _ghost_mark_pnl(pos, snapshot))
     except Exception:
         pass
-    position = load_paper_position(paths)
+    position = load_paper_position(paths, drop_stale=True)   # never manage a stranded overnight position
     if position is None:
         return None
 
