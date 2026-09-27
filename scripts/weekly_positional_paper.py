@@ -130,6 +130,16 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
+    # FLAT-GUARD: this executor is scheduled daily, so it must NEVER stack a second position. If a weekly
+    # positional trade is already open (the defense-ladder monitor is managing it), stand aside. Reuses the
+    # monitor's reconstruction (folds PAPER_ADJUST, drops on PAPER_EXIT) so it reads the ledger identically.
+    import weekly_positional_monitor as wm
+    _open = wm._open_positions()
+    if _open:
+        print(f"=> already holding {len(_open)} weekly positional position(s) "
+              f"({', '.join(str(p.get('structure', '?')) for p in _open)}) — managed by the monitor; no new entry.")
+        return 0
+
     m = _latest_metadata()
     plan = brain.plan_entry(m)
     print(f"BRAIN: {plan['action']}  {plan.get('structure','')}  ({plan.get('direction','')})")
