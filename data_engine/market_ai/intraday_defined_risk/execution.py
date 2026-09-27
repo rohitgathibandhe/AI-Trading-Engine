@@ -468,6 +468,64 @@ def _evaluate_debit_exit(
     return ExitDecision(False, "HOLD", value, pnl)
 
 
+# REVERSAL-AT-WALL exit (default OFF until validated): the mirror of the entry override. A held
+# DIRECTIONAL debit riding INTO a wall that has flipped to a reversal-confluence AGAINST it should get
+# out — don't ride a bearish put-debit down into a support that's screaming "bounce" (the 23,021 case),
+# and don't ride a bullish call-debit up into a resistance that's screaming "rejection". Requires the SAME
+# confluence as the entry override: the wall building hard AND CVD confirming the turn AND the confirmed
+# W/M chart pattern AT the level. Reuses the entry thresholds so entry and exit read the wall identically.
+_REVERSAL_EXIT = os.environ.get("SEL_REVERSAL_EXIT", "0") == "1"
+_REVERSAL_EXIT_OI = float(os.environ.get("SEL_FADE_OVERRIDE_OI", "15000") or 15000.0)
+_REVERSAL_EXIT_CVD = float(os.environ.get("SEL_FADE_OVERRIDE_CVD", "0") or 0.0)
+_REVERSAL_EXIT_EDGE = float(os.environ.get("SEL_FADE_EDGE_PTS", "15") or 15.0)
+_REVERSAL_EXIT_MIN_HOLD = float(os.environ.get("SEL_REVERSAL_EXIT_MIN_HOLD", "3") or 3.0)
+
+
+def _evaluate_reversal_exit(
+    position: OpenPosition,
+    current_regime: RegimeState | None,
+    now: datetime,
+) -> ExitDecision | None:
+    """Exit a directional debit when a reversal-confluence forms AGAINST it AT the wall. Returns an
+    ExitDecision only when it should fire; None otherwise (so the caller falls through to normal exits).
+    Fails closed on missing regime/CVD — the guard only acts on positive confirmation, never on absence."""
+    if not _REVERSAL_EXIT or current_regime is None:
+        return None
+    m = current_regime.metadata or {}
+    cvd = m.get("cvd_slope")
+    if cvd is None:
+        return None
+    if _elapsed_minutes(now, position.entry_time) < _REVERSAL_EXIT_MIN_HOLD:
+        return None  # let it breathe — don't knife out on the entry bar
+    cvd = float(cvd)
+    strat = position.structure.strategy
+    from .strategy_matrix import _m_pattern_at_resistance, _w_pattern_at_support
+
+    def _f(key: str) -> float:
+        try:
+            return float(m.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    if strat == StrategyType.PUT_DEBIT_SPREAD:  # bearish position — threat is a bounce UP off support
+        support = _f("support_5m") or _f("support_15m") or _f("current_put_wall")
+        spot = _f("spot_price") or _f("spot")
+        at_wall = support > 0 and spot > 0 and abs(spot - support) <= _REVERSAL_EXIT_EDGE
+        oi_build = _f("put_support_oi_change") >= _REVERSAL_EXIT_OI
+        cvd_turn = cvd >= _REVERSAL_EXIT_CVD
+        if at_wall and oi_build and cvd_turn and _w_pattern_at_support(m):
+            return ExitDecision(True, "REVERSAL_AT_WALL_EXIT", 0.0, 0.0)
+    elif strat == StrategyType.CALL_DEBIT_SPREAD:  # bullish position — threat is rejection DOWN off resistance
+        resist = _f("resistance_5m") or _f("resistance_15m") or _f("current_call_wall")
+        spot = _f("spot_price") or _f("spot")
+        at_wall = resist > 0 and spot > 0 and abs(spot - resist) <= _REVERSAL_EXIT_EDGE
+        oi_build = _f("call_resistance_oi_change") >= _REVERSAL_EXIT_OI
+        cvd_turn = cvd <= -_REVERSAL_EXIT_CVD
+        if at_wall and oi_build and cvd_turn and _m_pattern_at_resistance(m):
+            return ExitDecision(True, "REVERSAL_AT_WALL_EXIT", 0.0, 0.0)
+    return None
+
+
 def evaluate_exit(
     position: OpenPosition,
     current_structure: TradeStructure | None = None,
@@ -477,6 +535,13 @@ def evaluate_exit(
     now: datetime,
 ) -> ExitDecision:
     if position.structure.strategy in {StrategyType.CALL_DEBIT_SPREAD, StrategyType.PUT_DEBIT_SPREAD}:
+        # REVERSAL-AT-WALL guard FIRST: if the wall has flipped against the position, get out before the
+        # normal target/stop — this is the "should have exited at 23,021" discipline (data-driven exit).
+        _rev = _evaluate_reversal_exit(position, current_regime, now)
+        if _rev is not None:
+            # price the exit with the real mark so P&L is correct, keeping the reversal reason.
+            _mark = _evaluate_debit_exit(position, current_snapshot, current_structure, now)
+            return ExitDecision(True, "REVERSAL_AT_WALL_EXIT", _mark.current_value_points, _mark.pnl_rupees)
         # RANGE-FADE positions are scalps, not fat-tail rides: exit on a SPOT target (the swing) or a
         # SPOT stop just beyond the faded level. This is the make-or-break discipline — a break of the
         # level cuts cheap. Falls through to the normal debit exit only if the fade exit says HOLD.

@@ -652,6 +652,41 @@ _FADE_TREND_ALIGN = os.environ.get("SEL_FADE_TREND_ALIGN", "1") == "1"
 # strike is UNWINDING (change < -threshold), the level is weakening and likely to break, so skip.
 _FADE_OI_CONFIRM = os.environ.get("SEL_FADE_OI_CONFIRM", "1") == "1"
 _FADE_OI_UNWIND = _sel_env_float("SEL_FADE_OI_UNWIND") or 5000.0   # ΔOI more negative than this = abandoned
+# COUNTER-TREND WALL OVERRIDE (default OFF until validated on the live-capture backtest): the trend-align
+# veto normally forbids fading AGAINST the daily trend (no buy-dip in a downtrend). But when the data AND
+# the chart both scream reversal AT the wall — the wall is STRONGLY building (not just holding) AND CVD is
+# confirming the turn — that is a higher-conviction long than the stale daily trend is a short. This is the
+# 23,000-bounce trade: BEARISH daily, but put-support OI +29k and CVD flipping up at the wall. The override
+# lifts ONLY the trend-align veto; the confirmed W/M chart pattern, at-level, non-trending, and
+# OI-not-abandoned checks ALL still apply — so it stays a confirmed rejection at a real level, never blind.
+_FADE_WALL_OVERRIDE = os.environ.get("SEL_FADE_WALL_OVERRIDE", "0") == "1"
+_FADE_OVERRIDE_OI = _sel_env_float("SEL_FADE_OVERRIDE_OI") or 15000.0    # ΔOI must BUILD past this = defended hard
+_FADE_OVERRIDE_CVD = _sel_env_float("SEL_FADE_OVERRIDE_CVD") or 0.0      # CVD slope magnitude floor (sign always required)
+
+
+def _wall_reversal_confluence(m: dict[str, Any], side: str) -> tuple[bool, str]:
+    """(ok, why) for the counter-trend override. side='LONG' fades UP off support (needs PUT writers piling
+    in + CVD turning up = buyers); side='SHORT' fades DOWN off resistance (CALL writers piling in + CVD
+    turning down = sellers). Requires a STRONG OI build (not just 'holding') AND CVD confirming the turn.
+    CVD sign must always agree; magnitude floor is tunable (default sign-only). Fails closed on missing data
+    — the override is the risky counter-trend path, so absent confirmation we do NOT lift the veto."""
+    cvd = m.get("cvd_slope")
+    if cvd is None:
+        return False, "no CVD — can't confirm the reversal, veto stays"
+    cvd = float(cvd)
+    if side == "LONG":
+        oi = _f(m, "put_support_oi_change")
+        oi_ok = oi >= _FADE_OVERRIDE_OI
+        cvd_ok = cvd >= _FADE_OVERRIDE_CVD
+        detail = f"put-support OI {oi:+.0f} (need ≥{_FADE_OVERRIDE_OI:+.0f}), CVD {cvd:+.0f} (buyers)"
+    else:
+        oi = _f(m, "call_resistance_oi_change")
+        oi_ok = oi >= _FADE_OVERRIDE_OI
+        cvd_ok = cvd <= -_FADE_OVERRIDE_CVD
+        detail = f"call-resistance OI {oi:+.0f} (need ≥{_FADE_OVERRIDE_OI:+.0f}), CVD {cvd:+.0f} (sellers)"
+    if oi_ok and cvd_ok:
+        return True, f"WALL-REVERSAL override: {detail} — data+chart confluence beats the daily trend"
+    return False, f"no override ({detail}) — wall not building hard enough or CVD not confirming"
 
 
 def _range_fade_signal(read, m: dict[str, Any], spot: float) -> tuple[str | None, str]:
@@ -666,6 +701,18 @@ def _range_fade_signal(read, m: dict[str, Any], spot: float) -> tuple[str | None
     daily = str(m.get("daily_trend") or "").upper()
     allow_short = not (_FADE_TREND_ALIGN and daily == "BULLISH")   # sell-rise: skip in an uptrend
     allow_long = not (_FADE_TREND_ALIGN and daily == "BEARISH")    # buy-dip: skip in a downtrend
+    # WALL-REVERSAL override: re-enable the counter-trend fade when the wall is building hard AND CVD
+    # confirms the turn (the 23,000-bounce case). Only lifts the trend-align veto; all other gates hold.
+    override_note = ""
+    if _FADE_WALL_OVERRIDE:
+        if not allow_long and daily == "BEARISH":
+            ok, why = _wall_reversal_confluence(m, "LONG")
+            if ok:
+                allow_long, override_note = True, " [" + why + "]"
+        if not allow_short and daily == "BULLISH":
+            ok, why = _wall_reversal_confluence(m, "SHORT")
+            if ok:
+                allow_short, override_note = True, " [" + why + "]"
     resist = _f(m, "resistance_5m") or _f(m, "resistance_15m") or _f(m, "current_call_wall")
     support = _f(m, "support_5m") or _f(m, "support_15m") or _f(m, "current_put_wall")
     at_resist = resist > 0 and abs(spot - resist) <= _FADE_EDGE_PTS
@@ -678,11 +725,11 @@ def _range_fade_signal(read, m: dict[str, Any], spot: float) -> tuple[str | None
     if at_resist and allow_short and not resist_weak and _m_pattern_at_resistance(m):
         _s = "strengthening" if call_oi_chg > 0 else "holding"
         return "FADE_SHORT", (f"RANGE-FADE SHORT: M-top rejection AT resistance {resist:.0f} ({_s} call OI "
-                              f"{call_oi_chg:+.0f}), daily {daily or 'NEUTRAL'} — SELL THE RISE, target the low.")
+                              f"{call_oi_chg:+.0f}), daily {daily or 'NEUTRAL'} — SELL THE RISE, target the low." + override_note)
     if at_support and allow_long and not support_weak and _w_pattern_at_support(m):
         _s = "strengthening" if put_oi_chg > 0 else "holding"
         return "FADE_LONG", (f"RANGE-FADE LONG: W-bottom rejection AT support {support:.0f} ({_s} put OI "
-                             f"{put_oi_chg:+.0f}), daily {daily or 'NEUTRAL'} — BUY THE DIP, target the high.")
+                             f"{put_oi_chg:+.0f}), daily {daily or 'NEUTRAL'} — BUY THE DIP, target the high." + override_note)
     return None, (f"no fade setup (eff {eff:.2f}, daily {daily}, at_R {at_resist}/{allow_short}, "
                   f"at_S {at_support}/{allow_long}, R_weak {resist_weak}, S_weak {support_weak})")
 
