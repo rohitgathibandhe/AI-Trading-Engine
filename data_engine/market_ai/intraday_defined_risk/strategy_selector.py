@@ -645,6 +645,14 @@ _FADE_EDGE_PTS = _sel_env_float("SEL_FADE_EDGE_PTS") or 15.0      # spot must be
 _FADE_MAX_EFF = _sel_env_float("SEL_FADE_MAX_EFF") or 0.55         # don't fade a strong trend (it'll break)
 _FADE_TARGET_PTS = _sel_env_float("SEL_FADE_TARGET_PTS") or 30.0   # take the swing into the range interior
 _FADE_STOP_PTS = _sel_env_float("SEL_FADE_STOP_PTS") or 12.0       # cut fast if the level breaks the wrong way
+# STRUCTURE-AWARE fade exit (default on): instead of a flat target, aim for the nearest OPPOSITE S/R level
+# (or VPOC) — where price actually stalls/reverses — and put the stop just BEYOND the faded level (a clean
+# invalidation), not a fixed distance. Bounded so a too-close level (noise) or an absurdly far one falls
+# back to the fixed pts. This trades the real chart, not a number. Env: SEL_FADE_STRUCT_EXIT=0 to disable.
+_FADE_STRUCT_EXIT = os.environ.get("SEL_FADE_STRUCT_EXIT", "1") == "1"
+_FADE_STOP_BUFFER = _sel_env_float("SEL_FADE_STOP_BUFFER") or 8.0   # stop this far BEYOND the faded level
+_FADE_TARGET_MIN = _sel_env_float("SEL_FADE_TARGET_MIN") or 12.0    # ignore an opposite level closer than this (noise)
+_FADE_TARGET_MAX = _sel_env_float("SEL_FADE_TARGET_MAX") or 60.0    # ignore one farther than this (fall back to fixed)
 # TREND-ALIGN the fade (default on): in a DOWNtrend only SELL THE RISE (fade short at resistance); in an
 # UPtrend only BUY THE DIP (fade long at support). Counter-trend fades are the low-prob ones that break.
 _FADE_TREND_ALIGN = os.environ.get("SEL_FADE_TREND_ALIGN", "1") == "1"
@@ -734,6 +742,37 @@ def _range_fade_signal(read, m: dict[str, Any], spot: float) -> tuple[str | None
                   f"at_S {at_support}/{allow_long}, R_weak {resist_weak}, S_weak {support_weak})")
 
 
+def _fade_exit_levels(m: dict[str, Any], direction: str, entry_spot: float) -> tuple[float, float, str]:
+    """(target_spot, stop_spot, why) for a fade scalp, STRUCTURE-AWARE. Target the nearest OPPOSITE S/R
+    level (or VPOC) within [MIN, MAX] of entry — where price actually stalls — instead of a flat distance;
+    stop just BEYOND the faded level (and beyond entry), a clean invalidation. Falls back to the fixed pts
+    when no level qualifies. FADE_SHORT profits DOWN (target below, stop above the faded resistance);
+    FADE_LONG profits UP (target above, stop below the faded support)."""
+    resist = _f(m, "resistance_5m") or _f(m, "resistance_15m") or _f(m, "current_call_wall")
+    support = _f(m, "support_5m") or _f(m, "support_15m") or _f(m, "current_put_wall")
+    vpoc = _f(m, "vpoc")
+    if not _FADE_STRUCT_EXIT:
+        if direction == "FADE_SHORT":
+            return entry_spot - _FADE_TARGET_PTS, entry_spot + _FADE_STOP_PTS, "fixed-distance fade exit"
+        return entry_spot + _FADE_TARGET_PTS, entry_spot - _FADE_STOP_PTS, "fixed-distance fade exit"
+
+    if direction == "FADE_SHORT":  # profit as spot FALLS -> target the nearest downside level
+        belows = [x for x in (support, _f(m, "support_15m"), _f(m, "current_put_wall"), vpoc)
+                  if x > 0 and _FADE_TARGET_MIN <= (entry_spot - x) <= _FADE_TARGET_MAX]
+        target = max(belows) if belows else entry_spot - _FADE_TARGET_PTS   # nearest below = the highest of them
+        stop = max(resist, entry_spot) + _FADE_STOP_BUFFER if resist > 0 else entry_spot + _FADE_STOP_PTS
+        tgt_src = "support/VPOC" if belows else f"fixed {_FADE_TARGET_PTS:.0f}pt"
+        why = f"target {target:.0f} ({tgt_src}), stop {stop:.0f} (just above faded R {resist:.0f})"
+    else:  # FADE_LONG: profit as spot RISES -> target the nearest upside level
+        aboves = [x for x in (resist, _f(m, "resistance_15m"), _f(m, "current_call_wall"), vpoc)
+                  if x > 0 and _FADE_TARGET_MIN <= (x - entry_spot) <= _FADE_TARGET_MAX]
+        target = min(aboves) if aboves else entry_spot + _FADE_TARGET_PTS   # nearest above = the lowest of them
+        stop = min(support, entry_spot) - _FADE_STOP_BUFFER if support > 0 else entry_spot - _FADE_STOP_PTS
+        tgt_src = "resistance/VPOC" if aboves else f"fixed {_FADE_TARGET_PTS:.0f}pt"
+        why = f"target {target:.0f} ({tgt_src}), stop {stop:.0f} (just below faded S {support:.0f})"
+    return target, stop, why
+
+
 def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> StrategyChoice:
     """Read the market, name the condition, and choose the strategy family + structures.
 
@@ -807,16 +846,18 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
                 choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
                 metadata["is_fade"] = True
                 metadata["fade_entry_spot"] = spot
-                metadata["fade_target_spot"] = spot - _FADE_TARGET_PTS   # target the range interior (down)
-                metadata["fade_stop_spot"] = spot + _FADE_STOP_PTS       # cut if it breaks back UP through the level
-                choice.rationale = _fwhy
+                _tgt, _stp, _elw = _fade_exit_levels(metadata, "FADE_SHORT", spot)
+                metadata["fade_target_spot"] = _tgt   # nearest DOWNSIDE level (structure-aware)
+                metadata["fade_stop_spot"] = _stp     # just above the faded resistance
+                choice.rationale = _fwhy + " | EXIT " + _elw
             elif _fdir == "FADE_LONG":
                 choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["CALL_DEBIT_SPREAD"]
                 metadata["is_fade"] = True
                 metadata["fade_entry_spot"] = spot
-                metadata["fade_target_spot"] = spot + _FADE_TARGET_PTS
-                metadata["fade_stop_spot"] = spot - _FADE_STOP_PTS
-                choice.rationale = _fwhy
+                _tgt, _stp, _elw = _fade_exit_levels(metadata, "FADE_LONG", spot)
+                metadata["fade_target_spot"] = _tgt   # nearest UPSIDE level (structure-aware)
+                metadata["fade_stop_spot"] = _stp     # just below the faded support
+                choice.rationale = _fwhy + " | EXIT " + _elw
             else:
                 metadata.pop("is_fade", None)
                 choice.family, choice.structures = FAM_STAND_ASIDE, []
