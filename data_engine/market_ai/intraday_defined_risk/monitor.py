@@ -1901,11 +1901,18 @@ def _emit_decision(decision) -> None:
 
 def run_live(config: dict[str, object]) -> None:
     provider_cls = load_object(str(config["provider_class"]))
-    executor_cls = load_object(str(config["executor_class"]))
     provider = provider_cls(config)
-    executor = executor_cls(config)
     learning_store = LearningStore(config.get("learning_db_path", "/tmp/intraday_defined_risk_learning.sqlite3"))
     runtime_config = load_runtime_config()
+    # MODE-DRIVEN executor selection: PAPER_LIVE keeps the configured (paper) executor; MICRO_LIVE forces
+    # the REAL Dhan executor (DhanLiveExecutor) regardless of executor_class, so the live path can never be
+    # a mis-wired paper stub. The 1-lot size cap + the arm/whitelist entry gate still govern whether any
+    # order actually fires — this only decides WHICH executor is wired in.
+    if runtime_config.mode == RuntimeMode.MICRO_LIVE:
+        from .live_runtime import DhanLiveExecutor
+        executor = DhanLiveExecutor(config)
+    else:
+        executor = load_object(str(config["executor_class"]))(config)
     _initial_tiers = tuple(getattr(runtime_config, "allowed_playbook_tiers", ("A", "B")))
     agent = IntradayDefinedRiskAgent(learning_store=learning_store, allowed_playbook_tiers=_initial_tiers)
     if runtime_config.mode == RuntimeMode.PAPER_LIVE:

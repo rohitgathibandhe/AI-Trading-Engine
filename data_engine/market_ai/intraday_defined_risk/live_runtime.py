@@ -651,3 +651,129 @@ class PaperOnlyExecutor:
 
     def exit_trade(self, position: OpenPosition, reason: str) -> dict[str, object]:
         raise RuntimeError("PaperOnlyExecutor never places broker orders.")
+
+
+class DhanLiveExecutor:
+    """Places REAL Dhan orders for intraday defined-risk spreads. Only ever constructed when the runtime
+    is MICRO_LIVE. Safety-first, by construction:
+      - SIZE CAP: every entry is capped at live_max_lots (default 1) — the graduated ramp. The agent's
+        chosen lot count is ignored above the cap; you raise the cap deliberately once fills look clean.
+      - LONG LEG FIRST on entry: the protective (BUY) leg is placed before the short (SELL) leg, so if the
+        second order fails you are never left holding a naked short — worst case is a lone long option.
+      - SHORT LEG FIRST on exit: buy back the short obligation before selling the long.
+      - Each leg's Dhan security_id is resolved from (symbol, front-expiry, strike, type); a missing id
+        aborts BEFORE any order is sent.
+      - Every real fill and every failure is logged and pushed to Telegram.
+    MARKET orders are used so both legs of a spread fill (a LIMIT that half-fills would leave a naked leg)."""
+
+    EXCH_SEG = "NSE_FNO"
+
+    def __init__(self, config: dict[str, object]) -> None:
+        from market_ai.dhan_wrapper import DhanWrapper
+        self.config = dict(config or {})
+        self._log = logging.getLogger("intraday_defined_risk.live_exec")
+        self._dw = DhanWrapper(logger=self._log)
+        self.underlying_id = int(self.config.get("underlying_id") or 13)
+        self.underlying_seg = str(self.config.get("underlying_seg") or "IDX_I")
+        self.lot_size = int(self.config.get("lot_size") or 65)
+        self.max_lots = max(1, int(self.config.get("live_max_lots") or 1))       # 1-lot ramp by default
+        self.product_type = str(self.config.get("live_product_type") or "INTRADAY").upper()
+        self.symbol = str(self.config.get("live_symbol") or "NIFTY")
+        self._log.warning("DhanLiveExecutor ARMED (REAL ORDERS) — max_lots=%s lot_size=%s product=%s",
+                          self.max_lots, self.lot_size, self.product_type)
+
+    def _expiry(self) -> str:
+        override = str(self.config.get("expiry") or "")
+        if override:
+            return override
+        return _front_expiry(self._dw, underlying_id=self.underlying_id,
+                             underlying_seg=self.underlying_seg, today=date.today())
+
+    def _sid(self, expiry: str, strike: float, option_type: str) -> int:
+        from market_ai.modules.data_fetch.dhan_scrip_cache import resolve_option_security_id
+        sid = resolve_option_security_id(self.symbol, expiry, float(strike), str(option_type))
+        if not sid:
+            raise RuntimeError(f"no Dhan security_id for {self.symbol} {expiry} {strike:.0f} {option_type}")
+        return int(sid)
+
+    @staticmethod
+    def _norm_legs(legs: Any) -> list[tuple[str, str, float]]:
+        """Normalize decision legs (dicts) or position legs (StrategyLeg) to (action, option_type, strike)."""
+        out: list[tuple[str, str, float]] = []
+        for lg in legs or []:
+            if isinstance(lg, dict):
+                out.append((str(lg.get("action")).upper(), str(lg.get("option_type")).upper(), float(lg.get("strike"))))
+            else:
+                ot = lg.option_type.value if hasattr(lg.option_type, "value") else str(lg.option_type)
+                out.append((str(lg.action).upper(), str(ot).upper(), float(lg.strike)))
+        return out
+
+    def get_positions_raw(self) -> list[dict[str, object]]:
+        try:
+            return self._dw.get_positions_raw()
+        except Exception as exc:  # noqa: BLE001 — reconciliation must never crash the loop
+            self._log.warning("get_positions_raw failed: %s", exc)
+            return []
+
+    def enter_trade(self, decision: DecisionOutput) -> dict[str, object]:
+        expiry = self._expiry()
+        legs = self._norm_legs(decision.legs)
+        qty = self.max_lots * self.lot_size
+        strat = decision.strategy.value if hasattr(decision.strategy, "value") else str(decision.strategy)
+        # LONG (BUY) leg first — never leave a naked short if the second order fails.
+        legs_sorted = sorted(legs, key=lambda l: 0 if l[0] == "BUY" else 1)
+        placed: list[dict[str, Any]] = []
+        for action, ot, strike in legs_sorted:
+            sid = self._sid(expiry, strike, ot)   # raises (pre-order) if unresolved
+            try:
+                resp = self._dw.place_order(side=action, exchange_seg=self.EXCH_SEG, security_id=sid,
+                                            quantity=qty, product_type=self.product_type, order_type="MARKET")
+            except Exception as exc:  # noqa: BLE001
+                if not placed:
+                    self._alert(f"🚨 LIVE ENTRY aborted — first leg {action} {ot} {strike:.0f} failed: {exc}. "
+                                f"NO position opened (safe).")
+                    raise
+                self._alert(f"🚨 LIVE ENTRY PARTIAL — {action} {ot} {strike:.0f} failed after {len(placed)} "
+                            f"leg(s) placed: {exc}. Holding a LONG-only leg (defined risk) — REVIEW NOW.")
+                return {"status": "PARTIAL", "expiry": expiry, "orders": placed, "error": str(exc)}
+            placed.append({"action": action, "option_type": ot, "strike": strike, "security_id": sid,
+                           "quantity": qty, "response": resp})
+        self._alert(f"✅ LIVE ENTRY {strat} exp {expiry} x{self.max_lots}lot ({qty}q): "
+                    + ", ".join(f"{p['action']} {p['option_type']} {p['strike']:.0f}" for p in placed))
+        return {"status": "OK", "expiry": expiry, "orders": placed, "lots": self.max_lots}
+
+    def exit_trade(self, position: OpenPosition, reason: str) -> dict[str, object]:
+        expiry = self._expiry()
+        legs = self._norm_legs(position.structure.legs)
+        qty = min(self.max_lots, int(position.lots or 1)) * self.lot_size
+        # Close the SHORT (original SELL) leg first — buy back the obligation before selling the long.
+        legs_sorted = sorted(legs, key=lambda l: 0 if l[0] == "SELL" else 1)
+        placed: list[dict[str, Any]] = []
+        for action, ot, strike in legs_sorted:
+            close_side = "BUY" if action == "SELL" else "SELL"
+            sid = self._sid(expiry, strike, ot)
+            try:
+                resp = self._dw.place_order(side=close_side, exchange_seg=self.EXCH_SEG, security_id=sid,
+                                            quantity=qty, product_type=self.product_type, order_type="MARKET")
+            except Exception as exc:  # noqa: BLE001
+                self._alert(f"🚨 LIVE EXIT PARTIAL ({reason}) — {close_side} {ot} {strike:.0f} failed: {exc}. "
+                            f"Closed {len(placed)} leg(s). REVIEW NOW.")
+                return {"status": "PARTIAL", "expiry": expiry, "orders": placed, "error": str(exc)}
+            placed.append({"close_side": close_side, "option_type": ot, "strike": strike,
+                           "security_id": sid, "quantity": qty, "response": resp})
+        self._alert(f"✅ LIVE EXIT ({reason}) exp {expiry}: closed "
+                    + ", ".join(f"{p['option_type']} {p['strike']:.0f}" for p in placed))
+        return {"status": "OK", "expiry": expiry, "orders": placed}
+
+    def _alert(self, msg: str) -> None:
+        self._log.warning(msg)
+        try:  # best-effort Telegram push from creds.json — never let a failed alert affect trading
+            import requests
+            creds_path = Path(__file__).resolve().parents[2] / "market_ai" / "state" / "creds.json"
+            creds = json.loads(creds_path.read_text())
+            token, chat = creds.get("telegram_bot_token"), creds.get("telegram_chat_id")
+            if token and chat:
+                requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                              json={"chat_id": chat, "text": msg}, timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
