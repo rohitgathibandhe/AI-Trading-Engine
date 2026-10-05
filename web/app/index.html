@@ -2440,12 +2440,14 @@
         openMtm = d.open_mtm_rupees || 0; realized = d.realized_rupees || 0;
         const positions = (d.snapshot && d.snapshot.positions) || [];
         if (!positions.length) {
-          const entries = (d.ledger || []).filter(r => r.event === "PAPER_ENTRY");
+          // Cross-check exits so we don't show closed positions as open.
+          const closedKeys = new Set((d.ledger || []).filter(r => r.event === "PAPER_EXIT").map(r => r.entry_key));
+          const entries = (d.ledger || []).filter(r => r.event === "PAPER_ENTRY" && !closedKeys.has(r.ts));
           bodyHTML = entries.length ? entries.map(r =>
             '<div style="padding:6px 8px;border:1px solid var(--border);border-radius:8px;background:#0b1224;margin-bottom:6px;"><b>'
             + r.structure + '</b> (' + r.direction + ') exp ' + r.expiry + ' — credit ₹' + (r.credit_rupees || 0).toLocaleString()
             + ' <span class="muted">(awaiting monitor snapshot)</span></div>').join("")
-            : '<div class="muted">No weekly positional trades yet.</div>';
+            : '<div class="muted">No open weekly positional trades.</div>';
         } else {
           bodyHTML = positions.map(p => {
             const pnl = p.mtm_rupees || 0, col = pnl >= 0 ? "#22c55e" : "#ef4444";
