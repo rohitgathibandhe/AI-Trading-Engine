@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, List
@@ -158,7 +159,33 @@ def run_rolling_option(args: argparse.Namespace, out_dir: Path) -> None:
     print(f"[rollingoption] summary saved to {summary_path} (days_with_data={summary.get('days_with_data')}, missing={summary.get('days_missing')})")
 
 
+def _load_creds_into_env() -> None:
+    """Force the Dhan token from state/creds.json (the single source of truth) into the
+    environment, overriding any STALE DHAN_ACCESS_TOKEN inherited from shell profiles.
+
+    Root cause of the capture blackout: .bash_profile / .zshrc export old (and even
+    wrong-client_id) tokens, and dhan_api falls back to os.environ before creds.json, so
+    the capture authenticated with a dead token and 401'd. creds.json is refreshed daily,
+    so it must win.
+    """
+    creds_path = ENGINE_DIR / "state" / "creds.json"
+    try:
+        creds = json.loads(creds_path.read_text())
+    except Exception as exc:  # noqa: BLE001 — capture must not crash on a bad/missing file
+        print(f"[creds] WARNING: could not read {creds_path}: {exc}; using existing env token")
+        return
+    tok = creds.get("access_token")
+    cid = creds.get("client_id")
+    if tok and cid:
+        os.environ["DHAN_ACCESS_TOKEN"] = str(tok)
+        os.environ["DHAN_CLIENT_ID"] = str(cid)
+        print(f"[creds] using creds.json token (client {cid}, len {len(str(tok))})")
+    else:
+        print(f"[creds] WARNING: creds.json missing access_token/client_id; using existing env token")
+
+
 def main() -> None:
+    _load_creds_into_env()
     args = parse_args()
     base_state = ENGINE_DIR / "state"
     default_chain_dir = base_state / "rolling_option_ladder"

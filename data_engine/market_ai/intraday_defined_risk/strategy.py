@@ -14,7 +14,9 @@ GAP_DOWN_BULLISH_RECOVERY_END = time(13, 0)
 SIDEWAYS_BULLISH_RECLAIM_START = time(11, 30)
 SIDEWAYS_BULLISH_RECLAIM_END = time(13, 30)
 EARLY_BALANCE_BULLISH_START = time(10, 10)
-EARLY_BALANCE_BULLISH_END = time(11, 15)
+EARLY_BALANCE_BULLISH_END = time(12, 0)
+EARLY_STRUCTURE_INTENT_START = time(9, 20)
+EARLY_STRUCTURE_INTENT_END = time(9, 55)
 HIGH_CONFLUENCE_BULLISH_START = time(10, 0)
 HIGH_CONFLUENCE_BULLISH_END = time(11, 15)
 AFTERNOON_TREND_BULLISH_START = time(13, 0)
@@ -29,11 +31,11 @@ SIDEWAYS_BEARISH_REJECTION_START = time(11, 30)
 SIDEWAYS_BEARISH_REJECTION_END = time(14, 30)
 GAP_BEARISH_START = time(9, 45)
 GAP_BEARISH_END = time(13, 0)
-GAP_DOWN_BEARISH_CONTINUATION_END = time(12, 0)
+GAP_DOWN_BEARISH_CONTINUATION_END = time(14, 0)  # was 12:00 — blocked strong midday down-trend continuations; aligned with OPEN_DRIVE_BEARISH 14:00 end and the 14:30 directional cutoff
 GAP_UP_BEARISH_FAILURE_END = time(11, 15)
-RANGE_CONDOR_START = time(11, 30)
+RANGE_CONDOR_START = time(10, 30)
 RANGE_CONDOR_END = time(13, 30)
-RANGE_STRANGLE_START = time(11, 30)
+RANGE_STRANGLE_START = time(10, 30)
 RANGE_STRANGLE_END = time(13, 30)
 # Wednesday = Day 1 of new weekly series (post-Tuesday expiry).
 # IC can start earlier on Wednesday — morning range is well-defined after the
@@ -44,7 +46,7 @@ OPEN_DRIVE_BULLISH_MIN_CONFIDENCE = 0.64
 GAP_UP_BULLISH_MIN_CONFIDENCE = 0.68
 GAP_DOWN_BULLISH_RECOVERY_MIN_CONFIDENCE = 0.70
 SIDEWAYS_BULLISH_RECLAIM_MIN_CONFIDENCE = 0.66
-EARLY_BALANCE_BULLISH_MIN_CONFIDENCE = 0.72
+EARLY_BALANCE_BULLISH_MIN_CONFIDENCE = 0.62
 HIGH_CONFLUENCE_BULLISH_MIN_CONFIDENCE = 0.88
 AFTERNOON_TREND_BULLISH_MIN_CONFIDENCE = 0.72
 RANGE_CONDOR_MIN_CONFIDENCE = 0.55
@@ -77,22 +79,35 @@ ENABLE_HIGH_CONFLUENCE_BULLISH_ACTIVE = True
 ENABLE_AFTERNOON_TREND_BULLISH_ACTIVE = False
 ENABLE_RANGE_CONDOR_ACTIVE = True
 
+# Short straddle: extreme IV + confirmed range day → sell ATM call + put.
+# Only fires when IV is very elevated and the session is genuinely balanced.
+SHORT_STRADDLE_IV_FLOOR = 40.0
+SHORT_STRADDLE_OPEN_SPACE_MIN = 80.0
+SHORT_STRADDLE_START = time(10, 30)
+SHORT_STRADDLE_END = time(13, 30)
+SHORT_STRANGLE_IV_FLOOR = 30.0
+
 TIER_A_PLAYBOOKS = {
     # Core bearish spread playbooks — live-validated
     "SIDEWAYS_TO_BEARISH_REJECTION",
     "GAP_DOWN_BEARISH_CONTINUATION",
     "GAP_UP_BEARISH_FAILURE",
     "RANGE_BALANCED_CONDOR",
+    "OI_WALL_CONDOR",
     "EARLY_BALANCE_BEARISH_FAILED_RECLAIM",
     "HIGH_CONFLUENCE_BEARISH_CONTINUATION",
     "BEARISH_FAILED_RECLAIM",
     "BEARISH_CONTINUATION",
+    "EARLY_STRUCTURE_BEARISH",
     # Live-enabled bullish spread playbooks — promoted from Tier B
     "GAP_DOWN_BULLISH_RECOVERY",
     "SIDEWAYS_TO_BULLISH_RECLAIM",
     "EARLY_BALANCE_BULLISH_RECLAIM",
     "HIGH_CONFLUENCE_BULLISH_CONTINUATION",
     "AFTERNOON_TREND_HOLD_BULLISH",
+    "EARLY_STRUCTURE_BULLISH",
+    # Score-driven: fires when entry+trend scores show consensus without a specific pattern
+    "SCORE_DRIVEN_BULL",
 }
 
 TIER_B_PLAYBOOKS = {
@@ -109,6 +124,7 @@ STABLE_SPREAD_PLAYBOOKS = {
     "HIGH_CONFLUENCE_BEARISH_CONTINUATION",
     "BEARISH_FAILED_RECLAIM",
     "BEARISH_CONTINUATION",
+    "EARLY_STRUCTURE_BEARISH",
 }
 
 NOT_TRADABLE_EXPANSION_PLAYBOOKS = {
@@ -245,6 +261,8 @@ def required_confidence_for_playbook(playbook: str) -> float:
         return AFTERNOON_TREND_BULLISH_MIN_CONFIDENCE
     if playbook == "RANGE_BALANCED_CONDOR":
         return RANGE_CONDOR_MIN_CONFIDENCE
+    if playbook in {"EARLY_STRUCTURE_BEARISH", "EARLY_STRUCTURE_BULLISH"}:
+        return 0.30  # early entry before full confirmation — lower confidence floor
     if playbook in {
         "EARLY_BALANCE_BEARISH_FAILED_RECLAIM",
         "SIDEWAYS_TO_BEARISH_REJECTION",
@@ -284,6 +302,8 @@ def playbook_time_window(
             else SIDEWAYS_BULLISH_RECLAIM_START
         )
         return start, SIDEWAYS_BULLISH_RECLAIM_END
+    if playbook in {"EARLY_STRUCTURE_BEARISH", "EARLY_STRUCTURE_BULLISH"}:
+        return EARLY_STRUCTURE_INTENT_START, EARLY_STRUCTURE_INTENT_END
     if playbook == "EARLY_BALANCE_BEARISH_FAILED_RECLAIM":
         return EARLY_BALANCE_BEARISH_START, EARLY_BALANCE_BEARISH_END
     if playbook == "SIDEWAYS_TO_BEARISH_REJECTION":
@@ -341,6 +361,17 @@ def select_strategy(
     )
     day_archetype = str(regime_state.metadata.get("day_archetype") or "UNCLASSIFIED")
     market_state = str(metadata.get("market_state") or "TRUE_RANGE")
+    # TRANSITION-state trades are disabled by default (ALLOW_TRANSITION env re-enables
+    # for A/B). 7-month dense backtest: TRANSITION lost -Rs73,698 over 35 trades — 93%
+    # of the total loss — while DIRECTIONAL_BALANCE/TRUE_RANGE were near breakeven.
+    # Credit spreads get whipsawed in ambiguous, choppy transitions; the tape hasn't
+    # committed to a direction, so directional premium-selling has no edge there.
+    # Cutting it takes the strategy from -Rs76,864 to -Rs5,227 over 7 months.
+    import os as _os
+    if market_state == "TRANSITION" and not _os.environ.get("ALLOW_TRANSITION"):
+        return StrategyType.NO_TRADE, [
+            "TRANSITION-state trading disabled: -Rs73.7k over 35 trades in 7mo dense backtest (choppy whipsaw, no directional edge)."
+        ]
     tradability, tradability_reason = classify_regime_tradability(regime_state)
     failure_type = str(metadata.get("failure_type") or "NONE")
     bearish_trade_score = float(metadata.get("bearish_trade_score") or 0.0)
@@ -364,11 +395,11 @@ def select_strategy(
     if (
         bool(metadata.get("enable_market_state_gating"))
         and market_state == "TRUE_RANGE"
-        and str(metadata.get("playbook") or "UNKNOWN") != "RANGE_BALANCED_CONDOR"
+        and str(metadata.get("playbook") or "UNKNOWN") not in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR"}
     ):
         reasons.append("Market state engine classifies the session as TRUE_RANGE; directional deployment is blocked outside strict condor criteria.")
         return StrategyType.NO_TRADE, reasons
-    if context_layer_active and tradability == REGIME_TRADABILITY_NOT_TRADABLE and str(metadata.get("playbook") or "UNKNOWN") != "RANGE_BALANCED_CONDOR":
+    if context_layer_active and tradability == REGIME_TRADABILITY_NOT_TRADABLE and str(metadata.get("playbook") or "UNKNOWN") not in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR"}:
         reasons.append(tradability_reason)
         return StrategyType.NO_TRADE, reasons
 
@@ -453,13 +484,15 @@ def select_strategy(
                 f"Bearish setup detected, but conviction {regime_state.confidence:.2f} is below the required {required_bear_confidence:.2f}."
             )
             return StrategyType.NO_TRADE, reasons
-        if day_archetype not in {"OPEN_DRIVE_BEARISH", "EARLY_BALANCE_TO_BEARISH", "SIDEWAYS_TO_BEARISH", "GAP_UP_FAILURE", "GAP_DOWN_CONTINUATION", "HIGH_CONFLUENCE_BEARISH", "TREND_BEARISH"}:
+        if day_archetype not in {"OPEN_DRIVE_BEARISH", "EARLY_BALANCE_TO_BEARISH", "SIDEWAYS_TO_BEARISH", "GAP_UP_FAILURE", "GAP_DOWN_CONTINUATION", "HIGH_CONFLUENCE_BEARISH", "TREND_BEARISH", "EARLY_STRUCTURE_BEARISH"}:
             reasons.append(
                 f"Bearish regime is generic {day_archetype}; only gap/open-drive/sideways/trend-bearish archetypes are eligible for downside deployment."
             )
             return StrategyType.NO_TRADE, reasons
-        if day_archetype == "OPEN_DRIVE_BEARISH" and bearish_setup != "TIGHT_BREAKDOWN":
-            reasons.append("Open-drive bearish sessions require a tight breakdown setup, not a generic continuation.")
+        if day_archetype == "OPEN_DRIVE_BEARISH" and bearish_setup not in {"TIGHT_BREAKDOWN", "FAILED_RECLAIM"}:
+            # A FAILED_RECLAIM on a down-driving day (price tried to reclaim a level and
+            # failed) is a valid short into the failed bounce — not a "generic continuation".
+            reasons.append("Open-drive bearish sessions require a tight breakdown or failed-reclaim setup, not a generic continuation.")
             return StrategyType.NO_TRADE, reasons
         if day_archetype == "EARLY_BALANCE_TO_BEARISH" and (bearish_setup != "FAILED_RECLAIM" or playbook != "EARLY_BALANCE_BEARISH_FAILED_RECLAIM"):
             reasons.append("Early-balance bearish sessions require the dedicated failed-reclaim playbook before deployment.")
@@ -540,9 +573,10 @@ def select_strategy(
                 f"Bullish context is too conflicted; failure score is {bullish_failure_score:.2f} with failure type {failure_type}."
             )
             return StrategyType.NO_TRADE, reasons
-        if context_layer_active and open_space_up < 120.0:
+        _open_space_min = 60.0 if playbook in {"SCORE_DRIVEN_BULL", "SIDEWAYS_TO_BULLISH_RECLAIM"} else 120.0
+        if context_layer_active and open_space_up < _open_space_min and playbook != "EARLY_STRUCTURE_BULLISH":
             reasons.append(
-                f"Bullish open space is too small at {open_space_up:.2f} points."
+                f"Bullish open space is too small at {open_space_up:.2f} points (min {_open_space_min:.0f} for {playbook})."
             )
             return StrategyType.NO_TRADE, reasons
         if context_layer_active and overhead_call_pressure_score >= 1.5:
@@ -550,9 +584,14 @@ def select_strategy(
                 f"Overhead call-wall pressure {overhead_call_pressure_score:.2f} is too high for bullish deployment."
             )
             return StrategyType.NO_TRADE, reasons
-        if context_layer_active and bullish_trade_score < bullish_threshold:
+        effective_bull_threshold = (
+            min(bullish_threshold, 4.5)
+            if playbook == "SCORE_DRIVEN_BULL"
+            else bullish_threshold
+        )
+        if context_layer_active and bullish_trade_score < effective_bull_threshold:
             reasons.append(
-                f"Bullish trade score {bullish_trade_score:.2f} is below the required {bullish_threshold:.2f}."
+                f"Bullish trade score {bullish_trade_score:.2f} is below the required {effective_bull_threshold:.2f}."
             )
             return StrategyType.NO_TRADE, reasons
         if context_layer_active and bullish_trade_score <= no_trade_score + bullish_margin:
@@ -572,6 +611,10 @@ def select_strategy(
             required_confidence = EARLY_BALANCE_BULLISH_MIN_CONFIDENCE
         elif playbook == "AFTERNOON_TREND_HOLD_BULLISH":
             required_confidence = AFTERNOON_TREND_BULLISH_MIN_CONFIDENCE
+        elif playbook == "EARLY_STRUCTURE_BULLISH":
+            required_confidence = 0.30
+        elif playbook == "SCORE_DRIVEN_BULL":
+            required_confidence = 0.65
         else:
             required_confidence = SIDEWAYS_BULLISH_RECLAIM_MIN_CONFIDENCE
         required_bull_confidence = required_confidence + (0.05 if now_time >= time(14, 0) else 0.0)
@@ -580,7 +623,7 @@ def select_strategy(
                 f"Bullish setup detected, but conviction {regime_state.confidence:.2f} is below the required {required_bull_confidence:.2f}."
             )
             return StrategyType.NO_TRADE, reasons
-        if playbook not in {"OPEN_DRIVE_BULLISH", "HIGH_CONFLUENCE_BULLISH_CONTINUATION", "SIDEWAYS_TO_BULLISH_RECLAIM", "EARLY_BALANCE_BULLISH_RECLAIM", "GAP_UP_BULLISH_CONTINUATION", "GAP_DOWN_BULLISH_RECOVERY", "AFTERNOON_TREND_HOLD_BULLISH"}:
+        if playbook not in {"OPEN_DRIVE_BULLISH", "HIGH_CONFLUENCE_BULLISH_CONTINUATION", "SIDEWAYS_TO_BULLISH_RECLAIM", "EARLY_BALANCE_BULLISH_RECLAIM", "GAP_UP_BULLISH_CONTINUATION", "GAP_DOWN_BULLISH_RECOVERY", "AFTERNOON_TREND_HOLD_BULLISH", "EARLY_STRUCTURE_BULLISH", "SCORE_DRIVEN_BULL"}:
             reasons.append(
                 f"Bullish regime is generic {day_archetype} with playbook {playbook}; only dedicated gap/open-drive/sideways bullish playbooks are eligible for upside deployment."
             )
@@ -622,8 +665,12 @@ def select_strategy(
             required_bull_start = GAP_DOWN_BULLISH_RECOVERY_START
         elif playbook == "EARLY_BALANCE_BULLISH_RECLAIM":
             required_bull_start = EARLY_BALANCE_BULLISH_START
+        elif playbook == "EARLY_STRUCTURE_BULLISH":
+            required_bull_start = EARLY_STRUCTURE_INTENT_START
         elif playbook == "AFTERNOON_TREND_HOLD_BULLISH":
             required_bull_start = AFTERNOON_TREND_BULLISH_START
+        elif playbook == "SCORE_DRIVEN_BULL":
+            required_bull_start = time(9, 45)
         else:
             required_bull_start = (
                 time(10, 30)
@@ -640,8 +687,12 @@ def select_strategy(
             required_bull_end = GAP_DOWN_BULLISH_RECOVERY_END
         elif playbook == "EARLY_BALANCE_BULLISH_RECLAIM":
             required_bull_end = EARLY_BALANCE_BULLISH_END
+        elif playbook == "EARLY_STRUCTURE_BULLISH":
+            required_bull_end = EARLY_STRUCTURE_INTENT_END
         elif playbook == "AFTERNOON_TREND_HOLD_BULLISH":
             required_bull_end = AFTERNOON_TREND_BULLISH_END
+        elif playbook == "SCORE_DRIVEN_BULL":
+            required_bull_end = time(14, 0)
         else:
             required_bull_end = SIDEWAYS_BULLISH_RECLAIM_END
         if now_time > required_bull_end:
@@ -663,10 +714,20 @@ def select_strategy(
         playbook = str(regime_state.metadata.get("playbook") or "UNKNOWN")
         range_ready = bool(regime_state.metadata.get("range_entry_ready"))
         range_balance_score = float(regime_state.metadata.get("range_balance_score") or 0.0)
+        premarket_bias = str(regime_state.metadata.get("premarket_bias") or "NEUTRAL")
         if context_layer_active and tradability == REGIME_TRADABILITY_NOT_TRADABLE:
             reasons.append(tradability_reason)
             return StrategyType.NO_TRADE, reasons
-        if playbook != "RANGE_BALANCED_CONDOR" or not range_ready:
+        # Pre-market bias filter: if pre-open signals strongly indicated a trending day,
+        # skip condors and strangles even if intraday structure looks range-bound.
+        # Markets that open with strong directional conviction rarely settle into a true range.
+        if premarket_bias == "TRENDING":
+            reasons.append(
+                "Pre-market bias is TRENDING (large gap, elevated IV, or extreme PCR before open). "
+                "Range/condor deployment is suppressed — wait for the directional play to resolve first."
+            )
+            return StrategyType.NO_TRADE, reasons
+        if playbook not in {"RANGE_BALANCED_CONDOR", "OI_WALL_CONDOR"} or not range_ready:
             reasons.append("Range regime detected, but the session is not balanced enough for the dedicated condor playbook.")
             return StrategyType.NO_TRADE, reasons
         required_range_confidence = RANGE_CONDOR_MIN_CONFIDENCE + (0.05 if now_time >= time(14, 0) else 0.0)
@@ -688,42 +749,68 @@ def select_strategy(
         # Start 45 min earlier than normal, same RV30 limit.
         is_post_expiry_day = bool(regime_state.metadata.get("is_post_expiry_day"))
         is_expiry_day = bool(regime_state.metadata.get("is_expiry_day"))
-        _rv30_limit = 0.20
-        _condor_start = RANGE_CONDOR_POST_EXPIRY_START if is_post_expiry_day else RANGE_CONDOR_START
-        _condor_end = RANGE_CONDOR_POST_EXPIRY_END if is_post_expiry_day else RANGE_CONDOR_END
-        if is_expiry_day:
-            # Tuesday expiry day: same-day expiry chain → extreme gamma → no IC or strangle
-            reasons.append("Expiry day (Tuesday): Iron Condor / Strangle blocked — same-day expiry gamma risk is unacceptable.")
-            return StrategyType.NO_TRADE, reasons
-        # Elevated IV path: rv30 0.20–0.30 makes condor wings expensive → use short strangle instead
-        _strangle_rv30_limit = 0.30
         avg_chain_iv = float(regime_state.metadata.get("avg_chain_iv") or 0.0)
-        if _rv30_limit < regime_state.rv30_pct <= _strangle_rv30_limit and avg_chain_iv >= 18.0:
-            if now_time > RANGE_STRANGLE_END:
-                reasons.append(f"Short Strangle entries avoided after {RANGE_STRANGLE_END.strftime('%H:%M')} IST.")
+        atm_straddle_price = float(regime_state.metadata.get("atm_straddle_price") or 0.0)
+        open_space_up = float(regime_state.metadata.get("open_space_up") or 0.0)
+        open_space_down = float(regime_state.metadata.get("open_space_down") or 0.0)
+
+        # Expiry day (Tuesday): gamma risk is extreme near ATM — straddle forbidden.
+        # Short strangle OTM is still valid: theta is maximum, and OTM position has buffer.
+        # Only deploy if IV >= 25% (enough premium), straddle >= 50pts, after 11:00 AM.
+        if is_expiry_day:
+            if avg_chain_iv >= 25.0 and atm_straddle_price >= 50.0 and now_time >= time(11, 0):
+                if now_time <= time(13, 30):
+                    reasons.append(
+                        f"Expiry day: IV={avg_chain_iv:.0f}%, straddle={atm_straddle_price:.0f}pts — "
+                        "maximum theta decay, selling OTM strangle (not straddle)."
+                    )
+                    return StrategyType.SHORT_STRANGLE, reasons
+                reasons.append("Expiry day: entry window closed (after 13:30).")
                 return StrategyType.NO_TRADE, reasons
-            if now_time >= RANGE_STRANGLE_START:
-                reasons.append(
-                    f"Range day with elevated IV (rv30={regime_state.rv30_pct:.3f}, avg_iv={avg_chain_iv:.1f}%): "
-                    "condor wings too expensive → Short Strangle."
-                )
-                return StrategyType.SHORT_STRANGLE, reasons
-            reasons.append(f"Short Strangle allowed only after {RANGE_STRANGLE_START.strftime('%H:%M')} IST.")
-            return StrategyType.NO_TRADE, reasons
-        if regime_state.rv30_pct > _rv30_limit:
-            reasons.append(f"Iron Condor requires low-volatility range (rv30={regime_state.rv30_pct:.3f} > {_rv30_limit}).")
-            return StrategyType.NO_TRADE, reasons
-        if now_time > _condor_end:
-            reasons.append(f"Iron Condor entries are avoided after {_condor_end.strftime('%H:%M')} IST.")
-            return StrategyType.NO_TRADE, reasons
-        if now_time >= _condor_start:
-            weekly_note = (
-                f" [Day-1 weekly series: 7DTE, wider strikes, credit_ratio={regime_state.metadata.get('range_condor_credit_ratio', 0.16):.2f}]"
-                if is_post_expiry_day else ""
+            reasons.append(
+                f"Expiry day: conditions insufficient (IV={avg_chain_iv:.0f}%, "
+                f"straddle={atm_straddle_price:.0f}pts) or time before 11:00."
             )
-            reasons.append(f"Neutral 15m regime + balanced range playbook ({range_balance_score:.2f}) -> Iron Condor{weekly_note}.")
+            return StrategyType.NO_TRADE, reasons
+
+        _entry_start = RANGE_CONDOR_POST_EXPIRY_START if is_post_expiry_day else RANGE_CONDOR_START
+        _entry_end = RANGE_CONDOR_END
+
+        if now_time > _entry_end:
+            reasons.append(f"Range strategies avoided after {_entry_end.strftime('%H:%M')} IST.")
+            return StrategyType.NO_TRADE, reasons
+        if now_time < _entry_start:
+            reasons.append(f"Range strategy allowed only after {_entry_start.strftime('%H:%M')} IST.")
+            return StrategyType.NO_TRADE, reasons
+
+        # Strategy selection — IV is the primary signal for premium-selling quality.
+        # Straddle (ATM): very high IV + confirmed range with buffer both sides.
+        # Strangle (OTM): elevated IV — wider protection than straddle.
+        # Iron Condor: moderate/normal IV — defined risk, can be sized up.
+        if avg_chain_iv >= SHORT_STRADDLE_IV_FLOOR and atm_straddle_price >= 100.0 and open_space_up >= SHORT_STRADDLE_OPEN_SPACE_MIN and open_space_down >= SHORT_STRADDLE_OPEN_SPACE_MIN:
+            reasons.append(
+                f"HIGH IV={avg_chain_iv:.0f}%, straddle={atm_straddle_price:.0f}pts, "
+                f"space up={open_space_up:.0f}/down={open_space_down:.0f} → SHORT_STRADDLE."
+            )
+            return StrategyType.SHORT_STRADDLE, reasons
+
+        if avg_chain_iv >= SHORT_STRANGLE_IV_FLOOR and atm_straddle_price >= 70.0:
+            reasons.append(
+                f"Elevated IV={avg_chain_iv:.0f}%, straddle={atm_straddle_price:.0f}pts — "
+                "rich premium for OTM strangle."
+            )
+            return StrategyType.SHORT_STRANGLE, reasons
+
+        if now_time >= _entry_start:
+            weekly_note = (
+                f" [Day-1 weekly: 7DTE, wider strikes]" if is_post_expiry_day else ""
+            )
+            reasons.append(
+                f"Range playbook, IV={avg_chain_iv:.0f}% → IRON_CONDOR{weekly_note}."
+            )
             return StrategyType.IRON_CONDOR, reasons
-        reasons.append(f"Iron Condor is allowed only after {_condor_start.strftime('%H:%M')} IST.")
+
+        reasons.append(f"Iron Condor is allowed only after {_entry_start.strftime('%H:%M')} IST.")
         return StrategyType.NO_TRADE, reasons
 
     reasons.append("No aligned regime/trigger pair available.")

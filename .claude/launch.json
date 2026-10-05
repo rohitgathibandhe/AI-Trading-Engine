@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "paper-dashboard",
+      "runtimeExecutable": "/Users/Rohit/.venvs/data_engine_py310/bin/python",
+      "runtimeArgs": ["scripts/paper_pnl_server.py", "--port", "8010"],
+      "port": 8010
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.algoagent.weekly_ic_monitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/Rohit/.venvs/data_engine_py310/bin/python</string>
+    <string>/Users/Rohit/AI-Trading-Engine/scripts/weekly_ic_monitor.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/Rohit/AI-Trading-Engine</string>
+  <!-- Every 15 min; the script itself no-ops outside 09:15-15:30 on weekdays and
+       when there is no DEPLOYED position, so this stays cheap. -->
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/weekly_ic_monitor.log</string>
+  <key>StandardErrorPath</key><string>/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/weekly_ic_monitor.log</string>
+</dict>
+</plist>

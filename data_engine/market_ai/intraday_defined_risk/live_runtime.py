@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -280,6 +281,7 @@ class DhanLiveMarketDataProvider:
         self._previous_close_cache: tuple[date, float | None] | None = None
         self._daily_bars_cache: tuple[date, list[OhlcvBar]] | None = None
         self._chain_miss_streak: int = 0
+        self._candle_mem_cache: dict[tuple[int, str], list[OhlcvBar]] = {}  # (interval, date_iso) -> bars
 
     def _readiness_diagnostics(
         self,
@@ -334,8 +336,33 @@ class DhanLiveMarketDataProvider:
         )
         raise LiveDataReadinessError("INSUFFICIENT_DATA", reason, diagnostics)
 
+    def _candle_disk_path(self, interval: int, today: date) -> Path:
+        return STATE_ROOT / f"candle_cache_{today.isoformat()}_{interval}m.json"
+
+    def _save_candle_disk(self, interval: int, today: date, bars: list[OhlcvBar]) -> None:
+        try:
+            data = [
+                {"timestamp": b.timestamp.isoformat(), "open": b.open, "high": b.high,
+                 "low": b.low, "close": b.close, "volume": b.volume}
+                for b in bars if b.timestamp is not None
+            ]
+            self._candle_disk_path(interval, today).write_text(json.dumps(data))
+        except Exception:
+            pass
+
+    def _load_candle_disk(self, interval: int, today: date) -> list[OhlcvBar]:
+        try:
+            path = self._candle_disk_path(interval, today)
+            if not path.exists():
+                return []
+            raw = json.loads(path.read_text())
+            return _bars_from_candles(raw)
+        except Exception:
+            return []
+
     def _candles(self, *, interval: int, today: date) -> list[OhlcvBar]:
-        candles = self._dw.get_intraday_candles(
+        cache_key = (interval, today.isoformat())
+        raw = self._dw.get_intraday_candles(
             self.underlying_id,
             self.underlying_seg,
             "INDEX",
@@ -343,7 +370,31 @@ class DhanLiveMarketDataProvider:
             from_date=today.isoformat(),
             to_date=today.isoformat(),
         )
-        return _bars_from_candles(candles or [])
+        bars = _bars_from_candles(raw or [])
+        if bars:
+            # Successful fetch — update both in-memory and disk cache
+            prev = self._candle_mem_cache.get(cache_key, [])
+            if len(bars) >= len(prev):
+                self._candle_mem_cache[cache_key] = bars
+                self._save_candle_disk(interval, today, bars)
+            return bars
+        # Fetch returned empty — try in-memory cache first
+        cached = self._candle_mem_cache.get(cache_key)
+        if cached:
+            logging.getLogger("intraday_defined_risk.v83").warning(
+                "[candles] live fetch returned 0 bars for %dm; using %d cached bars from memory",
+                interval, len(cached),
+            )
+            return cached
+        # Fall back to disk cache (survives restarts)
+        disk = self._load_candle_disk(interval, today)
+        if disk:
+            self._candle_mem_cache[cache_key] = disk  # warm the memory cache
+            logging.getLogger("intraday_defined_risk.v83").warning(
+                "[candles] live fetch failed; loaded %d bars from disk cache for %dm",
+                len(disk), interval,
+            )
+        return disk
 
     def _cached_front_expiry(self, today: date) -> str:
         if self._front_expiry_cache and self._front_expiry_cache[0] == today:
@@ -421,49 +472,51 @@ class DhanLiveMarketDataProvider:
                 spot=spot,
             )
         expiry = str(self.config.get("expiry") or "") or self._cached_front_expiry(today)
-        # On post-expiry day (series ≤2 days old), OI in the new front-week chain is near-zero,
-        # silencing all option-chain pressure signals.  Load the next-week chain for OI signals.
-        oi_expiry = _oi_signal_expiry(
-            self._dw,
-            underlying_id=self.underlying_id,
-            underlying_seg=self.underlying_seg,
-            today=today,
-            front_expiry_str=expiry,
-        )
-        chain_raw = self._dw.get_option_chain(self.underlying_id, self.underlying_seg, oi_expiry)
+        # Build the TRADEABLE chain from the FRONT expiry — the one we price, select strikes from,
+        # and execute against. The snapshot is labeled with this same `expiry` below, so the prices
+        # and the label MUST come from the same series.
+        #
+        # BUG FIXED 2026-07-21: this previously fetched the chain with `oi_expiry` (the next-week
+        # series _oi_signal_expiry returns on post-roll days) while still labeling the snapshot as
+        # `expiry` (the front). So for the 1-2 days after every weekly expiry the agent PRICED,
+        # SELECTED and BOOKED trades off the wrong expiry — e.g. today a 07-28 spread was recorded
+        # with 08-04 premiums (24200 PUT booked at ~224 vs the real 07-28 ~171), which also made
+        # the UI's MTM meaningless (entry from one expiry, LTP from another). The substitution
+        # existed to dodge "near-zero OI" on a brand-new front series, but a normal ~7-DTE weekly
+        # front is deeply liquid (verified 07-28: 184M total OI, 6.7M on the ATM put), so it fixed
+        # a non-problem and corrupted real pricing. Price from the front; if the front chain is
+        # genuinely empty, `quotes` stays empty and the snapshot degrades to NO_TRADE below — the
+        # correct fail-safe, far better than trading a mislabeled expiry.
+        chain_raw = self._dw.get_option_chain(self.underlying_id, self.underlying_seg, expiry)
         chain_rows = _flatten_option_chain_payload(
             chain_raw,
             timestamp=now,
             decision_time=now.strftime("%H:%M"),
-            expiry=oi_expiry,
+            expiry=expiry,
         )
         quotes = [_quote_from_row(dict(row)) for row in chain_rows]
         quotes = [quote for quote in quotes if quote is not None]
+        _log = logging.getLogger("intraday_defined_risk.v83")
         if not quotes:
             self._chain_miss_streak += 1
-            _log = logging.getLogger("intraday_defined_risk.v83")
             if self._chain_miss_streak == 5:
                 _log.warning(
                     "[option_chain] HEALTH ALERT: chain unavailable for %d consecutive polls "
                     "(expiry=%s, seg=%s). Check Dhan API connectivity and token validity.",
-                    self._chain_miss_streak, oi_expiry, self.underlying_seg,
+                    self._chain_miss_streak, expiry, self.underlying_seg,
                 )
             elif self._chain_miss_streak % 20 == 0:
                 _log.error(
                     "[option_chain] PERSISTENT OUTAGE: chain missing for %d consecutive polls. "
-                    "Entire session is flying blind.",
+                    "Regime signals will be degraded; structure selection is blocked.",
                     self._chain_miss_streak,
                 )
-            self._raise_insufficient(
-                "OPTION_CHAIN_QUOTES_UNAVAILABLE",
-                now=now,
-                bars_5m=bars_5m,
-                bars_15m=bars_15m,
-                spot=spot,
-                quotes=quotes,
-                expiry=expiry,
-            )
-        self._chain_miss_streak = 0
+            # Degraded path: candles + spot are good, so regime classification can still run.
+            # We build a snapshot with no chain quotes — downstream blocks structure selection
+            # via option_chain_available=False but regime + entry gate still evaluate.
+            _log.debug("[option_chain] proceeding in degraded mode (no chain quotes)")
+        else:
+            self._chain_miss_streak = 0
 
         chain = OptionsChainSnapshot(
             timestamp=now,
@@ -481,6 +534,7 @@ class DhanLiveMarketDataProvider:
                 max_risk_rupees_per_trade=float(self.config.get("max_risk_rupees_per_trade") or 10_000.0),
                 max_margin_rupees=float(self.config.get("max_margin_rupees") or 200_000.0),
                 max_daily_loss_rupees=float(self.config.get("max_daily_loss_rupees") or 10_000.0),
+                min_lots_per_trade=int(self.config.get("min_lots_per_trade") or 1),
             ),
             account_state=AccountState(realised_pnl_rupees=0.0, margin_used_rupees=0.0),
             live_vwap=_vwap_from_bars(bars_5m),
@@ -491,6 +545,94 @@ class DhanLiveMarketDataProvider:
         )
         snapshot.validate()
         self._previous_chain = chain
+
+        # Phase 6: Fetch auxiliary market context (India VIX + BankNifty) best-effort.
+        # Written to state/market_context.json for regime.py to read each cycle.
+        # security_ids: India VIX=1, BankNifty=25 (both IDX_I segment on Dhan).
+        # Use get_ltp_once per symbol (ticker + quote fallback) rather than bulk
+        # call — the bulk API returns status=failure for non-subscribed sec IDs.
+        _VIX_ID = 1
+        _BANK_ID = 25
+        try:
+            _vix_ltp = self._dw.get_ltp_once(self.underlying_seg, _VIX_ID)
+            _bank_ltp = self._dw.get_ltp_once(self.underlying_seg, _BANK_ID)
+            _ctx_path = STATE_ROOT / "market_context.json"
+            _ctx: dict = {}
+            if _ctx_path.exists():
+                try:
+                    _ctx = json.loads(_ctx_path.read_text())
+                except Exception:
+                    _ctx = {}
+            # Shift current → prev before overwriting so regime.py can compute % change
+            if "nifty_spot" in _ctx:
+                _ctx["nifty_spot_prev"] = _ctx["nifty_spot"]
+            if "banknifty_spot" in _ctx:
+                _ctx["banknifty_spot_prev"] = _ctx["banknifty_spot"]
+            _ctx["nifty_spot"] = spot
+            # India VIX realistically sits ~8-40 (never >100). A read outside that is a bad tick — the
+            # LTP fetch for sec-id 1 intermittently returns a SPOT-like value (~22,436 seen 2026-09-25),
+            # which as 'VIX' corrupts every VIX-gated rule (lot scale, credit floor, IV branches). Reject
+            # insane reads: fall through to the chain-IV proxy, else keep the prior good VIX.
+            _vix_ok = False
+            if _vix_ltp:
+                try:
+                    _v = float(_vix_ltp)
+                    if 5.0 <= _v <= 100.0:
+                        _ctx["india_vix"] = _v
+                        _ctx["india_vix_source"] = "dhan_api"
+                        _vix_ok = True
+                    else:
+                        logging.getLogger("intraday_defined_risk.v83").warning(
+                            "[vix] rejecting insane India VIX read %.1f (out of 5-100) — using proxy/prior", _v)
+                except (TypeError, ValueError):
+                    pass
+            if (not _vix_ok) and quotes:
+                # Dhan API for VIX returns None — derive proxy from option chain ATM IV.
+                # ATM ± 200pts = near-money options that dominate VIX calculation.
+                _atm_ivs = [
+                    float(q.iv)
+                    for q in quotes
+                    if q.iv is not None and q.ltp > 0
+                    and abs(q.strike - spot) <= 200.0
+                ]
+                if _atm_ivs:
+                    _vix_proxy = round(sum(_atm_ivs) / len(_atm_ivs), 2)
+                    if 5.0 <= _vix_proxy <= 100.0:      # same sanity gate — never publish a junk proxy
+                        _ctx["india_vix"] = _vix_proxy
+                        _ctx["india_vix_source"] = "chain_iv_proxy"
+            if _bank_ltp:
+                _ctx["banknifty_spot"] = float(_bank_ltp)
+                if "banknifty_spot_prev" not in _ctx:
+                    _ctx["banknifty_spot_prev"] = float(_bank_ltp)
+            _ctx["updated_at"] = now.isoformat()
+            _ctx_path.write_text(json.dumps(_ctx))
+        except Exception:
+            pass
+
+        # Phase 12: Persist today's OI snapshot so EOD watchdog can archive it.
+        # Written every poll — overwrites with latest intraday values (EOD = final).
+        try:
+            if quotes:
+                _oi_by_strike: dict[str, dict[str, int]] = {}
+                for _q in quotes:
+                    if _q.oi:
+                        _k = str(int(_q.strike))
+                        if _k not in _oi_by_strike:
+                            _oi_by_strike[_k] = {"ce_oi": 0, "pe_oi": 0}
+                        if _q.option_type == OptionType.CALL:
+                            _oi_by_strike[_k]["ce_oi"] += int(_q.oi)
+                        else:
+                            _oi_by_strike[_k]["pe_oi"] += int(_q.oi)
+                _oi_path = STATE_ROOT / "oi_today.json"
+                _oi_path.write_text(json.dumps({
+                    "date": today.isoformat(),
+                    "spot": spot,
+                    "expiry": expiry,
+                    "strikes": _oi_by_strike,
+                }))
+        except Exception:
+            pass
+
         return snapshot
 
     def current_structure_quotes(self, position: OpenPosition) -> MarketSnapshot:
@@ -509,3 +651,129 @@ class PaperOnlyExecutor:
 
     def exit_trade(self, position: OpenPosition, reason: str) -> dict[str, object]:
         raise RuntimeError("PaperOnlyExecutor never places broker orders.")
+
+
+class DhanLiveExecutor:
+    """Places REAL Dhan orders for intraday defined-risk spreads. Only ever constructed when the runtime
+    is MICRO_LIVE. Safety-first, by construction:
+      - SIZE CAP: every entry is capped at live_max_lots (default 1) — the graduated ramp. The agent's
+        chosen lot count is ignored above the cap; you raise the cap deliberately once fills look clean.
+      - LONG LEG FIRST on entry: the protective (BUY) leg is placed before the short (SELL) leg, so if the
+        second order fails you are never left holding a naked short — worst case is a lone long option.
+      - SHORT LEG FIRST on exit: buy back the short obligation before selling the long.
+      - Each leg's Dhan security_id is resolved from (symbol, front-expiry, strike, type); a missing id
+        aborts BEFORE any order is sent.
+      - Every real fill and every failure is logged and pushed to Telegram.
+    MARKET orders are used so both legs of a spread fill (a LIMIT that half-fills would leave a naked leg)."""
+
+    EXCH_SEG = "NSE_FNO"
+
+    def __init__(self, config: dict[str, object]) -> None:
+        from market_ai.dhan_wrapper import DhanWrapper
+        self.config = dict(config or {})
+        self._log = logging.getLogger("intraday_defined_risk.live_exec")
+        self._dw = DhanWrapper(logger=self._log)
+        self.underlying_id = int(self.config.get("underlying_id") or 13)
+        self.underlying_seg = str(self.config.get("underlying_seg") or "IDX_I")
+        self.lot_size = int(self.config.get("lot_size") or 65)
+        self.max_lots = max(1, int(self.config.get("live_max_lots") or 1))       # 1-lot ramp by default
+        self.product_type = str(self.config.get("live_product_type") or "INTRADAY").upper()
+        self.symbol = str(self.config.get("live_symbol") or "NIFTY")
+        self._log.warning("DhanLiveExecutor ARMED (REAL ORDERS) — max_lots=%s lot_size=%s product=%s",
+                          self.max_lots, self.lot_size, self.product_type)
+
+    def _expiry(self) -> str:
+        override = str(self.config.get("expiry") or "")
+        if override:
+            return override
+        return _front_expiry(self._dw, underlying_id=self.underlying_id,
+                             underlying_seg=self.underlying_seg, today=date.today())
+
+    def _sid(self, expiry: str, strike: float, option_type: str) -> int:
+        from market_ai.modules.data_fetch.dhan_scrip_cache import resolve_option_security_id
+        sid = resolve_option_security_id(self.symbol, expiry, float(strike), str(option_type))
+        if not sid:
+            raise RuntimeError(f"no Dhan security_id for {self.symbol} {expiry} {strike:.0f} {option_type}")
+        return int(sid)
+
+    @staticmethod
+    def _norm_legs(legs: Any) -> list[tuple[str, str, float]]:
+        """Normalize decision legs (dicts) or position legs (StrategyLeg) to (action, option_type, strike)."""
+        out: list[tuple[str, str, float]] = []
+        for lg in legs or []:
+            if isinstance(lg, dict):
+                out.append((str(lg.get("action")).upper(), str(lg.get("option_type")).upper(), float(lg.get("strike"))))
+            else:
+                ot = lg.option_type.value if hasattr(lg.option_type, "value") else str(lg.option_type)
+                out.append((str(lg.action).upper(), str(ot).upper(), float(lg.strike)))
+        return out
+
+    def get_positions_raw(self) -> list[dict[str, object]]:
+        try:
+            return self._dw.get_positions_raw()
+        except Exception as exc:  # noqa: BLE001 — reconciliation must never crash the loop
+            self._log.warning("get_positions_raw failed: %s", exc)
+            return []
+
+    def enter_trade(self, decision: DecisionOutput) -> dict[str, object]:
+        expiry = self._expiry()
+        legs = self._norm_legs(decision.legs)
+        qty = self.max_lots * self.lot_size
+        strat = decision.strategy.value if hasattr(decision.strategy, "value") else str(decision.strategy)
+        # LONG (BUY) leg first — never leave a naked short if the second order fails.
+        legs_sorted = sorted(legs, key=lambda l: 0 if l[0] == "BUY" else 1)
+        placed: list[dict[str, Any]] = []
+        for action, ot, strike in legs_sorted:
+            sid = self._sid(expiry, strike, ot)   # raises (pre-order) if unresolved
+            try:
+                resp = self._dw.place_order(side=action, exchange_seg=self.EXCH_SEG, security_id=sid,
+                                            quantity=qty, product_type=self.product_type, order_type="MARKET")
+            except Exception as exc:  # noqa: BLE001
+                if not placed:
+                    self._alert(f"🚨 LIVE ENTRY aborted — first leg {action} {ot} {strike:.0f} failed: {exc}. "
+                                f"NO position opened (safe).")
+                    raise
+                self._alert(f"🚨 LIVE ENTRY PARTIAL — {action} {ot} {strike:.0f} failed after {len(placed)} "
+                            f"leg(s) placed: {exc}. Holding a LONG-only leg (defined risk) — REVIEW NOW.")
+                return {"status": "PARTIAL", "expiry": expiry, "orders": placed, "error": str(exc)}
+            placed.append({"action": action, "option_type": ot, "strike": strike, "security_id": sid,
+                           "quantity": qty, "response": resp})
+        self._alert(f"✅ LIVE ENTRY {strat} exp {expiry} x{self.max_lots}lot ({qty}q): "
+                    + ", ".join(f"{p['action']} {p['option_type']} {p['strike']:.0f}" for p in placed))
+        return {"status": "OK", "expiry": expiry, "orders": placed, "lots": self.max_lots}
+
+    def exit_trade(self, position: OpenPosition, reason: str) -> dict[str, object]:
+        expiry = self._expiry()
+        legs = self._norm_legs(position.structure.legs)
+        qty = min(self.max_lots, int(position.lots or 1)) * self.lot_size
+        # Close the SHORT (original SELL) leg first — buy back the obligation before selling the long.
+        legs_sorted = sorted(legs, key=lambda l: 0 if l[0] == "SELL" else 1)
+        placed: list[dict[str, Any]] = []
+        for action, ot, strike in legs_sorted:
+            close_side = "BUY" if action == "SELL" else "SELL"
+            sid = self._sid(expiry, strike, ot)
+            try:
+                resp = self._dw.place_order(side=close_side, exchange_seg=self.EXCH_SEG, security_id=sid,
+                                            quantity=qty, product_type=self.product_type, order_type="MARKET")
+            except Exception as exc:  # noqa: BLE001
+                self._alert(f"🚨 LIVE EXIT PARTIAL ({reason}) — {close_side} {ot} {strike:.0f} failed: {exc}. "
+                            f"Closed {len(placed)} leg(s). REVIEW NOW.")
+                return {"status": "PARTIAL", "expiry": expiry, "orders": placed, "error": str(exc)}
+            placed.append({"close_side": close_side, "option_type": ot, "strike": strike,
+                           "security_id": sid, "quantity": qty, "response": resp})
+        self._alert(f"✅ LIVE EXIT ({reason}) exp {expiry}: closed "
+                    + ", ".join(f"{p['option_type']} {p['strike']:.0f}" for p in placed))
+        return {"status": "OK", "expiry": expiry, "orders": placed}
+
+    def _alert(self, msg: str) -> None:
+        self._log.warning(msg)
+        try:  # best-effort Telegram push from creds.json — never let a failed alert affect trading
+            import requests
+            creds_path = Path(__file__).resolve().parents[2] / "market_ai" / "state" / "creds.json"
+            creds = json.loads(creds_path.read_text())
+            token, chat = creds.get("telegram_bot_token"), creds.get("telegram_chat_id")
+            if token and chat:
+                requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                              json={"chat_id": chat, "text": msg}, timeout=5)
+        except Exception:  # noqa: BLE001
+            pass

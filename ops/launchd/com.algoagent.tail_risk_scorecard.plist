@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.algoagent.tail_risk_scorecard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/Rohit/.venvs/data_engine_py310/bin/python</string>
+    <string>/Users/Rohit/AI-Trading-Engine/scripts/tail_risk_scorecard.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/Rohit/AI-Trading-Engine</string>
+  <!-- Daily 16:05 IST, after the close and after the shadow book has written the day's row. -->
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>5</integer></dict>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/tail_risk_scorecard.log</string>
+  <key>StandardErrorPath</key><string>/Users/Rohit/AI-Trading-Engine/data_engine/market_ai/state/tail_risk_scorecard.log</string>
+</dict>
+</plist>

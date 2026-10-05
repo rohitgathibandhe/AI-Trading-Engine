@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import os
 from collections import Counter, defaultdict
 from datetime import date, datetime
 from pathlib import Path
@@ -39,11 +40,12 @@ def _default_entry_times() -> set[str]:
 
 
 DEFAULT_ENTRY_TIMES = _default_entry_times()
+_BACKTEST_ENTRY_WAIT = False  # set per-run from BACKTEST_ENTRY_WAIT in run_backtest (default OFF)
 
 MONETIZATION_REJECTION_REASONS = {
     "CREDIT_TOO_LOW",
     "WIDTH_TOO_LARGE",
-    "DELTA_TOO_HIGH",
+    "DELTA_OUT_OF_BAND",
     "HEDGE_TOO_EXPENSIVE",
     "LIQUIDITY_BAD",
     "INVALIDATION_TOO_CLOSE",
@@ -143,7 +145,7 @@ def _build_funnel_report(decisions: list[dict[str, object]], trades: list[dict[s
             if reason == "LIQUIDITY_BAD":
                 rejected_liquidity += 1
                 monthly[month]["rejected_liquidity"] += 1
-            if reason == "DELTA_TOO_HIGH":
+            if reason == "DELTA_OUT_OF_BAND":
                 rejected_delta += 1
                 monthly[month]["rejected_delta"] += 1
             if reason == "INVALIDATION_TOO_CLOSE":
@@ -553,6 +555,21 @@ def run_backtest(
 ) -> dict[str, object]:
     if reset_learning_db:
         Path(learning_db_path).unlink(missing_ok=True)
+    # Entry-timing: use an ISOLATED pending-state file so a backtest never clobbers the LIVE agent's
+    # in-flight entry-wait state, and start clean. Default ON to mirror the live entry logic.
+    # Default OFF: entry-timing needs FINE-cadence ticks to track an intraday retrace. Our datasets are
+    # dense-synthetic (biased spreads) or live-capture (sparse ~16-min — too coarse to see the retrace,
+    # so it wrongly drops ~half the trades). Enable (BACKTEST_ENTRY_WAIT=1) only on fine-cadence data.
+    # The LIVE agent (monitor.py, ~30s cadence) always runs entry-timing regardless of this flag.
+    global _BACKTEST_ENTRY_WAIT
+    _BACKTEST_ENTRY_WAIT = os.environ.get("BACKTEST_ENTRY_WAIT", "0") == "1"
+    if _BACKTEST_ENTRY_WAIT:
+        os.environ.setdefault("ENTRY_PENDING_PATH", str(Path(learning_db_path).with_name("bt_entry_pending.json")))
+        try:
+            from .entry_timing import clear as _clear_entry
+            _clear_entry()
+        except Exception:  # noqa: BLE001 — entry-timing must never break the backtest
+            pass
     density_guardrail = assess_dataset_density(data_path, start=start, end=end)
     if density_guardrail.warning_required:
         message = (
@@ -659,6 +676,8 @@ def run_backtest(
         trade_counts[current_strategy] += 1
         pnl_by_strategy[current_strategy] += pnl_fragment
         equity_curve.append(total_realized_pnl_rupees)
+        from .volatility_engine import assess_vol as _assess_vol
+        _vs = _assess_vol(position.metadata)
         trades.append(
             {
                 "entry_timestamp": position.entry_time.isoformat(),
@@ -692,6 +711,17 @@ def run_backtest(
                 "gross_pnl_rupees": gross_pnl_fragment,
                 "transaction_cost_rupees": trade_cost_rupees,
                 "pnl_rupees": pnl_fragment,
+                # Volatility state at entry — for calibrating whether vol predicts P&L
+                "avg_chain_iv": position.metadata.get("avg_chain_iv"),
+                "daily_atr": position.metadata.get("daily_atr"),
+                "vrp": _vs.vrp,
+                "vol_implied": _vs.implied_vol,
+                "vol_realized": _vs.realized_vol,
+                "vol_regime": _vs.regime,
+                # Dealer gamma-exposure at entry — for validating GEX as a signal
+                "gex_regime": position.metadata.get("gex_regime"),
+                "gex_net": position.metadata.get("gex_net"),
+                "gex_dist_to_flip_pct": position.metadata.get("gex_dist_to_flip_pct"),
             }
         )
 
@@ -756,6 +786,19 @@ def run_backtest(
         decisions.append(decision_record)
         signal_counts[decision.strategy.value] += 1
         if decision.action == "TRADE":
+            # ENTRY TIMING (faithful to live): a directional signal does not enter at the raw signal
+            # price — it waits for a retrace to a better fill (or the window to expire). The live loop
+            # does this (monitor.py); without it here the backtest bought at the worst price and
+            # understated the debit. Hold this cycle and re-check at the next grid timestamp. Default
+            # ON to match live; BACKTEST_ENTRY_WAIT=0 restores the raw-price behavior for A/B.
+            if _BACKTEST_ENTRY_WAIT:
+                from .entry_timing import should_wait
+                _strat = decision.strategy.value if hasattr(decision.strategy, "value") else str(decision.strategy)
+                _ew_wait, _ = should_wait(_strat, float(snapshot.option_chain.spot), ts)
+                if _ew_wait:
+                    last_snapshot = snapshot
+                    previous_chain_snapshot = chain_snapshot
+                    continue
             agent.start_position(snapshot, decision)
             margin_used = snapshot.option_chain.margin_estimate_per_lot or decision.max_loss_rupees_per_lot
             margin_util_samples.append(

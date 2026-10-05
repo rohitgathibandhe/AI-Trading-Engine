@@ -196,11 +196,23 @@ def check_runtime_config() -> tuple[str, str]:
     if max_lots < 1:
         issues.append(f"max_lots_per_trade={max_lots} invalid")
 
+    # LIVE whitelist is promotion-gate-governed: it must stay EMPTY until a strategy has objectively
+    # earned live (promotion_gate.py: >=20 days, positive avg, win>=55%, edge>=3x worst day). Any
+    # strategy appearing here that the gate has NOT promoted is a footgun — flag it. Banned neutral
+    # structures (IRON_FLY/SHORT_STRADDLE) must NEVER be live-enabled.
     enabled_strats = config.get("live_enabled_strategies") or []
-    if "IRON_CONDOR" not in enabled_strats:
-        issues.append("IRON_CONDOR not in live_enabled_strategies")
-    if "BULL_PUT_CREDIT_SPREAD" not in enabled_strats:
-        issues.append("BULL_PUT_CREDIT_SPREAD not in live_enabled_strategies")
+    _BANNED_LIVE = {"IRON_FLY", "SHORT_STRADDLE"}
+    _banned_enabled = [s for s in enabled_strats if s in _BANNED_LIVE]
+    if _banned_enabled:
+        issues.append(f"banned structures live-enabled: {_banned_enabled}")
+    try:
+        from market_ai.intraday_defined_risk.promotion import eligible_set as _promoted
+        promoted = set(_promoted())
+    except Exception:
+        promoted = set()
+    _unproven = [s for s in enabled_strats if s not in promoted]
+    if _unproven:
+        issues.append(f"live-enabled but NOT promotion-gate-proven: {_unproven}")
 
     if issues:
         return "WARNING", f"⚠️ Config issues: {', '.join(issues)}"

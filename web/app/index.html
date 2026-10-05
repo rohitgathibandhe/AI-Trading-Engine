@@ -164,6 +164,46 @@
   <main>
     <!-- Control -->
     <section id="tab-control">
+      <div class="card" id="preflight-card" style="margin-bottom:12px; border-left:4px solid #64748b;">
+        <div class="card-header">
+          <div style="font-weight:700; display:flex; align-items:center; gap:10px;">
+            <span id="preflight-badge" style="display:inline-flex;align-items:center;justify-content:center;min-width:74px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:800;letter-spacing:.5px;background:#334155;color:#e2e8f0;">— — —</span>
+            <span>Pre-Flight Readiness</span>
+          </div>
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <span class="chip" id="preflight-session">—</span>
+            <span class="chip" id="preflight-summary">—</span>
+            <button id="preflight-refresh" style="background:#0f172a; color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:8px; cursor:pointer; font-size:12px;">Recheck</button>
+          </div>
+        </div>
+        <div id="preflight-grid" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:6px; margin-top:10px;">
+          <div class="muted">Loading readiness…</div>
+        </div>
+        <div class="hint" id="preflight-updated" style="margin-top:8px;">—</div>
+      </div>
+      <div class="card" id="weekly-positional-card" style="margin-bottom:12px; border-left:4px solid #8b5cf6;">
+        <div class="card-header">
+          <div style="font-weight:700;">Weekly Positional (defined-risk selling)</div>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span class="chip" id="wkpos-open-mtm">Open MTM: —</span>
+            <span class="chip" id="wkpos-realized">Realized: —</span>
+            <button id="wkpos-refresh" style="background:#0f172a; color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:8px; cursor:pointer; font-size:12px;">Refresh</button>
+          </div>
+        </div>
+        <div id="wkpos-body" style="margin-top:10px; font-size:13px;">—</div>
+        <div class="hint" id="wkpos-updated" style="margin-top:8px;">—</div>
+      </div>
+      <div class="card" id="scorecard-card" style="margin-bottom:12px; border-left:4px solid #14b8a6;">
+        <div class="card-header">
+          <div style="font-weight:700;">Strategy Selection &amp; Forward Scorecard</div>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span class="chip" id="scorecard-pick">Pick: —</span>
+            <button id="scorecard-refresh" style="background:#0f172a; color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:8px; cursor:pointer; font-size:12px;">Refresh</button>
+          </div>
+        </div>
+        <div id="scorecard-body" style="margin-top:10px; font-size:12px;">—</div>
+        <div class="hint" id="scorecard-updated" style="margin-top:8px;">selection = how well it FITS the tape + how it has PERFORMED forward (tilt engages at 5+ days)</div>
+      </div>
       <div class="grid">
         <div class="card">
           <div class="card-header"><div style="font-weight:700;">Credentials</div></div>
@@ -407,6 +447,11 @@
 
       <!-- ── Top summary bar ── -->
       <div class="summary-bar">
+        <div class="summary-card" style="border:1px solid #8b5cf6;">
+          <div class="summary-title">Combined P&L (both books)</div>
+          <div class="summary-value" id="combined-pnl">₹ 0.00</div>
+          <div class="summary-sub" id="combined-pnl-sub">intraday + weekly</div>
+        </div>
         <div class="summary-card">
           <div class="summary-title">Open MTM</div>
           <div class="summary-value" id="total-pnl">₹ 0.00</div>
@@ -432,6 +477,20 @@
           <div class="summary-value" id="state-text" style="font-size:13px;">—</div>
           <div class="summary-sub"><span class="chip" id="paper-ltp-chip">LTP: —</span></div>
         </div>
+      </div>
+
+      <!-- ── Weekly Positional (defined-risk selling) ── -->
+      <div class="card" id="weekly-positional-pnl-card" style="margin-top:16px; border-left:4px solid #8b5cf6;">
+        <div class="card-header">
+          <div style="font-weight:700;">Weekly Positional (defined-risk selling)</div>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span class="chip" id="wkpos-pnl-open-mtm">Open MTM: —</span>
+            <span class="chip" id="wkpos-pnl-realized">Realized: —</span>
+            <button id="wkpos-pnl-refresh" style="background:#0f172a; color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:8px; cursor:pointer; font-size:12px;">Refresh</button>
+          </div>
+        </div>
+        <div id="wkpos-pnl-body" style="margin-top:10px; font-size:13px;">—</div>
+        <div class="hint" id="wkpos-pnl-updated" style="margin-top:8px;">—</div>
       </div>
 
       <!-- ── Open Position ── -->
@@ -1467,12 +1526,15 @@
 
       // ── Realized P&L — from v83 intraday_performance (NOT blotter) ───────
       const realizedEl = document.getElementById("paper-realized-pnl");
+      const intradayRealized = Number((data.intraday_performance || {}).realized_pnl_rs ?? 0);
       if (realizedEl) {
-        const realized = Number((data.intraday_performance || {}).realized_pnl_rs ?? 0);
-        realizedEl.textContent = fmtMoney(realized);
-        realizedEl.classList.toggle("pos", realized > 0);
-        realizedEl.classList.toggle("neg", realized < 0);
+        realizedEl.textContent = fmtMoney(intradayRealized);
+        realizedEl.classList.toggle("pos", intradayRealized > 0);
+        realizedEl.classList.toggle("neg", intradayRealized < 0);
       }
+      // Feed the COMBINED (both-books) P&L: intraday realized + intraday open MTM
+      window.__pnlParts = Object.assign(window.__pnlParts || {}, { iRealized: intradayRealized, iOpen: v83OpenMtm });
+      updateCombinedPnl();
 
       document.getElementById("last-refresh").textContent = "Updated: " + new Date().toLocaleTimeString();
 
@@ -2287,11 +2349,204 @@
       }
     }
 
+    // Fast (~3s) refresh of JUST the open position's live legs + total — hits the light
+    // /api/open_position_live endpoint so live P&L updates far more often than the 15s loop.
+    async function refreshLivePosition() {
+      try {
+        const d = await fetchJSON("/api/open_position_live");
+        const op = d.v83_open_position || {};
+        const legs = op.legs || [];
+        const mtm = Number(op.open_mtm || 0);
+        const pnlEl = document.getElementById("total-pnl");
+        if (pnlEl) {
+          pnlEl.textContent = fmtMoney(mtm);
+          pnlEl.classList.toggle("pos", mtm > 0);
+          pnlEl.classList.toggle("neg", mtm < 0);
+        }
+        let openTotal = 0.0;
+        upsertRows(
+          "#legs-table tbody",
+          legs,
+          (leg) => `${leg.strike}-${leg.option_type}-${leg.side}`,
+          (leg, tr) => {
+            const pnlClass = (leg.pnl || 0) > 0 ? "pos" : ((leg.pnl || 0) < 0 ? "neg" : "");
+            openTotal += leg.pnl || 0;
+            const change = leg.entry && leg.ltp ? ((leg.ltp - leg.entry) / leg.entry * 100) : null;
+            tr.innerHTML = `
+              <td>${leg.side === "SELL" ? "S" : "B"}</td>
+              <td>${leg.option_type || ""}</td>
+              <td>${leg.strike}</td>
+              <td>${leg.expiry || "—"}</td>
+              <td>${leg.qty}</td>
+              <td>${fmtMoney(leg.entry)}</td>
+              <td>${fmtMoney(leg.ltp)}</td>
+              <td class="${pnlClass}">${fmtMoney(leg.pnl)}</td>
+              <td class="${pnlClass}">${change !== null ? change.toFixed(2) + '%' : '—'}</td>
+            `;
+          }
+        );
+        const totEl = document.getElementById("paper-positions-pnl");
+        if (totEl) totEl.textContent = `Total P&L: ${fmtMoney(openTotal)}`;
+        const cellEl = document.getElementById("paper-open-totalcell");
+        if (cellEl) cellEl.textContent = fmtMoney(openTotal);
+        document.getElementById("last-refresh").textContent = "Updated: " + new Date().toLocaleTimeString();
+      } catch (e) { /* keep last values on transient errors */ }
+    }
+
+    async function loadPreflight() {
+      const grid = document.getElementById("preflight-grid");
+      const badge = document.getElementById("preflight-badge");
+      const card = document.getElementById("preflight-card");
+      try {
+        const d = await fetchJSON("/api/preflight");
+        const palette = {
+          GREEN: { bar: "#22c55e", bg: "#14532d", fg: "#bbf7d0", label: "READY" },
+          AMBER: { bar: "#f59e0b", bg: "#78350f", fg: "#fde68a", label: "CHECK" },
+          RED:   { bar: "#ef4444", bg: "#7f1d1d", fg: "#fecaca", label: "NOT READY" },
+        };
+        const p = palette[d.overall] || palette.RED;
+        badge.textContent = p.label;
+        badge.style.background = p.bg;
+        badge.style.color = p.fg;
+        card.style.borderLeftColor = p.bar;
+        document.getElementById("preflight-session").textContent = "Market: " + (d.market_session || "—");
+        document.getElementById("preflight-summary").textContent = (d.pass_count + "/" + d.total + " checks");
+        document.getElementById("preflight-updated").textContent = "Checked " + (d.generated_at || "—") + " · broker token cached up to 5 min";
+        grid.innerHTML = "";
+        (d.checks || []).forEach(c => {
+          const dot = c.ok ? "#22c55e" : (c.critical ? "#ef4444" : "#f59e0b");
+          const row = document.createElement("div");
+          row.style.cssText = "display:flex;align-items:flex-start;gap:8px;padding:6px 8px;border:1px solid var(--border);border-radius:8px;background:#0b1224;";
+          row.innerHTML =
+            '<span style="flex:0 0 auto;width:9px;height:9px;border-radius:50%;margin-top:5px;background:' + dot + ';"></span>' +
+            '<div style="min-width:0;"><div style="font-size:12px;font-weight:600;color:var(--text);">' + c.label + '</div>' +
+            '<div style="font-size:11px;color:var(--muted);word-break:break-word;">' + (c.detail || "") + '</div></div>';
+          grid.appendChild(row);
+        });
+      } catch (e) {
+        badge.textContent = "ERROR";
+        badge.style.background = "#7f1d1d";
+        badge.style.color = "#fecaca";
+        grid.innerHTML = '<div class="muted">Readiness check unavailable: ' + (e && e.message ? e.message : e) + '</div>';
+      }
+    }
+
+    async function loadWeeklyPositional() {
+      // Renders into BOTH the Control-tab card and the Paper-P&L-tab card (whichever are present).
+      if (!document.getElementById("wkpos-body") && !document.getElementById("wkpos-pnl-body")) return;
+      let bodyHTML = '<div class="muted">—</div>', openMtm = 0, realized = 0, updated = "—";
+      try {
+        const d = await fetchJSON("/api/weekly_positional");
+        openMtm = d.open_mtm_rupees || 0; realized = d.realized_rupees || 0;
+        const positions = (d.snapshot && d.snapshot.positions) || [];
+        if (!positions.length) {
+          // Cross-check exits so we don't show closed positions as open.
+          const closedKeys = new Set((d.ledger || []).filter(r => r.event === "PAPER_EXIT").map(r => r.entry_key));
+          const entries = (d.ledger || []).filter(r => r.event === "PAPER_ENTRY" && !closedKeys.has(r.ts));
+          bodyHTML = entries.length ? entries.map(r =>
+            '<div style="padding:6px 8px;border:1px solid var(--border);border-radius:8px;background:#0b1224;margin-bottom:6px;"><b>'
+            + r.structure + '</b> (' + r.direction + ') exp ' + r.expiry + ' — credit ₹' + (r.credit_rupees || 0).toLocaleString()
+            + ' <span class="muted">(awaiting monitor snapshot)</span></div>').join("")
+            : '<div class="muted">No open weekly positional trades.</div>';
+        } else {
+          bodyHTML = positions.map(p => {
+            const pnl = p.mtm_rupees || 0, col = pnl >= 0 ? "#22c55e" : "#ef4444";
+            const legs = (p.legs || []).map(l => l.action + " " + l.opt + " " + l.strike).join(" / ");
+            return '<div style="padding:8px;border:1px solid var(--border);border-radius:8px;background:#0b1224;margin-bottom:6px;">'
+              + '<div style="display:flex;justify-content:space-between;"><b>' + p.structure + '</b> <span style="color:' + col + ';font-weight:700;">₹' + pnl.toLocaleString() + '</span></div>'
+              + '<div class="muted" style="font-size:12px;">' + p.direction + ' · exp ' + p.expiry + ' · ' + p.days_to_expiry + 'd left · short Δ ' + p.short_delta + ' · trend ' + p.trend_now + '</div>'
+              + '<div class="muted" style="font-size:11px;">' + legs + '</div>'
+              + '<div style="font-size:12px;margin-top:4px;">Ladder: <b>' + p.ladder_action + '</b> — ' + p.ladder_reason + '</div></div>';
+          }).join("");
+          updated = "Snapshot " + ((d.snapshot && d.snapshot.updated) || "—");
+        }
+        const g = d.go_live_gate || {};
+        if (g.status) {
+          const ok = g.eligible, col = ok ? "#22c55e" : "#f59e0b";
+          bodyHTML = '<div style="padding:6px 8px;border:1px dashed ' + col + ';border-radius:8px;margin-bottom:8px;font-size:12px;">'
+            + '<b style="color:' + col + ';">Go-live: ' + (ok ? "✅ ELIGIBLE" : "not ready") + '</b> — '
+            + (g.n_trades || 0) + ' trades (need 15), ' + (g.tested_trades || 0) + ' tested (need 3, defense proven), '
+            + 'win ' + (g.win_rate != null ? g.win_rate + "%" : "—") + ', avg ₹' + (g.avg != null ? g.avg : "—")
+            + '</div>' + bodyHTML;
+        }
+      } catch (e) {
+        bodyHTML = '<div class="muted">Weekly positional unavailable: ' + (e && e.message ? e.message : e) + '</div>';
+      }
+      [["wkpos-body", "wkpos-open-mtm", "wkpos-realized", "wkpos-updated"],
+       ["wkpos-pnl-body", "wkpos-pnl-open-mtm", "wkpos-pnl-realized", "wkpos-pnl-updated"]].forEach(([b, om, rz, up]) => {
+        const be = document.getElementById(b); if (!be) return;
+        be.innerHTML = bodyHTML;
+        const ome = document.getElementById(om); if (ome) ome.textContent = "Open MTM: ₹" + openMtm.toLocaleString();
+        const rze = document.getElementById(rz); if (rze) rze.textContent = "Realized: ₹" + realized.toLocaleString();
+        const upe = document.getElementById(up); if (upe) upe.textContent = updated;
+      });
+      // Feed the COMBINED (both-books) P&L: weekly realized + weekly open MTM
+      window.__pnlParts = Object.assign(window.__pnlParts || {}, { wRealized: realized, wOpen: openMtm });
+      updateCombinedPnl();
+    }
+
+    // Combined P&L across BOTH books (intraday + weekly positional). Each loader feeds its parts into
+    // window.__pnlParts and calls this; the headline shows the grand total = realized + open, both books.
+    function updateCombinedPnl() {
+      const p = window.__pnlParts || {};
+      const iR = Number(p.iRealized || 0), iO = Number(p.iOpen || 0);
+      const wR = Number(p.wRealized || 0), wO = Number(p.wOpen || 0);
+      const total = iR + iO + wR + wO;
+      const el = document.getElementById("combined-pnl");
+      if (el) {
+        el.textContent = fmtMoney(total);
+        el.classList.toggle("pos", total > 0);
+        el.classList.toggle("neg", total < 0);
+      }
+      const sub = document.getElementById("combined-pnl-sub");
+      if (sub) sub.textContent = "intraday ₹" + Math.round(iR + iO).toLocaleString() + " + weekly ₹" + Math.round(wR + wO).toLocaleString();
+    }
+
+    async function loadScorecard() {
+      const body = document.getElementById("scorecard-body");
+      if (!body) return;
+      try {
+        const d = await fetchJSON("/api/strategy_scorecard");
+        document.getElementById("scorecard-pick").textContent = "Pick: " + (d.picked || "—") + (d.bias ? " (" + d.bias + ")" : "");
+        const ranked = d.ranked || [];
+        let html = "";
+        if (ranked.length) {
+          html += '<table style="width:100%;border-collapse:collapse;"><tr style="color:var(--muted);text-align:left;font-size:11px;"><th>structure</th><th>fit</th><th>fwd</th><th>score</th><th>why</th></tr>';
+          html += ranked.map(r => {
+            const t = r.forward_tilt || 0, tc = t > 0 ? "#22c55e" : (t < 0 ? "#ef4444" : "var(--muted)");
+            return '<tr style="border-top:1px solid var(--border);">'
+              + '<td style="padding:4px 0;font-weight:' + (r.picked ? "700" : "400") + ';">' + (r.picked ? "★ " : "") + r.strategy + '</td>'
+              + '<td>' + (r.fit_score != null ? r.fit_score.toFixed(1) : "—") + '</td>'
+              + '<td style="color:' + tc + ';">' + (t >= 0 ? "+" : "") + t.toFixed(2) + '</td>'
+              + '<td style="font-weight:700;">' + (r.score != null ? r.score.toFixed(1) : "—") + '</td>'
+              + '<td style="color:var(--muted);font-size:11px;">' + (r.why || "").slice(0, 70) + '</td></tr>';
+          }).join("");
+          html += '</table>';
+        } else {
+          html += '<div class="muted">No structure fits the current tape — stand aside.</div>';
+        }
+        const fwd = d.forward || [];
+        if (fwd.length) {
+          html += '<div style="margin-top:10px;font-weight:600;">Forward record (drives the tilt as it grows to 20 days):</div>';
+          html += fwd.filter(f => f.qualifying_days).sort((a, b) => (b.avg || -1e9) - (a.avg || -1e9)).map(f => {
+            const c = (f.avg || 0) >= 0 ? "#22c55e" : "#ef4444";
+            return '<div style="font-size:11px;color:var(--muted);">' + f.strategy + ': ' + f.qualifying_days + 'd, avg <span style="color:' + c + ';">₹' + (f.avg != null ? f.avg : "—") + '</span>, win ' + (f.win_rate != null ? f.win_rate + "%" : "—") + ' — ' + (f.status || "") + '</div>';
+          }).join("");
+        }
+        body.innerHTML = html;
+      } catch (e) {
+        body.innerHTML = '<div class="muted">Scorecard unavailable: ' + (e && e.message ? e.message : e) + '</div>';
+      }
+    }
+
     async function loadControl() {
       if (inflight.control) return;
       inflight.control = true;
       try {
         await Promise.all([
+          loadPreflight(),
+          loadWeeklyPositional(),
+          loadScorecard(),
           loadCreds(),
           loadStrategy(),
           refreshAgentStatus(),
@@ -2310,7 +2565,7 @@
       if (tab === "control") {
         await loadControl();
       } else if (tab === "pnl") {
-        await loadPnl();
+        await Promise.all([loadPnl(), loadWeeklyPositional()]);
       } else if (tab === "live") {
         await loadLive();
       } else if (tab === "state") {
@@ -2342,6 +2597,10 @@
     document.getElementById("save-settings").addEventListener("click", saveSettings);
     document.getElementById("save-creds").addEventListener("click", saveCreds);
     document.getElementById("test-telegram").addEventListener("click", testTelegram);
+    document.getElementById("preflight-refresh").addEventListener("click", () => loadPreflight().catch(() => {}));
+    document.getElementById("wkpos-refresh").addEventListener("click", () => loadWeeklyPositional().catch(() => {}));
+    document.getElementById("wkpos-pnl-refresh").addEventListener("click", () => loadWeeklyPositional().catch(() => {}));
+    document.getElementById("scorecard-refresh").addEventListener("click", () => loadScorecard().catch(() => {}));
     document.getElementById("start-agent").addEventListener("click", startAgent);
     document.getElementById("stop-agent").addEventListener("click", stopAgent);
     document.getElementById("bkm-ai-clear-lock").addEventListener("click", toggleBkmAiProtection);
@@ -2361,12 +2620,22 @@
       if (!pageVisible()) return;
       // Always refresh agent status (used by the header health chip on every tab).
       refreshAgentStatus().catch(() => {});
+      // Keep the readiness panel current while the Control tab is open.
+      if (activeTab === "control") loadPreflight().catch(() => {});
       // Refresh the active tab's content.
       if (activeTab === "pnl") loadPnl().catch(() => {});
       else if (activeTab === "live") loadLive().catch(() => {});
       else if (activeTab === "state") loadState().catch(() => {});
       else if (activeTab === "logs") loadLogs().catch(() => {});
     }, 15000);
+
+    // Fast loop: while viewing Paper P&L, refresh JUST the open position's live legs +
+    // total every 3s (light endpoint) so live P&L tracks close to real time, without
+    // re-running the heavy full payload.
+    setInterval(() => {
+      if (!pageVisible()) return;
+      if (activeTab === "pnl") refreshLivePosition().catch(() => {});
+    }, 3000);
 
     document.addEventListener("visibilitychange", () => {
       if (!pageVisible()) return;
