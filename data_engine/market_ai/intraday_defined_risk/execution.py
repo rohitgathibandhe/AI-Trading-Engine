@@ -351,6 +351,11 @@ _THETA_INVALIDATION_MIN_STREAK = 2
 _CREDIT_EXIT_MIN_SHORT_DELTA = float(os.environ.get("CREDIT_EXIT_MIN_SHORT_DELTA", "0.30") or 0.30)
 DEBIT_TRAIL_ARM = 0.40        # once 40% of max profit is captured, trail
 DEBIT_TRAIL_GIVEBACK = 0.35   # exit if the trade gives back 35% of its peak profit
+# Rs-denominated debit trail: arm once Rs X in profit; never give back more than Rs Y of peak.
+# The %-of-max trail (40%) requires a ~190pt spot move — too far for intraday debit spreads;
+# this absolute trail protects real gains regardless of spread width.
+DEBIT_RS_TRAIL_ARM = float(os.environ.get('DEBIT_RS_TRAIL_ARM', '600') or 600.0)
+DEBIT_RS_TRAIL_GIVEBACK = float(os.environ.get('DEBIT_RS_TRAIL_GIVEBACK', '300') or 300.0)
 
 
 def _current_debit_value(
@@ -384,6 +389,49 @@ def _current_debit_value(
 
 
 _FADE_MIN_HOLD_MIN = 3   # small breathe so a rejection wick's own noise doesn't insta-stop the fade
+
+# SEL_CHOP patience gate: if the trade hasn't shown Rs200 of profit within 45 minutes, the
+# chop regime didn't deliver the expected move — exit cheap rather than bleed to TIME_EXIT.
+# The Sep-29 -Rs3,146 (held 335 min, TIME_EXIT) and Aug-12 -Rs2,291 (171 min) were both
+# trades that peaked far below Rs200 then slowly bled. Good SEL_CHOP winners (Sep-22
+# +Rs1,677, Sep-28 +Rs1,219) showed profit well within 45 min.
+_CHOP_PATIENCE_MINUTES = int(os.environ.get("SEL_CHOP_PATIENCE_MIN", "45") or 45)
+_CHOP_PATIENCE_MIN_MFE = float(os.environ.get("SEL_CHOP_PATIENCE_MFE", "200") or 200.0)
+
+
+def _evaluate_chop_patience_exit(
+    position: OpenPosition,
+    current_snapshot: MarketSnapshot | None,
+    current_structure: TradeStructure | None,
+    now: datetime,
+) -> ExitDecision | None:
+    """Exit a SEL_CHOP trade that hasn't shown Rs200 profit after 45 minutes.
+
+    Applies to all strategy types (credit spreads, debit spreads, iron flies).
+    Returns None when the patience check passes or the playbook is not SEL_CHOP.
+    """
+    if position.metadata.get("playbook") != "SEL_CHOP":
+        return None
+    elapsed = _elapsed_minutes(now, position.entry_time)
+    if elapsed < _CHOP_PATIENCE_MINUTES:
+        return None
+    if position.structure.strategy in {StrategyType.CALL_DEBIT_SPREAD, StrategyType.PUT_DEBIT_SPREAD}:
+        entry_debit = abs(position.entry_credit_points)
+        value = _current_debit_value(position, current_snapshot, current_structure)
+        if value is None:
+            value = entry_debit
+        pnl = (value - entry_debit) * position.lot_size * position.lots
+    else:
+        value, _ = _current_position_mark(position, current_snapshot, current_structure)
+        if value is None:
+            return None
+        pnl = (position.entry_credit_points - value) * position.lot_size * position.lots
+    peak = max(float(position.metadata.get("chop_peak_pnl_rupees") or 0.0), pnl)
+    position.metadata["chop_peak_pnl_rupees"] = peak
+    if peak < _CHOP_PATIENCE_MIN_MFE:
+        return ExitDecision(True, "CHOP_PATIENCE_EXIT", value, pnl)
+    return None
+
 
 
 def _evaluate_fade_exit(
@@ -455,6 +503,16 @@ def _evaluate_debit_exit(
     # Hard stop: lost >= 50% of the debit (after a short breathe)
     if elapsed_minutes >= DEBIT_MIN_HOLD and value <= entry_debit * (1.0 - DEBIT_STOP_FRAC):
         return ExitDecision(True, "DEBIT_STOP", value, pnl)
+
+    # Rs-denominated trail: arm at Rs 600 profit; floor = max(peak - Rs 500, 0).
+    # The %-of-max trail below requires ~190pt spot move to arm — effectively never fires
+    # intraday. This absolute guard locks in real gains at any debit width.
+    peak_pnl_rs = max(float(position.metadata.get('debit_peak_pnl_rupees') or 0.0), pnl)
+    position.metadata['debit_peak_pnl_rupees'] = peak_pnl_rs
+    if peak_pnl_rs >= DEBIT_RS_TRAIL_ARM:
+        floor_pnl_rs = max(peak_pnl_rs - DEBIT_RS_TRAIL_GIVEBACK, 0.0)
+        if pnl <= floor_pnl_rs:
+            return ExitDecision(True, 'DEBIT_RS_TRAIL', value, pnl)
 
     # Profit trail: once armed at 40% of max profit, exit on a 35% giveback of peak
     peak = max(float(position.metadata.get("debit_peak_value") or entry_debit), value)
@@ -550,6 +608,10 @@ def evaluate_exit(
             if _fade.should_exit:
                 return _fade
         return _evaluate_debit_exit(position, current_snapshot, current_structure, now)
+    # SEL_CHOP patience: must show Rs200 profit within 45 min or exit cheap.
+    _patience = _evaluate_chop_patience_exit(position, current_snapshot, current_structure, now)
+    if _patience is not None:
+        return _patience
     current_value_points, current_legs = _current_position_mark(position, current_snapshot, current_structure)
     if now.time() >= TIME_EXIT:
         liability = current_value_points if current_value_points is not None else position.stop_value_points
@@ -833,6 +895,26 @@ def _regime_invalidation_reason(
             return "REVERSAL_STRUCTURE"
         if closed_bar_check_allowed and short_tested and spot > vwap and last_n_closes_above(vwap, bars, n=2):
             return "VWAP_INVALIDATION"
+    elif strategy == StrategyType.PUT_DEBIT_SPREAD:
+        # Bearish thesis: entered expecting the market to fall. Invalidate when market proves
+        # bullish by reclaiming both VWAP and EMA20 for 2 consecutive bars — the same signal
+        # BEAR_CALL credit uses, mirrored for the debit side. Gate: 15 min hold so early noise
+        # (the position just entered) doesn't fire before the trade can breathe.
+        ema20_5m = ema_value(closes(bars), period=20)
+        if closed_bar_check_allowed and minutes_since_entry >= 15:
+            vwap_reclaimed = spot > (vwap or 0) and last_n_closes_above(vwap, bars, n=2)
+            ema_reclaimed = ema20_5m is not None and last_n_closes_above(ema20_5m, bars, n=2)
+            if vwap_reclaimed and ema_reclaimed:
+                return "BULLISH_RECLAIM_INVALIDATION"
+    elif strategy == StrategyType.CALL_DEBIT_SPREAD:
+        # Bullish thesis: entered expecting the market to rise. Invalidate when market proves
+        # bearish by losing both VWAP and EMA20 for 2 consecutive bars.
+        ema20_5m = ema_value(closes(bars), period=20)
+        if closed_bar_check_allowed and minutes_since_entry >= 15:
+            vwap_lost = spot < (vwap or float('inf')) and last_n_closes_below(vwap, bars, n=2)
+            ema_lost = ema20_5m is not None and last_n_closes_below(ema20_5m, bars, n=2)
+            if vwap_lost and ema_lost:
+                return "BEARISH_BREAKDOWN_INVALIDATION"
     elif strategy in {StrategyType.IRON_CONDOR, StrategyType.IRON_FLY, StrategyType.SHORT_STRANGLE, StrategyType.SHORT_STRADDLE}:
         # Two reasons these flies died at 0.6-1.2 min on 2026-08-06 (mfe never left 0, then decayed
         # to +812/+770 by close — ~Rs 1,644 handed back, seen in exit_shadow_toclose):

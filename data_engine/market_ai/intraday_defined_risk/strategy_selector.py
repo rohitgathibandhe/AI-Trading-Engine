@@ -843,13 +843,29 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
             # so execution can manage it as a scalp, not a fat-tail hold). Env-gated (default off).
             _fdir, _fwhy = _range_fade_signal(read, metadata, spot) if _RANGE_FADE else (None, "")
             if _fdir == "FADE_SHORT":
-                choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
-                metadata["is_fade"] = True
-                metadata["fade_entry_spot"] = spot
-                _tgt, _stp, _elw = _fade_exit_levels(metadata, "FADE_SHORT", spot)
-                metadata["fade_target_spot"] = _tgt   # nearest DOWNSIDE level (structure-aware)
-                metadata["fade_stop_spot"] = _stp     # just above the faded resistance
-                choice.rationale = _fwhy + " | EXIT " + _elw
+                # Fading a call wall: BEAR_CALL (sell the ceiling, collect theta) beats PUT_DEBIT
+                # (pay theta) when price is AT the wall. Condition: within 50pts of call wall AND
+                # call OI is building (velocity > 0) — i.e. the wall is actively defended.
+                # Outside that context (general resistance fade) keep PUT_DEBIT (validated +40k engine).
+                _dist_to_cw = _f(metadata, "distance_to_call_wall", 999)
+                _cw_velocity = _f(metadata, "call_wall_oi_velocity", 0.0)
+                _fade_at_call_wall = _dist_to_cw <= 50 and _cw_velocity > 0
+                if _fade_at_call_wall:
+                    choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BEAR_CALL_CREDIT_SPREAD"]
+                    metadata["is_fade"] = True
+                    metadata["fade_entry_spot"] = spot
+                    _tgt, _stp, _elw = _fade_exit_levels(metadata, "FADE_SHORT", spot)
+                    metadata["fade_target_spot"] = _tgt
+                    metadata["fade_stop_spot"] = _stp
+                    choice.rationale = _fwhy + f" [BEAR_CALL: {_dist_to_cw:.0f}pts from call wall, OI building — sell the ceiling] | EXIT " + _elw
+                else:
+                    choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
+                    metadata["is_fade"] = True
+                    metadata["fade_entry_spot"] = spot
+                    _tgt, _stp, _elw = _fade_exit_levels(metadata, "FADE_SHORT", spot)
+                    metadata["fade_target_spot"] = _tgt   # nearest DOWNSIDE level (structure-aware)
+                    metadata["fade_stop_spot"] = _stp     # just above the faded resistance
+                    choice.rationale = _fwhy + " | EXIT " + _elw
             elif _fdir == "FADE_LONG":
                 choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["CALL_DEBIT_SPREAD"]
                 metadata["is_fade"] = True
