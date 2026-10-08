@@ -204,7 +204,7 @@ def main() -> int:
                 else:
                     acted = "no credit available for the opposite spread — hold"
             elif act == "ROLL_OUT":
-                nxt = (date.fromisoformat(expiry) + timedelta(days=7)).isoformat()
+                nxt = wp._expiry_after(expiry, creds)
                 nraw = wx._get_raw_chain(creds, nxt); nparsed = wx._parse_chain(nraw, spot=spot_hint)
                 ndeltas = wp._deltas_by_strike(nraw)
                 if nparsed.get("strikes"):
