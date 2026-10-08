@@ -3664,6 +3664,8 @@ _SECONDARY_PNL_CACHE_TTL = 60.0
 # polls return instantly from cache; only ONE thread rebuilds at a time while the rest serve the
 # last payload, so slow rebuilds never pile up or block the UI. Live P&L still comes fresh from
 # the fast /api/open_position_live.
+_live_ready_cache: Dict[str, Any] = {}
+_live_ready_ts: float = 0.0
 _paper_positions_cache: Optional[Dict[str, Any]] = None
 _paper_positions_cache_ts: float = 0.0
 _paper_positions_rebuild_lock = threading.Lock()
@@ -4696,6 +4698,20 @@ class PaperHandler(SimpleHTTPRequestHandler):
                 gate = _json_read(gate_f) if gate_f.exists() else {}
                 self._send_json({"ledger": rows, "snapshot": snapshot, "go_live_gate": gate,
                                  "realized_rupees": round(realized, 0), "open_mtm_rupees": round(open_mtm, 0)})
+            except Exception as exc:  # pragma: no cover - defensive
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if self.path.startswith("/api/live_readiness"):
+            # Go-live countdown (scripts/live_readiness.py): evidence bar + clean-day streak + locks.
+            # Cached 5 min — it re-scores the promotion gate and reads the watchdog log.
+            try:
+                global _live_ready_cache, _live_ready_ts
+                if "force=1" in self.path or not _live_ready_cache or (time.time() - _live_ready_ts) > 300:
+                    sys.path.insert(0, str(Path(__file__).resolve().parent))
+                    import live_readiness as _lr
+                    _live_ready_cache = _lr.evaluate()
+                    _live_ready_ts = time.time()
+                self._send_json(_live_ready_cache)
             except Exception as exc:  # pragma: no cover - defensive
                 self._send_json({"error": str(exc)}, status=500)
             return
