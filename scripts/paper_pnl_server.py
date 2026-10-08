@@ -2193,6 +2193,23 @@ _ltp_refresher_lock = threading.Lock()
 _ltp_wanted_exp: Optional[str] = None   # requested by the endpoint; None => resolve front tradeable
 _ltp_wanted_at: float = 0.0             # last time the endpoint asked (thread idles when stale)
 _open_leg_spot: Optional[float] = None  # underlying spot from the same chain fetch (cheap for the UI)
+_open_leg_spot_ts: float = 0.0           # when _open_leg_spot was last refreshed (it idles when nobody watches)
+_SPOT_FRESH_SECS = 180.0               # older than this → not LIVE
+
+
+def _fresh_spot() -> Optional[float]:
+    """Nifty spot that is actually current, or None. Agent's market_context.json first, refresher second."""
+    try:
+        ctx = _json_read(STATE_DIR / "market_context.json")
+        if isinstance(ctx, dict) and ctx.get("nifty_spot") and ctx.get("updated_at"):
+            age = (datetime.now() - datetime.fromisoformat(str(ctx["updated_at"]))).total_seconds()
+            if 0 <= age <= _SPOT_FRESH_SECS:
+                return float(ctx["nifty_spot"])
+    except (TypeError, ValueError, OSError):
+        pass
+    if _open_leg_spot and (time.time() - _open_leg_spot_ts) <= _SPOT_FRESH_SECS:
+        return _open_leg_spot
+    return None
 
 
 def _resolve_front_tradeable_expiry(dw) -> Optional[str]:
@@ -2215,7 +2232,7 @@ def _resolve_front_tradeable_expiry(dw) -> Optional[str]:
 def _ltp_refresher_loop() -> None:
     """Daemon: keep _open_leg_ltp_cache fresh for the currently-wanted expiry. ALL the slow/blocking
     Dhan work lives here, off the request path, so the endpoint never waits."""
-    global _open_leg_ltp_cache, _open_leg_ltp_cache_ts, _open_leg_ltp_cache_exp, _open_leg_spot
+    global _open_leg_ltp_cache, _open_leg_ltp_cache_ts, _open_leg_ltp_cache_exp, _open_leg_spot, _open_leg_spot_ts
     dw = None
     while True:
         try:
@@ -2254,6 +2271,7 @@ def _ltp_refresher_loop() -> None:
                         _sp = _dd.get("last_price")
                         if _sp:
                             _open_leg_spot = float(_sp)
+                            _open_leg_spot_ts = time.time()
                     except (TypeError, ValueError):
                         pass
         except Exception:
@@ -4714,11 +4732,11 @@ class PaperHandler(SimpleHTTPRequestHandler):
                     v83_open = _build_v83_open_position_payload()
                     v83_market_state = _get_v83_market_state()
 
-                    # Spot for the payoff chart now comes from the background LTP refresher's cache
-                    # (free) instead of load_positions(BLOTTER) — a SYNCHRONOUS Dhan fetch that
-                    # dominated this endpoint's latency (6-22s) and enriched a blotter v83 doesn't
-                    # even use. _build_v83_open_position_payload already started the refresher.
-                    _spot_cached = _open_leg_spot
+                    # Spot: the refresher only runs while a position is open, so when flat its value
+                    # froze (days old) yet was labelled LIVE. Prefer the agent's own spot from
+                    # market_context.json (written every ~30s cycle); else the refresher's if fresh;
+                    # else None → STALE. Never a synchronous Dhan fetch on the request path.
+                    _spot_cached = _fresh_spot()
 
                     payload: Dict[str, Any] = {
                         # V83 open position — authoritative source for Open Legs / MTM
