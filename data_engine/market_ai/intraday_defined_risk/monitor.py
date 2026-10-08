@@ -60,6 +60,12 @@ from .strikes import select_best_structure, select_structure
 _IST = timezone(timedelta(hours=5, minutes=30))
 _MARKET_OPEN_TIME = dtime(9, 15)
 _MARKET_CLOSE_TIME = dtime(15, 35)
+# A market-hours gap between loop cycles longer than this means the process was suspended (Mac
+# slept: lid closed on battery, 2026-10-08 lost 11:00-15:30). After a wake the network/candles are
+# stale for a cycle or two, so entries are held for _WAKE_RESYNC_CYCLES while the open position is
+# still managed first. The watchdog sends the Telegram alert.
+_WAKE_GAP_SECONDS = 180
+_WAKE_RESYNC_CYCLES = 2
 
 ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT = 35.0
 MIN_NET_EDGE_RUPEES = 500.0
@@ -1919,6 +1925,8 @@ def run_live(config: dict[str, object]) -> None:
         agent.open_position = load_paper_position()
     poll_seconds = int(config.get("poll_seconds", 30))
     _ops_poll_counter = 0
+    _last_live_cycle_at: datetime | None = None
+    _wake_resync_left = 0
 
     while True:
         _ops_poll_counter += 1
@@ -1945,6 +1953,16 @@ def run_live(config: dict[str, object]) -> None:
         # Throttle the expensive status-report build to every 5th poll (~150 s).
         # On trade events / active positions the caller overrides this flag.
         _should_report = (_ops_poll_counter % 5 == 0)
+
+        _cycle_now = datetime.now(_IST)
+        if _last_live_cycle_at is not None and _last_live_cycle_at.date() == _cycle_now.date():
+            _gap = (_cycle_now - _last_live_cycle_at).total_seconds()
+            if _gap > _WAKE_GAP_SECONDS:
+                _wake_resync_left = _WAKE_RESYNC_CYCLES
+                logging.getLogger("intraday_defined_risk.v83").warning(
+                    "[wake] loop gap %.0fs (%s -> %s) — process was suspended (sleep?); holding entries %d cycles",
+                    _gap, _last_live_cycle_at.strftime("%H:%M:%S"), _cycle_now.strftime("%H:%M:%S"), _WAKE_RESYNC_CYCLES)
+        _last_live_cycle_at = _cycle_now
 
         _write_v83_agent_heartbeat(runtime_config=runtime_config, phase="v83_run_live_loop")
         try:
@@ -2081,6 +2099,18 @@ def run_live(config: dict[str, object]) -> None:
                 )
                 _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="ACTIVE_STRUCTURE_EXISTS")
                 build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
+                sleep(poll_seconds)
+                continue
+            if _wake_resync_left > 0:
+                _wake_resync_left -= 1
+                decision = build_no_trade_decision(
+                    RegimeLabel.NO_TRADE.value,
+                    ["Just resumed after a suspended gap (sleep) — re-syncing data before allowing new entries."],
+                    extra_metadata={"runtime_mode": runtime_config.mode.value, "primary_block_reason": "WAKE_RESYNC"},
+                )
+                log_validation_decision(decision, snapshot=snapshot, block_reason="WAKE_RESYNC")
+                _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="WAKE_RESYNC")
+                _emit_decision(decision)
                 sleep(poll_seconds)
                 continue
 

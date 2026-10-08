@@ -3526,7 +3526,7 @@ def _preflight_status() -> Dict[str, Any]:
         hhmm = ist.strftime("%H:%M")
         weekday = ist.weekday() < 5
         market_open = weekday and ("09:15" <= hhmm <= "15:30")
-        session = ("OPEN" if market_open else ("PRE_OPEN" if (weekday and hhmm < "09:15")
+        session = ("OPEN" if market_open else ("PRE_OPEN" if (weekday and "08:00" <= hhmm < "09:15")
                    else ("CLOSED" if weekday else "WEEKEND")))
         gen_at = ist.strftime("%Y-%m-%d %H:%M:%S IST")
     except Exception:
@@ -3559,9 +3559,19 @@ def _preflight_status() -> Dict[str, Any]:
         add("process", "Agent running", False, f"error: {str(exc)[:80]}")
 
     # 2) Broker token + option chain (cached)
+    # Overnight Dhan is often slow enough to trip the 8s timeout, which turned the panel RED every
+    # night for no real fault. Outside market/pre-open hours a TIMEOUT is only a warning; a definite
+    # failure (invalid/expired token, no expiries) stays critical at any hour.
     tok = _preflight_token_check()
-    add("token", "Broker token valid", bool(tok.get("ok")), tok.get("detail", ""))
-    add("chain", "Option chain reachable", bool(tok.get("chain_ok")), tok.get("chain_detail", ""))
+    _off_hours = session in ("CLOSED", "WEEKEND")
+    _tok_timeout = "timed out" in str(tok.get("detail", ""))
+    _chain_timeout = "timed out" in str(tok.get("chain_detail", ""))
+    add("token", "Broker token valid", bool(tok.get("ok")),
+        tok.get("detail", "") + (" (off-hours — rechecked pre-open)" if _off_hours and _tok_timeout else ""),
+        critical=not (_off_hours and _tok_timeout))
+    add("chain", "Option chain reachable", bool(tok.get("chain_ok")),
+        tok.get("chain_detail", "") + (" (off-hours)" if _off_hours and _chain_timeout else ""),
+        critical=not (_off_hours and _chain_timeout))
 
     # 3) Config armed (from runtime config file)
     cfg = _json_read(V83_RUNTIME_CONFIG_JSON)

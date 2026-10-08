@@ -64,6 +64,7 @@ STALE_THRESHOLD_LATE = 15    # minutes (after 09:45 AM) — tolerate slow cycles
 STALE_THRESHOLD_EARLY = 20   # minutes (before 09:45 AM, accumulating candles)
 BULLISH_SIGNAL_MIN   = 3.3   # minimum bullish_entry_score we consider "signal present"
 BEARISH_SIGNAL_MIN   = 3.3   # minimum bearish_entry_score we consider "signal present"
+SLEEP_GAP_MINUTES    = 10    # watchdog ticks every 2 min; a gap this long in market hours = Mac was asleep
 
 
 # ─── Utilities ───────────────────────────────────────────────────────────────
@@ -1265,6 +1266,38 @@ def _check_pending_gap_report() -> None:
     )
 
 
+def _check_sleep_gap(state: dict, now: datetime) -> None:
+    """Alert when the Mac slept through market hours. The watchdog ticks every 2 min, so a long gap
+    between ticks means the whole machine (agent included) was suspended — 2026-10-08 lost 11:00-15:30
+    to a closed lid on battery with no alert. Fires on the first tick after wake."""
+    last = state.get("last_market_tick_at")
+    state["last_market_tick_at"] = now.isoformat()
+    if not last:
+        return
+    try:
+        prev = datetime.fromisoformat(last)
+    except ValueError:
+        return
+    if prev.date() != now.date():
+        return
+    gap_min = (now - prev).total_seconds() / 60.0
+    if gap_min < SLEEP_GAP_MINUTES:
+        return
+    cause = ""
+    try:
+        out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=5).stdout
+        if "Battery Power" in out:
+            cause = "\nRunning on <b>battery</b> — plug in; a closed lid on battery always sleeps."
+    except Exception:
+        pass
+    _log(f"SLEEP GAP: no watchdog tick for {gap_min:.0f} min ({prev.strftime('%H:%M')} -> {now.strftime('%H:%M')})")
+    _send_telegram(
+        f"😴 <b>V83 Watchdog — Mac was asleep</b>\n"
+        f"Agent offline {prev.strftime('%H:%M')}–{now.strftime('%H:%M')} IST ({gap_min:.0f} min) during market hours."
+        f"{cause}\nOpen positions are re-checked first; new entries resume after a short re-sync."
+    )
+
+
 def run_watchdog() -> None:
     now = _now()
     _log(f"Watchdog tick at {now.strftime('%H:%M:%S IST')}")
@@ -1276,6 +1309,7 @@ def run_watchdog() -> None:
 
     state = _load_wdog_state()
     fixes_applied: list[str] = []
+    _check_sleep_gap(state, now)
 
     # ── Grace window (post-restart, don't recheck immediately) ───────────────
     grace_until_str = state.get("restart_grace_until", "")
