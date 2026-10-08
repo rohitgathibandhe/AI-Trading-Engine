@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git checkout -b *)",
+      "Bash(git checkout *)",
+      "Bash(git push -u origin *)",
+      "Bash(git push origin *)",
+      "Bash(/opt/homebrew/bin/gh pr create *)",
+      "Bash(gh pr create *)"
+    ]
+  }
+}

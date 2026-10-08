@@ -3450,28 +3450,44 @@ def _preflight_token_check() -> Dict[str, Any]:
     if _preflight_token_cache and (now - _preflight_token_cache_ts) < _PREFLIGHT_TOKEN_TTL:
         return _preflight_token_cache
     out: Dict[str, Any] = {"ok": False, "detail": "", "chain_ok": False, "chain_detail": ""}
-    try:
-        from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
-        creds = _json_read(CREDS_FILE)
-        cid = (creds.get("client_id") or "").strip() if isinstance(creds, dict) else ""
-        tok = (creds.get("access_token") or "").strip() if isinstance(creds, dict) else ""
-        if cid and tok:
-            os.environ["DHAN_CLIENT_ID"] = cid
-            os.environ["DHAN_ACCESS_TOKEN"] = tok
-        dw = DhanWrapper(logger=None)
-        funds = dw.get_funds()
-        avail = funds.get("available") if isinstance(funds, dict) else None
-        out["ok"] = bool(funds) and avail is not None
-        out["detail"] = (f"funds available Rs {avail:,.0f}" if out["ok"]
-                         else "get_funds empty — token may be expired")
+    import concurrent.futures as _cf
+    def _do_check() -> Dict[str, Any]:
+        r: Dict[str, Any] = {"ok": False, "detail": "", "chain_ok": False, "chain_detail": ""}
         try:
-            el = dw.get_optionchain_expirylist("IDX_I", INDEX_SECURITY_ID)
-            out["chain_ok"] = bool(el)
-            out["chain_detail"] = (f"{len(el)} expiries (next {el[0]})" if el else "no expiries returned")
+            from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
+            creds = _json_read(CREDS_FILE)
+            cid = (creds.get("client_id") or "").strip() if isinstance(creds, dict) else ""
+            tok = (creds.get("access_token") or "").strip() if isinstance(creds, dict) else ""
+            if cid and tok:
+                os.environ["DHAN_CLIENT_ID"] = cid
+                os.environ["DHAN_ACCESS_TOKEN"] = tok
+            dw = DhanWrapper(logger=None)
+            funds = dw.get_funds()
+            avail = funds.get("available") if isinstance(funds, dict) else None
+            r["ok"] = bool(funds) and avail is not None
+            r["detail"] = (f"funds available Rs {avail:,.0f}" if r["ok"]
+                           else "get_funds empty — token may be expired")
+            try:
+                el = dw.get_optionchain_expirylist("IDX_I", INDEX_SECURITY_ID)
+                r["chain_ok"] = bool(el)
+                r["chain_detail"] = (f"{len(el)} expiries (next {el[0]})" if el else "no expiries returned")
+            except Exception as exc:
+                r["chain_detail"] = f"error: {str(exc)[:80]}"
         except Exception as exc:
-            out["chain_detail"] = f"error: {str(exc)[:80]}"
+            r["detail"] = f"error: {str(exc)[:100]}"
+        return r
+    try:
+        _ex = _cf.ThreadPoolExecutor(max_workers=1)
+        _fut = _ex.submit(_do_check)
+        try:
+            out = _fut.result(timeout=8.0)
+        except _cf.TimeoutError:
+            out["detail"] = "broker check timed out (>8s) — DHAN API slow or unreachable"
+            out["chain_detail"] = "timed out"
+        finally:
+            _ex.shutdown(wait=False)  # don't block on the hanging thread after timeout
     except Exception as exc:
-        out["detail"] = f"error: {str(exc)[:100]}"
+        out["detail"] = f"thread error: {str(exc)[:100]}"
     _preflight_token_cache = out
     _preflight_token_cache_ts = time.time()
     return out
@@ -4657,6 +4673,13 @@ class PaperHandler(SimpleHTTPRequestHandler):
             return
         if self.path.startswith("/api/preflight"):
             try:
+                # ?force=1 busts both caches so the Recheck button gets a fresh result
+                if "force=1" in self.path:
+                    global _preflight_cache, _preflight_cache_ts, _preflight_token_cache, _preflight_token_cache_ts
+                    _preflight_cache = {}
+                    _preflight_cache_ts = 0.0
+                    _preflight_token_cache = {}
+                    _preflight_token_cache_ts = 0.0
                 self._send_json(_preflight_status())
             except Exception as exc:  # pragma: no cover - defensive
                 self._send_json({"error": str(exc)}, status=500)

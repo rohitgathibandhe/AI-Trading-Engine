@@ -1934,8 +1934,11 @@ def run_live(config: dict[str, object]) -> None:
         # decisions overnight (18 h × 60 decisions/h).
         _ist_now = datetime.now(_IST)
         if not (_MARKET_OPEN_TIME <= _ist_now.time() <= _MARKET_CLOSE_TIME):
-            _write_v83_agent_heartbeat(runtime_config=runtime_config, phase="v83_after_hours")
-            sleep(300)
+            # Write heartbeat every 30s during the 5-min after-hours sleep so the
+            # watchdog (stale_after_sec=45) never flags the agent as stale overnight.
+            for _ in range(10):
+                _write_v83_agent_heartbeat(runtime_config=runtime_config, phase="v83_after_hours")
+                sleep(30)
             continue
         # ──────────────────────────────────────────────────────────────────────
 

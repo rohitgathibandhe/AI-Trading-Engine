@@ -2393,18 +2393,22 @@
       } catch (e) { /* keep last values on transient errors */ }
     }
 
-    async function loadPreflight() {
+    async function loadPreflight(force = false) {
       const grid = document.getElementById("preflight-grid");
       const badge = document.getElementById("preflight-badge");
       const card = document.getElementById("preflight-card");
+      const btn = document.getElementById("preflight-refresh");
+      if (force && btn) { btn.textContent = "Checking…"; btn.disabled = true; }
       try {
-        const d = await fetchJSON("/api/preflight");
+        const url = force ? "/api/preflight?force=1" : "/api/preflight";
+        const d = await fetchJSON(url);
         const palette = {
           GREEN: { bar: "#22c55e", bg: "#14532d", fg: "#bbf7d0", label: "READY" },
           AMBER: { bar: "#f59e0b", bg: "#78350f", fg: "#fde68a", label: "CHECK" },
           RED:   { bar: "#ef4444", bg: "#7f1d1d", fg: "#fecaca", label: "NOT READY" },
         };
         const p = palette[d.overall] || palette.RED;
+        if (btn) { btn.textContent = "Recheck"; btn.disabled = false; }
         badge.textContent = p.label;
         badge.style.background = p.bg;
         badge.style.color = p.fg;
@@ -2440,12 +2444,13 @@
         openMtm = d.open_mtm_rupees || 0; realized = d.realized_rupees || 0;
         const positions = (d.snapshot && d.snapshot.positions) || [];
         if (!positions.length) {
-          const entries = (d.ledger || []).filter(r => r.event === "PAPER_ENTRY");
+          const closedKeys = new Set((d.ledger || []).filter(r => r.event === "PAPER_EXIT").map(r => r.entry_key));
+          const entries = (d.ledger || []).filter(r => r.event === "PAPER_ENTRY" && !closedKeys.has(r.ts));
           bodyHTML = entries.length ? entries.map(r =>
             '<div style="padding:6px 8px;border:1px solid var(--border);border-radius:8px;background:#0b1224;margin-bottom:6px;"><b>'
             + r.structure + '</b> (' + r.direction + ') exp ' + r.expiry + ' — credit ₹' + (r.credit_rupees || 0).toLocaleString()
             + ' <span class="muted">(awaiting monitor snapshot)</span></div>').join("")
-            : '<div class="muted">No weekly positional trades yet.</div>';
+            : '<div class="muted">No open weekly positional trades.</div>';
         } else {
           bodyHTML = positions.map(p => {
             const pnl = p.mtm_rupees || 0, col = pnl >= 0 ? "#22c55e" : "#ef4444";
@@ -2595,7 +2600,10 @@
     document.getElementById("save-settings").addEventListener("click", saveSettings);
     document.getElementById("save-creds").addEventListener("click", saveCreds);
     document.getElementById("test-telegram").addEventListener("click", testTelegram);
-    document.getElementById("preflight-refresh").addEventListener("click", () => loadPreflight().catch(() => {}));
+    document.getElementById("preflight-refresh").addEventListener("click", () => loadPreflight(true).catch(() => {
+      const b = document.getElementById("preflight-refresh");
+      if (b) { b.textContent = "Recheck"; b.disabled = false; }
+    }));
     document.getElementById("wkpos-refresh").addEventListener("click", () => loadWeeklyPositional().catch(() => {}));
     document.getElementById("wkpos-pnl-refresh").addEventListener("click", () => loadWeeklyPositional().catch(() => {}));
     document.getElementById("scorecard-refresh").addEventListener("click", () => loadScorecard().catch(() => {}));

@@ -40,7 +40,8 @@ LATEST = STATE / "LATEST_SELF_DIAGNOSIS.txt"
 # Naked structures are banned, so a day only a naked short would have won is NOT a miss.
 DEFINED = ("put_debit", "call_debit", "bull_put", "bear_call", "iron_fly", "iron_condor")
 GOOD_TRADE_RUPEES = 500.0      # a defined-risk structure clearing this = a trade worth having taken
-BAD_LOSS_RUPEES = -4000.0      # traded and lost worse than this -> flag for retro
+BAD_LOSS_RUPEES = -1500.0      # traded and lost worse than this -> flag for retro (was -4000: it let a
+                               # -2,291 bear-call on 08-12 pass as "clean" — a real loss must surface)
 SUBOPTIMAL_GAP_RUPEES = 2500.0 # traded, but best-available beat what we took by more than this
 EXIT_GIVEBACK_RUPEES = -1200.0 # total handed back by exiting early vs holding to close -> flag
 
