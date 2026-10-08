@@ -1798,6 +1798,18 @@ def record_paper_entry(
     }
     _append_jsonl(paths.paper_trades, event)
     record_runtime_trade_entry(decision, snapshot, decision_origin=attribution, paths=paths)
+    try:   # ghost the debit+credit pair for this direction (structure-choice evidence; recorder only)
+        from . import pair_shadow
+        _dir = pair_shadow.direction_of(str(event.get("strategy")))
+        if _dir:
+            pair_shadow.open_pair(snapshot, _dir, "ENTRY", metadata=decision.metadata,
+                                  lots=int(getattr(position, "lots", 0) or 0) or None,
+                                  lot_size=int(getattr(position, "lot_size", 0) or 0) or None,
+                                  paired_entry=event["entry_timestamp"],
+                                  actual_structure=pair_shadow.strategy_key(str(event.get("strategy"))),
+                                  note=str(event.get("playbook") or ""))
+    except Exception:
+        pass
     state = load_runtime_state(paths, load_runtime_config(paths))
     state["last_simulated_order"] = event
     state["primary_block_reason"] = "NONE"
@@ -1833,6 +1845,11 @@ def manage_paper_position(
     try:
         from . import exit_shadow
         exit_shadow.reprice_ghosts(snapshot, lambda pos: _ghost_mark_pnl(pos, snapshot))
+    except Exception:
+        pass
+    try:
+        from . import pair_shadow      # paired bear-call ghosts (put-buy -> call-sell evidence). Recorder only.
+        pair_shadow.reprice(snapshot)
     except Exception:
         pass
     position = load_paper_position(paths, drop_stale=True)   # never manage a stranded overnight position

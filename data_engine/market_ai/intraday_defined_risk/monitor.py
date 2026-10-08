@@ -1091,6 +1091,8 @@ class IntradayDefinedRiskAgent:
         meta["selector_condition"] = choice.condition
         meta["selector_family"] = choice.family
         meta["selector_iv"] = choice.iv_regime
+        meta["selector_bias"] = getattr(choice.read, "bias", None)      # read behind the choice (pair_shadow features)
+        meta["selector_conviction"] = round(float(choice.conviction or 0.0), 3)
         meta["vol_regime"] = choice.vol_regime          # volatility engine read (advisory)
         meta["vol_notes"] = "; ".join(choice.vol_notes or [])
         # Attach the full multi-dimensional reasoning (option chain + chart + levels
@@ -2156,6 +2158,15 @@ def run_live(config: dict[str, object]) -> None:
                     _emit_decision(exit_decision)
         else:
             decision = agent.evaluate(snapshot)
+            if decision.action != "TRADE" and runtime_config.mode == RuntimeMode.PAPER_LIVE:
+                try:   # directional stand-aside -> ghost debit+credit pair (recorder only, see pair_shadow.py)
+                    from . import pair_shadow
+                    _dir = pair_shadow.read_direction(decision)
+                    if _dir:
+                        pair_shadow.open_pair(snapshot, _dir, "READ", metadata=decision.metadata,
+                                              note=" ".join(map(str, decision.rationale or [])))
+                except Exception:
+                    pass
             # Clamp lots to the operator cap *before* any gate check so that
             # LOTS_EXCEED_RUNTIME_LIMIT can never fire.  The risk engine already
             # computed a safe lot count; the runtime cap is a ceiling, not a veto.
