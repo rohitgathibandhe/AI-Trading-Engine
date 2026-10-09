@@ -1183,6 +1183,28 @@ def _train_win_probability_model(state: dict) -> None:
         _log(f"win_prob_model write failed: {exc}")
 
 
+def _agent_silence_minutes() -> float:
+    """Minutes since the agent last proved it is alive: the NEWER of the runner-log mtime and the
+    heartbeat timestamp. While MANAGING an open position the loop writes no decision lines to the
+    runner log (only the heartbeat, every cycle), so log-mtime alone read a healthy agent as stale and
+    the watchdog restarted it every ~16 min mid-trade (11:10/11:26/11:42/11:59 on 2026-10-09), and
+    the EoD guardian could force-close a live position. The heartbeat is written at the top of every
+    loop cycle, so a genuinely hung loop still goes stale on both."""
+    ages = []
+    try:
+        ages.append((time.time() - _LOG.stat().st_mtime) / 60.0)
+    except OSError:
+        pass
+    try:
+        hb = json.loads((_STATE / "intraday_v83_heartbeat.json").read_text())
+        ts = datetime.fromisoformat(str(hb.get("timestamp")))
+        if str(hb.get("phase")) == "v83_run_live_loop":
+            ages.append((datetime.now(ts.tzinfo or IST) - ts).total_seconds() / 60.0)
+    except Exception:
+        pass
+    return min(ages) if ages else 999.0
+
+
 def _guardian_force_close(now: datetime, state: dict, fixes_applied: list[str]) -> None:
     """
     After 15:20 IST, if a paper position is still open and the agent has not written
@@ -1205,7 +1227,7 @@ def _guardian_force_close(now: datetime, state: dict, fixes_applied: list[str]) 
         return  # no open position — nothing to do
 
     # Only act if log is stale (agent not writing decisions)
-    log_age_min = (time.time() - _LOG.stat().st_mtime) / 60.0 if _LOG.exists() else 999
+    log_age_min = _agent_silence_minutes()
     if log_age_min < 8:
         return  # agent is alive and handling it
 
@@ -1381,11 +1403,11 @@ def run_watchdog() -> None:
     # Telegram spam + restart loop. mtime reflects true liveness: a genuinely frozen loop
     # stops writing (mtime grows -> restart); a healthy OR data-API-down agent keeps
     # writing (mtime fresh -> no restart). API-down is handled by layer 1b, not here.
-    log_age_min = (time.time() - _LOG.stat().st_mtime) / 60.0 if _LOG.exists() else 999.0
+    log_age_min = _agent_silence_minutes()
     stale_threshold = STALE_THRESHOLD_EARLY if now.strftime("%H%M") < "0945" else STALE_THRESHOLD_LATE
 
     if log_age_min > stale_threshold:
-        _log(f"Log stale {log_age_min:.1f} min (mtime) — restarting")
+        _log(f"Log stale {log_age_min:.1f} min (log+heartbeat) — restarting")
         ok = _guarded_restart(state, now, "watchdog auto-heal")
         fixes_applied.append(f"Log stale ({log_age_min:.1f} min) → restarted")
         if log_age_min > 20:
