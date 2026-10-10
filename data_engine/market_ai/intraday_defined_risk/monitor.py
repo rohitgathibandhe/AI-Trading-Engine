@@ -60,6 +60,12 @@ from .strikes import select_best_structure, select_structure
 _IST = timezone(timedelta(hours=5, minutes=30))
 _MARKET_OPEN_TIME = dtime(9, 15)
 _MARKET_CLOSE_TIME = dtime(15, 35)
+# A market-hours gap between loop cycles longer than this means the process was suspended (Mac
+# slept: lid closed on battery, 2026-10-08 lost 11:00-15:30). After a wake the network/candles are
+# stale for a cycle or two, so entries are held for _WAKE_RESYNC_CYCLES while the open position is
+# still managed first. The watchdog sends the Telegram alert.
+_WAKE_GAP_SECONDS = 180
+_WAKE_RESYNC_CYCLES = 2
 
 ESTIMATED_ROUND_TRIP_COST_RUPEES_PER_LOT = 35.0
 MIN_NET_EDGE_RUPEES = 500.0
@@ -1085,6 +1091,8 @@ class IntradayDefinedRiskAgent:
         meta["selector_condition"] = choice.condition
         meta["selector_family"] = choice.family
         meta["selector_iv"] = choice.iv_regime
+        meta["selector_bias"] = getattr(choice.read, "bias", None)      # read behind the choice (pair_shadow features)
+        meta["selector_conviction"] = round(float(choice.conviction or 0.0), 3)
         meta["vol_regime"] = choice.vol_regime          # volatility engine read (advisory)
         meta["vol_notes"] = "; ".join(choice.vol_notes or [])
         # Attach the full multi-dimensional reasoning (option chain + chart + levels
@@ -1107,6 +1115,21 @@ class IntradayDefinedRiskAgent:
                     "final_result": result, "playbook": f"SEL_{choice.condition}",
                     "selector_condition": choice.condition, "selector_family": choice.family}
 
+        # CHART-AGREEMENT GATE (upskill 2026-10-10): a non-fade directional entry must not fight the
+        # chart — the confluence rule is "price action AND chain agree". Fades are exempt (counter-move by
+        # design, own spot-based exit). SEL_CHART_AGREE=0 disables. See decision_justification.chart_opposes.
+        if (os.environ.get("SEL_CHART_AGREE", "1") == "1" and choice.structures
+                and choice.family != FAM_STAND_ASIDE and not meta.get("is_fade")):
+            try:
+                from .decision_justification import chart_opposes
+                if chart_opposes(choice.structures[0], _thesis):
+                    choice.rationale = (f"CHART OPPOSES the {choice.structures[0]} read (chart {_thesis.chart.bias}: "
+                                        f"{'; '.join(_thesis.chart.points[:3])}) — price action and chain must agree. "
+                                        f"Stand aside. [was: {choice.rationale}]")
+                    choice.family, choice.structures = FAM_STAND_ASIDE, []
+                    meta["chart_gate_blocked"] = True
+            except NameError:      # _thesis not built (justification failed) — don't block on missing data
+                pass
         # Stand aside: chop / high-vol-undirected / not-yet-executable structure
         if choice.family == FAM_STAND_ASIDE or not choice.executable_today or not choice.structures:
             self._current_features = {"playbook": f"SEL_{choice.condition}", "selector_family": choice.family}
@@ -1919,6 +1942,8 @@ def run_live(config: dict[str, object]) -> None:
         agent.open_position = load_paper_position()
     poll_seconds = int(config.get("poll_seconds", 30))
     _ops_poll_counter = 0
+    _last_live_cycle_at: datetime | None = None
+    _wake_resync_left = 0
 
     while True:
         _ops_poll_counter += 1
@@ -1933,15 +1958,30 @@ def run_live(config: dict[str, object]) -> None:
         # instead of 30 seconds so we don't generate ~1 080 wasted NO_TRADE
         # decisions overnight (18 h × 60 decisions/h).
         _ist_now = datetime.now(_IST)
-        if not (_MARKET_OPEN_TIME <= _ist_now.time() <= _MARKET_CLOSE_TIME):
-            _write_v83_agent_heartbeat(runtime_config=runtime_config, phase="v83_after_hours")
-            sleep(300)
+        # Weekends too: the loop only checked the clock, so on Saturdays it cycled "market hours" against
+        # no data (INSUFFICIENT_DATA every 30s). Exchange holidays still fall through to that no-data path.
+        if _ist_now.weekday() >= 5 or not (_MARKET_OPEN_TIME <= _ist_now.time() <= _MARKET_CLOSE_TIME):
+            # Write heartbeat every 30s during the 5-min after-hours sleep so the
+            # watchdog (stale_after_sec=45) never flags the agent as stale overnight.
+            for _ in range(10):
+                _write_v83_agent_heartbeat(runtime_config=runtime_config, phase="v83_after_hours")
+                sleep(30)
             continue
         # ──────────────────────────────────────────────────────────────────────
 
         # Throttle the expensive status-report build to every 5th poll (~150 s).
         # On trade events / active positions the caller overrides this flag.
         _should_report = (_ops_poll_counter % 5 == 0)
+
+        _cycle_now = datetime.now(_IST)
+        if _last_live_cycle_at is not None and _last_live_cycle_at.date() == _cycle_now.date():
+            _gap = (_cycle_now - _last_live_cycle_at).total_seconds()
+            if _gap > _WAKE_GAP_SECONDS:
+                _wake_resync_left = _WAKE_RESYNC_CYCLES
+                logging.getLogger("intraday_defined_risk.v83").warning(
+                    "[wake] loop gap %.0fs (%s -> %s) — process was suspended (sleep?); holding entries %d cycles",
+                    _gap, _last_live_cycle_at.strftime("%H:%M:%S"), _cycle_now.strftime("%H:%M:%S"), _WAKE_RESYNC_CYCLES)
+        _last_live_cycle_at = _cycle_now
 
         _write_v83_agent_heartbeat(runtime_config=runtime_config, phase="v83_run_live_loop")
         try:
@@ -2080,6 +2120,18 @@ def run_live(config: dict[str, object]) -> None:
                 build_operator_status_report(snapshot=snapshot, broker_positions=broker_positions)
                 sleep(poll_seconds)
                 continue
+            if _wake_resync_left > 0:
+                _wake_resync_left -= 1
+                decision = build_no_trade_decision(
+                    RegimeLabel.NO_TRADE.value,
+                    ["Just resumed after a suspended gap (sleep) — re-syncing data before allowing new entries."],
+                    extra_metadata={"runtime_mode": runtime_config.mode.value, "primary_block_reason": "WAKE_RESYNC"},
+                )
+                log_validation_decision(decision, snapshot=snapshot, block_reason="WAKE_RESYNC")
+                _update_runtime_decision_state(decision, runtime_config=runtime_config, snapshot=snapshot, block_reason="WAKE_RESYNC")
+                _emit_decision(decision)
+                sleep(poll_seconds)
+                continue
 
         if agent.open_position:
             current_position = agent.open_position
@@ -2123,6 +2175,15 @@ def run_live(config: dict[str, object]) -> None:
                     _emit_decision(exit_decision)
         else:
             decision = agent.evaluate(snapshot)
+            if decision.action != "TRADE" and runtime_config.mode == RuntimeMode.PAPER_LIVE:
+                try:   # directional stand-aside -> ghost debit+credit pair (recorder only, see pair_shadow.py)
+                    from . import pair_shadow
+                    _dir = pair_shadow.read_direction(decision)
+                    if _dir:
+                        pair_shadow.open_pair(snapshot, _dir, "READ", metadata=decision.metadata,
+                                              note=" ".join(map(str, decision.rationale or [])))
+                except Exception:
+                    pass
             # Clamp lots to the operator cap *before* any gate check so that
             # LOTS_EXCEED_RUNTIME_LIMIT can never fire.  The risk engine already
             # computed a safe lot count; the runtime cap is a ceiling, not a veto.

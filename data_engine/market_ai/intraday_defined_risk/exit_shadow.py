@@ -123,6 +123,31 @@ def _pnl_trail(marks, *, debit_points: float, lot_value: float, **_):
     return _ride_to_close(marks)
 
 
+def _loss_stop_premium(marks, *, debit_points: float, lot_value: float, frac: float = 0.5, **_):
+    """LOSS stop (not a profit trail): exit once the open loss reaches `frac` of the premium at risk.
+    Added 2026-10-10: the two largest forward losses (09-29 -3,146 / 10-05 -2,204) were debits held
+    100+ pts against to TIME_EXIT with no stop firing. Trailing WINNERS is validated-negative (kills
+    the fat tail); cutting LOSERS is a different question — this measures it forward first."""
+    risk = debit_points * lot_value
+    if risk <= 0:
+        return _ride_to_close(marks)
+    for m in marks:
+        if m["pnl"] <= -frac * risk:
+            return m["t"], m["pnl"]
+    return _ride_to_close(marks)
+
+
+def _loss_stop_spot(marks, *, direction: int, pts: float = 60.0, **_):
+    """LOSS stop on the underlying: exit once spot is `pts` against the entry (thesis invalidated)."""
+    if direction == 0:
+        return _ride_to_close(marks)
+    entry = marks[0]["spot"]
+    for m in marks:
+        if (m["spot"] - entry) * direction <= -pts:
+            return m["t"], m["pnl"]
+    return _ride_to_close(marks)
+
+
 def _afternoon_lock(marks, *, hhmm: str = "14:00", **_):
     for m in marks:
         if m["t"][11:16] >= hhmm and m["pnl"] > 0:
@@ -142,6 +167,8 @@ def _evaluate(buf: dict, lot_value: float) -> dict[str, Any]:
         rules[f"SPOT_REVERSAL_{int(pts)}"] = _spot_reversal(marks, pts=pts, **kw)
     rules["PNL_TRAIL_R30_GB35"] = _pnl_trail(marks, **kw)
     rules["AFTERNOON_LOCK_1400"] = _afternoon_lock(marks, **kw)
+    rules["LOSS_STOP_50PCT"] = _loss_stop_premium(marks, **kw)
+    rules["LOSS_STOP_SPOT_60"] = _loss_stop_spot(marks, **kw)
     return {name: {"exit_at": t, "pnl_rupees": round(p, 2)} for name, (t, p) in rules.items()}
 
 

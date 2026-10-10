@@ -47,10 +47,34 @@ def _latest_metadata() -> dict:
     return {}
 
 
-def _next_week_expiry() -> str:
-    """The NEXT weekly expiry (not the nearest): the Tuesday after the coming one."""
+def _listed_expiries(creds: dict) -> list[str]:
+    """Exchange-listed Nifty expiries (sorted). Holiday weeks move expiry off Tuesday — e.g. 2026-10-20
+    is a holiday so that week's expiry is MON 10-19 — so never compute expiries by weekday arithmetic.
+    Returns [] if the broker call fails (callers fall back to the Tuesday rule)."""
+    try:
+        from market_ai.dhan_wrapper import DhanWrapper
+        dw = DhanWrapper(dhan_client_id=str(creds.get("client_id") or "").strip(),
+                         access_token=str(creds.get("access_token") or "").strip())
+        return sorted(str(e) for e in (dw.get_optionchain_expirylist("IDX_I", 13) or []))
+    except Exception as e:
+        print(f"[expiry] list fetch failed: {e}", file=sys.stderr)
+        return []
+
+
+def _next_week_expiry(creds: dict | None = None) -> str:
+    """The NEXT weekly expiry (not the nearest): the second listed expiry after today."""
+    today = date.today().isoformat()
+    upcoming = [e for e in _listed_expiries(creds or wx._load_creds()) if e > today]
+    if len(upcoming) >= 2:
+        return upcoming[1]
     nearest = wx._next_tuesday(date.today())
     return (nearest + timedelta(days=7)).isoformat()
+
+
+def _expiry_after(expiry: str, creds: dict | None = None) -> str:
+    """The listed expiry following `expiry` (roll-out target); Tuesday+7 only if the list is unavailable."""
+    later = [e for e in _listed_expiries(creds or wx._load_creds()) if e > expiry]
+    return later[0] if later else (date.fromisoformat(expiry) + timedelta(days=7)).isoformat()
 
 
 TARGET_SHORT_DELTA = 0.18   # place the short leg here (standard credit-spread delta), gap-floored below
@@ -148,9 +172,9 @@ def main() -> int:
         print("=> stand aside this week.")
         return 0
 
-    expiry = _next_week_expiry()
-    print(f"\nNEXT-WEEK EXPIRY: {expiry}")
     creds = wx._load_creds()
+    expiry = _next_week_expiry(creds)
+    print(f"\nNEXT-WEEK EXPIRY: {expiry}")
     raw = wx._get_raw_chain(creds, expiry)
     parsed = wx._parse_chain(raw, spot=float(m.get("atm_strike") or 0))
     if not parsed.get("strikes"):

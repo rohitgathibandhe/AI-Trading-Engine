@@ -2193,6 +2193,23 @@ _ltp_refresher_lock = threading.Lock()
 _ltp_wanted_exp: Optional[str] = None   # requested by the endpoint; None => resolve front tradeable
 _ltp_wanted_at: float = 0.0             # last time the endpoint asked (thread idles when stale)
 _open_leg_spot: Optional[float] = None  # underlying spot from the same chain fetch (cheap for the UI)
+_open_leg_spot_ts: float = 0.0           # when _open_leg_spot was last refreshed (it idles when nobody watches)
+_SPOT_FRESH_SECS = 180.0               # older than this → not LIVE
+
+
+def _fresh_spot() -> Optional[float]:
+    """Nifty spot that is actually current, or None. Agent's market_context.json first, refresher second."""
+    try:
+        ctx = _json_read(STATE_DIR / "market_context.json")
+        if isinstance(ctx, dict) and ctx.get("nifty_spot") and ctx.get("updated_at"):
+            age = (datetime.now() - datetime.fromisoformat(str(ctx["updated_at"]))).total_seconds()
+            if 0 <= age <= _SPOT_FRESH_SECS:
+                return float(ctx["nifty_spot"])
+    except (TypeError, ValueError, OSError):
+        pass
+    if _open_leg_spot and (time.time() - _open_leg_spot_ts) <= _SPOT_FRESH_SECS:
+        return _open_leg_spot
+    return None
 
 
 def _resolve_front_tradeable_expiry(dw) -> Optional[str]:
@@ -2215,7 +2232,7 @@ def _resolve_front_tradeable_expiry(dw) -> Optional[str]:
 def _ltp_refresher_loop() -> None:
     """Daemon: keep _open_leg_ltp_cache fresh for the currently-wanted expiry. ALL the slow/blocking
     Dhan work lives here, off the request path, so the endpoint never waits."""
-    global _open_leg_ltp_cache, _open_leg_ltp_cache_ts, _open_leg_ltp_cache_exp, _open_leg_spot
+    global _open_leg_ltp_cache, _open_leg_ltp_cache_ts, _open_leg_ltp_cache_exp, _open_leg_spot, _open_leg_spot_ts
     dw = None
     while True:
         try:
@@ -2254,6 +2271,7 @@ def _ltp_refresher_loop() -> None:
                         _sp = _dd.get("last_price")
                         if _sp:
                             _open_leg_spot = float(_sp)
+                            _open_leg_spot_ts = time.time()
                     except (TypeError, ValueError):
                         pass
         except Exception:
@@ -3450,28 +3468,44 @@ def _preflight_token_check() -> Dict[str, Any]:
     if _preflight_token_cache and (now - _preflight_token_cache_ts) < _PREFLIGHT_TOKEN_TTL:
         return _preflight_token_cache
     out: Dict[str, Any] = {"ok": False, "detail": "", "chain_ok": False, "chain_detail": ""}
-    try:
-        from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
-        creds = _json_read(CREDS_FILE)
-        cid = (creds.get("client_id") or "").strip() if isinstance(creds, dict) else ""
-        tok = (creds.get("access_token") or "").strip() if isinstance(creds, dict) else ""
-        if cid and tok:
-            os.environ["DHAN_CLIENT_ID"] = cid
-            os.environ["DHAN_ACCESS_TOKEN"] = tok
-        dw = DhanWrapper(logger=None)
-        funds = dw.get_funds()
-        avail = funds.get("available") if isinstance(funds, dict) else None
-        out["ok"] = bool(funds) and avail is not None
-        out["detail"] = (f"funds available Rs {avail:,.0f}" if out["ok"]
-                         else "get_funds empty — token may be expired")
+    import concurrent.futures as _cf
+    def _do_check() -> Dict[str, Any]:
+        r: Dict[str, Any] = {"ok": False, "detail": "", "chain_ok": False, "chain_detail": ""}
         try:
-            el = dw.get_optionchain_expirylist("IDX_I", INDEX_SECURITY_ID)
-            out["chain_ok"] = bool(el)
-            out["chain_detail"] = (f"{len(el)} expiries (next {el[0]})" if el else "no expiries returned")
+            from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
+            creds = _json_read(CREDS_FILE)
+            cid = (creds.get("client_id") or "").strip() if isinstance(creds, dict) else ""
+            tok = (creds.get("access_token") or "").strip() if isinstance(creds, dict) else ""
+            if cid and tok:
+                os.environ["DHAN_CLIENT_ID"] = cid
+                os.environ["DHAN_ACCESS_TOKEN"] = tok
+            dw = DhanWrapper(logger=None)
+            funds = dw.get_funds()
+            avail = funds.get("available") if isinstance(funds, dict) else None
+            r["ok"] = bool(funds) and avail is not None
+            r["detail"] = (f"funds available Rs {avail:,.0f}" if r["ok"]
+                           else "get_funds empty — token may be expired")
+            try:
+                el = dw.get_optionchain_expirylist("IDX_I", INDEX_SECURITY_ID)
+                r["chain_ok"] = bool(el)
+                r["chain_detail"] = (f"{len(el)} expiries (next {el[0]})" if el else "no expiries returned")
+            except Exception as exc:
+                r["chain_detail"] = f"error: {str(exc)[:80]}"
         except Exception as exc:
-            out["chain_detail"] = f"error: {str(exc)[:80]}"
+            r["detail"] = f"error: {str(exc)[:100]}"
+        return r
+    try:
+        _ex = _cf.ThreadPoolExecutor(max_workers=1)
+        _fut = _ex.submit(_do_check)
+        try:
+            out = _fut.result(timeout=8.0)
+        except _cf.TimeoutError:
+            out["detail"] = "broker check timed out (>8s) — DHAN API slow or unreachable"
+            out["chain_detail"] = "timed out"
+        finally:
+            _ex.shutdown(wait=False)  # don't block on the hanging thread after timeout
     except Exception as exc:
-        out["detail"] = f"error: {str(exc)[:100]}"
+        out["detail"] = f"thread error: {str(exc)[:100]}"
     _preflight_token_cache = out
     _preflight_token_cache_ts = time.time()
     return out
@@ -3492,7 +3526,7 @@ def _preflight_status() -> Dict[str, Any]:
         hhmm = ist.strftime("%H:%M")
         weekday = ist.weekday() < 5
         market_open = weekday and ("09:15" <= hhmm <= "15:30")
-        session = ("OPEN" if market_open else ("PRE_OPEN" if (weekday and hhmm < "09:15")
+        session = ("OPEN" if market_open else ("PRE_OPEN" if (weekday and "08:00" <= hhmm < "09:15")
                    else ("CLOSED" if weekday else "WEEKEND")))
         gen_at = ist.strftime("%Y-%m-%d %H:%M:%S IST")
     except Exception:
@@ -3525,9 +3559,19 @@ def _preflight_status() -> Dict[str, Any]:
         add("process", "Agent running", False, f"error: {str(exc)[:80]}")
 
     # 2) Broker token + option chain (cached)
+    # Overnight Dhan is often slow enough to trip the 8s timeout, which turned the panel RED every
+    # night for no real fault. Outside market/pre-open hours a TIMEOUT is only a warning; a definite
+    # failure (invalid/expired token, no expiries) stays critical at any hour.
     tok = _preflight_token_check()
-    add("token", "Broker token valid", bool(tok.get("ok")), tok.get("detail", ""))
-    add("chain", "Option chain reachable", bool(tok.get("chain_ok")), tok.get("chain_detail", ""))
+    _off_hours = session in ("CLOSED", "WEEKEND")
+    _tok_timeout = "timed out" in str(tok.get("detail", ""))
+    _chain_timeout = "timed out" in str(tok.get("chain_detail", ""))
+    add("token", "Broker token valid", bool(tok.get("ok")),
+        tok.get("detail", "") + (" (off-hours — rechecked pre-open)" if _off_hours and _tok_timeout else ""),
+        critical=not (_off_hours and _tok_timeout))
+    add("chain", "Option chain reachable", bool(tok.get("chain_ok")),
+        tok.get("chain_detail", "") + (" (off-hours)" if _off_hours and _chain_timeout else ""),
+        critical=not (_off_hours and _chain_timeout))
 
     # 3) Config armed (from runtime config file)
     cfg = _json_read(V83_RUNTIME_CONFIG_JSON)
@@ -3620,6 +3664,8 @@ _SECONDARY_PNL_CACHE_TTL = 60.0
 # polls return instantly from cache; only ONE thread rebuilds at a time while the rest serve the
 # last payload, so slow rebuilds never pile up or block the UI. Live P&L still comes fresh from
 # the fast /api/open_position_live.
+_live_ready_cache: Dict[str, Any] = {}
+_live_ready_ts: float = 0.0
 _paper_positions_cache: Optional[Dict[str, Any]] = None
 _paper_positions_cache_ts: float = 0.0
 _paper_positions_rebuild_lock = threading.Lock()
@@ -4655,8 +4701,29 @@ class PaperHandler(SimpleHTTPRequestHandler):
             except Exception as exc:  # pragma: no cover - defensive
                 self._send_json({"error": str(exc)}, status=500)
             return
+        if self.path.startswith("/api/live_readiness"):
+            # Go-live countdown (scripts/live_readiness.py): evidence bar + clean-day streak + locks.
+            # Cached 5 min — it re-scores the promotion gate and reads the watchdog log.
+            try:
+                global _live_ready_cache, _live_ready_ts
+                if "force=1" in self.path or not _live_ready_cache or (time.time() - _live_ready_ts) > 300:
+                    sys.path.insert(0, str(Path(__file__).resolve().parent))
+                    import live_readiness as _lr
+                    _live_ready_cache = _lr.evaluate()
+                    _live_ready_ts = time.time()
+                self._send_json(_live_ready_cache)
+            except Exception as exc:  # pragma: no cover - defensive
+                self._send_json({"error": str(exc)}, status=500)
+            return
         if self.path.startswith("/api/preflight"):
             try:
+                # ?force=1 busts both caches so the Recheck button gets a fresh result
+                if "force=1" in self.path:
+                    global _preflight_cache, _preflight_cache_ts, _preflight_token_cache, _preflight_token_cache_ts
+                    _preflight_cache = {}
+                    _preflight_cache_ts = 0.0
+                    _preflight_token_cache = {}
+                    _preflight_token_cache_ts = 0.0
                 self._send_json(_preflight_status())
             except Exception as exc:  # pragma: no cover - defensive
                 self._send_json({"error": str(exc)}, status=500)
@@ -4691,11 +4758,11 @@ class PaperHandler(SimpleHTTPRequestHandler):
                     v83_open = _build_v83_open_position_payload()
                     v83_market_state = _get_v83_market_state()
 
-                    # Spot for the payoff chart now comes from the background LTP refresher's cache
-                    # (free) instead of load_positions(BLOTTER) — a SYNCHRONOUS Dhan fetch that
-                    # dominated this endpoint's latency (6-22s) and enriched a blotter v83 doesn't
-                    # even use. _build_v83_open_position_payload already started the refresher.
-                    _spot_cached = _open_leg_spot
+                    # Spot: the refresher only runs while a position is open, so when flat its value
+                    # froze (days old) yet was labelled LIVE. Prefer the agent's own spot from
+                    # market_context.json (written every ~30s cycle); else the refresher's if fresh;
+                    # else None → STALE. Never a synchronous Dhan fetch on the request path.
+                    _spot_cached = _fresh_spot()
 
                     payload: Dict[str, Any] = {
                         # V83 open position — authoritative source for Open Legs / MTM

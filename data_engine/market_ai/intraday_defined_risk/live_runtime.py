@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -548,14 +549,22 @@ class DhanLiveMarketDataProvider:
 
         # Phase 6: Fetch auxiliary market context (India VIX + BankNifty) best-effort.
         # Written to state/market_context.json for regime.py to read each cycle.
-        # security_ids: India VIX=1, BankNifty=25 (both IDX_I segment on Dhan).
-        # Use get_ltp_once per symbol (ticker + quote fallback) rather than bulk
-        # call — the bulk API returns status=failure for non-subscribed sec IDs.
-        _VIX_ID = 1
+        # security_ids: India VIX=21, BankNifty=25 (both IDX_I segment on Dhan — see dhan_scrip_master.csv).
+        # NOT 1: sec-id 1 is NIFTY MIDCAP 150 (~21-22k), which is what the 'insane VIX' reads were.
+        # Dhan's marketfeed allows ~1 req/s: fired straight after the chain fetch (or after each
+        # other) the calls return status=failure, so VIX/BankNifty were almost always None. One bulk
+        # call for both after a short pause succeeds reliably (verified live 2026-10-08); fall back
+        # per-symbol only for whatever the bulk call missed.
+        _VIX_ID = 21
         _BANK_ID = 25
         try:
-            _vix_ltp = self._dw.get_ltp_once(self.underlying_seg, _VIX_ID)
-            _bank_ltp = self._dw.get_ltp_once(self.underlying_seg, _BANK_ID)
+            time.sleep(1.1)
+            _bulk = self._dw.get_ltp_bulk([(self.underlying_seg, _VIX_ID), (self.underlying_seg, _BANK_ID)]) or {}
+            _vix_ltp = _bulk.get((self.underlying_seg, _VIX_ID))
+            _bank_ltp = _bulk.get((self.underlying_seg, _BANK_ID))
+            if _vix_ltp is None:
+                time.sleep(1.1)
+                _vix_ltp = self._dw.get_ltp_once(self.underlying_seg, _VIX_ID)
             _ctx_path = STATE_ROOT / "market_context.json"
             _ctx: dict = {}
             if _ctx_path.exists():
@@ -569,9 +578,9 @@ class DhanLiveMarketDataProvider:
             if "banknifty_spot" in _ctx:
                 _ctx["banknifty_spot_prev"] = _ctx["banknifty_spot"]
             _ctx["nifty_spot"] = spot
-            # India VIX realistically sits ~8-40 (never >100). A read outside that is a bad tick — the
-            # LTP fetch for sec-id 1 intermittently returns a SPOT-like value (~22,436 seen 2026-09-25),
-            # which as 'VIX' corrupts every VIX-gated rule (lot scale, credit floor, IV branches). Reject
+            # India VIX realistically sits ~8-40 (never >100). The old ~22k reads were the wrong sec-id
+            # (1 = NIFTY MIDCAP 150), now fixed; keep the clamp as a guard against any bad tick, which
+            # as 'VIX' would corrupt every VIX-gated rule (lot scale, credit floor, IV branches). Reject
             # insane reads: fall through to the chain-IV proxy, else keep the prior good VIX.
             _vix_ok = False
             if _vix_ltp:

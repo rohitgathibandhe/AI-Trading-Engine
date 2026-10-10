@@ -181,6 +181,22 @@
         </div>
         <div class="hint" id="preflight-updated" style="margin-top:8px;">—</div>
       </div>
+      <div class="card" id="golive-card" style="margin-bottom:12px; border-left:4px solid #64748b;">
+        <div class="card-header">
+          <div style="font-weight:700; display:flex; align-items:center; gap:10px;">
+            <span id="golive-badge" style="display:inline-flex;align-items:center;justify-content:center;min-width:74px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:800;letter-spacing:.5px;background:#334155;color:#e2e8f0;">— — —</span>
+            <span>Go-Live Countdown</span>
+          </div>
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <span class="chip" id="golive-eta">ETA —</span>
+            <button id="golive-refresh" style="background:#0f172a; color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:8px; cursor:pointer; font-size:12px;">Recheck</button>
+          </div>
+        </div>
+        <div id="golive-grid" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:8px; margin-top:10px;">
+          <div class="muted">Loading…</div>
+        </div>
+        <div class="hint" id="golive-note" style="margin-top:8px;">Bars from the go-live plan. Clearing them makes the agent ELIGIBLE — switching to live stays your decision.</div>
+      </div>
       <div class="card" id="weekly-positional-card" style="margin-bottom:12px; border-left:4px solid #8b5cf6;">
         <div class="card-header">
           <div style="font-weight:700;">Weekly Positional (defined-risk selling)</div>
@@ -2393,18 +2409,22 @@
       } catch (e) { /* keep last values on transient errors */ }
     }
 
-    async function loadPreflight() {
+    async function loadPreflight(force = false) {
       const grid = document.getElementById("preflight-grid");
       const badge = document.getElementById("preflight-badge");
       const card = document.getElementById("preflight-card");
+      const btn = document.getElementById("preflight-refresh");
+      if (force && btn) { btn.textContent = "Checking…"; btn.disabled = true; }
       try {
-        const d = await fetchJSON("/api/preflight");
+        const url = force ? "/api/preflight?force=1" : "/api/preflight";
+        const d = await fetchJSON(url);
         const palette = {
           GREEN: { bar: "#22c55e", bg: "#14532d", fg: "#bbf7d0", label: "READY" },
           AMBER: { bar: "#f59e0b", bg: "#78350f", fg: "#fde68a", label: "CHECK" },
           RED:   { bar: "#ef4444", bg: "#7f1d1d", fg: "#fecaca", label: "NOT READY" },
         };
         const p = palette[d.overall] || palette.RED;
+        if (btn) { btn.textContent = "Recheck"; btn.disabled = false; }
         badge.textContent = p.label;
         badge.style.background = p.bg;
         badge.style.color = p.fg;
@@ -2428,6 +2448,54 @@
         badge.style.background = "#7f1d1d";
         badge.style.color = "#fecaca";
         grid.innerHTML = '<div class="muted">Readiness check unavailable: ' + (e && e.message ? e.message : e) + '</div>';
+      }
+    }
+
+    async function loadGoLive(force = false) {
+      const grid = document.getElementById("golive-grid");
+      if (!grid) return;
+      const badge = document.getElementById("golive-badge");
+      const card = document.getElementById("golive-card");
+      try {
+        const d = await fetchJSON(force ? "/api/live_readiness?force=1" : "/api/live_readiness");
+        const ready = d.verdict === "READY_FOR_OWNER_DECISION";
+        badge.textContent = ready ? "READY" : "NOT YET";
+        badge.style.background = ready ? "#14532d" : "#78350f";
+        badge.style.color = ready ? "#bbf7d0" : "#fde68a";
+        card.style.borderLeftColor = ready ? "#22c55e" : "#f59e0b";
+        document.getElementById("golive-eta").textContent = "ETA " + (d.eta_date || "—");
+        const e = d.evidence || {}, st = d.stability || {}, lk = d.locks || {}, cx = d.context || {};
+        const pct = (a, b) => Math.max(0, Math.min(100, Math.round(100 * (a || 0) / (b || 1))));
+        const bar = (p, col) => '<div style="height:6px;background:#1e293b;border-radius:4px;margin:6px 0;"><div style="height:6px;width:' + p + '%;background:' + col + ';border-radius:4px;"></div></div>';
+        const box = (ok, title, body) => '<div style="padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:#0b1224;">' +
+          '<div style="font-size:12px;font-weight:700;color:' + (ok ? "#22c55e" : "#f59e0b") + ';">' + (ok ? "✓ " : "… ") + title + '</div>' + body + '</div>';
+        const days = (st.recent_days || []).map(x => '<span title="' + (x.problems || []).join("; ") + '" style="display:inline-block;width:14px;height:14px;margin-right:3px;border-radius:3px;background:' + (x.clean ? "#22c55e" : "#ef4444") + ';"></span>').join("");
+        grid.innerHTML =
+          (() => {
+            const sk = d.skill || {}, fo = d.forward_overall || {}, ch = sk.checks || {};
+            const row = (k, lbl) => { const c = ch[k] || {}; return '<div style="font-size:11px;color:' + (c.ok ? "#22c55e" : "#f59e0b") + ';">' +
+              (c.ok ? "✓ " : "✗ ") + lbl + ": " + (c.value ?? "—") + " (bar " + c.bar + ")" + ((c.weak_day_types || []).length ? " · weak on " + c.weak_day_types.join(", ") : "") + "</div>"; };
+            const dt = Object.entries(sk.by_day_type || {}).map(([k, g]) => k + " " + g.n + "t ₹" + (g.net || 0).toLocaleString()).join(" · ");
+            return box(sk.ok && fo.ok, "1. Skill — reads, entries, exits (all trades)",
+              bar(pct(fo.trades, 20), "#3b82f6") +
+              '<div style="font-size:11px;color:var(--muted);">' + fo.trades + "/20 trades since " + e.since + " · net ₹" + (fo.net || 0).toLocaleString() + " · PF " + (fo.profit_factor ?? "—") + "</div>" +
+              row("read_60m", "read right 60 min later") + row("entry_score", "entry quality") + row("exit_capture", "exit keeps of peak") +
+              '<div style="font-size:11px;color:var(--muted);margin-top:4px;">by day type: ' + (dt || "—") + "</div>" +
+              '<div style="font-size:11px;color:var(--muted);">money switch: ' + e.lead_strategy + " " + e.trades + "/" + e.trades_target + " (" + (e.lead_status || "") + ")</div>");
+          })() +
+          box(st.ok, "2. Stability — clean trading days",
+            bar(pct(st.clean_streak, st.target), "#22c55e") +
+            '<div style="font-size:11px;color:var(--muted);">streak ' + st.clean_streak + "/" + st.target + ' (Mac awake all session, no stalls, token OK)</div>' +
+            '<div style="margin-top:6px;">' + days + '</div>') +
+          box(lk.all_engaged, "3. Safety locks " + (lk.all_engaged ? "engaged (paper only)" : "— CHECK"),
+            '<div style="font-size:11px;color:var(--muted);">paper executor ' + (lk.paper_executor ? "✓" : "✗") +
+            " · paper mode " + (lk.paper_mode ? "✓" : "✗") + " · live-arm off " + (lk.live_arm_off ? "✓" : "✗") +
+            " · no strategy promoted " + (lk.no_strategy_promoted ? "✓" : "✗") +
+            "<br>maturity " + (d.maturity_score || "—") + " · token " + (cx.token_hours_left ?? "—") + "h · " +
+            (cx.on_ac_power ? "on AC power" : '<b style="color:#f59e0b;">on battery — plug in</b>') + "</div>");
+      } catch (e) {
+        badge.textContent = "ERROR";
+        grid.innerHTML = '<div class="muted">Countdown unavailable: ' + (e && e.message ? e.message : e) + '</div>';
       }
     }
 
@@ -2545,6 +2613,7 @@
       try {
         await Promise.all([
           loadPreflight(),
+          loadGoLive(),
           loadWeeklyPositional(),
           loadScorecard(),
           loadCreds(),
@@ -2597,7 +2666,11 @@
     document.getElementById("save-settings").addEventListener("click", saveSettings);
     document.getElementById("save-creds").addEventListener("click", saveCreds);
     document.getElementById("test-telegram").addEventListener("click", testTelegram);
-    document.getElementById("preflight-refresh").addEventListener("click", () => loadPreflight().catch(() => {}));
+    document.getElementById("preflight-refresh").addEventListener("click", () => loadPreflight(true).catch(() => {
+      const b = document.getElementById("preflight-refresh");
+      if (b) { b.textContent = "Recheck"; b.disabled = false; }
+    }));
+    document.getElementById("golive-refresh").addEventListener("click", () => loadGoLive(true).catch(() => {}));
     document.getElementById("wkpos-refresh").addEventListener("click", () => loadWeeklyPositional().catch(() => {}));
     document.getElementById("wkpos-pnl-refresh").addEventListener("click", () => loadWeeklyPositional().catch(() => {}));
     document.getElementById("scorecard-refresh").addEventListener("click", () => loadScorecard().catch(() => {}));
