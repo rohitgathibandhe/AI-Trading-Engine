@@ -2508,6 +2508,7 @@
         openMtm = d.open_mtm_rupees || 0; realized = d.realized_rupees || 0;
         const positions = (d.snapshot && d.snapshot.positions) || [];
         if (!positions.length) {
+          // Cross-check exits so we don't show closed positions as open.
           const closedKeys = new Set((d.ledger || []).filter(r => r.event === "PAPER_EXIT").map(r => r.entry_key));
           const entries = (d.ledger || []).filter(r => r.event === "PAPER_ENTRY" && !closedKeys.has(r.ts));
           bodyHTML = entries.length ? entries.map(r =>
