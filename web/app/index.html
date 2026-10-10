@@ -2471,12 +2471,18 @@
           '<div style="font-size:12px;font-weight:700;color:' + (ok ? "#22c55e" : "#f59e0b") + ';">' + (ok ? "✓ " : "… ") + title + '</div>' + body + '</div>';
         const days = (st.recent_days || []).map(x => '<span title="' + (x.problems || []).join("; ") + '" style="display:inline-block;width:14px;height:14px;margin-right:3px;border-radius:3px;background:' + (x.clean ? "#22c55e" : "#ef4444") + ';"></span>').join("");
         grid.innerHTML =
-          box(e.ok, "1. Evidence — " + (e.lead_strategy || "") ,
-            bar(pct(e.trades, e.trades_target), "#3b82f6") +
-            '<div style="font-size:11px;color:var(--muted);">' + e.trades + "/" + e.trades_target + " trades since " + e.since +
-            " · total ₹" + (e.total || 0).toLocaleString() + " · win " + (e.win_rate ?? "—") + "% · PF " + (e.profit_factor ?? "—") +
-            "<br>needs " + e.trades_needed + " more trades (~" + e.trades_per_week_recent + "/wk) and ₹" +
-            (e.profit_needed_for_tail_bar || 0).toLocaleString() + " more profit (total ≥ 3× worst trade ₹" + Math.abs(e.worst || 0).toLocaleString() + ")</div>") +
+          (() => {
+            const sk = d.skill || {}, fo = d.forward_overall || {}, ch = sk.checks || {};
+            const row = (k, lbl) => { const c = ch[k] || {}; return '<div style="font-size:11px;color:' + (c.ok ? "#22c55e" : "#f59e0b") + ';">' +
+              (c.ok ? "✓ " : "✗ ") + lbl + ": " + (c.value ?? "—") + " (bar " + c.bar + ")" + ((c.weak_day_types || []).length ? " · weak on " + c.weak_day_types.join(", ") : "") + "</div>"; };
+            const dt = Object.entries(sk.by_day_type || {}).map(([k, g]) => k + " " + g.n + "t ₹" + (g.net || 0).toLocaleString()).join(" · ");
+            return box(sk.ok && fo.ok, "1. Skill — reads, entries, exits (all trades)",
+              bar(pct(fo.trades, 20), "#3b82f6") +
+              '<div style="font-size:11px;color:var(--muted);">' + fo.trades + "/20 trades since " + e.since + " · net ₹" + (fo.net || 0).toLocaleString() + " · PF " + (fo.profit_factor ?? "—") + "</div>" +
+              row("read_60m", "read right 60 min later") + row("entry_score", "entry quality") + row("exit_capture", "exit keeps of peak") +
+              '<div style="font-size:11px;color:var(--muted);margin-top:4px;">by day type: ' + (dt || "—") + "</div>" +
+              '<div style="font-size:11px;color:var(--muted);">money switch: ' + e.lead_strategy + " " + e.trades + "/" + e.trades_target + " (" + (e.lead_status || "") + ")</div>");
+          })() +
           box(st.ok, "2. Stability — clean trading days",
             bar(pct(st.clean_streak, st.target), "#22c55e") +
             '<div style="font-size:11px;color:var(--muted);">streak ' + st.clean_streak + "/" + st.target + ' (Mac awake all session, no stalls, token OK)</div>' +

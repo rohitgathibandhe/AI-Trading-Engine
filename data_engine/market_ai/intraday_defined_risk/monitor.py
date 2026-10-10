@@ -1943,7 +1943,9 @@ def run_live(config: dict[str, object]) -> None:
         # instead of 30 seconds so we don't generate ~1 080 wasted NO_TRADE
         # decisions overnight (18 h × 60 decisions/h).
         _ist_now = datetime.now(_IST)
-        if not (_MARKET_OPEN_TIME <= _ist_now.time() <= _MARKET_CLOSE_TIME):
+        # Weekends too: the loop only checked the clock, so on Saturdays it cycled "market hours" against
+        # no data (INSUFFICIENT_DATA every 30s). Exchange holidays still fall through to that no-data path.
+        if _ist_now.weekday() >= 5 or not (_MARKET_OPEN_TIME <= _ist_now.time() <= _MARKET_CLOSE_TIME):
             # Write heartbeat every 30s during the 5-min after-hours sleep so the
             # watchdog (stale_after_sec=45) never flags the agent as stale overnight.
             for _ in range(10):
