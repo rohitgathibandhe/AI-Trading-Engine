@@ -179,9 +179,23 @@ def evaluate() -> dict:
     ops_needed = max(0, OPS_STREAK_TARGET - streak)
     weeks_ops = ops_needed / 5.0
     weeks = max(weeks_trades if weeks_trades is not None else 99, weeks_ops)
+    # the skill/overall bar needs MIN_DAYS trades across ALL structures — usually sooner than one structure
+    _all_recent = [t for v in pg._paper_pnls().values() for t, _ in v
+                   if t[:10] >= (date.today() - timedelta(days=21)).isoformat()]
+    _need_all = max(0, pg.MIN_DAYS - sum(len(v) for v in pg._paper_pnls().values()))
+    _wk_all = (_need_all / (len(_all_recent) / 3.0)) if _all_recent else 99
+    weeks = max(_wk_all, weeks_ops)
     eta = (date.today() + timedelta(weeks=weeks)).isoformat() if weeks < 99 else None
 
-    evidence_ok = bool(eligible)
+    # SKILL is the deciding evidence (user, 2026-10-10): judge the TRADER across all trades and day
+    # types — read accuracy, entry, exit — plus an overall profitable forward record, not one structure.
+    import agent_skill_report as sk
+    skill = sk.evaluate(pg.FORWARD_EPOCH)
+    allp = [p for v in pg._paper_pnls().values() for _, p in v]
+    gw, gl = sum(x for x in allp if x > 0), -sum(x for x in allp if x < 0)
+    overall = {"trades": len(allp), "net": round(sum(allp)), "profit_factor": round(gw / gl, 2) if gl > 0 else None,
+               "ok": len(allp) >= pg.MIN_DAYS and sum(allp) > 0 and (gl == 0 or gw / gl >= pg.MIN_PROFIT_FACTOR)}
+    evidence_ok = bool(skill["skill_ok"] and overall["ok"])
     stability_ok = streak >= OPS_STREAK_TARGET
     locks = _locks()
     if evidence_ok and stability_ok:
@@ -192,6 +206,9 @@ def evaluate() -> dict:
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "verdict": verdict,
         "eta_date": eta,
+        "skill": {"ok": skill["skill_ok"], "checks": skill["checks"], "overall": skill["overall"],
+                  "by_day_type": skill["by_day_type"], "reads": skill["reads"]},
+        "forward_overall": overall,
         "evidence": {
             "ok": evidence_ok, "eligible": eligible, "lead_strategy": LEAD_STRATEGY,
             "lead_status": lead.get("status"), "trades": n, "trades_target": pg.MIN_DAYS,
@@ -215,7 +232,13 @@ def main() -> int:
     r = evaluate()
     e, s = r["evidence"], r["stability"]
     print(f"LIVE READINESS — {r['verdict']}   (ETA ~{r['eta_date'] or 'unknown — no recent trade rate'})")
-    print(f"\n1. EVIDENCE  {'PASS' if e['ok'] else 'not yet'} — {e['lead_strategy']} {e['trades']}/{e['trades_target']} "
+    sk_, fo = r["skill"], r["forward_overall"]
+    print(f"\n1. SKILL     {'PASS' if sk_['ok'] else 'not yet'} — all trades since {e['since']}: "
+          f"{fo['trades']}/20 trades, net Rs {fo['net']:,}, PF {fo['profit_factor']}")
+    for k, c in sk_["checks"].items():
+        print(f"   [{'PASS' if c['ok'] else 'FAIL'}] {k:13} {c['value']} vs bar {c['bar']}"
+              + (f"  weak on: {', '.join(c['weak_day_types'])}" if c['weak_day_types'] else ""))
+    print(f"\n   per-strategy money switch (promotion gate) — {e['lead_strategy']} {e['trades']}/{e['trades_target']} "
           f"trades since {e['since']}, total Rs {e['total']}, win {e['win_rate']}%, PF {e['profit_factor']}, "
           f"worst Rs {e['worst']}")
     print(f"   needs {e['trades_needed']} more trades (~{e['trades_per_week_recent']}/week recently) and "
