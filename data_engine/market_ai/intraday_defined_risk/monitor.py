@@ -1115,6 +1115,21 @@ class IntradayDefinedRiskAgent:
                     "final_result": result, "playbook": f"SEL_{choice.condition}",
                     "selector_condition": choice.condition, "selector_family": choice.family}
 
+        # CHART-AGREEMENT GATE (upskill 2026-10-10): a non-fade directional entry must not fight the
+        # chart — the confluence rule is "price action AND chain agree". Fades are exempt (counter-move by
+        # design, own spot-based exit). SEL_CHART_AGREE=0 disables. See decision_justification.chart_opposes.
+        if (os.environ.get("SEL_CHART_AGREE", "1") == "1" and choice.structures
+                and choice.family != FAM_STAND_ASIDE and not meta.get("is_fade")):
+            try:
+                from .decision_justification import chart_opposes
+                if chart_opposes(choice.structures[0], _thesis):
+                    choice.rationale = (f"CHART OPPOSES the {choice.structures[0]} read (chart {_thesis.chart.bias}: "
+                                        f"{'; '.join(_thesis.chart.points[:3])}) — price action and chain must agree. "
+                                        f"Stand aside. [was: {choice.rationale}]")
+                    choice.family, choice.structures = FAM_STAND_ASIDE, []
+                    meta["chart_gate_blocked"] = True
+            except NameError:      # _thesis not built (justification failed) — don't block on missing data
+                pass
         # Stand aside: chop / high-vol-undirected / not-yet-executable structure
         if choice.family == FAM_STAND_ASIDE or not choice.executable_today or not choice.structures:
             self._current_features = {"playbook": f"SEL_{choice.condition}", "selector_family": choice.family}

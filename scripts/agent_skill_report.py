@@ -39,7 +39,10 @@ OUT = STATE / "agent_skill.json"
 DEFAULT_SINCE = "2026-09-17"      # current selector config (FORWARD_EPOCH in promotion_gate)
 
 # Skill bars (the "competence gate"); per day type a bar is only judged with >= MIN_CELL samples.
-BARS = {"read_60m": 0.60, "entry_score": 0.55, "exit_capture": 0.50}
+# read_touch (first-touch) is the READ bar: horizon-free, so a 15-min fade that hit target and then
+# saw price continue isn't scored "wrong" the way a fixed 60-min look-ahead scores it.
+BARS = {"read_touch": 0.60, "entry_score": 0.55, "exit_capture": 0.50}
+TOUCH_PTS = 15.0
 MIN_CELL = 5
 
 _DIR = {"PUT_DEBIT": -1, "BEAR_CALL": -1, "CALL_DEBIT": 1, "BULL_PUT": 1}
@@ -150,6 +153,16 @@ def _trade_metrics(entry: dict, exit_: dict, bars: list[dict], toclose: dict | N
     sclose = bars[-1]["c"]
     m["read_60m"] = (d * (s60 - spot) > 0) if s60 is not None else None
     m["read_close"] = d * (sclose - spot) > 0
+    # FIRST-TOUCH: did spot go TOUCH_PTS the agent's way before TOUCH_PTS against? (same-bar = against)
+    for b in (x for x in bars if x["t"] > et - timedelta(minutes=5)):
+        fav = (spot - b["l"]) if d < 0 else (b["h"] - spot)
+        adv = (b["h"] - spot) if d < 0 else (spot - b["l"])
+        if adv >= TOUCH_PTS:
+            m["read_touch"] = False
+            break
+        if fav >= TOUCH_PTS:
+            m["read_touch"] = True
+            break
     win = [b for b in bars if et - timedelta(minutes=30) <= b["t"] <= et + timedelta(minutes=30)]
     if win:
         hi, lo = max(b["h"] for b in win), min(b["l"] for b in win)
@@ -195,7 +208,7 @@ def _agg(rows: list[dict]) -> dict:
     pnl = [r["pnl"] for r in rows if "pnl" in r]
     return {"n": len(rows), "net": round(sum(pnl)) if pnl else None,
             "win_rate": round(sum(1 for x in pnl if x > 0) / len(pnl), 2) if pnl else None,
-            "read_60m": rate("read_60m"), "read_close": rate("read_close"), "entry_score": med("entry_score"),
+            "read_touch": rate("read_touch"), "read_60m": rate("read_60m"), "read_close": rate("read_close"), "entry_score": med("entry_score"),
             "exit_capture": med("exit_capture"), "heat_pts": med("heat_pts"), "loss_cut": rate("loss_cut"),
             "exit_vs_hold": (round(sum(r["exit_vs_hold"] for r in rows if r.get("exit_vs_hold") is not None))
                              if any(r.get("exit_vs_hold") is not None for r in rows) else None)}
@@ -254,13 +267,13 @@ def main() -> int:
     r = evaluate(a.since)
     o = r["overall"]
     print(f"AGENT SKILL REPORT — trades since {r['since']}  (structure-agnostic)\n")
-    print(f"{'':16}{'trades':>7}{'net':>9}{'win':>6}{'read60':>14}{'readEOD':>14}{'entry':>13}{'exitCap':>13}{'heat':>12}{'exit-hold':>10}{'lossCut':>9}")
+    print(f"{'':16}{'trades':>7}{'net':>9}{'win':>6}{'readTouch':>11}{'read60':>10}{'readEOD':>14}{'entry':>13}{'exitCap':>13}{'heat':>12}{'exit-hold':>10}{'lossCut':>9}")
     def line(lbl, g):
         def p(t, pct=True):
             if t[0] is None:
                 return "—"
             return (f"{t[0]:.0%}" if pct else f"{t[0]:g}") + f"/{t[1]}"
-        print(f"{lbl:16}{g['n']:>7}{(g['net'] or 0):>9,}{(g['win_rate'] or 0):>6.0%}{p(g['read_60m']):>14}"
+        print(f"{lbl:16}{g['n']:>7}{(g['net'] or 0):>9,}{(g['win_rate'] or 0):>6.0%}{p(g['read_touch']):>11}{p(g['read_60m']):>10}"
               f"{p(g['read_close']):>14}{p(g['entry_score'], False):>13}{p(g['exit_capture'], False):>13}"
               f"{p(g['heat_pts'], False):>12}{(g['exit_vs_hold'] if g['exit_vs_hold'] is not None else '—'):>10}"
               f"{p(g['loss_cut']):>9}")
@@ -279,7 +292,7 @@ def main() -> int:
     print(f"\n=> skill {'PROVEN' if r['skill_ok'] else 'NOT YET PROVEN'}  -> {OUT}")
     print("\nPer trade:")
     for t in r["trades"]:
-        print(f"  {t['entry']}  {str(t['strategy'])[:16]:16} {t['day_type']:10} pnl {t['pnl']:>6}  read60 "
+        print(f"  {t['entry']}  {str(t['strategy'])[:16]:16} {t['day_type']:10} pnl {t['pnl']:>6}  touch {t.get('read_touch','—')!s:5} read60 "
               f"{t.get('read_60m','—')!s:5} entry {t.get('entry_score','—')!s:5} heat {t.get('heat_pts','—')!s:6} "
               f"capture {t.get('exit_capture','—')!s:5} exit {t.get('exit_reason')}")
     return 0

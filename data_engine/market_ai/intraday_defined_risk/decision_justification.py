@@ -190,3 +190,23 @@ def build_thesis(metadata: dict[str, Any], spot: float, *, strategy: str = "", s
         net_bias=net, confluence=confluence, conviction=conviction,
         strategy=strategy, strategy_why=strategy_why, entry_why=entry_why, exit_why=exit_why,
     )
+
+
+_STRUCT_DIR = {"PUT_DEBIT": "BEARISH", "BEAR_CALL": "BEARISH", "CALL_DEBIT": "BULLISH", "BULL_PUT": "BULLISH"}
+
+
+def chart_opposes(structure: str, thesis: "TradeThesis | None") -> bool:
+    """True when a DIRECTIONAL structure would be entered against what the chart itself says.
+
+    The confluence design (2026-09-17) is "price action AND option chain agree". Forward record since
+    then: non-fade entries with the chart opposing (09-29 put-debit vs a BULLISH chart: -3,146; 10-06)
+    vs aligned entries — the read is weakest exactly where the chart disagrees. Fades are exempt by the
+    caller (they fade a move by design and carry their own tight spot-based exit)."""
+    if thesis is None or thesis.chart is None:
+        return False
+    s = (structure or "").upper()
+    want = next((d for k, d in _STRUCT_DIR.items() if k in s), None)
+    if want is None:
+        return False
+    opposite = "BULLISH" if want == "BEARISH" else "BEARISH"
+    return thesis.chart.bias == opposite
