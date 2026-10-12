@@ -47,5 +47,8 @@ def test_chain_lookup_handles_decimal_keys(monkeypatch):
 
     strike = 19200
     result = _extract_leg_from_chain_sources(sources, strike, "CALL", "NIFTY", "2025-11-25")
-    assert result == (424242, 0.0)
+    # Contract is (security_id, ltp, leg_details) — the 3rd element was added for quote/greeks context.
+    sec_id, ltp, details = result
+    assert (sec_id, ltp) == (424242, 0.0)
+    assert isinstance(details, dict)
     assert captured["args"] == ("NIFTY", "2025-11-25", float(strike), "CALL")

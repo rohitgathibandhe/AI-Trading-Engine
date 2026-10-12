@@ -1173,10 +1173,15 @@ def evaluate_paper_context_override_gate(
         reasons.append("DAILY_REALIZED_LOSS_LOCK")
     if float(state.get("total_pnl_rupees") or 0.0) <= -abs(config.risk.max_daily_total_loss_rupees):
         reasons.append("DAILY_TOTAL_LOSS_LOCK")
-    # Expiry-day guard: same-day expiry = extreme gamma risk, block paper entries too
+    # Expiry-day guard — same rule as evaluate_entry_gate: defined-risk sellers ARE allowed on expiry
+    # (EXPIRY_ALLOW_DEFINED_SELLERS, 2026-07-28). This override path kept the old block-everything rule,
+    # so the same defined-risk trade was allowed by one gate and blocked by the other.
     try:
         chain_expiry = snapshot.option_chain.expiry
-        if isinstance(chain_expiry, date) and chain_expiry == snapshot.timestamp.date():
+        _ovr_strategy = decision.strategy.value if isinstance(decision.strategy, StrategyType) else str(decision.strategy)
+        _allow_exp = (os.environ.get("EXPIRY_ALLOW_DEFINED_SELLERS", "1") == "1"
+                      and _ovr_strategy in {"IRON_FLY", "IRON_CONDOR", "BULL_PUT_CREDIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD"})
+        if isinstance(chain_expiry, date) and chain_expiry == snapshot.timestamp.date() and not _allow_exp:
             reasons.append("EXPIRY_DAY_BLOCKED")
     except Exception:
         pass

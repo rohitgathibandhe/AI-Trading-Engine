@@ -3903,7 +3903,7 @@ def _start_v83_process(*, trade_mode: str) -> Dict[str, Any]:
         "market_ai.intraday_defined_risk.cli",
         "run_live",
         "--config",
-        str(ROOT / "data_engine" / "market_ai" / "state" / "intraday_v83_run_live_config.json"),
+        str(V83_RUN_CONFIG_JSON),   # the file _write_v83_run_config() just wrote (was a hard-coded duplicate path)
     ]
     V83_RUNNER_LOG.parent.mkdir(parents=True, exist_ok=True)
     with V83_RUNNER_LOG.open("ab") as log_handle:

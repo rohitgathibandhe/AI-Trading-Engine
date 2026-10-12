@@ -262,7 +262,7 @@ def test_directional_balance_override_uses_relative_margin(tmp_path: Path) -> No
     )
 
     assert gate["allowed"] is False
-    assert gate["primary_block_reason"] == "BEARISH_SCORE_MARGIN_FAIL"
+    assert gate["primary_block_reason"] == "DIRECTIONAL_SCORE_MARGIN_FAIL"   # renamed when bullish playbooks became symmetric (e2164ea)
     assert gate["score_margin_required"] == 0.4
 
 

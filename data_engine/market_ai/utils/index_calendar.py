@@ -29,12 +29,17 @@ def monthly_expiry_date(target: date) -> date:
     """
     Return the index monthly expiry for `target`'s month.
 
-    Per our NIFTY setup, we treat the monthly expiry as the last Tuesday
-    of the month (weekday=1), shifting earlier if that Tuesday is a holiday
-    via last_weekday_of_month helper.
+    NIFTY monthly expiry = last Tuesday of the month for expiries on/after 2025-09-01 (the exchange
+    moved index expiries Thu -> Tue), and the last THURSDAY before that. Always returning Tuesday gave
+    the wrong date for every pre-Sep-2025 month (e.g. 2025-06-24 instead of 2025-06-26), which
+    mis-dates historical/backtest expiries.
     """
+    from .nifty_expiry_calendar import NIFTY_TUESDAY_EXPIRY_EFFECTIVE_DATE
 
-    return last_weekday_of_month(target.year, target.month, weekday=1)  # 1 = Tuesday
+    tuesday = last_weekday_of_month(target.year, target.month, weekday=1)
+    if tuesday >= NIFTY_TUESDAY_EXPIRY_EFFECTIVE_DATE:
+        return tuesday
+    return last_weekday_of_month(target.year, target.month, weekday=3)  # 3 = Thursday
 
 
 def last_friday_before(expiry: date) -> date:

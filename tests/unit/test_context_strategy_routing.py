@@ -92,7 +92,9 @@ def test_select_strategy_allows_directional_balance_bearish_context() -> None:
     assert strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD
 
 
-def test_select_strategy_allows_bearish_rejection_transition_context() -> None:
+def test_select_strategy_allows_bearish_rejection_transition_context(monkeypatch) -> None:
+    # TRANSITION-state entries are disabled by default (validated: -Rs73.7k / 35 trades on the 7-month
+    # dense backtest); ALLOW_TRANSITION re-enables them. Assert both halves of that contract.
     regime = _bearish_regime(
         day_archetype="SIDEWAYS_TO_BEARISH",
         playbook="SIDEWAYS_TO_BEARISH_REJECTION",
@@ -108,6 +110,12 @@ def test_select_strategy_allows_bearish_rejection_transition_context() -> None:
         bearish_close_location=0.40,
         bearish_candle_quality_score=0.60,
     )
+    monkeypatch.delenv("ALLOW_TRANSITION", raising=False)
+    blocked, why = select_strategy(regime, time(12, 10), allowed_playbook_tiers=("A", "B"))
+    assert blocked == StrategyType.NO_TRADE
+    assert any("TRANSITION-state trading disabled" in reason for reason in why)
+
+    monkeypatch.setenv("ALLOW_TRANSITION", "1")
     strategy, reasons = select_strategy(regime, time(12, 10), allowed_playbook_tiers=("A", "B"))
     assert strategy == StrategyType.BEAR_CALL_CREDIT_SPREAD
     assert any("Bear Call Credit Spread" in reason for reason in reasons)

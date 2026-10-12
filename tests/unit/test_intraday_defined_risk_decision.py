@@ -5,6 +5,8 @@ from copy import deepcopy
 from market_ai.intraday_defined_risk.decision import make_decision
 
 
+# Bid/ask kept realistic (<1.5pt): the selector rejects wider markets as illiquid (live Nifty spreads
+# are ~0.8% of mid), so 2pt-wide synthetic quotes made every short call untradeable.
 BASE_PAYLOAD = {
     "date": "2026-04-03",
     "time_ist": "09:55",
@@ -33,12 +35,12 @@ BASE_PAYLOAD = {
     "options_chain": {
         "expiry": "2026-04-09",
         "strikes": [
-            {"k": 22500, "ce_ltp": 64.0, "pe_ltp": 41.0, "ce_bid": 63.0, "ce_ask": 65.0, "pe_bid": 40.0, "pe_ask": 42.0, "ce_delta": 0.31, "pe_delta": -0.12},
-            {"k": 22600, "ce_ltp": 43.0, "pe_ltp": 28.0, "ce_bid": 42.0, "ce_ask": 44.0, "pe_bid": 27.0, "pe_ask": 29.0, "ce_delta": 0.22, "pe_delta": -0.09},
+            {"k": 22500, "ce_ltp": 64.0, "pe_ltp": 41.0, "ce_bid": 63.6, "ce_ask": 64.4, "pe_bid": 40.0, "pe_ask": 42.0, "ce_delta": 0.31, "pe_delta": -0.12},
+            {"k": 22600, "ce_ltp": 43.0, "pe_ltp": 28.0, "ce_bid": 42.6, "ce_ask": 43.4, "pe_bid": 27.0, "pe_ask": 29.0, "ce_delta": 0.22, "pe_delta": -0.09},
             {"k": 22700, "ce_ltp": 12.0, "pe_ltp": 18.0, "ce_bid": 11.5, "ce_ask": 12.5, "pe_bid": 17.5, "pe_ask": 18.5, "ce_delta": 0.07, "pe_delta": -0.05},
             {"k": 22200, "ce_ltp": 14.0, "pe_ltp": 10.0, "ce_bid": 13.5, "ce_ask": 14.5, "pe_bid": 9.5, "pe_ask": 10.5, "ce_delta": 0.05, "pe_delta": -0.07},
             {"k": 22300, "ce_ltp": 19.0, "pe_ltp": 20.0, "ce_bid": 18.5, "ce_ask": 19.5, "pe_bid": 19.0, "pe_ask": 21.0, "ce_delta": 0.08, "pe_delta": -0.22},
-            {"k": 22400, "ce_ltp": 26.0, "pe_ltp": 37.0, "ce_bid": 25.0, "ce_ask": 27.0, "pe_bid": 36.0, "pe_ask": 38.0, "ce_delta": 0.11, "pe_delta": -0.31},
+            {"k": 22400, "ce_ltp": 26.0, "pe_ltp": 37.0, "ce_bid": 25.6, "ce_ask": 26.4, "pe_bid": 36.0, "pe_ask": 38.0, "ce_delta": 0.11, "pe_delta": -0.31},
         ],
     },
     "risk": {

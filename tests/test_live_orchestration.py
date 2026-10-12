@@ -39,7 +39,10 @@ class StubIngestor:
         self._monthly = monthly_df
 
     def list_expiries(self) -> pd.Series:
-        return pd.Series(["2025-11-25"])
+        # Relative to today: _pick_monthly_expiry only considers FUTURE expiries, so a hard-coded
+        # 2025-11-25 made this test silently stop exercising the roll path once that date passed.
+        from datetime import date, timedelta
+        return pd.Series([(date.today() + timedelta(days=21)).isoformat()])
 
     def fetch(self, expiry: str) -> pd.DataFrame:
         if expiry == "weekly":
