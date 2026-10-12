@@ -1087,6 +1087,7 @@ class IntradayDefinedRiskAgent:
         # Attach the ml_* snapshot on the SELECTOR path too — it is the live decision driver,
         # and without this every PAPER_ENTRY it wrote logged ml_* as null (see helper docstring).
         meta.update(_ml_feature_snapshot(regime_state))
+        meta.setdefault("session_date", snapshot.timestamp.date().isoformat())   # e.g. broken-fade-level memory
         choice = _select(meta, spot, now_time=snapshot.timestamp.time())
         meta["selector_condition"] = choice.condition
         meta["selector_family"] = choice.family
