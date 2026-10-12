@@ -542,6 +542,8 @@ _CONF_ALLOW_BULLISH = os.environ.get("SEL_CONF_ALLOW_BULLISH", "0") == "1"
 # CVD pushing the trade's way (buyers for up, sellers for down). A slow grind with a directional bias is
 # NOT a buy — it's a sell (bull-put) or a stand-aside. Env SEL_MOMENTUM_GATE / thresholds.
 _MOMENTUM_GATE = os.environ.get("SEL_MOMENTUM_GATE", "1") == "1"
+# BEARISH confluence without momentum -> SELL a bear-call (seller exit) instead of standing aside.
+_NOMOM_SELL = os.environ.get("SEL_NOMOM_SELL", "1") == "1"
 _MOM_MIN_RVOL = _sel_env_float("SEL_MOM_MIN_RVOL") or 1.05        # volume at/above average = participation
 _MOM_MIN_CVD = _sel_env_float("SEL_MOM_MIN_CVD_SLOPE") or 1.0     # |CVD slope| this side = real pressure
 
@@ -836,9 +838,19 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
             if _mom_ok:
                 choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
                 choice.rationale = _why + f" [BUY put-debit — {_mom_why}]"
+            elif _NOMOM_SELL:
+                # Bearish but NO momentum for a BUY -> SELL the grind (user, 2026-10-12: "buying needs momentum;
+                # when momentum fades the premium fades too"). Paired shadow on live fills: the bear-call made
+                # money on 6/6 bearish reads on 10-12 (and the sell side 10/11 over 10-09/10-12), incl. the two
+                # moments the put-debit fades were stopped out. The old "bear-call is the validated loser" came
+                # from SEL_CHOP entries killed by momentum stops — so this path carries seller_exit=True:
+                # TP 50% / stop 2x credit or spot within 50pts of the short, no EMA/VWAP invalidation.
+                choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BEAR_CALL_CREDIT_SPREAD"]
+                metadata["seller_exit"] = True
+                choice.rationale = (_why + " [SELL a bear-call — " + _mom_why.split(" — ")[0]
+                                    + ": no momentum to BUY, so sell the slow grind; seller exit]")
             else:
-                # Bearish but NO momentum: a debit would bleed theta on the grind, and selling calls
-                # (bear-call) is the validated loser — so stand aside (or the range-fade below catches it).
+                # Bearish but NO momentum and selling disabled (SEL_NOMOM_SELL=0): stand aside.
                 choice.family, choice.structures = FAM_STAND_ASIDE, []
                 choice.rationale = "BEARISH but " + _mom_why
         elif _dir == "BULLISH" and _bull_is_debit:
