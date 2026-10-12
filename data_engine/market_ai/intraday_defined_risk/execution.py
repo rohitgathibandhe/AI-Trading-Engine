@@ -597,6 +597,35 @@ def _evaluate_reversal_exit(
     return None
 
 
+SELLER_TP_FRACTION = float(os.environ.get("SELLER_TP_FRACTION", "0.5") or 0.5)
+SELLER_STOP_CREDIT_MULT = float(os.environ.get("SELLER_STOP_CREDIT_MULT", "2.0") or 2.0)
+SELLER_STRIKE_BUFFER_PTS = float(os.environ.get("SELLER_STRIKE_BUFFER_PTS", "50") or 50.0)
+
+
+def _evaluate_seller_exit(position: OpenPosition, current_snapshot: MarketSnapshot | None,
+                          current_value_points: float | None) -> ExitDecision | None:
+    """Strike-buffer-aware credit exit (see the SELLER EXIT note in evaluate_exit). None = hold."""
+    if current_value_points is None:
+        return None
+    credit = float(position.entry_credit_points)
+    pnl = (credit - current_value_points) * position.lot_size * position.lots
+    credit_rs = credit * position.lot_size * position.lots
+    if credit_rs > 0 and pnl >= SELLER_TP_FRACTION * credit_rs:
+        return ExitDecision(True, "SELLER_TAKE_PROFIT", current_value_points, pnl)
+    if credit_rs > 0 and pnl <= -SELLER_STOP_CREDIT_MULT * credit_rs:
+        return ExitDecision(True, "SELLER_STOP_CREDIT", current_value_points, pnl)
+    spot = float(current_snapshot.option_chain.spot) if current_snapshot is not None else None
+    if spot is not None:
+        for leg in position.structure.legs:
+            if str(leg.action).upper() != "SELL":
+                continue
+            is_call = str(getattr(leg.option_type, "value", leg.option_type)).upper() in ("CALL", "CE")
+            if (is_call and spot >= leg.strike - SELLER_STRIKE_BUFFER_PTS) or \
+                    (not is_call and spot <= leg.strike + SELLER_STRIKE_BUFFER_PTS):
+                return ExitDecision(True, "SELLER_STRIKE_BUFFER", current_value_points, pnl)
+    return None
+
+
 def evaluate_exit(
     position: OpenPosition,
     current_structure: TradeStructure | None = None,
@@ -632,6 +661,18 @@ def evaluate_exit(
         return ExitDecision(True, "TIME_EXIT", liability, pnl_rupees)
 
     elapsed_minutes = _elapsed_minutes(now, position.entry_time)
+
+    # SELLER EXIT (positions opened with seller_exit=True, e.g. "sell the grind" bear-calls): a credit
+    # spread wins by TIME + distance, so it must not be thrown out by EMA20/VWAP momentum stops on a
+    # pop that never threatens the short (08-05: correct bear-call exited -1,160 vs +146 held). Exit only
+    # on: take-profit at 50% of credit, a loss of 2x credit, or spot within 50pts of the short strike.
+    if position.metadata.get("seller_exit"):
+        _sx = _evaluate_seller_exit(position, current_snapshot, current_value_points)
+        if _sx is not None:
+            return _sx
+        return ExitDecision(False, "HOLD", current_value_points or 0.0,
+                            ((position.entry_credit_points - current_value_points) * position.lot_size * position.lots)
+                            if current_value_points is not None else 0.0)
 
     quick_invalidation_reason = _intrabar_regime_invalidation_reason(position, current_snapshot, now=now)
     if quick_invalidation_reason:
