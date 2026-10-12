@@ -131,6 +131,22 @@ def test_build_intraday_performance_payload_summarizes_history(tmp_path: Path, m
     ]
     hist.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
     monkeypatch.setattr(paper_server, "INTRADAY_AI_TRADE_HISTORY_JSONL", hist)
+    # PAPER mode reads the v83 ledger (PAPER_ENTRY/PAPER_EXIT pairs), not the legacy history file —
+    # point it at a temp ledger with the same two paper trades so the test never reads live state.
+    v83 = tmp_path / "intraday_v83_paper_live_trades.jsonl"
+    ev = []
+    for ts, strat, pnl, hold, why in (("2026-03-06T10:02:00+05:30", "BEAR_CALL_CREDIT_SPREAD", 1200.0, 28.0, "TARGET_HIT"),
+                                      ("2026-03-06T11:40:00+05:30", "BULL_PUT_CREDIT_SPREAD", -800.0, 35.0, "SL_HIT")):
+        from datetime import datetime, timedelta
+        exit_ts = (datetime.fromisoformat(ts) + timedelta(minutes=hold)).isoformat()
+        ev.append({"event": "PAPER_ENTRY", "timestamp": ts, "entry_timestamp": ts, "strategy": strat, "legs": []})
+        ev.append({"event": "PAPER_EXIT", "timestamp": exit_ts, "entry_timestamp": ts, "exit_timestamp": exit_ts,
+                   "exit_reason": why, "realized_paper_pnl": pnl, "strategy": strat})
+    v83.write_text("".join(json.dumps(e) + "\n" for e in ev), encoding="utf-8")
+    monkeypatch.setattr(paper_server, "V83_PAPER_LIVE_TRADES_JSONL", v83)
+
+    live = paper_server._build_intraday_performance_payload(trade_mode="live")
+    assert live["total_trades"] == 1                     # live mode still reads the legacy history file
 
     out = paper_server._build_intraday_performance_payload(trade_mode="paper")
 

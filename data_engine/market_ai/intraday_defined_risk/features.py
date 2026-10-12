@@ -2034,14 +2034,22 @@ def compute_momentum_persistence(bars: list[OhlcvBar], n: int = 6) -> dict[str, 
     }
 
 
-def read_market_context() -> dict:
+def read_market_context(as_of=None, max_age_minutes: float = 10.0) -> dict:
     """Read auxiliary market context (VIX, BankNifty) written by DhanLiveMarketDataProvider.
 
-    Returns an empty dict when the file is absent or unreadable — callers must handle missing keys.
+    `as_of` (the snapshot time) makes it point-in-time safe: the file only describes the LIVE market
+    right now, so a backtest/test snapshot from another time must not consume it (it silently applied
+    today's VIX + BankNifty to historical bars). If `as_of` is given and the file's updated_at is more
+    than `max_age_minutes` away from it, return {} (unknown). Callers must handle missing keys.
     """
     try:
         if _MARKET_CONTEXT_PATH.exists():
-            return json.loads(_MARKET_CONTEXT_PATH.read_text())
+            ctx = json.loads(_MARKET_CONTEXT_PATH.read_text())
+            if as_of is not None:
+                upd = datetime.fromisoformat(str(ctx.get("updated_at"))).replace(tzinfo=None)
+                if abs((as_of.replace(tzinfo=None) - upd).total_seconds()) > max_age_minutes * 60:
+                    return {}
+            return ctx
     except Exception:
         pass
     return {}

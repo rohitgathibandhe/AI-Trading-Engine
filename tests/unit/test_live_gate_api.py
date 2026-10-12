@@ -261,6 +261,12 @@ def test_start_agent_process_launches_v83_paper_runner(monkeypatch, tmp_path: Pa
         return DummyProc()
 
     monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    # NEVER touch real processes from a test: _start_v83_process now kickstarts the launchd job and first
+    # SIGKILLs every running v83 agent (_find_all_v83_pids). Unmocked, running this test would kill the live
+    # agent. Report no running agents and launchd unavailable -> exercises the subprocess fallback.
+    monkeypatch.setattr(server, "_find_all_v83_pids", lambda: [])
+    monkeypatch.setattr(server, "_kickstart_v83_via_launchd",
+                        lambda: server.subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="launchd unavailable (test)"))
 
     out = server._start_agent_process("paper")
 

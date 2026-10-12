@@ -69,10 +69,13 @@ def _fake_spread(expiry, option_type):
 
 
 def test_selector_opens_strangle_when_sideways():
+    # The strangle path now requires IV percentile >= 0.3 and 2-4 DTE (deliberate guards); the default
+    # fixture (VIX 12, 7 DTE) is correctly refused, so use a market that satisfies them.
+    import dataclasses
     selector = StrategySelector(symbol="NIFTY", lot_size=75)
     expiry = date(2025, 11, 27)
     decision = selector.decide(
-        market=_market(),
+        market=dataclasses.replace(_market(), india_vix=16.0, now=datetime(2025, 11, 24, 10, 0, 0)),
         option_chain=_chain(expiry),
         expiry=expiry,
         risk=_risk(),

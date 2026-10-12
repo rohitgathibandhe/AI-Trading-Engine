@@ -40,7 +40,9 @@ RANGE_STRANGLE_END = time(13, 30)
 # Wednesday = Day 1 of new weekly series (post-Tuesday expiry).
 # IC can start earlier on Wednesday — morning range is well-defined after the
 # previous day's expiry flush, and 7DTE options carry the most weekly premium.
-RANGE_CONDOR_POST_EXPIRY_START = time(10, 45)   # 45 min earlier than normal
+# Post-expiry days may start EARLIER than normal, never later. (When the normal start moved 11:30 -> 10:30
+# this stayed at 10:45 — i.e. later than normal, the opposite of its intent.)
+RANGE_CONDOR_POST_EXPIRY_START = min(time(10, 45), RANGE_CONDOR_START)
 RANGE_CONDOR_POST_EXPIRY_END = time(13, 30)      # same close — no extra risk
 OPEN_DRIVE_BULLISH_MIN_CONFIDENCE = 0.64
 GAP_UP_BULLISH_MIN_CONFIDENCE = 0.68

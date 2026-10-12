@@ -1638,7 +1638,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     # VIX > 22: gap risk, wide spreads → raise bar both sides.
     # VIX 16-22: elevated premium, good theta capture → slight bonus.
     # VIX < 12: crushed vol, premium barely covers slippage → raise bar.
-    _mkt_ctx = read_market_context()
+    _mkt_ctx = read_market_context(as_of=snapshot.timestamp)   # point-in-time: never today's file in a backtest
     _india_vix = float(_mkt_ctx.get("india_vix") or 0.0)
     if _india_vix > 22:
         bullish_entry_score -= 0.4
@@ -1669,10 +1669,11 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["banknifty_divergence"] = _bank_divergence
 
     # Phase 6C: Monthly expiry gate — last Thursday of month carries extreme gamma risk.
+    # Monthly expiry = last TUESDAY since 2025-09-01 (last Thursday before) — the gate keyed on the last
+    # Thursday, so live it fired two days late (e.g. Oct-2026: 29th instead of the 27th).
+    from ..utils.index_calendar import monthly_expiry_date
     _today = snapshot.timestamp.date()
-    _month_weeks = calendar.monthcalendar(_today.year, _today.month)
-    _last_thu = max(w[calendar.THURSDAY] for w in _month_weeks if w[calendar.THURSDAY])
-    _days_to_monthly = _last_thu - _today.day
+    _days_to_monthly = (monthly_expiry_date(_today) - _today).days
     if _days_to_monthly == 0:
         bullish_entry_score -= 0.8
         bearish_entry_score -= 0.8
@@ -2136,7 +2137,10 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     _early_window = EARLY_INTENT_START <= _now_time <= EARLY_INTENT_END
     early_structure_bearish_intent = False
     early_structure_bullish_intent = False
-    if _early_window and execution_5m != "UP_CONFIRMED":
+    # Early intent is a FALLBACK for the opening window — it must not overwrite a setup that is already
+    # confirmed and more specific (gap continuation / open-drive reclaim) together with that setup's
+    # playbook, width, edge and score threshold. Previously it ran unconditionally and relabelled them.
+    if _early_window and execution_5m != "UP_CONFIRMED" and not metadata.get("bearish_entry_ready"):
         _ei_bear = early_structure_intent_bearish(
             bars_5m=bars_5m,
             ema20_5m=ema20_5m_value,
@@ -2163,7 +2167,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                 f"EMA20 position, LH/LL structure, and chain pressure aligned in the "
                 f"opening window before trend labels confirmed."
             )
-    if _early_window and execution_5m != "DOWN_CONFIRMED" and not early_structure_bearish_intent:
+    if (_early_window and execution_5m != "DOWN_CONFIRMED" and not early_structure_bearish_intent
+            and not metadata.get("bullish_entry_ready")):
         _ei_bull = early_structure_intent_bullish(
             bars_5m=bars_5m,
             ema20_5m=ema20_5m_value,

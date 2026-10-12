@@ -109,6 +109,8 @@ def _decision() -> DecisionOutput:
         metadata={
             "playbook": "SIDEWAYS_TO_BEARISH_REJECTION",
             "setup_direction": "BEARISH",
+            # PH21 (2026-07-07): before 10:15 a directional credit needs 5m confirmation in its direction.
+            "execution_5m": "DOWN_CONFIRMED",
             "market_state": "TRANSITION",
             "tradability_class": "TRADABLE",
             "failure_type": "FAILED_RECLAIM",
@@ -258,6 +260,10 @@ def test_collector_staleness_does_not_block_paper_live_when_live_data_is_healthy
     )
 
     snapshot = _snapshot(datetime(2026, 5, 15, 10, 5))
+    # Health ages are measured against the wall clock (correct live); freeze it at the snapshot time so
+    # this test doesn't silently depend on the date/time it is run (it broke once May 2026 passed).
+    _frozen = ops_runtime._now().replace(year=2026, month=5, day=15, hour=10, minute=5, second=30, microsecond=0)
+    monkeypatch.setattr(ops_runtime, "_now", lambda: _frozen)
 
     health = build_unified_health(config=RuntimeConfig(mode=RuntimeMode.PAPER_LIVE), paths=paths, snapshot=snapshot)
 
