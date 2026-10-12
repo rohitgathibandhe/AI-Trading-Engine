@@ -434,6 +434,17 @@ def _evaluate_chop_patience_exit(
 
 
 
+def _note_broken_fade(position: OpenPosition, now: datetime, stop) -> None:
+    """Tell the selector this faded level failed today, so it isn't faded again (see strategy_selector)."""
+    try:
+        from .strategy_selector import record_broken_fade
+        md = position.metadata or {}
+        direction = "FADE_SHORT" if position.structure.strategy == StrategyType.PUT_DEBIT_SPREAD else "FADE_LONG"
+        record_broken_fade(now.date().isoformat(), direction, float(md.get("fade_entry_spot") or stop), float(stop))
+    except Exception:
+        pass
+
+
 def _evaluate_fade_exit(
     position: OpenPosition,
     current_snapshot: MarketSnapshot | None,
@@ -463,11 +474,13 @@ def _evaluate_fade_exit(
         if spot <= float(target):
             return ExitDecision(True, "FADE_TARGET", value, pnl)
         if spot >= float(stop):
+            _note_broken_fade(position, now, stop)
             return ExitDecision(True, "FADE_STOP", value, pnl)
     else:                                          # fade-long: target ABOVE, stop BELOW
         if spot >= float(target):
             return ExitDecision(True, "FADE_TARGET", value, pnl)
         if spot <= float(stop):
+            _note_broken_fade(position, now, stop)
             return ExitDecision(True, "FADE_STOP", value, pnl)
     return ExitDecision(False, "HOLD", value, pnl)
 

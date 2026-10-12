@@ -1045,7 +1045,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "last_hour_change_pct": hour_change_pct,
         "support_5m": support_5m[0] if support_5m else None,
         "resistance_5m": resistance_5m[0] if resistance_5m else None,
-        **compute_volume_signals(bars_5m),   # relative_volume, cumulative_volume_delta, cvd_slope, vpoc
+        **compute_volume_signals(bars_5m, now=snapshot.timestamp),   # rvol (completed bars), CVD, cvd_slope, vpoc
         "support_15m": support_15m[0] if support_15m else None,
         "resistance_15m": resistance_15m[0] if resistance_15m else None,
         "bullish_chain_pressure": option_pressure["bullish_pressure"],

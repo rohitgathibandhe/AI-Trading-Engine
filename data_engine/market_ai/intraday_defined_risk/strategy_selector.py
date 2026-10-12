@@ -697,6 +697,22 @@ def _wall_reversal_confluence(m: dict[str, Any], side: str) -> tuple[bool, str]:
     return False, f"no override ({detail}) — wall not building hard enough or CVD not confirming"
 
 
+# Levels that FAILED today: a fade whose stop fired means price ran through the level, so it is no longer
+# acting as S/R. 2026-10-12 re-faded the same broken 22,382 an hour after it stopped the first fade and
+# was stopped again in 3 minutes (-475). In-process memory (recorded by execution on FADE_STOP), keyed by
+# session date so it also behaves correctly in a backtest; lost on restart, which only makes it permissive.
+_BROKEN_FADE_ZONES: dict[str, list[tuple[str, float, float]]] = {}
+
+
+def record_broken_fade(day: str, direction: str, entry_spot: float, stop_spot: float) -> None:
+    lo, hi = sorted((float(entry_spot), float(stop_spot)))
+    _BROKEN_FADE_ZONES.setdefault(day, []).append((direction, lo - _FADE_EDGE_PTS, hi + _FADE_EDGE_PTS))
+
+
+def _level_broken_today(day: str | None, direction: str, level: float) -> bool:
+    return bool(day) and any(d == direction and lo <= level <= hi for d, lo, hi in _BROKEN_FADE_ZONES.get(day, []))
+
+
 def _range_fade_signal(read, m: dict[str, Any], spot: float) -> tuple[str | None, str]:
     """(direction, why). FADE_SHORT at a confirmed M-top on resistance; FADE_LONG at a confirmed
     W-bottom on support; else None. Gates, in order: non-trending tape (fading a trend blows up);
@@ -730,6 +746,11 @@ def _range_fade_signal(read, m: dict[str, Any], spot: float) -> tuple[str | None
     put_oi_chg = _f(m, "put_support_oi_change")
     resist_weak = _FADE_OI_CONFIRM and call_oi_chg < -_FADE_OI_UNWIND
     support_weak = _FADE_OI_CONFIRM and put_oi_chg < -_FADE_OI_UNWIND
+    _day = str(m.get("session_date") or m.get("trade_date") or "") or None
+    if at_resist and _level_broken_today(_day, "FADE_SHORT", resist):
+        return None, f"resistance {resist:.0f} already FAILED today (a fade stopped through it) — not a level any more"
+    if at_support and _level_broken_today(_day, "FADE_LONG", support):
+        return None, f"support {support:.0f} already FAILED today (a fade stopped through it) — not a level any more"
     if at_resist and allow_short and not resist_weak and _m_pattern_at_resistance(m):
         _s = "strengthening" if call_oi_chg > 0 else "holding"
         return "FADE_SHORT", (f"RANGE-FADE SHORT: M-top rejection AT resistance {resist:.0f} ({_s} call OI "

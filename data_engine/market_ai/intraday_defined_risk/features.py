@@ -933,7 +933,8 @@ def nearest_resistance(bars: list[OhlcvBar], spot: float, count: int = 1) -> lis
     return sorted(pivots)[:count]
 
 
-def compute_volume_signals(bars: list[OhlcvBar], bucket: float = 25.0) -> dict[str, float | None]:
+def compute_volume_signals(bars: list[OhlcvBar], bucket: float = 25.0, *, now=None,
+                           interval_min: int = 5) -> dict[str, float | None]:
     """Volume‑profile + order‑flow signals from intraday bars (the one real data gap in the audit):
       - relative_volume: current bar volume / avg of the prior bars (>1.3 = conviction, <0.7 = apathy)
       - cumulative_volume_delta (CVD): running sum of signed volume (up bar +vol, down bar −vol) — a
@@ -948,8 +949,21 @@ def compute_volume_signals(bars: list[OhlcvBar], bucket: float = 25.0) -> dict[s
     vols = [float(b.volume or 0.0) for b in bars]
     if len(bars) < 3 or sum(vols) <= 0:
         return out
-    avg_prior = (sum(vols[:-1]) / max(len(vols) - 1, 1)) or 1.0
-    out["relative_volume"] = round(vols[-1] / avg_prior, 3)
+    # relative_volume must use the last COMPLETED bar. Live, the final bar is still forming, so it holds
+    # only a fraction of its volume: on 2026-10-12 the agent read rvol 0.00-0.33 while completed bars
+    # were 0.56-1.32, and the momentum gate wrongly said "no momentum" through a clean trend-down day.
+    rv = vols
+    if now is not None:
+        try:
+            _now = now.replace(tzinfo=None)
+            _last = bars[-1].timestamp.replace(tzinfo=None)
+            if (_now - _last).total_seconds() < interval_min * 60:
+                rv = vols[:-1]
+        except Exception:
+            pass
+    if len(rv) >= 2:
+        avg_prior = (sum(rv[:-1]) / max(len(rv) - 1, 1)) or 1.0
+        out["relative_volume"] = round(rv[-1] / avg_prior, 3)
     # CVD: sign each bar's volume by its close-vs-open direction
     signed = [(v if b.close >= b.open else -v) for b, v in zip(bars, vols)]
     cvd_series = []
