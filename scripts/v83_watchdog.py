@@ -1198,7 +1198,10 @@ def _agent_silence_minutes() -> float:
     try:
         hb = json.loads((_STATE / "intraday_v83_heartbeat.json").read_text())
         ts = datetime.fromisoformat(str(hb.get("timestamp")))
-        if str(hb.get("phase")) == "v83_run_live_loop":
+        # Any loop phase proves the process is alive — incl. v83_after_hours, which is what the heartbeat
+        # says until the first in-session cycle. Requiring v83_run_live_loop made the watchdog restart a
+        # healthy agent at 09:15 every morning (2026-10-12), marking every day "not clean".
+        if str(hb.get("phase")) in ("v83_run_live_loop", "v83_after_hours"):
             ages.append((datetime.now(ts.tzinfo or IST) - ts).total_seconds() / 60.0)
     except Exception:
         pass
