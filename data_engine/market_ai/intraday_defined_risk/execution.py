@@ -356,6 +356,8 @@ DEBIT_TRAIL_GIVEBACK = 0.35   # exit if the trade gives back 35% of its peak pro
 # this absolute trail protects real gains regardless of spread width.
 DEBIT_RS_TRAIL_ARM = float(os.environ.get('DEBIT_RS_TRAIL_ARM', '600') or 600.0)
 DEBIT_RS_TRAIL_GIVEBACK = float(os.environ.get('DEBIT_RS_TRAIL_GIVEBACK', '300') or 300.0)
+DEBIT_TRAIL_MODE = os.environ.get("DEBIT_TRAIL_MODE", "SPOT").upper()          # SPOT | RS (legacy P&L trail)
+DEBIT_SPOT_REVERSAL_PTS = float(os.environ.get("DEBIT_SPOT_REVERSAL_PTS", "25") or 25.0)
 
 
 def _current_debit_value(
@@ -522,7 +524,22 @@ def _evaluate_debit_exit(
     # intraday. This absolute guard locks in real gains at any debit width.
     peak_pnl_rs = max(float(position.metadata.get('debit_peak_pnl_rupees') or 0.0), pnl)
     position.metadata['debit_peak_pnl_rupees'] = peak_pnl_rs
-    if peak_pnl_rs >= DEBIT_RS_TRAIL_ARM:
+    # NON-FADE debits trail the UNDERLYING, not the P&L (DEBIT_TRAIL_MODE=SPOT, default). The Rs-300
+    # P&L trail cut the 2026-10-13 call-debit at +416 on the first premium wiggle; held it made +8,749.
+    # On every non-fade debit with a full to-close path (exit_shadow_toclose), "exit once spot retraces
+    # 25pts from its best level while green" beat both the actual exit and holding: 09-29 +595 (actual
+    # -3,146), 10-05 +514 (-2,204), 10-13 +7,410 (+416) -> +8,519 vs -4,934. A runner keeps extending
+    # the extreme and is never touched; a fader is cut as the index turns. Fades keep their own exits.
+    if DEBIT_TRAIL_MODE == "SPOT" and not position.metadata.get("is_fade") and current_snapshot is not None:
+        _spot = float(current_snapshot.option_chain.spot)
+        _down = position.structure.strategy == StrategyType.PUT_DEBIT_SPREAD
+        _ext = position.metadata.get("debit_fav_spot")
+        _ext = _spot if _ext is None else (min(float(_ext), _spot) if _down else max(float(_ext), _spot))
+        position.metadata["debit_fav_spot"] = _ext
+        _retrace = (_spot - _ext) if _down else (_ext - _spot)
+        if pnl > 0 and _retrace >= DEBIT_SPOT_REVERSAL_PTS:
+            return ExitDecision(True, "DEBIT_SPOT_REVERSAL", value, pnl)
+    elif peak_pnl_rs >= DEBIT_RS_TRAIL_ARM:
         floor_pnl_rs = max(peak_pnl_rs - DEBIT_RS_TRAIL_GIVEBACK, 0.0)
         if pnl <= floor_pnl_rs:
             return ExitDecision(True, 'DEBIT_RS_TRAIL', value, pnl)
