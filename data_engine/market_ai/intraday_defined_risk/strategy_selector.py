@@ -933,6 +933,32 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
                 choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
                 metadata["conf_bull_sell_closer"] = True
                 choice.rationale = _why + f" [no momentum for a call-buy ({_mom_why}) -> SELL a bull-put instead]"
+        elif _dir == "BULLISH" and _STRUCT_CHOOSER:
+            # Same BUY-or-SELL chooser as the bearish side (user: "call buy vs put sell" must be the agent's
+            # call). 2026-10-13 expiry morning: a clean bullish trend (eff 1.00) was read correctly but the
+            # path was hard-wired to SELL a bull-put, and every build failed CREDIT_TOO_LOW_IV_ADJUSTED
+            # (expiry-day OTM puts are near-worthless) -> no trade while Nifty ran +280. A SELL that can't be
+            # built now falls back to the call-debit, but only when momentum confirms a buy.
+            _side, _cwhy, _cdet = choose_buy_or_sell("BULLISH", metadata, context="trend",
+                                                     vol_regime=vol.regime, now_time=now_time)
+            _mom_ok_b = _has_momentum(metadata, "BULLISH")[0]
+            if _side == "BUY" and _in_blackout:
+                _side, _cwhy = "SELL", _cwhy + " | BUY blocked by the debit blackout -> SELL"
+                _cdet["side"] = "SELL"
+            metadata["structure_choice"] = _cdet
+            if _side == "BUY":
+                metadata.pop("conf_bull_sell_closer", None)
+                choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["CALL_DEBIT_SPREAD"]
+                choice.rationale = _why + f" [BUY call-debit — {_cwhy}]"
+            else:
+                metadata["conf_bull_sell_closer"] = True
+                metadata["seller_exit"] = True
+                choice.family = FAM_DIRECTIONAL_CREDIT
+                choice.structures = ["BULL_PUT_CREDIT_SPREAD"] + (
+                    ["CALL_DEBIT_SPREAD"] if (_mom_ok_b and not _in_blackout) else [])
+                choice.rationale = _why + (f" [SELL bull-put — {_cwhy}; seller exit"
+                                           + ("; call-debit fallback if the put credit can't be built]"
+                                              if len(choice.structures) > 1 else "]"))
         elif _dir == "BULLISH":
             choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BULL_PUT_CREDIT_SPREAD"]
             # Strong bullish conviction -> sell the put CLOSER (higher delta) for real credit even at low

@@ -368,10 +368,6 @@ def test_classify_regime_detects_bullish_pullback_reclaim() -> None:
     assert regime.metadata["trade_plan"]["fvg_context"] in {"BULLISH_FVG_ACTIVE", "NONE"}
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "OPEN DESIGN QUESTION (2026-10-12): gap setups only form 09:15-10:00, where the session-phase penalty "
-    "(-0.5) applies; with gap thresholds 3.3/3.4 this fixture scores 3.2 (3.7-0.5) and is not gap-ready. "
-    "Decide: exempt confirmed gap setups from the OPEN penalty, or accept it and update this test."))
 def test_classify_regime_detects_gap_up_bullish_continuation() -> None:
     snapshot = _build_gap_up_bullish_snapshot()
     regime = classify_regime(snapshot)
@@ -382,10 +378,6 @@ def test_classify_regime_detects_gap_up_bullish_continuation() -> None:
     assert regime.metadata["gap_bullish_ready"] is True
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "OPEN DESIGN QUESTION (2026-10-12): gap setups only form 09:15-10:00, where the session-phase penalty "
-    "(-0.5) applies; with gap thresholds 3.3/3.4 this fixture scores 3.2 (3.7-0.5) and is not gap-ready. "
-    "Decide: exempt confirmed gap setups from the OPEN penalty, or accept it and update this test."))
 def test_classify_regime_detects_gap_down_bearish_continuation() -> None:
     snapshot = _build_gap_down_bearish_snapshot()
     regime = classify_regime(snapshot)

@@ -2055,15 +2055,24 @@ def read_market_context(as_of=None, max_age_minutes: float = 10.0) -> dict:
     return {}
 
 
-def read_fii_bias() -> dict:
+def read_fii_bias(as_of=None, max_lag_days: int = 5) -> dict:
     """Read latest FII/DII directional bias from NSE data fetched by the EOD watchdog.
 
-    Returns an empty dict when absent — callers must handle missing keys gracefully.
+    Point-in-time when `as_of` is given: the file holds ONE day's flow (its `date`, e.g. "12-Oct-2026"),
+    which is only a T-1 overlay for the sessions shortly after it. For any other snapshot (a backtest or
+    a test fixture) it returns {} — it used to apply today's flow to every historical bar, and its 09:57
+    refresh on 2026-10-13 changed a regime test's outcome mid-session.
     Keys: date, fii_net_crores, dii_net_crores, bias (STRONG_BULLISH/BULLISH/NEUTRAL/BEARISH/STRONG_BEARISH).
     """
     try:
         if _FII_BIAS_PATH.exists():
-            return json.loads(_FII_BIAS_PATH.read_text())
+            data = json.loads(_FII_BIAS_PATH.read_text())
+            if as_of is not None:
+                flow_day = datetime.strptime(str(data.get("date")), "%d-%b-%Y").date()
+                lag = (as_of.date() - flow_day).days
+                if lag < 1 or lag > max_lag_days:
+                    return {}
+            return data
     except Exception:
         pass
     return {}
@@ -2080,7 +2089,7 @@ _ML_FEATURE_NAMES = [
 ]
 
 
-def compute_win_probability(features: dict, direction: str = "BEARISH") -> float:
+def compute_win_probability(features: dict, direction: str = "BEARISH", as_of=None) -> float:
     """Apply trained logistic regression to score a setup's win probability.
 
     Returns 0.5 (neutral — no opinion) when the model is absent or undertrained.
@@ -2088,6 +2097,9 @@ def compute_win_probability(features: dict, direction: str = "BEARISH") -> float
     """
     try:
         if not _WIN_PROB_MODEL_PATH.exists():
+            return 0.5
+        # Point-in-time: a model trained AFTER the snapshot didn't exist then (look-ahead in a backtest).
+        if as_of is not None and as_of.timestamp() < _WIN_PROB_MODEL_PATH.stat().st_mtime:
             return 0.5
         model = json.loads(_WIN_PROB_MODEL_PATH.read_text())
         key = "bearish" if direction != "BULLISH" else "bullish"
