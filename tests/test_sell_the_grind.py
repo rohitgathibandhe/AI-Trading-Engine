@@ -6,6 +6,7 @@ from market_ai.intraday_defined_risk import strategy_selector as ss
 def _route(monkeypatch, sell_on: bool):
     monkeypatch.setattr(ss, "_CONFLUENCE_ONLY", True)
     monkeypatch.setattr(ss, "_NOMOM_SELL", sell_on)
+    monkeypatch.setattr(ss, "_STRUCT_CHOOSER", sell_on)   # chooser off -> legacy path (stand aside when selling is off)
     monkeypatch.setattr(ss, "_high_prob_confluence", lambda read, m: ("BEARISH", "HIGH-PROB BEARISH: test"))
     monkeypatch.setattr(ss, "_has_momentum", lambda m, d: (False, "NO momentum for a buy (rvol 0.6<1.05) — test"))
     meta: dict = {}

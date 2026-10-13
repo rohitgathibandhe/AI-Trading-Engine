@@ -1800,6 +1800,9 @@ def record_paper_entry(
         "thesis_net_bias":           decision.metadata.get("thesis_net_bias"),
         "selector_condition":        decision.metadata.get("selector_condition"),
         "selector_family":           decision.metadata.get("selector_family"),
+        # BUY-or-SELL chooser: the side picked + every factor, graded later against the other side (pair_shadow)
+        "structure_choice":          decision.metadata.get("structure_choice"),
+        "seller_exit":               decision.metadata.get("seller_exit"),
     }
     _append_jsonl(paths.paper_trades, event)
     record_runtime_trade_entry(decision, snapshot, decision_origin=attribution, paths=paths)

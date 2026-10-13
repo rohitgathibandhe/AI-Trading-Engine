@@ -566,6 +566,57 @@ def _has_momentum(m: dict[str, Any], direction: str) -> tuple[bool, str]:
     return False, (f"NO momentum for a buy (rvol {rvol:.2f}{'<' if not vol_ok else '>='}{_MOM_MIN_RVOL}, "
                    f"CVD slope {cvd_slope:+.0f} {'not ' if not flow_ok else ''}{direction.lower()}) — a debit "
                    f"needs a fast move; a slow grind is a SELL or a stand-aside, not a buy")
+# ── BUY-or-SELL CHOOSER (2026-10-13) ───────────────────────────────────────────────────────────────
+# One decision for every directional trade (trend OR fade): BUY the debit or SELL the credit spread.
+# SELLER-FIRST (the owner's standing rule): selling is the default; a BUY needs a clearly stronger case
+# (buy score >= sell score + _BUY_MARGIN). Why each factor:
+#   momentum (completed-bar rvol + CVD) -> a debit needs a FAST move to beat theta; no momentum = grind = sell
+#   trend efficiency                    -> clean directional path favours buying; choppy path favours selling
+#   vol regime                          -> rich premium (IV > realized) favours selling; cheap favours buying
+#   time of day / expiry day            -> less time left + faster theta favours selling
+#   fade level strength                 -> a tight spot stop at a weak level gets shaken out (10-12: two
+#                                          put-debit fades stopped by noise; the bear-call won both); a
+#                                          defended OI wall protects a short strike placed beyond it
+# 10-12 evidence: the bear-call won all 6 bearish reads on live fills. The choice + every factor is logged
+# in metadata["structure_choice"] and graded against the other side by pair_shadow (it prices both).
+_STRUCT_CHOOSER = os.environ.get("SEL_STRUCT_CHOOSER", "1") == "1"
+_BUY_MARGIN = _sel_env_float("SEL_BUY_MARGIN") or 2.0
+
+
+def choose_buy_or_sell(direction: str, m: dict[str, Any], *, context: str, vol_regime: str | None = None,
+                       now_time=None) -> tuple[str, str, dict[str, Any]]:
+    """('BUY'|'SELL', why, detail) for a directional trade. context: 'trend' or 'fade'."""
+    buy: list[str] = []
+    sell: list[str] = []
+    mom_ok, mom_why = _has_momentum(m, direction)
+    (buy if mom_ok else sell).extend([("momentum" if mom_ok else "no momentum")] * 2)
+    eff = _f(m, "trend_efficiency_ratio")
+    if eff >= 0.55:
+        buy.append(f"clean trend (eff {eff:.2f})")
+    elif eff < 0.35:
+        sell.append(f"choppy path (eff {eff:.2f})")
+    if vol_regime == RICH_SELL:
+        sell.append("premium rich (IV > realized)")
+    elif vol_regime == CHEAP_BUY:
+        buy.append("premium cheap")
+    if now_time is not None and now_time >= time(13, 30):
+        sell.append("late session (theta > time for a move)")
+    if m.get("is_expiry_day"):
+        sell.append("expiry day (fast decay)")
+    if context == "fade":
+        dist_wall = _f(m, "distance_to_call_wall" if direction == "BEARISH" else "distance_to_put_wall", 999)
+        wall_vel = _f(m, "call_wall_oi_velocity" if direction == "BEARISH" else "put_wall_oi_velocity", 0.0)
+        if dist_wall <= 50 and wall_vel > 0:
+            sell.extend(["defended OI wall protects a short beyond it"] * 2)
+        else:
+            sell.append("weak intraday level (tight spot stop = noise risk)")
+    side = "BUY" if len(buy) >= len(sell) + _BUY_MARGIN else "SELL"
+    why = (f"{side} (buy {len(buy)}: {', '.join(dict.fromkeys(buy)) or '-'} | sell {len(sell)}: "
+           f"{', '.join(dict.fromkeys(sell)) or '-'}; seller-first, buy needs +{_BUY_MARGIN:g})")
+    return side, why, {"side": side, "buy_score": len(buy), "sell_score": len(sell), "buy": buy, "sell": sell,
+                       "context": context, "momentum": mom_why}
+
+
 # Structure for a BULLISH confluence day. BUYING up (CALL_DEBIT) is validated-negative — up-moves
 # grind, a long debit whipsaws (real data: -16k / 16 tr). SELLING up (BULL_PUT credit) fits the grind
 # (theta, wins on up OR sideways) and the synthetic dense set was BIASED AGAINST selling (5x-wide
@@ -828,7 +879,21 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         _is_debit_entry = (_dir == "BEARISH") or (_dir == "BULLISH" and _bull_is_debit)
         _in_blackout = (_DEBIT_BLACKOUT is not None and now_time is not None
                         and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1])
-        if _is_debit_entry and _in_blackout:
+        if _dir == "BEARISH" and _STRUCT_CHOOSER:
+            _side, _cwhy, _cdet = choose_buy_or_sell("BEARISH", metadata, context="trend",
+                                                     vol_regime=vol.regime, now_time=now_time)
+            if _side == "BUY" and _in_blackout:     # debit entries leak in the blackout; selling doesn't
+                _side, _cwhy = "SELL", _cwhy + " | BUY blocked by the debit blackout -> SELL"
+                _cdet["side"] = "SELL"
+            metadata["structure_choice"] = _cdet
+            if _side == "BUY":
+                choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, ["PUT_DEBIT_SPREAD"]
+                choice.rationale = _why + f" [BUY put-debit — {_cwhy}]"
+            else:
+                choice.family, choice.structures = FAM_DIRECTIONAL_CREDIT, ["BEAR_CALL_CREDIT_SPREAD"]
+                metadata["seller_exit"] = True
+                choice.rationale = _why + f" [SELL bear-call — {_cwhy}; seller exit]"
+        elif _is_debit_entry and _in_blackout:
             choice.family, choice.structures = FAM_STAND_ASIDE, []
             choice.rationale = (f"{_dir} confluence but inside the {_DEBIT_BLACKOUT[0].strftime('%H:%M')}-"
                                 f"{_DEBIT_BLACKOUT[1].strftime('%H:%M')} debit blackout (post-open-drive "
@@ -875,7 +940,26 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
             # directional debit with a FADE exit (tight target + stop just beyond the level — set here
             # so execution can manage it as a scalp, not a fat-tail hold). Env-gated (default off).
             _fdir, _fwhy = _range_fade_signal(read, metadata, spot) if _RANGE_FADE else (None, "")
-            if _fdir == "FADE_SHORT":
+            if _fdir in ("FADE_SHORT", "FADE_LONG") and _STRUCT_CHOOSER:
+                _fd = "BEARISH" if _fdir == "FADE_SHORT" else "BULLISH"
+                _side, _cwhy, _cdet = choose_buy_or_sell(_fd, metadata, context="fade",
+                                                         vol_regime=vol.regime, now_time=now_time)
+                metadata["structure_choice"] = _cdet
+                metadata["is_fade"] = True          # fades stay exempt from the chart-agreement gate
+                metadata["fade_entry_spot"] = spot
+                _tgt, _stp, _elw = _fade_exit_levels(metadata, _fdir, spot)
+                metadata["fade_target_spot"] = _tgt
+                metadata["fade_stop_spot"] = _stp
+                if _side == "BUY":
+                    choice.family = FAM_DIRECTIONAL_DEBIT
+                    choice.structures = ["PUT_DEBIT_SPREAD" if _fdir == "FADE_SHORT" else "CALL_DEBIT_SPREAD"]
+                    choice.rationale = _fwhy + f" [BUY — {_cwhy}] | EXIT " + _elw
+                else:                                # sell beyond the faded level; seller exit, not the spot stop
+                    choice.family = FAM_DIRECTIONAL_CREDIT
+                    choice.structures = ["BEAR_CALL_CREDIT_SPREAD" if _fdir == "FADE_SHORT" else "BULL_PUT_CREDIT_SPREAD"]
+                    metadata["seller_exit"] = True
+                    choice.rationale = _fwhy + f" [SELL — {_cwhy}; seller exit]"
+            elif _fdir == "FADE_SHORT":
                 # Fading a call wall: BEAR_CALL (sell the ceiling, collect theta) beats PUT_DEBIT
                 # (pay theta) when price is AT the wall. Condition: within 50pts of call wall AND
                 # call OI is building (velocity > 0) — i.e. the wall is actively defended.

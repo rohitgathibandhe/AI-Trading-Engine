@@ -239,6 +239,29 @@ def evaluate(since: str = DEFAULT_SINCE) -> dict:
         reads_by_day[r["day_type"]].append(r)
 
     overall = _agg(rows)
+    # STRUCTURE CHOICE: on every entry pair_shadow priced BOTH sides (buy and sell) on the same live chain.
+    # Right = the side the agent took did at least as well as the side it didn't (managed exits).
+    choice_rows = []
+    for r in _jsonl(STATE / "pair_shadow.jsonl"):
+        if r.get("trigger") != "ENTRY" or str(r.get("session_date")) < since or not r.get("actual_structure"):
+            continue
+        st = r.get("structures") or {}
+        took = r["actual_structure"]
+        other = next((k for k in st if k != took), None)
+        if took not in st or other is None:
+            continue
+        def _best(leg):
+            c = leg.get("candidates") or {}
+            return (c.get("SELLER_EXIT") or c.get("DEBIT_EXIT") or c.get("RIDE_TO_CLOSE") or {}).get("pnl_rupees")
+        # the side TAKEN is graded on what actually happened (the agent's own exit), the side NOT taken on
+        # its ghost with a managed exit — the comparison is the decision as executed, not two ghosts.
+        _act = next((x.get("realized_paper_pnl") for x in _jsonl(STATE / "intraday_v83_paper_live_trades.jsonl")
+                     if x.get("event") == "PAPER_EXIT" and str(x.get("entry_timestamp")) == str(r.get("paired_entry"))), None)
+        a = float(_act) if _act is not None else _best(st[took])
+        b = _best(st[other])
+        if a is not None and b is not None:
+            choice_rows.append({"date": r.get("session_date"), "took": took, "other": other,
+                                "took_pnl": a, "other_pnl": b, "right": a >= b})
     # Bars: overall value must clear the bar, and no day type with >= MIN_CELL samples may fall short.
     checks = {}
     for k, bar in BARS.items():
@@ -251,7 +274,9 @@ def evaluate(since: str = DEFAULT_SINCE) -> dict:
            "min_cell": MIN_CELL, "overall": overall, "by_day_type": {k: _agg(v) for k, v in by_day.items()},
            "reads": {"n": len(reads), "read_60m": _agg(reads)["read_60m"], "read_close": _agg(reads)["read_close"],
                      "by_day_type": {k: _agg(v)["read_60m"] for k, v in reads_by_day.items()}},
-           "checks": checks, "skill_ok": all(c["ok"] for c in checks.values()), "trades": rows}
+           "checks": checks, "skill_ok": all(c["ok"] for c in checks.values()), "trades": rows,
+           "structure_choice": {"n": len(choice_rows), "right": sum(1 for c in choice_rows if c["right"]),
+                                "rows": choice_rows}}
     OUT.write_text(json.dumps(res, indent=2, default=str))
     return res
 
@@ -285,6 +310,11 @@ def main() -> int:
           f"right 60 min later {_fmt(rd['read_60m'])}, right by close {_fmt(rd['read_close'])}")
     for k, v in rd["by_day_type"].items():
         print(f"  {k:12} {_fmt(v)}")
+    sc = r["structure_choice"]
+    print(f"\nBUY-vs-SELL CHOICE (pair_shadow, entries): picked the better side {sc['right']}/{sc['n']}")
+    for c in sc["rows"]:
+        print(f"  {c['date']} took {c['took']:10} {c['took_pnl']:>7.0f}  vs  {c['other']:10} {c['other_pnl']:>7.0f}  "
+              f"{'right' if c['right'] else 'WRONG'}")
     print("\nSKILL BARS (overall AND every day type with >= %d samples):" % r["min_cell"])
     for k, c in r["checks"].items():
         print(f"  [{'PASS' if c['ok'] else 'FAIL'}] {k:13} {c['value']} (n={c['n']}) vs bar {c['bar']}"
