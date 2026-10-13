@@ -599,7 +599,13 @@ def choose_buy_or_sell(direction: str, m: dict[str, Any], *, context: str, vol_r
         sell.append("premium rich (IV > realized)")
     elif vol_regime == CHEAP_BUY:
         buy.append("premium cheap")
-    if now_time is not None and now_time >= time(13, 30):
+    # Time cuts both ways: a debit needs TIME for the move to develop — plenty in the morning, little late.
+    # Pair-shadow on live fills (10-09 + 10-12): before 11:30 BUY beat SELL on 5/7 reads (often by
+    # Rs 2.5-4k); after 13:30 SELL beat BUY 2/2 (the debits lost). The original chooser only scored the
+    # late-session side, which could push a strong morning setup into a sell (user, 2026-10-13).
+    if now_time is not None and now_time < time(11, 30):
+        buy.append("early session (time for the move)")
+    elif now_time is not None and now_time >= time(13, 30):
         sell.append("late session (theta > time for a move)")
     if m.get("is_expiry_day"):
         sell.append("expiry day (fast decay)")

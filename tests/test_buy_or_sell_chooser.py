@@ -53,3 +53,14 @@ def test_blackout_turns_a_buy_into_a_sell(monkeypatch):
     choice = ss.select_strategy(meta, 22400.0, now_time=time(10, 10))     # inside 10:00-10:30
     assert choice.structures == ["BEAR_CALL_CREDIT_SPREAD"] and meta["seller_exit"] is True
     assert meta["structure_choice"]["side"] == "SELL"
+
+
+def test_morning_momentum_setup_buys_but_morning_grind_still_sells(monkeypatch):
+    # 10-12 09:35-11:05: strong bearish trend, BUY beat SELL by Rs 2.5-4k — a morning momentum setup buys
+    monkeypatch.setattr(ss, "_has_momentum", _mom(True))
+    side, why, _ = ss.choose_buy_or_sell("BEARISH", {"trend_efficiency_ratio": 0.45}, context="trend", now_time=time(9, 50))
+    assert side == "BUY", why
+    # ...but without momentum the morning is still a sell (no-momentum = +2 sell outweighs +1 early)
+    monkeypatch.setattr(ss, "_has_momentum", _mom(False))
+    side, why, _ = ss.choose_buy_or_sell("BEARISH", {"trend_efficiency_ratio": 0.45}, context="trend", now_time=time(9, 50))
+    assert side == "SELL", why
