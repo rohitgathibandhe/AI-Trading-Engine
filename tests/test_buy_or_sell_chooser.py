@@ -64,3 +64,29 @@ def test_morning_momentum_setup_buys_but_morning_grind_still_sells(monkeypatch):
     monkeypatch.setattr(ss, "_has_momentum", _mom(False))
     side, why, _ = ss.choose_buy_or_sell("BEARISH", {"trend_efficiency_ratio": 0.45}, context="trend", now_time=time(9, 50))
     assert side == "SELL", why
+
+
+def _bull_route(monkeypatch, mom_ok, eff, t):
+    monkeypatch.setattr(ss, "_CONFLUENCE_ONLY", True)
+    monkeypatch.setattr(ss, "_STRUCT_CHOOSER", True)
+    monkeypatch.setattr(ss, "_CONF_UP_STRUCT", "BULL_PUT")
+    monkeypatch.setattr(ss, "_DEBIT_BLACKOUT", (time(10, 0), time(10, 30)))
+    monkeypatch.setattr(ss, "_high_prob_confluence", lambda read, m: ("BULLISH", "HIGH-PROB BULLISH: test"))
+    monkeypatch.setattr(ss, "_has_momentum", _mom(mom_ok))
+    meta = {"trend_efficiency_ratio": eff}
+    return ss.select_strategy(meta, 22560.0, now_time=t), meta
+
+
+def test_2026_10_13_bullish_momentum_morning_buys_a_call_debit(monkeypatch):
+    choice, meta = _bull_route(monkeypatch, True, 1.0, time(10, 40))
+    assert choice.structures == ["CALL_DEBIT_SPREAD"] and meta["structure_choice"]["side"] == "BUY"
+
+
+def test_bullish_grind_sells_a_bull_put_without_buy_fallback(monkeypatch):
+    choice, meta = _bull_route(monkeypatch, False, 0.4, time(12, 0))
+    assert choice.structures == ["BULL_PUT_CREDIT_SPREAD"] and meta["seller_exit"] is True
+
+
+def test_bullish_sell_in_blackout_has_no_debit_fallback(monkeypatch):
+    choice, _ = _bull_route(monkeypatch, True, 1.0, time(10, 10))
+    assert choice.structures == ["BULL_PUT_CREDIT_SPREAD"]

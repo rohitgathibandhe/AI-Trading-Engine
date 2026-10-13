@@ -1698,8 +1698,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
         "ml_bearish_momentum": _bear_persist,
         "ml_rv30_pct": rv30_pct,
     }
-    _wp_bear = compute_win_probability(_ml_features, direction="BEARISH")
-    _wp_bull = compute_win_probability(_ml_features, direction="BULLISH")
+    _wp_bear = compute_win_probability(_ml_features, direction="BEARISH", as_of=snapshot.timestamp)
+    _wp_bull = compute_win_probability(_ml_features, direction="BULLISH", as_of=snapshot.timestamp)
     if _wp_bear < 0.42:
         bearish_entry_score -= 0.5
     elif _wp_bear > 0.68:
@@ -1772,7 +1772,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     # Phase 14: FII/DII institutional flow overlay — T-1 net buy/sell from NSE.
     # FIIs are the dominant price-setters in Nifty; their direction from yesterday
     # provides a credible next-session bias overlay.  Modest scoring — T-1 lag limits precision.
-    _fii = read_fii_bias()
+    _fii = read_fii_bias(as_of=snapshot.timestamp)   # point-in-time (T-1 flow only)
     _fii_bias = str(_fii.get("bias", ""))
     if _fii_bias == "STRONG_BULLISH":
         bullish_entry_score += 0.3
@@ -2325,7 +2325,9 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
             if metadata.get("playbook") == "EARLY_BALANCE_BEARISH_FAILED_RECLAIM"
             else (
                 "EARLY_STRUCTURE_BEARISH"
-                if early_structure_bearish_intent
+                # a CONFIRMED gap continuation outranks the early-intent fallback (gap readiness is
+                # computed after the early block, so it must be checked here, at labelling time)
+                if early_structure_bearish_intent and not gap_down_bearish_continuation_ready
                 else (
                     "GAP_DOWN_CONTINUATION"
                     if gap_down_bearish_continuation_ready
@@ -2557,7 +2559,7 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                 if metadata.get("playbook") == "EARLY_BALANCE_BULLISH_RECLAIM"
                 else (
                     "EARLY_STRUCTURE_BULLISH"
-                    if early_structure_bullish_intent
+                    if early_structure_bullish_intent and not gap_up_bullish_ready   # confirmed gap outranks early intent
                     else (
                         "GAP_UP_CONTINUATION"
                         if gap_up_bullish_ready
