@@ -581,6 +581,7 @@ def _has_momentum(m: dict[str, Any], direction: str) -> tuple[bool, str]:
 # in metadata["structure_choice"] and graded against the other side by pair_shadow (it prices both).
 _STRUCT_CHOOSER = os.environ.get("SEL_STRUCT_CHOOSER", "1") == "1"
 _SESSION_ALIGN = os.environ.get("SEL_SESSION_ALIGN", "1") == "1"   # see SESSION ALIGNMENT in select_strategy
+_TREND_DAY = os.environ.get("SEL_TREND_DAY", "1") == "1"            # see TREND-DAY MODE in select_strategy
 _BUY_MARGIN = _sel_env_float("SEL_BUY_MARGIN") or 2.0
 
 
@@ -893,6 +894,21 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
                     _why = (f"{_dir} read is a pullback AGAINST the session (opening range broke {_orb}, price "
                             f"{float(_pvv):+.0f} vs VWAP) — don't fade the day's trend. [was: {_why}]")
                     _dir = None
+        # TREND-DAY MODE (owner, 2026-10-14: "on a trending day the agent must be in the trade"): when the
+        # session is a declared trend day and a with-trend trigger fired (pullback / day-high-low breakout /
+        # range breakout / late safety net), take it even if the single-moment confluence gate is silent.
+        # Structure still comes from the BUY-or-SELL chooser below. SEL_TREND_DAY=0 disables.
+        _td = metadata.get("trend_day") or {}
+        if _TREND_DAY and _dir is None and _td.get("trigger") and _td.get("state") in ("TREND_UP", "TREND_DOWN"):
+            _tg = _td["trigger"]
+            _dir = "BULLISH" if _td["state"] == "TREND_UP" else "BEARISH"
+            _why = f"TREND-DAY {_td['state']} — {_tg['kind']}: {_tg['why']} (since {str(_td.get('since'))[11:16]})"
+            metadata["trend_day_entry"] = _tg["kind"]
+            try:
+                from .trend_day import note_trigger_used
+                note_trigger_used(_tg["at"])
+            except Exception:
+                pass
         # The validated STRUCTURE for a high-conviction directional leg is a DEBIT, not a credit spread:
         # on the shadow book the bear-call CREDIT lost -1,241 (71% win, capped winner / big loser) while
         # the PUT-DEBIT made +2,787 (50% win, convex — small losses, big wins). So confluence -> BUY the
