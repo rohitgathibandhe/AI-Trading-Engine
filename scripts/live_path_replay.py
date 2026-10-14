@@ -27,7 +27,10 @@ LIVE_STATE = ROOT / "data_engine" / "market_ai" / "state"
 PY = "/Users/Rohit/.venvs/data_engine_py310/bin/python"
 PLIST = Path.home() / "Library" / "LaunchAgents" / "com.algoagent.intraday_v83.plist"
 SEED_FILES = ("intraday_v83_run_live_config.json", "intraday_v83_runtime_config.json", "agent_settings.json",
-              "promotion_state.json", "creds.json", "dhan_scrip_master.csv")
+              "promotion_state.json", "creds.json", "dhan_scrip_master.csv",
+              # sizing/learning inputs the live agent reads every cycle (Kelly lot cap, ML, FII overlay) —
+              # without them the replay sized 5-6 lots where live sized 2 and overstated rupee P&L ~3x
+              "setup_performance.json", "win_prob_model.json", "fii_bias.json", "iv_history.csv")
 
 RUNNER = r'''
 import json, sys, traceback
@@ -82,9 +85,15 @@ def main() -> int:
                 shutil.copy2(LIVE_STATE / name, st / name)
         (st / "intraday_v83_reconciliation_status.json").write_text('{"status": "NO_POSITIONS"}')
         cfg = json.loads((st / "intraday_v83_run_live_config.json").read_text())
+        # every absolute path in the live config must point into the scratch state — the live config's
+        # learning_db_path is ABSOLUTE and would otherwise make the replay write into the live learning DB
+        for k, v in list(cfg.items()):
+            if isinstance(v, str) and v.startswith(str(LIVE_STATE)):
+                cfg[k] = str(st / Path(v).name)
         cfg.update({"provider_class": "market_ai.intraday_defined_risk.replay_provider:ReplayMarketDataProvider",
                     "replay_data_path": str(data), "replay_start": a.start, "replay_end": a.end})
         assert "PaperOnly" in str(cfg.get("executor_class")), "refusing: executor is not PaperOnly"
+        assert not any(isinstance(v, str) and str(LIVE_STATE) in v for v in cfg.values()), "refusing: live path in config"
         cfg_path = work / "replay_run_live_config.json"
         cfg_path.write_text(json.dumps(cfg))
         env = {k: str(v) for k, v in plistlib.load(open(PLIST, "rb")).get("EnvironmentVariables", {}).items()}
