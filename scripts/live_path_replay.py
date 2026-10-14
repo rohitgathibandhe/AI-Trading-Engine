@@ -84,6 +84,15 @@ def main() -> int:
             if (LIVE_STATE / name).exists():
                 shutil.copy2(LIVE_STATE / name, st / name)
         (st / "intraday_v83_reconciliation_status.json").write_text('{"status": "NO_POSITIONS"}')
+        # point-in-time learned state: use the evening snapshot from the day BEFORE --start when present
+        snaps = sorted(p for p in (LIVE_STATE / "learned_snapshots").glob("*") if p.is_dir() and p.name < a.start) \
+            if (LIVE_STATE / "learned_snapshots").exists() else []
+        if snaps:
+            for f in snaps[-1].iterdir():
+                shutil.copy2(f, st / f.name)
+            print(f"learned state: snapshot {snaps[-1].name}")
+        else:
+            print("learned state: today's files (no snapshot before --start yet — sizing may differ from what live had)")
         cfg = json.loads((st / "intraday_v83_run_live_config.json").read_text())
         # every absolute path in the live config must point into the scratch state — the live config's
         # learning_db_path is ABSOLUTE and would otherwise make the replay write into the live learning DB
