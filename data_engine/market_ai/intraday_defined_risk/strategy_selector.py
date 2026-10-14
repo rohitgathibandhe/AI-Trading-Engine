@@ -580,6 +580,7 @@ def _has_momentum(m: dict[str, Any], direction: str) -> tuple[bool, str]:
 # 10-12 evidence: the bear-call won all 6 bearish reads on live fills. The choice + every factor is logged
 # in metadata["structure_choice"] and graded against the other side by pair_shadow (it prices both).
 _STRUCT_CHOOSER = os.environ.get("SEL_STRUCT_CHOOSER", "1") == "1"
+_SESSION_ALIGN = os.environ.get("SEL_SESSION_ALIGN", "1") == "1"   # see SESSION ALIGNMENT in select_strategy
 _BUY_MARGIN = _sel_env_float("SEL_BUY_MARGIN") or 2.0
 
 
@@ -875,6 +876,23 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     # a confluence direction sells the WITH-TREND defined-risk credit spread (bull-put / bear-call).
     if _CONFLUENCE_ONLY:
         _dir, _why = _high_prob_confluence(read, metadata)
+        # SESSION ALIGNMENT: the confluence read uses a short rolling window (~40 min), so a pullback inside a
+        # trend day can read as a "clean" opposite trend. 2026-10-13 (closed +358 at the high): from 10:39 a
+        # ~85pt pullback read "HIGH-PROB BEARISH, eff 0.89" and the agent tried to sell bear-calls for four
+        # hours while the opening range had broken UP and price held ABOVE VWAP (each would have lost
+        # Rs 4.2-5.2k on live fills; only expiry delta bands stopped them). Don't trade AGAINST the
+        # session's own structure: no bearish entry after an UP opening-range break while above VWAP, and
+        # no bullish entry after a DOWN break while below VWAP. SEL_SESSION_ALIGN=0 disables.
+        if _SESSION_ALIGN and _dir in ("BEARISH", "BULLISH"):
+            _orb = str(metadata.get("opening_range_break_state") or "")
+            _pvv = metadata.get("price_vs_vwap")
+            if _pvv is not None:
+                _against = ((_dir == "BEARISH" and _orb == "UP" and float(_pvv) > 0)
+                            or (_dir == "BULLISH" and _orb in ("DOWN", "FAILED_UP") and float(_pvv) < 0))
+                if _against:
+                    _why = (f"{_dir} read is a pullback AGAINST the session (opening range broke {_orb}, price "
+                            f"{float(_pvv):+.0f} vs VWAP) — don't fade the day's trend. [was: {_why}]")
+                    _dir = None
         # The validated STRUCTURE for a high-conviction directional leg is a DEBIT, not a credit spread:
         # on the shadow book the bear-call CREDIT lost -1,241 (71% win, capped winner / big loser) while
         # the PUT-DEBIT made +2,787 (50% win, convex — small losses, big wins). So confluence -> BUY the
