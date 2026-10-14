@@ -27,18 +27,31 @@ LIVE_STATE = ROOT / "data_engine" / "market_ai" / "state"
 PY = "/Users/Rohit/.venvs/data_engine_py310/bin/python"
 PLIST = Path.home() / "Library" / "LaunchAgents" / "com.algoagent.intraday_v83.plist"
 SEED_FILES = ("intraday_v83_run_live_config.json", "intraday_v83_runtime_config.json", "agent_settings.json",
-              "promotion_state.json", "creds.json", "dhan_scrip_master.csv")
+              "promotion_state.json", "creds.json", "dhan_scrip_master.csv",
+              # sizing/learning inputs the live agent reads every cycle (Kelly lot cap, ML, FII overlay) —
+              # without them the replay sized 5-6 lots where live sized 2 and overstated rupee P&L ~3x
+              "setup_performance.json", "win_prob_model.json", "fii_bias.json", "iv_history.csv")
 
 RUNNER = r'''
-import json, sys
+import json, sys, traceback
 from market_ai.intraday_defined_risk import replay_provider as rp
 from market_ai.intraday_defined_risk import monitor
 rp.install_clock()
 cfg = json.load(open(sys.argv[1]))
-try:
-    monitor.run_live(cfg)
-except rp.ReplayFinished:
-    print("REPLAY_FINISHED")
+crashes = 0
+while True:
+    try:
+        monitor.run_live(cfg)          # re-entered after a crash, like launchd KeepAlive restarting the agent
+    except rp.ReplayFinished:
+        print(f"REPLAY_FINISHED crashes={crashes}")
+        break
+    except Exception as exc:  # the live agent crashed here; launchd restarts it ~30s later
+        crashes += 1
+        print(f"AGENT_CRASH #{crashes} at {rp.CLOCK.now.isoformat()}: {type(exc).__name__}: {exc}", flush=True)
+        if crashes > 200:
+            print("REPLAY_FINISHED crashes>200 (aborted)")
+            break
+        rp._replay_sleep(); cfg = dict(cfg, _resume=True)   # provider resumes its position (see __new__)
 '''
 
 
@@ -60,6 +73,10 @@ def main() -> int:
         if not a.data:
             subprocess.run([PY, str(ROOT / "scripts" / "build_live_dataset.py"), str(data)], check=True,
                            capture_output=True)
+        # the replay provider is TEST HARNESS, not agent code: inject the current one so any historical --ref
+        # (e.g. the exact commit that was live on a past day) can be replayed for a fidelity check.
+        shutil.copy2(ROOT / "data_engine" / "market_ai" / "intraday_defined_risk" / "replay_provider.py",
+                     wt / "data_engine" / "market_ai" / "intraday_defined_risk" / "replay_provider.py")
         st = wt / "data_engine" / "market_ai" / "state"
         st.mkdir(parents=True, exist_ok=True)
         (wt / "data_engine" / "state").mkdir(parents=True, exist_ok=True)     # day_thesis.py writes here
@@ -67,10 +84,25 @@ def main() -> int:
             if (LIVE_STATE / name).exists():
                 shutil.copy2(LIVE_STATE / name, st / name)
         (st / "intraday_v83_reconciliation_status.json").write_text('{"status": "NO_POSITIONS"}')
+        # point-in-time learned state: use the evening snapshot from the day BEFORE --start when present
+        snaps = sorted(p for p in (LIVE_STATE / "learned_snapshots").glob("*") if p.is_dir() and p.name < a.start) \
+            if (LIVE_STATE / "learned_snapshots").exists() else []
+        if snaps:
+            for f in snaps[-1].iterdir():
+                shutil.copy2(f, st / f.name)
+            print(f"learned state: snapshot {snaps[-1].name}")
+        else:
+            print("learned state: today's files (no snapshot before --start yet — sizing may differ from what live had)")
         cfg = json.loads((st / "intraday_v83_run_live_config.json").read_text())
+        # every absolute path in the live config must point into the scratch state — the live config's
+        # learning_db_path is ABSOLUTE and would otherwise make the replay write into the live learning DB
+        for k, v in list(cfg.items()):
+            if isinstance(v, str) and v.startswith(str(LIVE_STATE)):
+                cfg[k] = str(st / Path(v).name)
         cfg.update({"provider_class": "market_ai.intraday_defined_risk.replay_provider:ReplayMarketDataProvider",
                     "replay_data_path": str(data), "replay_start": a.start, "replay_end": a.end})
         assert "PaperOnly" in str(cfg.get("executor_class")), "refusing: executor is not PaperOnly"
+        assert not any(isinstance(v, str) and str(LIVE_STATE) in v for v in cfg.values()), "refusing: live path in config"
         cfg_path = work / "replay_run_live_config.json"
         cfg_path.write_text(json.dumps(cfg))
         env = {k: str(v) for k, v in plistlib.load(open(PLIST, "rb")).get("EnvironmentVariables", {}).items()}
@@ -78,6 +110,9 @@ def main() -> int:
                     "PATH": "/usr/bin:/bin"})
         proc = subprocess.run([PY, "-c", RUNNER, str(cfg_path)], cwd=str(wt / "data_engine"), env=env,
                               capture_output=True, text=True, timeout=3600)
+        for ln in proc.stdout.splitlines():
+            if ln.startswith("AGENT_CRASH") or ln.startswith("REPLAY_FINISHED"):
+                print(ln)
         if "REPLAY_FINISHED" not in proc.stdout:
             print(proc.stdout[-2000:], proc.stderr[-4000:])
             return 1

@@ -2196,7 +2196,13 @@ def run_live(config: dict[str, object]) -> None:
                     # 10:00 put-debit) — the trade was lost and launchd restarted the loop. Found by the live-path
                     # replay (scripts/live_path_replay.py); the backtest never runs this code.
                     import dataclasses as _dc
-                    decision = _dc.replace(decision, lots=ops_max)
+                    # the cap must apply to the ORDER LEGS too: they carry quantity = lots x lot_size from the
+                    # sizing step, so clamping only decision.lots left a 14-lot leg quantity under a 6-lot cap
+                    # (found by the live-path replay, 10-13 50pt call-debit) — what an executor would send.
+                    _old = max(int(decision.lots or 1), 1)
+                    _legs = [dict(l, quantity=int(round(float(l.get("quantity") or 0) * ops_max / _old)))
+                             if isinstance(l, dict) and l.get("quantity") else l for l in (decision.legs or [])]
+                    decision = _dc.replace(decision, lots=ops_max, legs=_legs)
             _emit_decision(decision)
             if decision.action == "TRADE":
                 if runtime_config.mode == RuntimeMode.SHADOW_LIVE:

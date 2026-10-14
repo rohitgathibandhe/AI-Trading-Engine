@@ -78,8 +78,17 @@ def install_clock() -> None:
 
 
 class ReplayMarketDataProvider:
+    def __new__(cls, config: dict[str, Any]):
+        # after a simulated crash run_live builds a NEW provider; like live data after a launchd restart, the
+        # replay must continue from where it was, not rewind
+        if config.get("_resume") and _PROVIDER is not None:
+            return _PROVIDER
+        return super().__new__(cls)
+
     def __init__(self, config: dict[str, Any]):
         global _PROVIDER
+        if config.get("_resume") and _PROVIDER is self:
+            return
         from .backtest import load_backtest_dataset, _group_bars_by_day, _session_previous_closes
         ds = load_backtest_dataset(config["replay_data_path"])
         self.config = config
@@ -145,4 +154,18 @@ class ReplayMarketDataProvider:
             live_vwap=_vwap_from_bars(closed5), lot_size=self._lot_size, slippage_points=self._slippage,
             previous_option_chain=self._prev_chain, previous_session_close=self._prev_close.get(day))
         self._prev_chain = chain
+        self._write_market_context(chain, stamp)
         return snap
+
+    def _write_market_context(self, chain, stamp) -> None:
+        """Publish market_context.json each cycle like DhanLiveMarketDataProvider (VIX via the same ATM-IV
+        proxy live falls back to). Lives in the replay worktree's own state folder."""
+        try:
+            import json
+            from .live_runtime import STATE_ROOT
+            ivs = [float(q.iv) for q in chain.quotes if q.iv and q.ltp > 0 and abs(q.strike - chain.spot) <= 200.0]
+            ctx = {"nifty_spot": chain.spot, "updated_at": stamp.isoformat(),
+                   "india_vix": round(sum(ivs) / len(ivs), 2) if ivs else None, "india_vix_source": "chain_iv_proxy"}
+            (STATE_ROOT / "market_context.json").write_text(json.dumps(ctx))
+        except Exception:
+            pass

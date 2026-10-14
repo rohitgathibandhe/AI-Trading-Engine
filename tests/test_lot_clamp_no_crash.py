@@ -21,3 +21,10 @@ def test_monitor_no_longer_assigns_to_frozen_decision():
     from market_ai.intraday_defined_risk import monitor
     src = inspect.getsource(monitor.run_live)
     assert "decision.lots = ops_max" not in src
+
+
+def test_clamp_rescales_leg_quantities():
+    import inspect
+    from market_ai.intraday_defined_risk import monitor
+    src = inspect.getsource(monitor.run_live)
+    assert "quantity=int(round(float(l.get(\"quantity\") or 0) * ops_max / _old))" in src
