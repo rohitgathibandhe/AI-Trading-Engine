@@ -78,8 +78,17 @@ def install_clock() -> None:
 
 
 class ReplayMarketDataProvider:
+    def __new__(cls, config: dict[str, Any]):
+        # after a simulated crash run_live builds a NEW provider; like live data after a launchd restart, the
+        # replay must continue from where it was, not rewind
+        if config.get("_resume") and _PROVIDER is not None:
+            return _PROVIDER
+        return super().__new__(cls)
+
     def __init__(self, config: dict[str, Any]):
         global _PROVIDER
+        if config.get("_resume") and _PROVIDER is self:
+            return
         from .backtest import load_backtest_dataset, _group_bars_by_day, _session_previous_closes
         ds = load_backtest_dataset(config["replay_data_path"])
         self.config = config

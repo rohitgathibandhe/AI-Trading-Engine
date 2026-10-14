@@ -30,15 +30,25 @@ SEED_FILES = ("intraday_v83_run_live_config.json", "intraday_v83_runtime_config.
               "promotion_state.json", "creds.json", "dhan_scrip_master.csv")
 
 RUNNER = r'''
-import json, sys
+import json, sys, traceback
 from market_ai.intraday_defined_risk import replay_provider as rp
 from market_ai.intraday_defined_risk import monitor
 rp.install_clock()
 cfg = json.load(open(sys.argv[1]))
-try:
-    monitor.run_live(cfg)
-except rp.ReplayFinished:
-    print("REPLAY_FINISHED")
+crashes = 0
+while True:
+    try:
+        monitor.run_live(cfg)          # re-entered after a crash, like launchd KeepAlive restarting the agent
+    except rp.ReplayFinished:
+        print(f"REPLAY_FINISHED crashes={crashes}")
+        break
+    except Exception as exc:  # the live agent crashed here; launchd restarts it ~30s later
+        crashes += 1
+        print(f"AGENT_CRASH #{crashes} at {rp.CLOCK.now.isoformat()}: {type(exc).__name__}: {exc}", flush=True)
+        if crashes > 200:
+            print("REPLAY_FINISHED crashes>200 (aborted)")
+            break
+        rp._replay_sleep(); cfg = dict(cfg, _resume=True)   # provider resumes its position (see __new__)
 '''
 
 
@@ -60,6 +70,10 @@ def main() -> int:
         if not a.data:
             subprocess.run([PY, str(ROOT / "scripts" / "build_live_dataset.py"), str(data)], check=True,
                            capture_output=True)
+        # the replay provider is TEST HARNESS, not agent code: inject the current one so any historical --ref
+        # (e.g. the exact commit that was live on a past day) can be replayed for a fidelity check.
+        shutil.copy2(ROOT / "data_engine" / "market_ai" / "intraday_defined_risk" / "replay_provider.py",
+                     wt / "data_engine" / "market_ai" / "intraday_defined_risk" / "replay_provider.py")
         st = wt / "data_engine" / "market_ai" / "state"
         st.mkdir(parents=True, exist_ok=True)
         (wt / "data_engine" / "state").mkdir(parents=True, exist_ok=True)     # day_thesis.py writes here
@@ -78,6 +92,9 @@ def main() -> int:
                     "PATH": "/usr/bin:/bin"})
         proc = subprocess.run([PY, "-c", RUNNER, str(cfg_path)], cwd=str(wt / "data_engine"), env=env,
                               capture_output=True, text=True, timeout=3600)
+        for ln in proc.stdout.splitlines():
+            if ln.startswith("AGENT_CRASH") or ln.startswith("REPLAY_FINISHED"):
+                print(ln)
         if "REPLAY_FINISHED" not in proc.stdout:
             print(proc.stdout[-2000:], proc.stderr[-4000:])
             return 1
