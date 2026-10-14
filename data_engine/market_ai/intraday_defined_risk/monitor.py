@@ -2191,7 +2191,12 @@ def run_live(config: dict[str, object]) -> None:
             if decision.action == "TRADE":
                 ops_max = int(getattr(getattr(runtime_config, "risk", None), "max_lots_per_trade", None) or 6)
                 if decision.lots > ops_max:
-                    decision.lots = ops_max
+                    # DecisionOutput is a FROZEN dataclass: assigning decision.lots raised FrozenInstanceError and
+                    # crashed run_live on every oversized TRADE decision (live: 7x on 10-08/09, 2x on 10-12 incl. a
+                    # 10:00 put-debit) — the trade was lost and launchd restarted the loop. Found by the live-path
+                    # replay (scripts/live_path_replay.py); the backtest never runs this code.
+                    import dataclasses as _dc
+                    decision = _dc.replace(decision, lots=ops_max)
             _emit_decision(decision)
             if decision.action == "TRADE":
                 if runtime_config.mode == RuntimeMode.SHADOW_LIVE:

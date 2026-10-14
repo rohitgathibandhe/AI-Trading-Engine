@@ -62,6 +62,7 @@ def main() -> int:
                            capture_output=True)
         st = wt / "data_engine" / "market_ai" / "state"
         st.mkdir(parents=True, exist_ok=True)
+        (wt / "data_engine" / "state").mkdir(parents=True, exist_ok=True)     # day_thesis.py writes here
         for name in SEED_FILES:
             if (LIVE_STATE / name).exists():
                 shutil.copy2(LIVE_STATE / name, st / name)
