@@ -2211,7 +2211,9 @@ def run_live(config: dict[str, object]) -> None:
                     # reacting to — wait for a retrace to a better price, or for the window to
                     # expire. Fails open, and the signal stays live while we wait. See entry_timing.
                     _wait = False
-                    if gate["allowed"]:
+                    # a trend-day entry already IS the retrace/breakout trigger — waiting for another one
+                    # is how 10-12/10-13 trend entries were never filled
+                    if gate["allowed"] and not decision.metadata.get("trend_day_entry"):
                         from .entry_timing import should_wait
                         _wait, _wait_why = should_wait(
                             decision.strategy.value if hasattr(decision.strategy, "value") else str(decision.strategy),

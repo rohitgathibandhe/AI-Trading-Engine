@@ -3166,6 +3166,16 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["price_vs_or_low"] = None if opening_range is None else round(spot - opening_range.low, 2)
     metadata["inside_opening_range"] = bool(opening_range is not None and opening_range.low <= spot <= opening_range.high)
     metadata["opening_range_break_state"] = opening_range_break_state
+    # TREND-DAY MODE inputs: session direction + entry trigger on completed bars (see trend_day.py)
+    try:
+        from .trend_day import evaluate as _trend_day_eval
+        metadata["trend_day"] = _trend_day_eval(
+            bars_5m, snapshot.timestamp,
+            oi={"put_oi_change": oi_flow.get("put_support_oi_change"),
+                "call_oi_change": oi_flow.get("call_resistance_oi_change"),
+                "smart_money_bias": oi_flow.get("smart_money_bias")})
+    except Exception:  # noqa: BLE001 — a research overlay must never break classification
+        metadata["trend_day"] = {"state": "NONE", "trigger": None}
     metadata["higher_low_confirmed"] = higher_low_confirmed
     metadata["lower_high_confirmed"] = lower_high_confirmed
     if bool(metadata.get("higher_lows_5m")) and bool(metadata.get("higher_highs_5m")):
