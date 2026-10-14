@@ -372,8 +372,8 @@ def _estimate_candidate_objective(candidate: AdaptiveParameters, rows: list[sqli
     filtered: list[sqlite3.Row] = []
     for row in rows:
         features = json.loads(row["feature_json"])
-        rv30 = float(features.get("rv30_pct", 0.0))
-        credit_ratio = float(features.get("credit_width_ratio", 0.0))
+        rv30 = float(features.get("rv30_pct") or 0.0)
+        credit_ratio = float(features.get("credit_width_ratio") or 0.0)
         is_condor = row["strategy"] == "IRON_CONDOR"
         threshold = candidate.condor_credit_width_ratio if is_condor else candidate.directional_credit_width_ratio
         if credit_ratio < threshold:
@@ -388,11 +388,11 @@ def _estimate_candidate_objective(candidate: AdaptiveParameters, rows: list[sqli
 
 def _heuristic_candidate(current: AdaptiveParameters, rows: list[sqlite3.Row]) -> AdaptiveParameters:
     features = [json.loads(row["feature_json"]) for row in rows]
-    high_rv_losses = [row["pnl_rupees"] for row, feature in zip(rows, features) if float(feature.get("rv30_pct", 0.0)) > current.rv_high_cutoff]
+    high_rv_losses = [row["pnl_rupees"] for row, feature in zip(rows, features) if float(feature.get("rv30_pct") or 0.0) > current.rv_high_cutoff]
     low_credit_losses = [
         row["pnl_rupees"]
         for row, feature in zip(rows, features)
-        if float(feature.get("credit_width_ratio", 0.0)) < current.directional_credit_width_ratio
+        if float(feature.get("credit_width_ratio") or 0.0) < current.directional_credit_width_ratio
     ]
     candidate = current
     if high_rv_losses and sum(high_rv_losses) < 0:

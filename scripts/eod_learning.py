@@ -278,11 +278,24 @@ def _load_jsonl(path: Path) -> list[dict]:
     return records
 
 
+def _json_safe(obj):
+    """inf (profit factor with no losses) -> None so the files stay strict JSON for every reader."""
+    if isinstance(obj, float) and obj == float("inf"):
+        return None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 def _profit_factor(pnls: list[float]) -> float:
     gross_profit = sum(p for p in pnls if p > 0)
     gross_loss   = abs(sum(p for p in pnls if p < 0))
     if gross_loss == 0:
-        return gross_profit if gross_profit > 0 else 0.0
+        # No losing trade yet: profit factor is unbounded, NOT the rupee profit (that printed "PF=1979.25"
+        # for a playbook that had simply made Rs 1,979 with no losses, and fed threshold adaptation).
+        return float("inf") if gross_profit > 0 else 0.0
     return round(gross_profit / gross_loss, 3)
 
 
@@ -747,7 +760,7 @@ def _build_telegram_report(
             emoji = "🟢" if s["total_pnl"] >= 0 else "🔴"
             lines.append(
                 f"  {emoji} {pb[:30]}"
-                f"\n      PF={s['profit_factor']:.2f}  WR={s['win_rate']*100:.0f}%"
+                f"\n      PF={('no losses yet' if s['profit_factor'] == float('inf') else format(s['profit_factor'], '.2f'))}  WR={s['win_rate']*100:.0f}%"
                 f"  n={s['samples']}  P&amp;L=₹{s['total_pnl']:+,.0f}"
             )
 
@@ -860,8 +873,8 @@ def main() -> None:
         "today_wins":      sum(1 for t in trades if t["pnl_rupees"] > 0),
     }
     if not dry_run:
-        EOD_REPORT_FILE.write_text(json.dumps(report, indent=2, default=str))
-        PLAYBOOK_STATS_FILE.write_text(json.dumps(playbook_stats, indent=2, default=str))
+        EOD_REPORT_FILE.write_text(json.dumps(_json_safe(report), indent=2, default=str))
+        PLAYBOOK_STATS_FILE.write_text(json.dumps(_json_safe(playbook_stats), indent=2, default=str))
         _log(f"Reports written to {EOD_REPORT_FILE.name} and {PLAYBOOK_STATS_FILE.name}")
 
     # 9. Telegram report

@@ -316,6 +316,10 @@ def _effective_hedge_cost_ratio_cap(
     return params.hedge_cost_ratio_cap
 
 
+_SELLER_MIN_CREDIT_RATIO = float(os.environ.get("SELLER_MIN_CREDIT_RATIO", "0.12") or 0.12)
+SELLER_MIN_CREDIT_PTS = float(os.environ.get("SELLER_MIN_CREDIT_PTS", "10") or 10.0)
+
+
 def _iv_adjusted_credit_ratio(
     required_credit_ratio: float,
     avg_chain_iv: float | None,
@@ -607,6 +611,14 @@ def _evaluate_vertical_candidates(
         base_required_credit_ratio,
         avg_chain_iv,
     )
+    # SELLER-EXIT trades (the BUY-or-SELL chooser's SELL side) are not held to max loss: the seller exit
+    # stops at 2x credit or when spot nears the short. The credit/width floor (0.26, x0.72 at low IV = 0.187)
+    # assumes a hold-to-width loss and is unreachable for in-band bear-calls at VIX ~15 (calls' skew makes
+    # them cheaper): 10-14 had 153 DELTA_OUT_OF_BAND rejections, best in-band pair 0.172 — so the sell side
+    # never executed. The pair_shadow bear-calls that won 6/6 on 10-12 were ~0.08-0.11 of width. For
+    # seller_exit trades require SELLER_MIN_CREDIT_RATIO of width and >= SELLER_MIN_CREDIT_PTS absolute.
+    if regime_state.metadata.get("seller_exit"):
+        required_credit_ratio = min(required_credit_ratio, _SELLER_MIN_CREDIT_RATIO)
     max_hedge_cost_ratio = _effective_hedge_cost_ratio_cap(
         params,
         setup_quality_score=setup_quality_score,
@@ -683,6 +695,8 @@ def _evaluate_vertical_candidates(
             )
             credit_ratio = credit / width if width > 0 else 0.0
             passed_credit_width = credit > 0 and credit_ratio >= required_credit_ratio
+            if regime_state.metadata.get("seller_exit") and credit < SELLER_MIN_CREDIT_PTS:
+                passed_credit_width = False      # never sell for pennies (e.g. expiry-day far-OTM)
             short_abs = abs(short_quote.delta) if short_quote.delta is not None else None
             long_abs = abs(long_quote.delta) if long_quote.delta is not None else None
             passed_delta = True
