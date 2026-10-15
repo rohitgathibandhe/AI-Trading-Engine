@@ -1089,6 +1089,12 @@ class IntradayDefinedRiskAgent:
         meta.update(_ml_feature_snapshot(regime_state))
         meta.setdefault("session_date", snapshot.timestamp.date().isoformat())   # e.g. broken-fade-level memory
         choice = _select(meta, spot, now_time=snapshot.timestamp.time())
+        # PH21 early-session gate (ops_runtime.evaluate_entry_gate) reads execution_5m / trend_15m from the
+        # DECISION metadata. The legacy path put them there; this selector path never did, so before 10:15 every
+        # directional credit entry was blocked EARLY_SESSION_UNCONFIRMED regardless of the tape (2026-10-15:
+        # a +155 up-open, SEL_BREAKOUT_UP bull-put blocked from 09:39 with execution_5m=None).
+        meta["execution_5m"] = regime_state.execution_5m
+        meta["trend_15m"] = regime_state.trend_15m
         meta["selector_condition"] = choice.condition
         meta["selector_family"] = choice.family
         meta["selector_iv"] = choice.iv_regime
