@@ -62,6 +62,7 @@ def main() -> int:
     ap.add_argument("--data", default="")
     ap.add_argument("--ref", default="HEAD", help="git ref of the code to replay (default: current HEAD)")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--set", action="append", default=[], help="override a run_live config key for a what-if, e.g. --set min_5m_candles=3")
     a = ap.parse_args()
 
     work = Path(tempfile.mkdtemp(prefix="livereplay_"))
@@ -99,6 +100,10 @@ def main() -> int:
         for k, v in list(cfg.items()):
             if isinstance(v, str) and v.startswith(str(LIVE_STATE)):
                 cfg[k] = str(st / Path(v).name)
+        for kv in a.set:
+            k, v = kv.split("=", 1)
+            cfg[k] = json.loads(v) if v.replace(".", "", 1).isdigit() or v in ("true", "false") else v
+            print(f"what-if: {k}={cfg[k]}")
         cfg.update({"provider_class": "market_ai.intraday_defined_risk.replay_provider:ReplayMarketDataProvider",
                     "replay_data_path": str(data), "replay_start": a.start, "replay_end": a.end})
         assert "PaperOnly" in str(cfg.get("executor_class")), "refusing: executor is not PaperOnly"
