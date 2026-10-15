@@ -51,8 +51,22 @@ def run() -> list[dict]:
 
 
 def main() -> int:
+    import time as _t
+    res = None
+    for _attempt in range(10):           # before ~09:40 the live provider has too few candles: wait, don't alarm
+        try:
+            res = run()
+            break
+        except Exception as exc:  # noqa: BLE001
+            if "NOT_READY" in str(exc) or "NOT_READY" in type(exc).__name__ or "LiveDataReadiness" in type(exc).__name__:
+                _t.sleep(60)
+                continue
+            res = [{"structure": "ALL", "ok": False, "detail": f"smoke test crashed: {type(exc).__name__}: {exc}"}]
+            break
+    if res is None:
+        res = [{"structure": "ALL", "ok": False, "detail": "live data still not ready after 10 min"}]
     try:
-        res = run()
+        pass
     except Exception as exc:  # noqa: BLE001
         res = [{"structure": "ALL", "ok": False, "detail": f"smoke test crashed: {type(exc).__name__}: {exc}"}]
     for r in res:
