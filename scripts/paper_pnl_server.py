@@ -2182,7 +2182,11 @@ import threading  # noqa: E402  (local: used only by the live-price refresher be
 _open_leg_ltp_cache: Dict[float, Dict[str, Any]] = {}
 _open_leg_ltp_cache_ts: float = 0.0
 _open_leg_ltp_cache_exp: Optional[str] = None  # which expiry the cache is for (invalidate on change)
-_OPEN_LEG_LTP_TTL = 3.0   # Dhan chain is ~1 req/3s; 3s is the floor for the fast poller
+# Dhan allows ~1 option-chain request / 3s PER TOKEN, shared with the trading agent. Polling at 3s while a
+# position was open starved the agent: 2026-10-15 from 09:56 (right after entry) every agent chain fetch came
+# back empty ("chain unavailable for 5 consecutive polls") so it could not mark/exit the open trade. The
+# dashboard is display-only — 30s is plenty, and the agent always wins the budget.
+_OPEN_LEG_LTP_TTL = 30.0
 
 # Background live-price refresher. The Dhan chain fetch can BLOCK for seconds (the 1-req/3s
 # throttle, or up to 90s on a 429 cooldown), so doing it inline made /api/open_position_live stall
