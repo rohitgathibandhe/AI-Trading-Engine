@@ -139,7 +139,9 @@ class ReplayMarketDataProvider:
         day = ts.date()
         closed5 = [b for b in self._bars5.get(day, []) if b.timestamp + timedelta(minutes=5) <= stamp]
         closed15 = [b for b in self._bars15.get(day, []) if b.timestamp + timedelta(minutes=15) <= stamp]
-        if len(closed5) < 3 or not closed15:
+        # live counts the FORMING bar in min_5m_candles (Dhan returns it), so N candles live = N-1 closed here
+        need_closed = max(int(self.config.get("min_5m_candles") or 5) - 1, 1)
+        if len(closed5) < need_closed or not closed15:
             from .live_runtime import LiveDataReadinessError  # same failure the live provider raises
             raise LiveDataReadinessError("MIN_5M_CANDLES_NOT_READY", "replay: not enough closed candles yet",
                                          diagnostics={"replay": True})
