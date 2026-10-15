@@ -131,7 +131,7 @@ class RuntimeConfig:
     directional_balance_score_margin_override: float = 0.08
     allowed_entry_start_hhmm: str = "09:30"
     allowed_entry_end_hhmm: str = "14:30"
-    allowed_bullish_entry_start_hhmm: str = "10:00"
+    allowed_bullish_entry_start_hhmm: str = "09:30"   # was 10:00 (bearish-only era): kept a correct bullish read out (10-15 09:36)
     paper_override_bearish_score_threshold: float = 6.5
     paper_override_margin: float = 1.0
     paper_experiment_entry_end_hhmm: str = "14:30"
@@ -173,7 +173,7 @@ class RuntimeConfig:
             ),
             allowed_entry_start_hhmm=str(payload.get("allowed_entry_start_hhmm") or "09:30"),
             allowed_entry_end_hhmm=str(payload.get("allowed_entry_end_hhmm") or "14:30"),
-            allowed_bullish_entry_start_hhmm=str(payload.get("allowed_bullish_entry_start_hhmm") or "10:00"),
+            allowed_bullish_entry_start_hhmm=str(payload.get("allowed_bullish_entry_start_hhmm") or "09:30"),
             paper_override_bearish_score_threshold=float(payload.get("paper_override_bearish_score_threshold", 6.5) or 6.5),
             paper_override_margin=float(payload.get("paper_override_margin", 1.0) or 1.0),
             paper_experiment_entry_end_hhmm=str(payload.get("paper_experiment_entry_end_hhmm") or "14:30"),
