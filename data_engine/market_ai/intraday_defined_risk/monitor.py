@@ -2234,7 +2234,9 @@ def run_live(config: dict[str, object]) -> None:
                     # continuing (missed: 10-12 09:56 put-debit, ran 99pts with no retrace; 10-14 13:05 score
                     # 8.32 put-debit). The wait still guards fades/counter-moves (saved 10-12 10:27 fade-long).
                     _strong = str(decision.metadata.get("playbook") or "").startswith("SEL_STRONG_TREND")
-                    if gate["allowed"] and not decision.metadata.get("trend_day_entry") and not _strong:
+                    # an OPENING DRIVE entry is timed by the study itself: right after 09:30 beat waiting for a pullback
+                    _drive = bool(decision.metadata.get("opening_drive_entry"))
+                    if gate["allowed"] and not decision.metadata.get("trend_day_entry") and not _strong and not _drive:
                         from .entry_timing import should_wait
                         _wait, _wait_why = should_wait(
                             decision.strategy.value if hasattr(decision.strategy, "value") else str(decision.strategy),
