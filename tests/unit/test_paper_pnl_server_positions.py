@@ -429,3 +429,20 @@ def test_build_intraday_index_chart_payload_stands_aside_in_range() -> None:
     assert out["plan"]["trade_idea"] == "Stand aside / range read"
     assert out["plan"]["posture"] == "WAIT_EDGE_TEST"
     assert out["structure"]["higher_tf_confluence"]["status"] in {"MIXED", "PARTIAL", "ALIGNED"}
+
+
+def test_live_leg_ltps_drops_stale_cache(monkeypatch) -> None:
+    """2026-10-16: a refresher stuck on a dead token served 10-15's leg prices as live (MTM -5,353 vs -185)."""
+    import time as _t
+
+    class _Alive:
+        def is_alive(self):
+            return True
+
+    monkeypatch.setattr(paper_server, "_ltp_refresher_thread", _Alive())
+    monkeypatch.setattr(paper_server, "_open_leg_ltp_cache", {22950.0: {"PUT": 161.2}})
+    monkeypatch.setattr(paper_server, "_open_leg_ltp_cache_exp", "2026-10-19")
+    monkeypatch.setattr(paper_server, "_open_leg_ltp_cache_ts", _t.time() - 86400)
+    assert paper_server._live_leg_ltps("2026-10-19") == {}
+    monkeypatch.setattr(paper_server, "_open_leg_ltp_cache_ts", _t.time() - 5)
+    assert paper_server._live_leg_ltps("2026-10-19") == {22950.0: {"PUT": 161.2}}

@@ -2187,6 +2187,7 @@ _open_leg_ltp_cache_exp: Optional[str] = None  # which expiry the cache is for (
 # back empty ("chain unavailable for 5 consecutive polls") so it could not mark/exit the open trade. The
 # dashboard is display-only — 30s is plenty, and the agent always wins the budget.
 _OPEN_LEG_LTP_TTL = 30.0
+_LTP_MAX_AGE = 120.0   # 4 missed refreshes → stop showing the cached LTP
 
 # Background live-price refresher. The Dhan chain fetch can BLOCK for seconds (the 1-req/3s
 # throttle, or up to 90s on a 429 cooldown), so doing it inline made /api/open_position_live stall
@@ -2238,21 +2239,25 @@ def _ltp_refresher_loop() -> None:
     Dhan work lives here, off the request path, so the endpoint never waits."""
     global _open_leg_ltp_cache, _open_leg_ltp_cache_ts, _open_leg_ltp_cache_exp, _open_leg_spot, _open_leg_spot_ts
     dw = None
+    dw_token = None
     while True:
         try:
             if (time.time() - _ltp_wanted_at) > 60:  # nobody viewed the position in 60s → idle
                 time.sleep(2)
                 continue
-            if dw is None:
+            # Rebuild the client whenever creds.json carries a new token. The overnight auto-renew KILLS the
+            # old token, and a client built once at startup kept failing silently — 2026-10-16 the UI showed
+            # 2026-10-15's leg prices (22950 PE 161 vs ~50 live, open MTM -5,353 vs agent mark -185).
+            creds = _json_read(CREDS_FILE)
+            tok = (creds.get("access_token") or "").strip() if isinstance(creds, dict) else ""
+            if dw is None or (tok and tok != dw_token):
                 from data_engine.market_ai.dhan_wrapper import DhanWrapper  # type: ignore
-                creds = _json_read(CREDS_FILE)
-                if isinstance(creds, dict):
-                    cid = (creds.get("client_id") or "").strip()
-                    tok = (creds.get("access_token") or "").strip()
-                    if cid and tok:
-                        os.environ["DHAN_CLIENT_ID"] = cid
-                        os.environ["DHAN_ACCESS_TOKEN"] = tok
+                cid = (creds.get("client_id") or "").strip() if isinstance(creds, dict) else ""
+                if cid and tok:
+                    os.environ["DHAN_CLIENT_ID"] = cid
+                    os.environ["DHAN_ACCESS_TOKEN"] = tok
                 dw = DhanWrapper(logger=None)
+                dw_token = tok
             exp = _ltp_wanted_exp or _resolve_front_tradeable_expiry(dw)
             if exp:
                 raw = dw.get_option_chain(INDEX_SECURITY_ID, "IDX_I", exp)
@@ -2323,7 +2328,10 @@ def _live_leg_ltps(position_expiry: Optional[str] = None) -> Dict[float, Dict[st
     # the heuristic (unstamped) path serve whatever the refresher last fetched. Empty only until
     # the first refresh lands (a few seconds on first load), during which the caller shows the
     # frozen entry quote.
-    if _open_leg_ltp_cache and (exp is None or _open_leg_ltp_cache_exp == exp):
+    # Never serve stale prices as live: a cache older than _LTP_MAX_AGE (failed refreshes) is dropped and
+    # the caller falls back to the frozen entry quote instead of showing yesterday's LTP.
+    if _open_leg_ltp_cache and (exp is None or _open_leg_ltp_cache_exp == exp) \
+            and (time.time() - _open_leg_ltp_cache_ts) <= _LTP_MAX_AGE:
         return _open_leg_ltp_cache
     return {}
 
