@@ -161,6 +161,40 @@ def recent_lower_highs(bars: list[OhlcvBar], needed: int = 3) -> bool:
     return all(left > right for left, right in zip(recent, recent[1:]))
 
 
+def swing_structure_confirmation(bars: list[OhlcvBar], vwap: float | None) -> str:
+    """5m swing-structure confirmation, independent of the opening range.
+
+    UP_CONFIRMED: after the session low, price formed a swing high (3-bar pivot) and the last closed bar
+    closed ABOVE it (change of character: higher low + break of the swing high), with the last two closes
+    above VWAP. DOWN_CONFIRMED is the mirror around the session high. The OR-high rule lags badly when the
+    first candle is a large move against the day: 2026-10-16 opened 23,065 -> 22,955 in the first bar, the
+    swing structure turned up at the 09:55 close (23,027 > swing high 22,981) but two closes above the OR high
+    (23,077) came only at 10:15, ~110pts later.
+    """
+    if vwap is None or len(bars) < 5:
+        return "UNCONFIRMED"
+    last, prev = bars[-1], bars[-2]
+    lows = [b.low for b in bars]
+    highs = [b.high for b in bars]
+    lo_i = min(range(len(bars)), key=lambda i: lows[i])
+    hi_i = max(range(len(bars)), key=lambda i: highs[i])
+    up = down = False
+    # pivots strictly between the extreme and the last bar (the pivot needs a bar after it)
+    piv_hi = [bars[i].high for i in range(lo_i + 1, len(bars) - 1)
+              if bars[i].high > bars[i - 1].high and bars[i].high > bars[i + 1].high]
+    if piv_hi and lo_i < len(bars) - 2 and last.close > piv_hi[-1] and last.close > vwap and prev.close > vwap:
+        up = True
+    piv_lo = [bars[i].low for i in range(hi_i + 1, len(bars) - 1)
+              if bars[i].low < bars[i - 1].low and bars[i].low < bars[i + 1].low]
+    if piv_lo and hi_i < len(bars) - 2 and last.close < piv_lo[-1] and last.close < vwap and prev.close < vwap:
+        down = True
+    if up and not down:
+        return "UP_CONFIRMED"
+    if down and not up:
+        return "DOWN_CONFIRMED"
+    return "UNCONFIRMED"
+
+
 def recent_higher_lows(bars: list[OhlcvBar], needed: int = 3) -> bool:
     pivots = _pivot_lows(bars)
     if len(pivots) < needed:
