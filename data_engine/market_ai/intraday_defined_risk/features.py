@@ -170,7 +170,8 @@ def opening_drive_read(bars: list[OhlcvBar], previous_close: float | None) -> di
     if previous_close is None or len(bars) < 3:
         return out
     day = bars[-1].timestamp.date()
-    first = [b for b in bars if b.timestamp.date() == day][:3]
+    # skip a pre-open 09:10 bar (present in the recorded data) — the drive starts at the 09:15 open
+    first = [b for b in bars if b.timestamp.date() == day and b.timestamp.strftime("%H:%M") >= "09:15"][:3]
     if len(first) < 3 or first[0].timestamp.strftime("%H:%M") != "09:15":
         return out
     body = first[-1].close - first[0].open

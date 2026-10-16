@@ -36,3 +36,9 @@ def test_selector_fills_direction_only_in_window(monkeypatch):
     assert c.structures and c.structures[0] in ("BULL_PUT_CREDIT_SPREAD", "CALL_DEBIT_SPREAD")
     c2 = sel.select_strategy(dict(md), 22750.0, now_time=time(10, 5))
     assert not c2.structures or "OPENING DRIVE" not in (c2.rationale or "")
+
+
+def test_skips_preopen_bar():
+    bars = _bars([(22599, 22599), (22599, 22528), (22531, 22517), (22519, 22503)], day=datetime(2026, 10, 8, 9, 10))
+    r = opening_drive_read(bars, 22603.05)
+    assert r["dir"] == "BEARISH" and r["gap"] == -4.05
