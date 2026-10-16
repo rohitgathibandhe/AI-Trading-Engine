@@ -1441,8 +1441,31 @@ def load_paper_position(paths: OpsPaths | None = None, *, drop_stale: bool = Fal
             entry = getattr(position, "entry_time", None)
             if entry is not None and entry.date() < datetime.now().date():
                 print(f"[stale-guard] Dropping STALE overnight paper position (entry {entry.isoformat()} "
-                      f"< today) — clearing so the new session is not blocked.")
-                save_paper_position(None, paths=paths)   # clear it from state
+                      f"< today) — booking it at its last mark and clearing so the new session is not blocked.")
+                # Book the stranded trade BEFORE clearing it: dropping it silently erased its P&L from the ledger
+                # (replay 2026-10-15/16: a 12:59 bull-put stranded by missing data vanished with no PAPER_EXIT).
+                _st = state if isinstance(state, dict) else {}
+                _mark = _st.get("last_mark_pnl_rupees")
+                event = {
+                    "event": "PAPER_EXIT",
+                    "timestamp": datetime.now().isoformat(),
+                    "session_date": entry.date().isoformat(),
+                    "entry_timestamp": entry.isoformat(),
+                    "exit_timestamp": datetime.now().isoformat(),
+                    "exit_reason": "STALE_OVERNIGHT_EXIT",
+                    "playbook": position.metadata.get("playbook"),
+                    "paper_trade_attribution": position.metadata.get("paper_trade_attribution"),
+                    "strategy": position.structure.strategy.value,
+                    "realized_paper_pnl": round(float(_mark), 2) if _mark is not None else None,
+                    "mfe_rupees": round(float(_st.get("mfe_rupees") or 0.0), 2),
+                    "mae_rupees": round(float(_st.get("mae_rupees") or 0.0), 2),
+                    "note": "Stranded past 15:15 (agent/data down at EoD); booked at the last known mark.",
+                }
+                try:
+                    _append_jsonl(paths.paper_trades, event)
+                except Exception:  # noqa: BLE001
+                    pass
+                save_paper_position(None, paths=paths, extra={"last_exit": event, "mfe_rupees": 0.0, "mae_rupees": 0.0})
                 return None
         except Exception:  # noqa: BLE001 — the guard must never break startup
             pass

@@ -49,3 +49,22 @@ def test_gate_override_confirms_and_vetoes(monkeypatch):
     assert _early_structure_override(False, True, {}, {}) == (False, False)    # nothing changes without a read
     monkeypatch.setenv("EARLY_SWING_CONFIRM", "0")
     assert _early_structure_override(False, True, up, {}) == (False, False)    # toggle off = old behaviour
+
+
+def test_stale_overnight_position_is_booked_not_erased(tmp_path, monkeypatch):
+    """A position stranded past 15:15 was dropped at the next start with NO PAPER_EXIT — its P&L vanished."""
+    import json
+    from types import SimpleNamespace
+    from market_ai.intraday_defined_risk import ops_runtime as ops
+
+    paths = ops.OpsPaths(paper_state=tmp_path / "state.json", paper_trades=tmp_path / "trades.jsonl")
+    paths.paper_state.write_text(json.dumps({"active_position": {"x": 1}, "last_mark_pnl_rupees": -484.25,
+                                             "mfe_rupees": 205.0, "mae_rupees": -600.0}))
+    stale = SimpleNamespace(entry_time=datetime.now() - timedelta(days=1), metadata={"playbook": "SEL_BREAKOUT_UP"},
+                            structure=SimpleNamespace(strategy=SimpleNamespace(value="BULL_PUT_CREDIT_SPREAD")))
+    monkeypatch.setattr(ops, "deserialize_open_position", lambda _d: stale)
+    monkeypatch.setattr(ops, "save_paper_position", lambda *a, **k: None)
+    assert ops.load_paper_position(paths, drop_stale=True) is None
+    ev = [json.loads(l) for l in paths.paper_trades.read_text().splitlines()]
+    assert ev and ev[-1]["event"] == "PAPER_EXIT" and ev[-1]["exit_reason"] == "STALE_OVERNIGHT_EXIT"
+    assert ev[-1]["realized_paper_pnl"] == -484.25
