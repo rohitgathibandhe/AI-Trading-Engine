@@ -6,6 +6,7 @@ from datetime import time
 from .data_models import AdaptiveParameters, MarketSnapshot, OhlcvBar, RegimeLabel, RegimeState, ValidationError
 from .day_thesis import get_or_form_day_thesis
 from .features import (
+    swing_structure_confirmation,
     RANGE_GATE_TIME,
     adaptive_or_length_minutes,
     balanced_range_condor_setup,
@@ -1275,6 +1276,8 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     else:
         reasons.append("Opening range or VWAP could not be established.")
 
+    # swing-structure read for the early-session gate (ops_runtime PH21) — advisory, does not change execution_5m
+    metadata["execution_5m_structure"] = swing_structure_confirmation(bars_5m, vwap)
     structure_state = market_structure_state(bars_5m, ema20_5m_value, ema50_5m_value, vwap)
     metadata.update(structure_state)
     current_structure_signal = _structure_signal(metadata)

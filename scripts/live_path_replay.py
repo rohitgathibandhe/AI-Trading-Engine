@@ -62,6 +62,7 @@ def main() -> int:
     ap.add_argument("--data", default="")
     ap.add_argument("--ref", default="HEAD", help="git ref of the code to replay (default: current HEAD)")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--env", action="append", default=[], help="KEY=VALUE env override on top of the live plist (A/B a toggle)")
     a = ap.parse_args()
 
     work = Path(tempfile.mkdtemp(prefix="livereplay_"))
@@ -108,8 +109,11 @@ def main() -> int:
         env = {k: str(v) for k, v in plistlib.load(open(PLIST, "rb")).get("EnvironmentVariables", {}).items()}
         env.update({"PYTHONPATH": str(wt / "data_engine"), "TRADE_MODE": "paper", "HOME": str(Path.home()),
                     "PATH": "/usr/bin:/bin"})
+        for kv in a.env:
+            k, _, v = kv.partition("=")
+            env[k] = v
         proc = subprocess.run([PY, "-c", RUNNER, str(cfg_path)], cwd=str(wt / "data_engine"), env=env,
-                              capture_output=True, text=True, timeout=3600)
+                              capture_output=True, text=True, timeout=6 * 3600)
         for ln in proc.stdout.splitlines():
             if ln.startswith("AGENT_CRASH") or ln.startswith("REPLAY_FINISHED"):
                 print(ln)
@@ -129,7 +133,7 @@ def main() -> int:
             if d.get("raw_action") == "TRADE" or str(d.get("block_reason") or "") not in ("SELECTOR_STAND_ASIDE", "INSUFFICIENT_DATA", "None"):
                 blocks[str(d.get("timestamp", ""))[:10]][str(d.get("block_reason"))[:40]] += 1
         total = 0.0
-        print(f"LIVE-PATH REPLAY {a.start}..{a.end} (code {a.ref}, real run_live loop, live plist env)")
+        print(f"LIVE-PATH REPLAY {a.start}..{a.end} (code {a.ref}, real run_live loop, live plist env{' + ' + ' '.join(a.env) if a.env else ''})")
         for day in sorted(set(by_day) | set(blocks)):
             pnl = sum(float(t.get("realized_paper_pnl") or 0) for t in by_day[day] if t.get("event") == "PAPER_EXIT")
             total += pnl

@@ -916,6 +916,19 @@ def _second_trade_block_reason(
     return None
 
 
+def _early_structure_override(confirmed: bool, is_bull: bool, metadata: dict, funnel: dict) -> tuple[bool, bool]:
+    """PH21 early-session gate, swing-structure leg (EARLY_SWING_CONFIRM=1, default on).
+
+    The OR-high/low rule alone confirmed ~110pts late on 2026-10-16 (big first candle against the day). A 5m
+    change of character in the trade direction (regime execution_5m_structure) also confirms; a CoCH AGAINST the
+    trade direction blocks it even if the OR rule says confirmed. Returns (confirmed, structure_opposes)."""
+    if os.environ.get("EARLY_SWING_CONFIRM", "1") != "1":
+        return confirmed, False
+    st = str(metadata.get("execution_5m_structure") or funnel.get("execution_5m_structure") or "")
+    want, against = ("UP_CONFIRMED", "DOWN_CONFIRMED") if is_bull else ("DOWN_CONFIRMED", "UP_CONFIRMED")
+    return (confirmed or st == want), st == against
+
+
 def evaluate_entry_gate(
     decision: DecisionOutput,
     snapshot: MarketSnapshot,
@@ -1005,8 +1018,9 @@ def evaluate_entry_gate(
             (_is_bull and _exec_5m == "UP_CONFIRMED")
             or (not _is_bull and _exec_5m == "DOWN_CONFIRMED")
         )
+        _confirmed, _struct_opposes = _early_structure_override(_confirmed, _is_bull, metadata, funnel)
         _ofi_opposes = (_is_bull and _ofi < -0.30) or (not _is_bull and _ofi > 0.30)
-        if not _confirmed or _ofi_opposes:
+        if not _confirmed or _ofi_opposes or _struct_opposes:
             reasons.append("EARLY_SESSION_UNCONFIRMED")
     daily_lock = state.get("daily_lock") if isinstance(state.get("daily_lock"), dict) else {}
     if bool(daily_lock.get("active")):
@@ -1151,8 +1165,9 @@ def evaluate_paper_context_override_gate(
             (_is_bull and _exec_5m == "UP_CONFIRMED")
             or (not _is_bull and _exec_5m == "DOWN_CONFIRMED")
         )
+        _confirmed, _struct_opposes = _early_structure_override(_confirmed, _is_bull, metadata, funnel)
         _ofi_opposes = (_is_bull and _ofi < -0.30) or (not _is_bull and _ofi > 0.30)
-        if not _confirmed or _ofi_opposes:
+        if not _confirmed or _ofi_opposes or _struct_opposes:
             reasons.append("EARLY_SESSION_UNCONFIRMED")
 
     daily_lock = state.get("daily_lock") if isinstance(state.get("daily_lock"), dict) else {}
