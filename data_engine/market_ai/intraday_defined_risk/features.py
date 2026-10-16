@@ -161,6 +161,28 @@ def recent_lower_highs(bars: list[OhlcvBar], needed: int = 3) -> bool:
     return all(left > right for left, right in zip(recent, recent[1:]))
 
 
+def opening_drive_read(bars: list[OhlcvBar], previous_close: float | None) -> dict:
+    """Opening Drive: the session's first 15 minutes (09:15-09:30, three 5m bars) moving the SAME way as the
+    opening gap. 52 sessions (2026-07-16..10-16): when gap and first-15m body agree, the 09:30->15:15 move
+    went that way 19/23 (83%; 10/13 and 9/10 in each half); entering at 09:30 beat waiting for a pullback
+    (+59 vs +29..+40 pts/trade — pullbacks fill mostly on the days that fail). Returns dir BULLISH/BEARISH/None."""
+    out = {"dir": None, "body": None, "gap": None}
+    if previous_close is None or len(bars) < 3:
+        return out
+    day = bars[-1].timestamp.date()
+    first = [b for b in bars if b.timestamp.date() == day][:3]
+    if len(first) < 3 or first[0].timestamp.strftime("%H:%M") != "09:15":
+        return out
+    body = first[-1].close - first[0].open
+    gap = first[0].open - float(previous_close)
+    out.update(body=round(body, 2), gap=round(gap, 2))
+    if body > 0 and gap > 0:
+        out["dir"] = "BULLISH"
+    elif body < 0 and gap < 0:
+        out["dir"] = "BEARISH"
+    return out
+
+
 def swing_structure_confirmation(bars: list[OhlcvBar], vwap: float | None) -> str:
     """5m swing-structure confirmation, independent of the opening range.
 

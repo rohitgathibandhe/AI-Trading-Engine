@@ -581,7 +581,9 @@ def _has_momentum(m: dict[str, Any], direction: str) -> tuple[bool, str]:
 # in metadata["structure_choice"] and graded against the other side by pair_shadow (it prices both).
 _STRUCT_CHOOSER = os.environ.get("SEL_STRUCT_CHOOSER", "1") == "1"
 _SESSION_ALIGN = os.environ.get("SEL_SESSION_ALIGN", "1") == "1"   # see SESSION ALIGNMENT in select_strategy
-_TREND_DAY = os.environ.get("SEL_TREND_DAY", "1") == "1"            # see TREND-DAY MODE in select_strategy
+_TREND_DAY = os.environ.get("SEL_TREND_DAY", "1") == "1"
+_OPEN_DRIVE = os.environ.get("SEL_OPEN_DRIVE", "1") == "1"            # see OPENING DRIVE in select_strategy
+_OPEN_DRIVE_UNTIL = os.environ.get("SEL_OPEN_DRIVE_UNTIL", "10:00")            # see TREND-DAY MODE in select_strategy
 _BUY_MARGIN = _sel_env_float("SEL_BUY_MARGIN") or 2.0
 
 
@@ -909,6 +911,17 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
                 note_trigger_used(_tg["at"])
             except Exception:
                 pass
+        # OPENING DRIVE (owner, 2026-10-16: "look at the first 15 min candle, the OI build-up ... plan the trade
+        # and optimize the entry"): gap and the first 15m body agreeing called the rest of the day 19/23 over 52
+        # sessions, and entering right after 09:30 beat waiting for a pullback. Fill in the direction when the
+        # confluence gate is silent, 09:30..SEL_OPEN_DRIVE_UNTIL. SEL_OPEN_DRIVE=0 disables.
+        _od = metadata.get("opening_drive") or {}
+        if (_OPEN_DRIVE and _dir is None and _od.get("dir") and now_time is not None
+                and time(9, 30) <= now_time < time.fromisoformat(_OPEN_DRIVE_UNTIL)):
+            _dir = _od["dir"]
+            _why = (f"OPENING DRIVE {_dir}: gap {float(_od['gap']):+.0f} and first-15m body {float(_od['body']):+.0f} "
+                    f"agree — trade the drive at the open (83% day-direction hit, 52-session study)")
+            metadata["opening_drive_entry"] = True
         # The validated STRUCTURE for a high-conviction directional leg is a DEBIT, not a credit spread:
         # on the shadow book the bear-call CREDIT lost -1,241 (71% win, capped winner / big loser) while
         # the PUT-DEBIT made +2,787 (50% win, convex — small losses, big wins). So confluence -> BUY the

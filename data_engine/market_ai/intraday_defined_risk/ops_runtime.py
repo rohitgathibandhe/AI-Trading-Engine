@@ -1005,6 +1005,7 @@ def evaluate_entry_gate(
         snapshot.timestamp.time() < time(10, 15)
         and strategy in {"BEAR_CALL_CREDIT_SPREAD", "BULL_PUT_CREDIT_SPREAD"}
         and playbook not in {"EARLY_STRUCTURE_BULLISH", "EARLY_STRUCTURE_BEARISH"}
+        and not metadata.get("opening_drive_entry")   # the drive IS the first-15m confirmation
     ):
         _exec_5m = str(metadata.get("execution_5m") or funnel.get("execution_5m") or "")
         _ofi = float(
@@ -1152,6 +1153,7 @@ def evaluate_paper_context_override_gate(
         and str(metadata.get("playbook") or funnel.get("playbook") or "") not in {
             "EARLY_STRUCTURE_BULLISH", "EARLY_STRUCTURE_BEARISH"
         }
+        and not metadata.get("opening_drive_entry")
     ):
         _exec_5m = str(metadata.get("execution_5m") or funnel.get("execution_5m") or "")
         _ofi = float(
