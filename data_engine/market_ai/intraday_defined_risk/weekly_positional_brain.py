@@ -64,6 +64,7 @@ UNTESTED_HARVEST_PCT = _env_f("WK_UNTESTED_HARVEST_PCT", 0.80) # close the untes
 # is only the MINIMUM distance so it can't sit too close. A full extra ATR on top double-counted with
 # delta and pushed the short so far OTM it collected no premium (2026-09-03: credit ratio 0.01).
 GAP_ATR_BUFFER       = _env_f("WK_GAP_ATR_BUFFER", 0.0)        # short beyond expected_move + this * daily ATR
+STRUCTURE_MODE       = (os.environ.get("WK_STRUCTURE", "CONDOR") or "CONDOR").upper()   # CONDOR | TREND
 
 
 # ── Broader trend (the HIGHER timeframe read — daily/weekly, not intraday) ────────────────────
@@ -118,6 +119,11 @@ def plan_entry(m: dict[str, Any]) -> dict[str, Any]:
     structure = {BULLISH: "BULL_PUT_CREDIT_SPREAD",
                  BEARISH: "BEAR_CALL_CREDIT_SPREAD",
                  NEUTRAL: "IRON_CONDOR"}[bt]
+    # 357-session study (2026-10-17): choosing the side by the daily trend gave no consistent edge (helped at
+    # DTE2, hurt at DTE6, neutral at DTE8-9) and the daily trend itself called direction <50%. Selling BOTH
+    # sides earned the edge without a direction bet. WK_STRUCTURE=TREND restores the trend-picked side.
+    if STRUCTURE_MODE == "CONDOR":
+        structure = "IRON_CONDOR"
 
     # Gap-safe short distance: beyond the weekly expected move PLUS a daily-ATR buffer, so a typical
     # overnight gap doesn't breach the short. The executor snaps to the nearest OI wall past this.
@@ -133,7 +139,7 @@ def plan_entry(m: dict[str, Any]) -> dict[str, Any]:
         "min_short_distance_pts": round(min_short_distance, 0),
         "min_credit_ratio": MIN_CREDIT_RATIO,   # executor rejects the week if the live credit can't clear this
         "why": (f"broader trend {bt} -> sell {structure} "
-                f"{'below support' if bt==BULLISH else 'above resistance' if bt==BEARISH else 'both walls'}; "
+                f"{'both walls' if structure == 'IRON_CONDOR' else 'below support' if bt==BULLISH else 'above resistance'}; "
                 f"short >= {min_short_distance:.0f}pts out (expected move {expected_move:.0f} + {GAP_ATR_BUFFER}xATR "
                 f"{atr:.0f}) to survive a gap."),
     }

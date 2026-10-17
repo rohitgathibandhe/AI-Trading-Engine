@@ -12,6 +12,7 @@ orders. Management (the defense ladder) is a separate daily monitor.
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
 from datetime import date, datetime, timedelta
@@ -69,6 +70,36 @@ def _next_week_expiry(creds: dict | None = None) -> str:
         return upcoming[1]
     nearest = wx._next_tuesday(date.today())
     return (nearest + timedelta(days=7)).isoformat()
+
+
+# ENTRY WINDOW by trading-days-to-expiry (357-session study, 2026-10-17, scratchpad research/dte_sim.py): the same
+# 0.20-delta spreads, exited before expiry day, earned per trade (Apr25-Apr26 | Apr26-Oct26): DTE9 +363|+613,
+# DTE8 +269|+312, DTE6-7 +96..+182|+219..+284, DTE2-4 mixed, DTE1 negative. Sell the expiry ~2 weeks out right
+# after the previous expiry; never open into the last days. WK_DTE_WINDOW=0 restores "next-week expiry".
+WK_DTE_WINDOW = os.environ.get("WK_DTE_WINDOW", "1") == "1"
+WK_ENTRY_MIN_DTE = int(os.environ.get("WK_ENTRY_MIN_DTE", "6"))
+WK_ENTRY_MAX_DTE = int(os.environ.get("WK_ENTRY_MAX_DTE", "9"))
+
+
+def _trading_dte(expiry: str, today: date | None = None) -> int:
+    """Weekdays after today up to and including expiry (exchange holidays not subtracted — small error)."""
+    t = today or date.today()
+    e = date.fromisoformat(expiry)
+    return sum(1 for k in range(1, (e - t).days + 1) if (t + timedelta(days=k)).weekday() < 5)
+
+
+def _entry_expiry(listed: list[str], today: date | None = None) -> tuple[str | None, str]:
+    """(expiry, why): the nearest listed expiry at least WK_ENTRY_MIN_DTE trading days out, if it is within
+    WK_ENTRY_MAX_DTE; otherwise None (too early — wait for the window)."""
+    t = today or date.today()
+    for e in sorted(x for x in listed if x > t.isoformat()):
+        d = _trading_dte(e, t)
+        if d < WK_ENTRY_MIN_DTE:
+            continue
+        if d > WK_ENTRY_MAX_DTE:
+            return None, f"nearest eligible expiry {e} is {d} trading days out (> {WK_ENTRY_MAX_DTE}) — wait for the window"
+        return e, f"expiry {e} at {d} trading days (window {WK_ENTRY_MIN_DTE}-{WK_ENTRY_MAX_DTE})"
+    return None, "no listed expiry inside the entry window"
 
 
 def _expiry_after(expiry: str, creds: dict | None = None) -> str:
@@ -173,8 +204,15 @@ def main() -> int:
         return 0
 
     creds = wx._load_creds()
-    expiry = _next_week_expiry(creds)
-    print(f"\nNEXT-WEEK EXPIRY: {expiry}")
+    if WK_DTE_WINDOW:
+        expiry, _ewhy = _entry_expiry(_listed_expiries(creds))
+        print(f"\nENTRY WINDOW: {_ewhy}")
+        if expiry is None:
+            print("=> stand aside today (outside the DTE entry window).")
+            return 0
+    else:
+        expiry = _next_week_expiry(creds)
+        print(f"\nNEXT-WEEK EXPIRY: {expiry}")
     raw = wx._get_raw_chain(creds, expiry)
     parsed = wx._parse_chain(raw, spot=float(m.get("atm_strike") or 0))
     if not parsed.get("strikes"):

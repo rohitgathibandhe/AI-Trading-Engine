@@ -9,13 +9,15 @@ def _entry(**m):
     return wb.plan_entry(base)
 
 
-def test_entry_uptrend_sells_bull_put():
+def test_entry_uptrend_sells_bull_put(monkeypatch):
+    monkeypatch.setattr(wb, "STRUCTURE_MODE", "TREND")
     p = _entry(daily_trend="BULLISH")
     assert p["action"] == "TRADE" and p["structure"] == "BULL_PUT_CREDIT_SPREAD"
     assert p["min_short_distance_pts"] == 300  # expected_move floor (delta-placement handles the rest)
 
 
-def test_entry_downtrend_sells_bear_call():
+def test_entry_downtrend_sells_bear_call(monkeypatch):
+    monkeypatch.setattr(wb, "STRUCTURE_MODE", "TREND")
     p = _entry(daily_trend="BEARISH", daily_ema20=24200, daily_ema50=24300)
     assert p["action"] == "TRADE" and p["structure"] == "BEAR_CALL_CREDIT_SPREAD"
 
@@ -100,3 +102,11 @@ def test_untested_side_is_harvested_when_near_worthless():
                                      "days_to_expiry": 6, "broader_trend": "BULLISH",
                                      "untested_decay_pct": 0.85})
     assert r["action"] == "HARVEST_UNTESTED"
+
+
+def test_default_condor_mode_sells_both_sides_regardless_of_trend():
+    # 357-session study: the trend-picked side had no consistent edge; both sides did
+    for trend in ("BULLISH", "BEARISH"):
+        p = _entry(daily_trend=trend, daily_ema20=24200 if trend == "BEARISH" else 23800,
+                   daily_ema50=24300 if trend == "BEARISH" else 23700)
+        assert p["action"] == "TRADE" and p["structure"] == "IRON_CONDOR" and p["direction"] == trend
