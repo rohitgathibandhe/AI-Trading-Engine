@@ -176,6 +176,12 @@ def _is_india_market_open(now: Optional[datetime] = None) -> bool:
 
 
 class _DefaultLogger:
+    # debug() was missing: the 1-req/3s chain throttle calls self.log.debug, so any script using the default
+    # logger crashed on its SECOND chain fetch. 2026-10-15..17 the weekly positional monitor's ROLL_OUT (needs
+    # this week's + next week's chain) failed every hour with "'_DefaultLogger' object has no attribute 'debug'"
+    # and a tested condor sat unmanaged for two sessions.
+    def debug(self, *args, **kwargs) -> None:
+        pass
     def info(self, *args, **kwargs) -> None:
         msg = args[0] if args else ""
         print(msg)
