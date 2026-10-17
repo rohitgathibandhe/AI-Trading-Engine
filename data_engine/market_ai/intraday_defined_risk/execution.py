@@ -399,6 +399,10 @@ _FADE_MIN_HOLD_MIN = 3   # small breathe so a rejection wick's own noise doesn't
 # +Rs1,677, Sep-28 +Rs1,219) showed profit well within 45 min.
 _CHOP_PATIENCE_MINUTES = int(os.environ.get("SEL_CHOP_PATIENCE_MIN", "45") or 45)
 _CHOP_PATIENCE_MIN_MFE = float(os.environ.get("SEL_CHOP_PATIENCE_MFE", "200") or 200.0)
+# A CREDIT spread earns from theta over HOURS, so "Rs200 within 45 min" cut almost every chop credit at a small
+# loss (spread + slippage) before decay could work: 18-month replay, sideways-all-day sessions, 32
+# CHOP_PATIENCE_EXITs won 9% and lost -12,523. SEL_CHOP_PATIENCE_CREDIT=0 limits the check to debits.
+_CHOP_PATIENCE_CREDIT = os.environ.get("SEL_CHOP_PATIENCE_CREDIT", "1") == "1"
 
 
 def _evaluate_chop_patience_exit(
@@ -413,6 +417,9 @@ def _evaluate_chop_patience_exit(
     Returns None when the patience check passes or the playbook is not SEL_CHOP.
     """
     if position.metadata.get("playbook") != "SEL_CHOP":
+        return None
+    if not _CHOP_PATIENCE_CREDIT and position.structure.strategy not in {
+            StrategyType.CALL_DEBIT_SPREAD, StrategyType.PUT_DEBIT_SPREAD}:
         return None
     elapsed = _elapsed_minutes(now, position.entry_time)
     if elapsed < _CHOP_PATIENCE_MINUTES:
