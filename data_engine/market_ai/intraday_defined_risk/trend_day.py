@@ -33,7 +33,14 @@ RANGE_BARS = 6
 RANGE_MAX_PTS = 40.0
 SAFETY_FROM = time(11, 30)
 SAFETY_IDLE = timedelta(minutes=60)
-LAST_ENTRY = time(14, 0)       # replay 10-08/09/12/13: entries after ~14:00 were exhausted (-20..-51pts on 3/4 days)
+LAST_ENTRY = time(14, 0)
+# A session whose completed bars have CLOSED beyond BOTH sides of the opening range is a two-sided / range day,
+# never a trend day. 357 sessions (2026-07-16..10-16, both halves): one-sided OR breaks became trend days 39%|37%
+# (median efficiency .60|.63); two-sided only 12%|7% (efficiency .33|.37). 2026-10-07 broke below the OR at 09:35
+# and above it at 10:55 inside a 170pt range; the detector flipped DOWN -> UP -> DOWN and the trend-day debit
+# bought the false 10:55 breakout (-4,999 in replay). TD_TWO_SIDED_RANGE=0 disables.
+import os as _os
+TWO_SIDED_RANGE = _os.environ.get("TD_TWO_SIDED_RANGE", "1") == "1"       # replay 10-08/09/12/13: entries after ~14:00 were exhausted (-20..-51pts on 3/4 days)
 
 
 def _get(b, k):
@@ -96,6 +103,9 @@ def trend_state(bars: list[dict], oi: dict | None = None) -> dict:
     if len(or_bars) < 3 or len(post) < VWAP_HOLD_BARS:
         return res
     or_h, or_l = max(b["h"] for b in or_bars), min(b["l"] for b in or_bars)
+    if TWO_SIDED_RANGE and any(b["c"] > or_h for b in post) and any(b["c"] < or_l for b in post):
+        return {"state": "RANGE_TWO_SIDED", "since": None,
+                "checks": {"two_sided": True, "or_high": or_h, "or_low": or_l}}
     vw = _vwap_series(bars)
     f15 = _fifteen(bars)
     for side in ("UP", "DOWN"):
