@@ -866,6 +866,41 @@ def _fade_exit_levels(m: dict[str, Any], direction: str, entry_spot: float) -> t
 
 
 def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> StrategyChoice:
+    choice = _select_strategy_core(metadata, spot, now_time=now_time)
+    return _trend_day_structure(choice, metadata, now_time)
+
+
+_TD_CONVERT = {"BULL_PUT_CREDIT_SPREAD": ("TREND_UP", "CALL_DEBIT_SPREAD"),
+               "BEAR_CALL_CREDIT_SPREAD": ("TREND_DOWN", "PUT_DEBIT_SPREAD")}
+
+
+def _trend_day_structure(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> StrategyChoice:
+    """On a CONFIRMED trend day, a with-trend credit spread becomes the matching DEBIT spread, whichever
+    selector path chose it. Real-loop replay of the current code, 10-08..10-15: the read was right on every
+    trend day but CHOP / ZONE / STRONG_TREND paths sold capped credit (10-08 -367 -> +1,076, 10-12 -230 ->
+    +2,452, 10-15 +326 -> +1,875) while the one debit (10-13 +358) made +8,005. Fade exits off (it is a trend
+    trade now). SEL_TREND_DAY_BUY=0 disables; the debit blackout still applies unless
+    SEL_TREND_DAY_BLACKOUT_EXEMPT=1."""
+    if not _TREND_DAY_BUY or not choice.structures:
+        return choice
+    first = choice.structures[0]
+    conv = _TD_CONVERT.get(first)
+    tds = str((metadata.get("trend_day") or {}).get("state") or "")
+    if conv is None or tds != conv[0]:
+        return choice
+    in_blackout = (_DEBIT_BLACKOUT is not None and now_time is not None
+                   and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1])
+    if in_blackout and not _TREND_DAY_BLACKOUT_EXEMPT:
+        return choice
+    choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, [conv[1]]
+    for k in ("seller_exit", "conf_bull_sell_closer", "is_fade"):
+        metadata.pop(k, None)
+    metadata["trend_day_debit"] = True
+    choice.rationale = (choice.rationale or "") + f" [TREND DAY {tds}: buy the {conv[1]} instead of selling capped credit]"
+    return choice
+
+
+def _select_strategy_core(metadata: dict[str, Any], spot: float, now_time=None) -> StrategyChoice:
     """Read the market, name the condition, and choose the strategy family + structures.
 
     now_time (datetime.time, optional): used for time-of-day rules learned from the
