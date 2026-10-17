@@ -339,6 +339,14 @@ def mark_to_market_value_points(position: OpenPosition, quotes_by_leg: list[Stra
 DEBIT_TP_CAPTURE = 0.60       # take profit at 60% of max profit
 DEBIT_STOP_FRAC = 0.50        # stop when 50% of the debit is lost
 DEBIT_MIN_HOLD = 10           # min minutes before the stop can fire (noise guard)
+# THESIS-BREAK exit for a LOSING directional debit: a with-trend debit's reason is "price is on the trend side of
+# VWAP"; once completed bars close back through VWAP against it, the reason is gone — exit small instead of holding
+# to the 50%-premium stop. 18-month replay: on reversal days 41 with-morning trades lost -53,975, of which 11
+# DEBIT_STOPs (-35,677) were held for hours (e.g. 2026-03-20 call-debit 11:20 -> 14:49, -7,316).
+# DEBIT_THESIS_EXIT=1 enables; needs DEBIT_THESIS_BARS consecutive closes beyond VWAP by DEBIT_THESIS_VWAP_PTS.
+DEBIT_THESIS_EXIT = os.environ.get("DEBIT_THESIS_EXIT", "0") == "1"
+DEBIT_THESIS_VWAP_PTS = float(os.environ.get("DEBIT_THESIS_VWAP_PTS", "10") or 10.0)
+DEBIT_THESIS_BARS = int(os.environ.get("DEBIT_THESIS_BARS", "2") or 2)
 # A neutral theta structure is entered when trend_efficiency < this (low follow-through = range-like).
 # Its RANGE_INVALIDATION exit must use the SAME bar, so it only fires when real follow-through returns
 # — mirrors the selector's _BUY_MIN_EFFICIENCY so entry and exit agree on what "not a range" means.
@@ -518,6 +526,15 @@ def _evaluate_debit_exit(
     # Hard stop: lost >= 50% of the debit (after a short breathe)
     if elapsed_minutes >= DEBIT_MIN_HOLD and value <= entry_debit * (1.0 - DEBIT_STOP_FRAC):
         return ExitDecision(True, "DEBIT_STOP", value, pnl)
+
+    if (DEBIT_THESIS_EXIT and pnl < 0 and elapsed_minutes >= DEBIT_MIN_HOLD and current_snapshot is not None
+            and not position.metadata.get("is_fade")):
+        _bars = list(current_snapshot.nifty_5m.bars)[-DEBIT_THESIS_BARS:]
+        _vw = current_snapshot.live_vwap
+        if _vw and len(_bars) == DEBIT_THESIS_BARS and all(b.timestamp > position.entry_time for b in _bars):
+            _down = position.structure.strategy == StrategyType.PUT_DEBIT_SPREAD
+            if all(((b.close - _vw) if _down else (_vw - b.close)) >= DEBIT_THESIS_VWAP_PTS for b in _bars):
+                return ExitDecision(True, "DEBIT_THESIS_BREAK", value, pnl)
 
     # Rs-denominated trail: arm at Rs 600 profit; floor = max(peak - Rs 500, 0).
     # The %-of-max trail below requires ~190pt spot move to arm — effectively never fires
