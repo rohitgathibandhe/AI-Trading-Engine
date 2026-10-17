@@ -581,7 +581,9 @@ def _has_momentum(m: dict[str, Any], direction: str) -> tuple[bool, str]:
 # in metadata["structure_choice"] and graded against the other side by pair_shadow (it prices both).
 _STRUCT_CHOOSER = os.environ.get("SEL_STRUCT_CHOOSER", "1") == "1"
 _SESSION_ALIGN = os.environ.get("SEL_SESSION_ALIGN", "1") == "1"   # see SESSION ALIGNMENT in select_strategy
-_TREND_DAY = os.environ.get("SEL_TREND_DAY", "1") == "1"            # see TREND-DAY MODE in select_strategy
+_TREND_DAY = os.environ.get("SEL_TREND_DAY", "1") == "1"
+_TREND_DAY_BUY = os.environ.get("SEL_TREND_DAY_BUY", "1") == "1"        # trend day -> debit (see choose_buy_or_sell)
+_TREND_DAY_BLACKOUT_EXEMPT = os.environ.get("SEL_TREND_DAY_BLACKOUT_EXEMPT", "0") == "1"            # see TREND-DAY MODE in select_strategy
 _BUY_MARGIN = _sel_env_float("SEL_BUY_MARGIN") or 2.0
 
 
@@ -601,6 +603,14 @@ def choose_buy_or_sell(direction: str, m: dict[str, Any], *, context: str, vol_r
         sell.append("premium rich (IV > realized)")
     elif vol_regime == CHEAP_BUY:
         buy.append("premium cheap")
+    # CONFIRMED TREND DAY -> BUY the convex debit. Real-loop replay 10-08..10-15 (current code): direction was
+    # right on every trend day, but the "no momentum" (rvol < 1.05) vote sold capped credit spreads: 10-08
+    # (-367) +1,076, 10-09 (+206) +1,826, 10-12 (-230) +2,452, 10-15 (+326) +1,875 — while the one debit
+    # (10-13, +358) made +8,005. A trend day's persistence IS the momentum a debit needs, whatever the index
+    # volume says. SEL_TREND_DAY_BUY=0 disables.
+    _tds = str((m.get("trend_day") or {}).get("state") or "")
+    if _TREND_DAY_BUY and context == "trend" and _tds == ("TREND_UP" if direction == "BULLISH" else "TREND_DOWN"):
+        buy.extend(["confirmed trend day (ORB + VWAP hold + structure)"] * 2)
     # Time cuts both ways: a debit needs TIME for the move to develop — plenty in the morning, little late.
     # Pair-shadow on live fills (10-09 + 10-12): before 11:30 BUY beat SELL on 5/7 reads (often by
     # Rs 2.5-4k); after 13:30 SELL beat BUY 2/2 (the debits lost). The original chooser only scored the
@@ -919,6 +929,9 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
         _is_debit_entry = (_dir == "BEARISH") or (_dir == "BULLISH" and _bull_is_debit)
         _in_blackout = (_DEBIT_BLACKOUT is not None and now_time is not None
                         and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1])
+        if _in_blackout and _TREND_DAY_BLACKOUT_EXEMPT and str((metadata.get("trend_day") or {}).get("state") or "") \
+                == {"BULLISH": "TREND_UP", "BEARISH": "TREND_DOWN"}.get(str(_dir)):
+            _in_blackout = False   # a confirmed trend day isn't the post-open-drive exhaustion the blackout guards
         if _dir == "BEARISH" and _STRUCT_CHOOSER:
             _side, _cwhy, _cdet = choose_buy_or_sell("BEARISH", metadata, context="trend",
                                                      vol_regime=vol.regime, now_time=now_time)
