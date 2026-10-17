@@ -867,7 +867,48 @@ def _fade_exit_levels(m: dict[str, Any], direction: str, entry_spot: float) -> t
 
 def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> StrategyChoice:
     choice = _select_strategy_core(metadata, spot, now_time=now_time)
-    return _trend_day_structure(choice, metadata, now_time)
+    choice = _trend_day_structure(choice, metadata, now_time)
+    return _skew_structure(choice, metadata)
+
+
+# SKEW-AWARE STRUCTURE MAP (SEL_STRUCT_MAP, comma list). Nifty puts trade RICHER than calls (recorded live chains:
+# OTM put IV 1.12-1.29x ATM, calls 0.90-0.97x), so per view one structure is structurally better value:
+#   BC2PD   bearish  -> PUT debit, never a bear-call credit (sell a cheap call = thin credit for the risk;
+#           a put debit SELLS the richer further put). 18-month replay: bear-call -30,323 / 124 trades
+#           (CHOP -20,002, BREAKOUT_DOWN -9,868) vs put-debit +43,931 / 124; real chains 07-15..10-16:
+#           bear-call -4,493 / 20 vs put-debit +14,136 / 12.
+#   BOUP2CD  bullish breakout/strong trend -> CALL debit, not a capped bull-put (18m: BREAKOUT_UP bull-put
+#           -4,978 / 30 vs call-debit +29,382 / 41).
+#   CHOPCD2BP bullish in chop -> bull-put credit (sell the rich put), not a call debit (18m: CHOP call-debit
+#           -7,649 / 69 vs bull-put +6,404 / 69).
+_STRUCT_MAP = {x.strip().upper() for x in os.environ.get("SEL_STRUCT_MAP", "").split(",") if x.strip()}
+
+
+def _skew_structure(choice: StrategyChoice, metadata: dict[str, Any]) -> StrategyChoice:
+    if not _STRUCT_MAP or not choice.structures:
+        return choice
+    first = choice.structures[0]
+    cond = str(choice.condition or "")
+    new = None
+    if "BC2PD" in _STRUCT_MAP and first == "BEAR_CALL_CREDIT_SPREAD":
+        new = "PUT_DEBIT_SPREAD"
+    elif "BOUP2CD" in _STRUCT_MAP and first == "BULL_PUT_CREDIT_SPREAD" and cond in ("BREAKOUT_UP", "STRONG_TREND_UP"):
+        new = "CALL_DEBIT_SPREAD"
+    elif "CHOPCD2BP" in _STRUCT_MAP and first == "CALL_DEBIT_SPREAD" and cond == "CHOP":
+        new = "BULL_PUT_CREDIT_SPREAD"
+    if new is None:
+        return choice
+    if new.endswith("DEBIT_SPREAD"):
+        choice.family = FAM_DIRECTIONAL_DEBIT
+        for k in ("seller_exit", "conf_bull_sell_closer"):
+            metadata.pop(k, None)
+    else:
+        choice.family = FAM_DIRECTIONAL_CREDIT
+        metadata["seller_exit"] = True
+    choice.structures = [new]
+    metadata["skew_structure_map"] = f"{first}->{new}"
+    choice.rationale = (choice.rationale or "") + f" [SKEW MAP: {first} -> {new}]"
+    return choice
 
 
 _TD_CONVERT = {"BULL_PUT_CREDIT_SPREAD": ("TREND_UP", "CALL_DEBIT_SPREAD"),
