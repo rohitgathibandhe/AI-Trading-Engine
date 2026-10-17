@@ -347,6 +347,7 @@ DEBIT_MIN_HOLD = 10           # min minutes before the stop can fire (noise guar
 DEBIT_THESIS_EXIT = os.environ.get("DEBIT_THESIS_EXIT", "0") == "1"
 DEBIT_THESIS_VWAP_PTS = float(os.environ.get("DEBIT_THESIS_VWAP_PTS", "10") or 10.0)
 DEBIT_THESIS_BARS = int(os.environ.get("DEBIT_THESIS_BARS", "2") or 2)
+DEBIT_THESIS_MIN_HOLD = int(os.environ.get("DEBIT_THESIS_MIN_HOLD", "30") or 30)   # real chains 07-16: fired at 11 min on a trade that recovered to +2,106
 # A neutral theta structure is entered when trend_efficiency < this (low follow-through = range-like).
 # Its RANGE_INVALIDATION exit must use the SAME bar, so it only fires when real follow-through returns
 # — mirrors the selector's _BUY_MIN_EFFICIENCY so entry and exit agree on what "not a range" means.
@@ -527,7 +528,7 @@ def _evaluate_debit_exit(
     if elapsed_minutes >= DEBIT_MIN_HOLD and value <= entry_debit * (1.0 - DEBIT_STOP_FRAC):
         return ExitDecision(True, "DEBIT_STOP", value, pnl)
 
-    if (DEBIT_THESIS_EXIT and pnl < 0 and elapsed_minutes >= DEBIT_MIN_HOLD and current_snapshot is not None
+    if (DEBIT_THESIS_EXIT and pnl < 0 and elapsed_minutes >= DEBIT_THESIS_MIN_HOLD and current_snapshot is not None
             and not position.metadata.get("is_fade")):
         _bars = list(current_snapshot.nifty_5m.bars)[-DEBIT_THESIS_BARS:]
         _vw = current_snapshot.live_vwap
