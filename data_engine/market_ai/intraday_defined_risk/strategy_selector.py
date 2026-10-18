@@ -867,7 +867,47 @@ def _fade_exit_levels(m: dict[str, Any], direction: str, entry_spot: float) -> t
 
 def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> StrategyChoice:
     choice = _select_strategy_core(metadata, spot, now_time=now_time)
-    return _trend_day_structure(choice, metadata, now_time)
+    choice = _trend_day_structure(choice, metadata, now_time)
+    return _edge_only(choice, metadata, now_time)
+
+
+# EDGE-ONLY MODE (SEL_EDGE_ONLY=1): trade ONLY the setups with a proven net edge after costs and stand aside otherwise.
+# Net of ~Rs150 per spread round trip (2026-10-18): BREAKOUT_UP -> CALL debit +39,519 (48 tr) on the 18-month replay and
+# +16,287 (7) on real chains; BREAKOUT_DOWN -> PUT debit +40,332 (23) / +15,157 (5); positive in both halves. Every
+# other playbook/structure netted about -94,000 (438 trades) / -14,000 (39) — filler trades paying brokerage with no
+# edge. A breakout credit spread becomes the matching debit (breakout credits: -8,065 / -14,330 net).
+_EDGE_ONLY = os.environ.get("SEL_EDGE_ONLY", "0") == "1"
+_EDGE_MAP = {"BREAKOUT_UP": ("CALL_DEBIT_SPREAD", "BULL_PUT_CREDIT_SPREAD"),
+             "BREAKOUT_DOWN": ("PUT_DEBIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD")}
+
+
+def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> StrategyChoice:
+    if not _EDGE_ONLY or not choice.structures:
+        return choice
+    want = _EDGE_MAP.get(str(choice.condition or ""))
+    first = choice.structures[0]
+    ok = want is not None and first in want
+    # A breakout on a session that has already broken BOTH sides of the opening range is a range-day fake-out:
+    # real chains, edge-only replay — breakout debits on two-sided days 6 trades -16,786 net vs trend days +25,384.
+    if ok and str((metadata.get("trend_day") or {}).get("state") or "") == "RANGE_TWO_SIDED":
+        ok = False
+        metadata["edge_only_two_sided"] = True
+    in_blackout = (_DEBIT_BLACKOUT is not None and now_time is not None
+                   and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1])
+    if not ok or in_blackout:
+        metadata["edge_only_skip"] = f"{choice.condition}/{first}"
+        choice.family, choice.structures = FAM_STAND_ASIDE, []
+        choice.rationale = (choice.rationale or "") + (f" [EDGE-ONLY: {choice.condition} {first} has no proven net edge"
+                                                       + (" (debit blackout window)" if ok else "") + " — stand aside]")
+        return choice
+    if first != want[0]:
+        for k in ("seller_exit", "conf_bull_sell_closer", "is_fade"):
+            metadata.pop(k, None)
+        choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, [want[0]]
+        choice.rationale = (choice.rationale or "") + f" [EDGE-ONLY: {first} -> {want[0]}]"
+    else:
+        metadata.pop("is_fade", None)
+    return choice
 
 
 _TD_CONVERT = {"BULL_PUT_CREDIT_SPREAD": ("TREND_UP", "CALL_DEBIT_SPREAD"),
