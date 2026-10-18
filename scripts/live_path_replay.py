@@ -63,6 +63,7 @@ def main() -> int:
     ap.add_argument("--ref", default="HEAD", help="git ref of the code to replay (default: current HEAD)")
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--env", action="append", default=[], help="KEY=VALUE env override on top of the live plist (A/B a toggle)")
+    ap.add_argument("--cfg", action="append", default=[], help="KEY=VALUE run_live config override (A/B a config value)")
     a = ap.parse_args()
 
     work = Path(tempfile.mkdtemp(prefix="livereplay_"))
@@ -102,6 +103,14 @@ def main() -> int:
                 cfg[k] = str(st / Path(v).name)
         cfg.update({"provider_class": "market_ai.intraday_defined_risk.replay_provider:ReplayMarketDataProvider",
                     "replay_data_path": str(data), "replay_start": a.start, "replay_end": a.end})
+        for kv in a.cfg:
+            k, _, v = kv.partition("=")
+            if k in ("executor_class", "trade_mode", "live_arm"):
+                raise SystemExit(f"refusing to override {k}")
+            try:
+                cfg[k] = json.loads(v)
+            except ValueError:
+                cfg[k] = v
         assert "PaperOnly" in str(cfg.get("executor_class")), "refusing: executor is not PaperOnly"
         assert not any(isinstance(v, str) and str(LIVE_STATE) in v for v in cfg.values()), "refusing: live path in config"
         cfg_path = work / "replay_run_live_config.json"
@@ -133,7 +142,7 @@ def main() -> int:
             if d.get("raw_action") == "TRADE" or str(d.get("block_reason") or "") not in ("SELECTOR_STAND_ASIDE", "INSUFFICIENT_DATA", "None"):
                 blocks[str(d.get("timestamp", ""))[:10]][str(d.get("block_reason"))[:40]] += 1
         total = 0.0
-        print(f"LIVE-PATH REPLAY {a.start}..{a.end} (code {a.ref}, real run_live loop, live plist env{' + ' + ' '.join(a.env) if a.env else ''})")
+        print(f"LIVE-PATH REPLAY {a.start}..{a.end} (code {a.ref}, real run_live loop, live plist env{' + ' + ' '.join(a.env + a.cfg) if (a.env or a.cfg) else ''})")
         for day in sorted(set(by_day) | set(blocks)):
             pnl = sum(float(t.get("realized_paper_pnl") or 0) for t in by_day[day] if t.get("event") == "PAPER_EXIT")
             total += pnl
