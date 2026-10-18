@@ -887,6 +887,11 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
     want = _EDGE_MAP.get(str(choice.condition or ""))
     first = choice.structures[0]
     ok = want is not None and first in want
+    # A breakout on a session that has already broken BOTH sides of the opening range is a range-day fake-out:
+    # real chains, edge-only replay — breakout debits on two-sided days 6 trades -16,786 net vs trend days +25,384.
+    if ok and str((metadata.get("trend_day") or {}).get("state") or "") == "RANGE_TWO_SIDED":
+        ok = False
+        metadata["edge_only_two_sided"] = True
     in_blackout = (_DEBIT_BLACKOUT is not None and now_time is not None
                    and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1])
     if not ok or in_blackout:
