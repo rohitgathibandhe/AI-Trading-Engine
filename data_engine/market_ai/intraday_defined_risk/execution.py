@@ -339,6 +339,13 @@ def mark_to_market_value_points(position: OpenPosition, quotes_by_leg: list[Stra
 DEBIT_TP_CAPTURE = 0.60       # take profit at 60% of max profit
 DEBIT_STOP_FRAC = 0.50        # stop when 50% of the debit is lost
 DEBIT_MIN_HOLD = 10           # min minutes before the stop can fire (noise guard)
+# BREAKEVEN LOCK: a debit that has PROVEN itself (peak P&L >= DEBIT_BE_ARM) must not become a big loss. The spot
+# trail only fires while pnl > 0, so a fast reversal from a small profit fell through to the -50% premium stop:
+# 18-month replay, 39 DEBIT_STOPs avg -3,206 — 72% had been in profit first (16 of them >= +500).
+# DEBIT_BE_LOCK=1 enables: once peak >= arm, exit if P&L falls back to <= DEBIT_BE_FLOOR.
+DEBIT_BE_LOCK = os.environ.get("DEBIT_BE_LOCK", "0") == "1"
+DEBIT_BE_ARM = float(os.environ.get("DEBIT_BE_ARM", "500") or 500.0)
+DEBIT_BE_FLOOR = float(os.environ.get("DEBIT_BE_FLOOR", "0") or 0.0)
 # A neutral theta structure is entered when trend_efficiency < this (low follow-through = range-like).
 # Its RANGE_INVALIDATION exit must use the SAME bar, so it only fires when real follow-through returns
 # — mirrors the selector's _BUY_MIN_EFFICIENCY so entry and exit agree on what "not a range" means.
@@ -518,6 +525,12 @@ def _evaluate_debit_exit(
     # Hard stop: lost >= 50% of the debit (after a short breathe)
     if elapsed_minutes >= DEBIT_MIN_HOLD and value <= entry_debit * (1.0 - DEBIT_STOP_FRAC):
         return ExitDecision(True, "DEBIT_STOP", value, pnl)
+
+    if DEBIT_BE_LOCK and not position.metadata.get("is_fade"):
+        _pk = max(float(position.metadata.get("debit_peak_pnl_rupees") or 0.0), pnl)
+        position.metadata["debit_peak_pnl_rupees"] = _pk
+        if _pk >= DEBIT_BE_ARM and pnl <= DEBIT_BE_FLOOR:
+            return ExitDecision(True, "DEBIT_BREAKEVEN_LOCK", value, pnl)
 
     # Rs-denominated trail: arm at Rs 600 profit; floor = max(peak - Rs 500, 0).
     # The %-of-max trail below requires ~190pt spot move to arm — effectively never fires
