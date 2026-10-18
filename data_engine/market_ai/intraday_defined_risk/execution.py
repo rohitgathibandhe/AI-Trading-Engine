@@ -346,6 +346,12 @@ DEBIT_MIN_HOLD = 10           # min minutes before the stop can fire (noise guar
 DEBIT_BE_LOCK = os.environ.get("DEBIT_BE_LOCK", "0") == "1"
 DEBIT_BE_ARM = float(os.environ.get("DEBIT_BE_ARM", "500") or 500.0)
 DEBIT_BE_FLOOR = float(os.environ.get("DEBIT_BE_FLOOR", "0") or 0.0)
+# CREDIT PROFIT LOCK: credit spreads only banked at 50% of credit, so a trade that reached a real profit and faded rode
+# back to ~nothing: 18-month replay, 88 credit TIME_EXITs averaged +125 though 75 of them had been >= +300.
+# CREDIT_PROFIT_LOCK=1: once peak P&L >= CREDIT_LOCK_ARM, exit if P&L falls to <= CREDIT_LOCK_KEEP x peak.
+CREDIT_PROFIT_LOCK = os.environ.get("CREDIT_PROFIT_LOCK", "0") == "1"
+CREDIT_LOCK_ARM = float(os.environ.get("CREDIT_LOCK_ARM", "600") or 600.0)
+CREDIT_LOCK_KEEP = float(os.environ.get("CREDIT_LOCK_KEEP", "0.4") or 0.4)
 # A neutral theta structure is entered when trend_efficiency < this (low follow-through = range-like).
 # Its RANGE_INVALIDATION exit must use the SAME bar, so it only fires when real follow-through returns
 # — mirrors the selector's _BUY_MIN_EFFICIENCY so entry and exit agree on what "not a range" means.
@@ -691,6 +697,13 @@ def evaluate_exit(
         return ExitDecision(True, "TIME_EXIT", liability, pnl_rupees)
 
     elapsed_minutes = _elapsed_minutes(now, position.entry_time)
+
+    if CREDIT_PROFIT_LOCK and current_value_points is not None:
+        _cp = (position.entry_credit_points - current_value_points) * position.lot_size * position.lots
+        _pk = max(float(position.metadata.get("credit_peak_pnl_rupees") or 0.0), _cp)
+        position.metadata["credit_peak_pnl_rupees"] = _pk
+        if _pk >= CREDIT_LOCK_ARM and _cp <= CREDIT_LOCK_KEEP * _pk:
+            return ExitDecision(True, "CREDIT_PROFIT_LOCK", current_value_points, _cp)
 
     # SELLER EXIT (positions opened with seller_exit=True, e.g. "sell the grind" bear-calls): a credit
     # spread wins by TIME + distance, so it must not be thrown out by EMA20/VWAP momentum stops on a
