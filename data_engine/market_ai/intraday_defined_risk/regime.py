@@ -3169,6 +3169,15 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     metadata["price_vs_or_low"] = None if opening_range is None else round(spot - opening_range.low, 2)
     metadata["inside_opening_range"] = bool(opening_range is not None and opening_range.low <= spot <= opening_range.high)
     metadata["opening_range_break_state"] = opening_range_break_state
+    # where price sits in the day's range so far (0 = session low, 1 = session high) — the extension guard in
+    # strategy_selector refuses to SELL premium into the edge the move already reached
+    try:
+        _sb = [b for b in bars_5m if b.timestamp.date() == snapshot.timestamp.date()]
+        _hi, _lo = max(b.high for b in _sb), min(b.low for b in _sb)
+        metadata["day_range_pos"] = round((spot - _lo) / (_hi - _lo), 3) if _hi - _lo >= 1 else None
+        metadata["day_range_pts"] = round(_hi - _lo, 1)
+    except Exception:  # noqa: BLE001
+        metadata["day_range_pos"] = None
     # TREND-DAY MODE inputs: session direction + entry trigger on completed bars (see trend_day.py)
     try:
         from .trend_day import evaluate as _trend_day_eval

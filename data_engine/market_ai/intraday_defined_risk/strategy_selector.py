@@ -867,7 +867,37 @@ def _fade_exit_levels(m: dict[str, Any], direction: str, entry_spot: float) -> t
 
 def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> StrategyChoice:
     choice = _select_strategy_core(metadata, spot, now_time=now_time)
-    return _trend_day_structure(choice, metadata, now_time)
+    choice = _trend_day_structure(choice, metadata, now_time)
+    return _extension_guard(choice, metadata)
+
+
+# EXTENSION GUARD (SEL_EXT_GUARD=1): never SELL a with-direction credit spread into the edge of the day's range the
+# move already reached — a bear-call at the session low / a bull-put at the session high sells into exhaustion,
+# where the snap-back hits the short. Loss autopsy of live paper trades (2026-05..10): the #1 mistake, 6/6 losers,
+# -8,577 (08-12 bear-call at 2% of range -2,291; 08-31 13% -2,428; 09-10 2% -923; 10-07 bull-put at 93% -1,944;
+# 10-15 100% -484; 07-07 98% -507). A trend day's breakout is already a DEBIT (see _trend_day_structure), so this
+# only blocks capped-credit chases.
+_EXT_GUARD = os.environ.get("SEL_EXT_GUARD", "0") == "1"
+_EXT_EDGE = float(os.environ.get("SEL_EXT_EDGE", "0.15") or 0.15)
+_EXT_MIN_RANGE = float(os.environ.get("SEL_EXT_MIN_RANGE", "60") or 60.0)
+
+
+def _extension_guard(choice: StrategyChoice, metadata: dict[str, Any]) -> StrategyChoice:
+    if not _EXT_GUARD or not choice.structures:
+        return choice
+    pos, rng = metadata.get("day_range_pos"), float(metadata.get("day_range_pts") or 0.0)
+    if pos is None or rng < _EXT_MIN_RANGE:
+        return choice
+    first = choice.structures[0]
+    chase = ((first == "BEAR_CALL_CREDIT_SPREAD" and float(pos) <= _EXT_EDGE)
+             or (first == "BULL_PUT_CREDIT_SPREAD" and float(pos) >= 1.0 - _EXT_EDGE))
+    if not chase:
+        return choice
+    metadata["extension_guard"] = f"{first} at {float(pos):.0%} of a {rng:.0f}pt day range"
+    choice.family, choice.structures = FAM_STAND_ASIDE, []
+    choice.rationale = (choice.rationale or "") + (f" [EXTENSION GUARD: no {first} at {float(pos):.0%} of the day's "
+                                                   f"range — that sells into exhaustion; wait for the pullback]")
+    return choice
 
 
 _TD_CONVERT = {"BULL_PUT_CREDIT_SPREAD": ("TREND_UP", "CALL_DEBIT_SPREAD"),
