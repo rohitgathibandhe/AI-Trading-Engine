@@ -336,7 +336,7 @@ def mark_to_market_value_points(position: OpenPosition, quotes_by_leg: list[Stra
 
 
 # ── Debit-spread exit engine (mirror of the credit logic) ───────────────────
-DEBIT_TP_CAPTURE = 0.60       # take profit at 60% of max profit
+DEBIT_TP_CAPTURE = float(os.environ.get("DEBIT_TP_CAPTURE", "0.60") or 0.60)   # take profit at this share of max profit (>1 = no fixed target; the spot trail exits)
 DEBIT_STOP_FRAC = 0.50        # stop when 50% of the debit is lost
 DEBIT_MIN_HOLD = 10           # min minutes before the stop can fire (noise guard)
 # A neutral theta structure is entered when trend_efficiency < this (low follow-through = range-like).
