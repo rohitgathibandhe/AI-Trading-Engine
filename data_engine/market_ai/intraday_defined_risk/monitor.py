@@ -2234,7 +2234,12 @@ def run_live(config: dict[str, object]) -> None:
                     # continuing (missed: 10-12 09:56 put-debit, ran 99pts with no retrace; 10-14 13:05 score
                     # 8.32 put-debit). The wait still guards fades/counter-moves (saved 10-12 10:27 fade-long).
                     _strong = str(decision.metadata.get("playbook") or "").startswith("SEL_STRONG_TREND")
-                    if gate["allowed"] and not decision.metadata.get("trend_day_entry") and not _strong:
+                    # BREAKOUT re-entries waited for a 21-pt retrace that a grinding trend never gives (2026-10-19:
+                    # SEL_BREAKOUT_DOWN scored 7.5-8.6 from ~12:40, held by ENTRY_WAIT, entered 13:25 at the next put
+                    # wall after the move). SEL_BREAKOUT_NO_WAIT=1 lets breakout entries go on the signal.
+                    _brk_nowait = (os.environ.get("SEL_BREAKOUT_NO_WAIT", "0") == "1"
+                                   and str(decision.metadata.get("playbook") or "").startswith("SEL_BREAKOUT"))
+                    if gate["allowed"] and not decision.metadata.get("trend_day_entry") and not _strong and not _brk_nowait:
                         from .entry_timing import should_wait
                         _wait, _wait_why = should_wait(
                             decision.strategy.value if hasattr(decision.strategy, "value") else str(decision.strategy),
