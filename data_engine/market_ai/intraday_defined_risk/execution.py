@@ -358,6 +358,10 @@ DEBIT_RS_TRAIL_ARM = float(os.environ.get('DEBIT_RS_TRAIL_ARM', '600') or 600.0)
 DEBIT_RS_TRAIL_GIVEBACK = float(os.environ.get('DEBIT_RS_TRAIL_GIVEBACK', '300') or 300.0)
 DEBIT_TRAIL_MODE = os.environ.get("DEBIT_TRAIL_MODE", "SPOT").upper()          # SPOT | RS (legacy P&L trail)
 DEBIT_SPOT_REVERSAL_PTS = float(os.environ.get("DEBIT_SPOT_REVERSAL_PTS", "25") or 25.0)
+# OI-ANCHORED HOLD (DEBIT_OI_HOLD=1): suspend the spot-reversal trail while the option-chain flow still backs the trade
+# (oi_flow.supports) and take profit at the next opposite OI wall. 2026-10-19 expiry: the breakdown put-debit exited
+# +84 on a 34-pt bounce while writers kept moving the ceiling down; Nifty fell ~90 pts more to the 22,850-22,800 wall.
+DEBIT_OI_HOLD = os.environ.get("DEBIT_OI_HOLD", "0") == "1"
 
 
 def _current_debit_value(
@@ -530,7 +534,22 @@ def _evaluate_debit_exit(
     # 25pts from its best level while green" beat both the actual exit and holding: 09-29 +595 (actual
     # -3,146), 10-05 +514 (-2,204), 10-13 +7,410 (+416) -> +8,519 vs -4,934. A runner keeps extending
     # the extreme and is never touched; a fader is cut as the index turns. Fades keep their own exits.
-    if DEBIT_TRAIL_MODE == "SPOT" and not position.metadata.get("is_fade") and current_snapshot is not None:
+    _oi_backed = False
+    if DEBIT_OI_HOLD and not position.metadata.get("is_fade") and current_snapshot is not None:
+        try:
+            from . import oi_flow as _oif
+            _dirn = "BEARISH" if position.structure.strategy == StrategyType.PUT_DEBIT_SPREAD else "BULLISH"
+            _sp = float(current_snapshot.option_chain.spot)
+            _tgt = position.metadata.get("oi_target_wall")
+            if _tgt is None:
+                _tgt = _oif.next_wall(_dirn, _sp)
+                position.metadata["oi_target_wall"] = _tgt
+            if _tgt is not None and pnl > 0 and ((_sp <= float(_tgt) + 10) if _dirn == "BEARISH" else (_sp >= float(_tgt) - 10)):
+                return ExitDecision(True, "DEBIT_OI_WALL_TARGET", value, pnl)
+            _oi_backed = bool(_oif.supports(_dirn, _sp))
+        except Exception:  # noqa: BLE001
+            _oi_backed = False
+    if DEBIT_TRAIL_MODE == "SPOT" and not position.metadata.get("is_fade") and current_snapshot is not None and not _oi_backed:
         _spot = float(current_snapshot.option_chain.spot)
         _down = position.structure.strategy == StrategyType.PUT_DEBIT_SPREAD
         _ext = position.metadata.get("debit_fav_spot")

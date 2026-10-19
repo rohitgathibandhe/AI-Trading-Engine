@@ -877,6 +877,7 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
 # other playbook/structure netted about -94,000 (438 trades) / -14,000 (39) — filler trades paying brokerage with no
 # edge. A breakout credit spread becomes the matching debit (breakout credits: -8,065 / -14,330 net).
 _EDGE_ONLY = os.environ.get("SEL_EDGE_ONLY", "0") == "1"
+_OI_FLIP_ENTRY = os.environ.get("SEL_OI_FLIP_ENTRY", "0") == "1"
 _EDGE_MAP = {"BREAKOUT_UP": ("CALL_DEBIT_SPREAD", "BULL_PUT_CREDIT_SPREAD"),
              "BREAKOUT_DOWN": ("PUT_DEBIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD")}
 
@@ -886,6 +887,12 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
         return choice
     want = _EDGE_MAP.get(str(choice.condition or ""))
     first = choice.structures[0]
+    # OI WALL-FLIP ENTRY (SEL_OI_FLIP_ENTRY=1): a strike changing hands (oi_flow.wall_flip) confirms the break before the
+    # price-based BREAKOUT read; treat a with-flip directional pick as the breakout (2026-10-19: flip at 23,000 at 11:43,
+    # price-based entry 12:08).
+    _flip = metadata.get("oi_wall_flip")
+    if want is None and _OI_FLIP_ENTRY and _flip in ("BULLISH", "BEARISH"):
+        want = _EDGE_MAP["BREAKOUT_UP" if _flip == "BULLISH" else "BREAKOUT_DOWN"]
     ok = want is not None and first in want
     # A breakout on a session that has already broken BOTH sides of the opening range is a range-day fake-out:
     # real chains, edge-only replay — breakout debits on two-sided days 6 trades -16,786 net vs trend days +25,384.
