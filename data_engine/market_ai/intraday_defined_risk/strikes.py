@@ -447,6 +447,13 @@ def _select_debit_spread(
     short_band = (0.20, 0.32)   # further-OTM short leg (finances the long, caps profit)
     widths = regime_state.metadata.get("allowed_width_points") or (100.0, 150.0)
     widths = {float(w) for w in widths}
+    # WIDE DEBIT (SEL_DEBIT_WIDE=1): the 0.20-0.32-delta short sat 50-100pt from the long on normal-IV days, so a trend
+    # day could pay ~15-20 premium pts at most. Same 24 live-mode entries on REAL chains re-priced (2026-10-19):
+    # as traded +12,892 net vs ATM/ATM+-200 spread with the spot trail +77,822 (avg win 2,392 -> 7,217, avg loss
+    # -2,723 -> -2,982). Sell a far-OTM leg so the spread can follow the move.
+    if os.environ.get("SEL_DEBIT_WIDE", "0") == "1":
+        short_band = (0.04, 0.18)
+        widths |= {150.0, 200.0, 250.0}
     # On expiry / low-IV days the delta-appropriate strikes cluster ~50pt apart, so a rigid
     # 100/150 width made the debit UN-buildable (blocked our edge on all 17 down-trend cycles
     # on 2026-07-14 expiry). Allowing a 50pt width is VALIDATED on the ordering-robust harness:
