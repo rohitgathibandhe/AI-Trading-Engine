@@ -537,7 +537,18 @@ def _evaluate_debit_exit(
         _ext = _spot if _ext is None else (min(float(_ext), _spot) if _down else max(float(_ext), _spot))
         position.metadata["debit_fav_spot"] = _ext
         _retrace = (_spot - _ext) if _down else (_ext - _spot)
-        if pnl > 0 and _retrace >= DEBIT_SPOT_REVERSAL_PTS:
+        # VOLATILITY-SCALED TRAIL (DEBIT_TRAIL_ATR_MULT>0): a fixed 25 pts cut 2026-10-19's breakdown at +84 on a 34-pt
+        # bounce on a day of 20-40pt 5m candles; scale the trail to the recent 5m range.
+        _thr = DEBIT_SPOT_REVERSAL_PTS
+        _mult = float(os.environ.get("DEBIT_TRAIL_ATR_MULT", "0") or 0.0)
+        if _mult > 0:
+            try:
+                _rb = list(current_snapshot.nifty_5m.bars)[-12:]
+                if _rb:
+                    _thr = max(_thr, _mult * sum(b.high - b.low for b in _rb) / len(_rb))
+            except Exception:  # noqa: BLE001
+                pass
+        if pnl > 0 and _retrace >= _thr:
             return ExitDecision(True, "DEBIT_SPOT_REVERSAL", value, pnl)
     elif peak_pnl_rs >= DEBIT_RS_TRAIL_ARM:
         floor_pnl_rs = max(peak_pnl_rs - DEBIT_RS_TRAIL_GIVEBACK, 0.0)
