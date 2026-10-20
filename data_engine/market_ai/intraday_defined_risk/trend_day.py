@@ -40,7 +40,23 @@ LAST_ENTRY = time(14, 0)
 # and above it at 10:55 inside a 170pt range; the detector flipped DOWN -> UP -> DOWN and the trend-day debit
 # bought the false 10:55 breakout (-4,999 in replay). TD_TWO_SIDED_RANGE=0 disables.
 import os as _os
-TWO_SIDED_RANGE = _os.environ.get("TD_TWO_SIDED_RANGE", "1") == "1"       # replay 10-08/09/12/13: entries after ~14:00 were exhausted (-20..-51pts on 3/4 days)
+TWO_SIDED_RANGE = _os.environ.get("TD_TWO_SIDED_RANGE", "1") == "1"
+# ACCEPTANCE (TD_BREAK_ACCEPT_BARS=N, default 0 = off): a side of the opening range counts as BROKEN only after N
+# consecutive closes beyond it. A single close that falls straight back inside is a failed break (a trap), not a
+# break — 2026-10-01: one 10:00 close 10pts over the 15m high (22,600 vs 22,590), next bar back inside; the 12:15/12:20
+# closes below the low were the real M-top breakdown (-300pts to 14:00) but the session was labelled RANGE_TWO_SIDED
+# and every bearish entry from 12:25 was vetoed.
+BREAK_ACCEPT_BARS = int(_os.environ.get("TD_BREAK_ACCEPT_BARS", "0") or 0)
+
+
+def _accepted(post: list[dict], beyond) -> bool:
+    n = max(BREAK_ACCEPT_BARS, 1)
+    run = 0
+    for b in post:
+        run = run + 1 if beyond(b) else 0
+        if run >= n:
+            return True
+    return False       # replay 10-08/09/12/13: entries after ~14:00 were exhausted (-20..-51pts on 3/4 days)
 
 
 def _get(b, k):
@@ -103,7 +119,7 @@ def trend_state(bars: list[dict], oi: dict | None = None) -> dict:
     if len(or_bars) < 3 or len(post) < VWAP_HOLD_BARS:
         return res
     or_h, or_l = max(b["h"] for b in or_bars), min(b["l"] for b in or_bars)
-    if TWO_SIDED_RANGE and any(b["c"] > or_h for b in post) and any(b["c"] < or_l for b in post):
+    if TWO_SIDED_RANGE and _accepted(post, lambda b: b["c"] > or_h) and _accepted(post, lambda b: b["c"] < or_l):
         return {"state": "RANGE_TWO_SIDED", "since": None,
                 "checks": {"two_sided": True, "or_high": or_h, "or_low": or_l}}
     vw = _vwap_series(bars)
