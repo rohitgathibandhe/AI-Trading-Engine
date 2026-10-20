@@ -3179,6 +3179,14 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                 "smart_money_bias": oi_flow.get("smart_money_bias")})
     except Exception:  # noqa: BLE001 — a research overlay must never break classification
         metadata["trend_day"] = {"state": "NONE", "trigger": None}
+    # ENTRY SCORE (entry_score.py): learned P(3R before the swing stop) for a LONG / SHORT at the latest closed bar
+    try:
+        from .entry_score import evaluate as _entry_score_eval
+        _daily = getattr(snapshot, "nifty_daily", None)
+        metadata["entry_score"] = _entry_score_eval(bars_5m, snapshot.timestamp,
+                                                    daily=_daily.bars if _daily is not None else None)
+    except Exception:  # noqa: BLE001
+        metadata["entry_score"] = {}
     metadata["higher_low_confirmed"] = higher_low_confirmed
     metadata["lower_high_confirmed"] = lower_high_confirmed
     if bool(metadata.get("higher_lows_5m")) and bool(metadata.get("higher_highs_5m")):

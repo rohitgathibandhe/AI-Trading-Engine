@@ -99,6 +99,11 @@ class ReplayMarketDataProvider:
         self._bars5 = _group_bars_by_day(ds["bars_5m"])
         self._bars15 = _group_bars_by_day(ds["bars_15m"])
         self._prev_close = _session_previous_closes(ds["bars_5m"])
+        # prior-session daily bars, like DhanLiveMarketDataProvider (90 calendar days before today)
+        from .data_models import OhlcvBar as _Bar
+        self._daily = {d: _Bar(timestamp=datetime.combine(d, datetime.min.time()), open=bs[0].open,
+                               high=max(b.high for b in bs), low=min(b.low for b in bs), close=bs[-1].close,
+                               volume=0.0) for d, bs in sorted(self._bars5.items()) if len(bs) >= 60}
         # identical to DhanLiveMarketDataProvider.current_snapshot (same run_live config keys)
         self._risk = AccountRiskLimits(
             max_risk_rupees_per_trade=float(config.get("max_risk_rupees_per_trade") or 10_000.0),
@@ -143,12 +148,14 @@ class ReplayMarketDataProvider:
             from .live_runtime import LiveDataReadinessError  # same failure the live provider raises
             raise LiveDataReadinessError("MIN_5M_CANDLES_NOT_READY", "replay: not enough closed candles yet",
                                          diagnostics={"replay": True})
+        prior_daily = [b for d, b in self._daily.items() if day - timedelta(days=90) <= d < day]
         chain = self._chains[ts]
         chain = type(chain)(timestamp=stamp, expiry=chain.expiry, spot=chain.spot, quotes=chain.quotes,
                             margin_estimate_per_lot=chain.margin_estimate_per_lot)
         snap = MarketSnapshot(
             nifty_5m=OhlcvSeries(timeframe_minutes=5, bars=closed5),
             nifty_15m=OhlcvSeries(timeframe_minutes=15, bars=closed15),
+            nifty_daily=OhlcvSeries(timeframe_minutes=1440, bars=prior_daily) if prior_daily else None,
             option_chain=chain, risk_limits=self._risk,
             account_state=AccountState(realised_pnl_rupees=0.0, margin_used_rupees=0.0),
             live_vwap=_vwap_from_bars(closed5), lot_size=self._lot_size, slippage_points=self._slippage,
