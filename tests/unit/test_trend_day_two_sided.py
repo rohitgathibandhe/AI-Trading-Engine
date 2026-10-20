@@ -26,3 +26,13 @@ def test_one_sided_break_can_still_be_a_trend(monkeypatch):
     assert st["state"] == "TREND_UP"
     monkeypatch.setattr(td, "TWO_SIDED_RANGE", False)
     assert td.trend_state(_bars(closes), oi={"smart_money_bias": "BULLISH"})["state"] == "TREND_UP"
+
+
+def test_accepted_break_needs_two_closes_and_detects_side():
+    from datetime import datetime, timedelta
+    from market_ai.intraday_defined_risk import trend_day as td
+    t0 = datetime(2026, 10, 1, 9, 15)
+    closes = [100, 101, 99, 100, 112, 99, 100, 85, 84, 83]          # OR 09:15-09:25; 09:35 poke up (1 close), then 2 closes down
+    bars = [{"t": t0 + timedelta(minutes=5 * k), "o": c, "h": c + 3, "l": c - 3, "c": c, "v": 0} for k, c in enumerate(closes)]
+    ab = td.accepted_break(bars)
+    assert ab["dir"] == "DOWN" and not ab["two_sided"] and ab["valid"]

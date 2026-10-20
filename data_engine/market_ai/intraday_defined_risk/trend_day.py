@@ -150,6 +150,31 @@ def trend_state(bars: list[dict], oi: dict | None = None) -> dict:
     return res
 
 
+def accepted_break(bars: list[dict]) -> dict | None:
+    """The owner's trigger on COMPLETED bars: the first time two consecutive closes sit beyond the 15-min opening range
+    (an ACCEPTED break, not a one-bar poke). {'dir': 'UP'|'DOWN', 'at', 'bars_since', 'valid', 'two_sided'}; valid =
+    the latest close is still beyond that side AND on the same side of VWAP."""
+    or_bars = [b for b in bars if b["t"].time() < OR_END]
+    post = [b for b in bars if b["t"].time() >= OR_END]
+    if len(or_bars) < 3 or len(post) < 2:
+        return None
+    or_h, or_l = max(b["h"] for b in or_bars), min(b["l"] for b in or_bars)
+    first = {}
+    for k in range(1, len(post)):
+        for side, beyond in (("UP", lambda b: b["c"] > or_h), ("DOWN", lambda b: b["c"] < or_l)):
+            if side not in first and beyond(post[k]) and beyond(post[k - 1]):
+                first[side] = k
+    if not first:
+        return None
+    side = min(first, key=first.get) if len(first) == 1 else max(first, key=first.get)   # the latest accepted side
+    k = first[side]
+    last, vw = bars[-1], _vwap_series(bars)[-1]
+    up = side == "UP"
+    valid = (last["c"] > or_h and last["c"] > vw) if up else (last["c"] < or_l and last["c"] < vw)
+    return {"dir": side, "at": post[k]["t"].isoformat(), "bars_since": len(post) - 1 - k, "valid": bool(valid),
+            "two_sided": len(first) == 2, "or_high": or_h, "or_low": or_l}
+
+
 def trigger(bars: list[dict], state: dict, *, last_trigger_at: datetime | None = None) -> dict | None:
     """Entry trigger on the LAST completed bar, in the state's direction. None if nothing fired."""
     if state.get("state") not in ("TREND_UP", "TREND_DOWN") or len(bars) < RANGE_BARS + 2:
@@ -222,4 +247,4 @@ def evaluate(bars: Sequence[Any], now: datetime, oi: dict | None = None,
     if tg is not None:
         tg = dict(tg, at=tg["at"].isoformat())
     return {"state": st["state"], "since": st["since"].isoformat() if st["since"] else None,
-            "checks": st["checks"], "trigger": tg}
+            "checks": st["checks"], "trigger": tg, "accepted_break": accepted_break(cb)}
