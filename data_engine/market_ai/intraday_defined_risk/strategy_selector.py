@@ -877,6 +877,7 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
 # other playbook/structure netted about -94,000 (438 trades) / -14,000 (39) — filler trades paying brokerage with no
 # edge. A breakout credit spread becomes the matching debit (breakout credits: -8,065 / -14,330 net).
 _EDGE_ONLY = os.environ.get("SEL_EDGE_ONLY", "0") == "1"
+_ENTRY_SCORE_MIN = float(os.environ.get("SEL_ENTRY_SCORE", "0") or 0)
 _EDGE_MAP = {"BREAKOUT_UP": ("CALL_DEBIT_SPREAD", "BULL_PUT_CREDIT_SPREAD"),
              "BREAKOUT_DOWN": ("PUT_DEBIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD")}
 
@@ -892,6 +893,15 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
     if ok and str((metadata.get("trend_day") or {}).get("state") or "") == "RANGE_TWO_SIDED":
         ok = False
         metadata["edge_only_two_sided"] = True
+    # ENTRY-SCORE GATE (SEL_ENTRY_SCORE=<min p>): take the breakout only when the learned entry score for its
+    # direction clears the bar (entry_score.py / scripts/entry_lab.py). No score (no swing stop / no model) = skip.
+    if ok and _ENTRY_SCORE_MIN > 0:
+        es = metadata.get("entry_score") or {}
+        p = es.get("long" if want[0] == "CALL_DEBIT_SPREAD" else "short")
+        metadata["entry_score_used"] = p
+        if p is None or p < _ENTRY_SCORE_MIN:
+            ok = False
+            metadata["entry_score_skip"] = True
     in_blackout = (_DEBIT_BLACKOUT is not None and now_time is not None
                    and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1])
     if not ok or in_blackout:
