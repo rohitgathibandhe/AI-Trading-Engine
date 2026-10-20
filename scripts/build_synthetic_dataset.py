@@ -24,6 +24,26 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 ATM_BY_DTE = {0: 1.21, 1: 1.07, 2: 0.95, 3: 0.83, 4: 0.86, 5: 0.87, 6: 0.92}
+# ATM IV / VIX by DTE x HOUR, measured on the recorded live chains (2026-07-15..10-16; DTE 2 interpolated): IV MELTS
+# intraday (DTE 3: 0.91 -> 0.73; expiry 1.26 -> 0.97). The flat-by-DTE table over-priced intraday option buying.
+ATM_BY_DTE_HOUR = {
+    0: {9: 1.26, 10: 1.21, 11: 1.19, 12: 1.14, 13: 1.06, 14: 1.22, 15: 0.97},
+    1: {9: 1.08, 10: 1.10, 11: 1.13, 12: 1.09, 13: 1.04, 14: 1.02, 15: 1.02},
+    2: {9: 1.00, 10: 0.99, 11: 0.99, 12: 0.96, 13: 0.91, 14: 0.89, 15: 0.88},
+    3: {9: 0.91, 10: 0.88, 11: 0.85, 12: 0.82, 13: 0.78, 14: 0.75, 15: 0.73},
+    4: {9: 0.87, 10: 0.88, 11: 0.86, 12: 0.85, 13: 0.81, 14: 0.83, 15: 0.81},
+    5: {9: 0.88, 10: 0.87, 11: 0.87, 12: 0.85, 13: 0.88, 14: 0.85, 15: 0.86},
+    6: {9: 0.93, 10: 0.92, 11: 0.91, 12: 0.91, 13: 0.95, 14: 0.94, 15: 0.91},
+}
+import os as _os
+IV_MODE = _os.environ.get("SYN_IV_MODE", "DTE_HOUR")      # DTE_HOUR (calibrated) | DTE (legacy flat)
+
+
+def _atm_ratio(dte: int, hour: int) -> float:
+    if IV_MODE != "DTE_HOUR":
+        return ATM_BY_DTE.get(min(dte, 6), 0.92)
+    row = ATM_BY_DTE_HOUR.get(min(dte, 6), ATM_BY_DTE_HOUR[6])
+    return row.get(min(max(hour, 9), 15), 0.9)
 SMILE = [(-3.0, 1.78), (-2.5, 1.41), (-2.0, 1.29), (-1.5, 1.21), (-1.0, 1.15), (-0.5, 1.12), (0.0, 1.0),
          (0.5, 0.90), (1.0, 0.92), (1.5, 0.97), (2.0, 1.05), (2.5, 1.16), (3.0, 1.53)]
 STRIKE_SPAN, STEP = 1000, 50
@@ -95,7 +115,7 @@ def build(src: Path, start: date, end: date, out: Path) -> None:
             k = bisect_left(vt, b["t"]) - 1
             vix = V[k]["c"] if k >= 0 and V[k]["t"].date() == d else (V[max(k, 0)]["c"] if V else 14.0)
             T = max((datetime.combine(exp, time(15, 30)) - b["t"]).total_seconds(), 900) / (365 * 86400)
-            atm = vix / 100 * ATM_BY_DTE.get(min(dte, 6), 0.92)
+            atm = vix / 100 * _atm_ratio(dte, b["t"].hour)
             k0 = round(spot / STEP) * STEP
             for K in range(int(k0 - STRIKE_SPAN), int(k0 + STRIKE_SPAN) + STEP, STEP):
                 x = math.log(K / spot) / (atm * math.sqrt(T))
