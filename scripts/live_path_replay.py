@@ -116,7 +116,7 @@ def main() -> int:
         cfg_path = work / "replay_run_live_config.json"
         cfg_path.write_text(json.dumps(cfg))
         env = {k: str(v) for k, v in plistlib.load(open(PLIST, "rb")).get("EnvironmentVariables", {}).items()}
-        env.update({"PYTHONPATH": str(wt / "data_engine"), "TRADE_MODE": "paper", "HOME": str(Path.home()),
+        env.update({"PYTHONPATH": str(wt / "data_engine"), "TRADE_MODE": "paper", "HOME": str(Path.home()), "REPLAY_HARNESS": "1",
                     "PATH": "/usr/bin:/bin"})
         for kv in a.env:
             k, _, v = kv.partition("=")

@@ -530,6 +530,24 @@ def _evaluate_debit_exit(
     # 25pts from its best level while green" beat both the actual exit and holding: 09-29 +595 (actual
     # -3,146), 10-05 +514 (-2,204), 10-13 +7,410 (+416) -> +8,519 vs -4,934. A runner keeps extending
     # the extreme and is never touched; a fader is cut as the index turns. Fades keep their own exits.
+    # TRADER PLAYBOOK exits (2026-10-19 decode): next-OI-wall target and the 5m structure trail.
+    if current_snapshot is not None and not position.metadata.get("is_fade"):
+        from . import trade_plan as _tp
+        _short = position.structure.strategy == StrategyType.PUT_DEBIT_SPREAD
+        _sp = float(current_snapshot.option_chain.spot)
+        if os.environ.get("DEBIT_WALL_TARGET", "0") == "1":
+            _tgt = position.metadata.get("plan_wall_target", "unset")
+            if _tgt == "unset":
+                _tgt = _tp.next_wall(current_snapshot.option_chain, _short, _sp)
+                position.metadata["plan_wall_target"] = _tgt
+            if _tgt is not None and pnl > 0 and ((_sp <= float(_tgt) + 10) if _short else (_sp >= float(_tgt) - 10)):
+                return ExitDecision(True, "DEBIT_WALL_TARGET", value, pnl)
+        if os.environ.get("DEBIT_SWING_TRAIL", "0") == "1":
+            _bars = _tp.closed_bars(current_snapshot)
+            _stop = _tp.swing_stop(_bars, position.entry_time, _short)
+            if _stop is not None and _bars and ((_bars[-1].close > _stop) if _short else (_bars[-1].close < _stop)):
+                return ExitDecision(True, "DEBIT_SWING_TRAIL", value, pnl)
+            return ExitDecision(False, "HOLD", value, pnl) if elapsed_minutes >= 0 and pnl > -entry_debit * DEBIT_STOP_FRAC * position.lot_size * position.lots else ExitDecision(True, "DEBIT_STOP", value, pnl)
     if DEBIT_TRAIL_MODE == "SPOT" and not position.metadata.get("is_fade") and current_snapshot is not None:
         _spot = float(current_snapshot.option_chain.spot)
         _down = position.structure.strategy == StrategyType.PUT_DEBIT_SPREAD

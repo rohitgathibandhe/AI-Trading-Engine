@@ -160,6 +160,9 @@ class ReplayMarketDataProvider:
     def _write_market_context(self, chain, stamp) -> None:
         """Publish market_context.json each cycle like DhanLiveMarketDataProvider (VIX via the same ATM-IV
         proxy live falls back to). Lives in the replay worktree's own state folder."""
+        import os
+        if os.environ.get("REPLAY_HARNESS") != "1":      # never write a live-looking market_context outside the harness
+            return
         try:
             import json
             from .live_runtime import STATE_ROOT

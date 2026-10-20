@@ -894,6 +894,20 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
         metadata["edge_only_two_sided"] = True
     in_blackout = (_DEBIT_BLACKOUT is not None and now_time is not None
                    and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1])
+    _short = str(choice.condition or "") == "BREAKOUT_DOWN"
+    # NO ENTRY INTO A WALL (SEL_NO_WALL_ENTRY=1): 2026-10-19 13:25 re-entry sold at 22,872 straight into the
+    # 22,850-22,800 put walls and lost; skip a breakout whose opposite wall is < 60 pts away.
+    if ok and os.environ.get("SEL_NO_WALL_ENTRY", "0") == "1":
+        _wd = metadata.get("plan_wall_distance_short" if _short else "plan_wall_distance_long")
+        if _wd is not None and float(_wd) < 60:
+            ok = False
+            metadata["edge_only_wall_veto"] = float(_wd)
+    # FAILED-RETEST ENTRY (SEL_RETEST_ENTRY=1): take the breakout only after the broken level was retested and held
+    # (10-19: 23,000 broke 11:35, retests 11:40-11:50 failed at 23,010-23,016 -> entry ~23,000, stop above).
+    if ok and os.environ.get("SEL_RETEST_ENTRY", "0") == "1":
+        if not metadata.get("plan_failed_retest_short" if _short else "plan_failed_retest_long"):
+            ok = False
+            metadata["edge_only_wait_retest"] = True
     if not ok or in_blackout:
         metadata["edge_only_skip"] = f"{choice.condition}/{first}"
         choice.family, choice.structures = FAM_STAND_ASIDE, []
