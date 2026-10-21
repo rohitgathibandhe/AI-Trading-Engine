@@ -197,6 +197,43 @@ def accepted_break(bars: list[dict]) -> dict | None:
             "two_sided": len(first) == 2, "or_high": or_h, "or_low": or_l}
 
 
+def failed_break(bars: list[dict]) -> dict | None:
+    """FAILED OPENING-RANGE BREAK (a trap) on COMPLETED bars: a close beyond one side of the 15-min opening range, then a
+    later close back INSIDE the range and on the other side of VWAP. Trade the reversal. 2026-10-21: 09:30/09:35 closed
+    above the 15m high (23,087), 09:45 closed back at 23,058 under VWAP -> the -470pt day (owner sold the 23,100 call;
+    +14.6k on 2 lots at 09:45 vs +3k at the agent's 11:50). Pattern lab (361 days): OR_FAIL +0.18R short / +0.30R long.
+    {'dir': reversal 'UP'|'DOWN', 'at', 'bars_since', 'valid', 'trap_extreme'}; valid = latest close still inside/through
+    the range on the reversal side of VWAP."""
+    or_bars = [b for b in bars if b["t"].time() < OR_END]
+    post = [b for b in bars if b["t"].time() >= OR_END]
+    if len(or_bars) < 3 or len(post) < 2:
+        return None
+    or_h, or_l = max(b["h"] for b in or_bars), min(b["l"] for b in or_bars)
+    vw = _vwap_series(bars)
+    off = len(bars) - len(post)
+    best = None
+    for side in ("UP", "DOWN"):
+        k0 = next((k for k, b in enumerate(post) if (b["c"] > or_h if side == "UP" else b["c"] < or_l)), None)
+        if k0 is None:
+            continue
+        for k in range(k0 + 1, len(post)):
+            b, v = post[k], vw[off + k]
+            back = (b["c"] < or_h and b["c"] < v) if side == "UP" else (b["c"] > or_l and b["c"] > v)
+            if back:
+                ext = max(x["h"] for x in post[k0:k + 1]) if side == "UP" else min(x["l"] for x in post[k0:k + 1])
+                ev = {"dir": "DOWN" if side == "UP" else "UP", "at": b["t"].isoformat(), "k": k, "trap_extreme": ext}
+                if best is None or k > best["k"]:
+                    best = ev
+                break
+    if best is None:
+        return None
+    last, v = bars[-1], vw[-1]
+    down = best["dir"] == "DOWN"
+    valid = (last["c"] < or_h and last["c"] < v) if down else (last["c"] > or_l and last["c"] > v)
+    return {"dir": best["dir"], "at": best["at"], "bars_since": len(post) - 1 - best.pop("k"), "valid": bool(valid),
+            "trap_extreme": best["trap_extreme"], "or_high": or_h, "or_low": or_l}
+
+
 def trigger(bars: list[dict], state: dict, *, last_trigger_at: datetime | None = None) -> dict | None:
     """Entry trigger on the LAST completed bar, in the state's direction. None if nothing fired."""
     if state.get("state") not in ("TREND_UP", "TREND_DOWN") or len(bars) < RANGE_BARS + 2:
@@ -269,4 +306,5 @@ def evaluate(bars: Sequence[Any], now: datetime, oi: dict | None = None,
     if tg is not None:
         tg = dict(tg, at=tg["at"].isoformat())
     return {"state": st["state"], "since": st["since"].isoformat() if st["since"] else None,
-            "checks": st["checks"], "trigger": tg, "accepted_break": accepted_break(cb)}
+            "checks": st["checks"], "trigger": tg, "accepted_break": accepted_break(cb),
+            "failed_break": failed_break(cb)}

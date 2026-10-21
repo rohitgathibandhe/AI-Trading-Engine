@@ -36,3 +36,13 @@ def test_accepted_break_needs_two_closes_and_detects_side():
     bars = [{"t": t0 + timedelta(minutes=5 * k), "o": c, "h": c + 3, "l": c - 3, "c": c, "v": 0} for k, c in enumerate(closes)]
     ab = td.accepted_break(bars)
     assert ab["dir"] == "DOWN" and not ab["two_sided"] and ab["valid"]
+
+
+def test_failed_break_up_trap_gives_down_reversal():
+    from datetime import datetime, timedelta
+    from market_ai.intraday_defined_risk import trend_day as td
+    t0 = datetime(2026, 10, 21, 9, 15)
+    closes = [100, 104, 103, 110, 109, 98, 95]                       # OR high ~107; 09:30/35 above; 09:45 back inside < VWAP
+    bars = [{"t": t0 + timedelta(minutes=5 * k), "o": c, "h": c + 3, "l": c - 3, "c": c, "v": 0} for k, c in enumerate(closes)]
+    fb = td.failed_break(bars)
+    assert fb["dir"] == "DOWN" and fb["valid"] and fb["trap_extreme"] == 113
