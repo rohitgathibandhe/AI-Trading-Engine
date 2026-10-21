@@ -40,7 +40,44 @@ LAST_ENTRY = time(14, 0)
 # and above it at 10:55 inside a 170pt range; the detector flipped DOWN -> UP -> DOWN and the trend-day debit
 # bought the false 10:55 breakout (-4,999 in replay). TD_TWO_SIDED_RANGE=0 disables.
 import os as _os
-TWO_SIDED_RANGE = _os.environ.get("TD_TWO_SIDED_RANGE", "1") == "1"       # replay 10-08/09/12/13: entries after ~14:00 were exhausted (-20..-51pts on 3/4 days)
+TWO_SIDED_RANGE = _os.environ.get("TD_TWO_SIDED_RANGE", "1") == "1"
+# ACCEPTANCE (TD_BREAK_ACCEPT_BARS=N, default 0 = off): a side of the opening range counts as BROKEN only after N
+# consecutive closes beyond it. A single close that falls straight back inside is a failed break (a trap), not a
+# break — 2026-10-01: one 10:00 close 10pts over the 15m high (22,600 vs 22,590), next bar back inside; the 12:15/12:20
+# closes below the low were the real M-top breakdown (-300pts to 14:00) but the session was labelled RANGE_TWO_SIDED
+# and every bearish entry from 12:25 was vetoed.
+BREAK_ACCEPT_BARS = int(_os.environ.get("TD_BREAK_ACCEPT_BARS", "0") or 0)
+
+
+# RELEASE (TD_TWO_SIDED_RELEASE_X=x, default 0 = off): a two-sided session stops being a "range" once price closes
+# beyond the LATER-broken side by >= x * the opening-range size, on that side of VWAP — a failed break that reversed
+# into a trend. 2026-10-21: 09:30/09:35 closed above the 15m high, 10:05/10:10 below the low -> RANGE_TWO_SIDED all
+# day; every put debit (11:45, 14:25, 14:45) was vetoed while Nifty fell 150-400 pts below the range (-470 on the day).
+TWO_SIDED_RELEASE_X = float(_os.environ.get("TD_TWO_SIDED_RELEASE_X", "0") or 0)
+
+
+def _two_sided_released(bars: list[dict], post: list[dict], or_h: float, or_l: float) -> bool:
+    if TWO_SIDED_RELEASE_X <= 0 or not post:
+        return False
+    first_up = next((k for k, b in enumerate(post) if b["c"] > or_h), None)
+    first_dn = next((k for k, b in enumerate(post) if b["c"] < or_l), None)
+    if first_up is None or first_dn is None:
+        return False
+    last, vw = bars[-1], _vwap_series(bars)[-1]
+    ext = TWO_SIDED_RELEASE_X * max(or_h - or_l, 1.0)
+    if first_dn > first_up:                                  # down was the later break
+        return last["c"] <= or_l - ext and last["c"] < vw
+    return last["c"] >= or_h + ext and last["c"] > vw
+
+
+def _accepted(post: list[dict], beyond) -> bool:
+    n = max(BREAK_ACCEPT_BARS, 1)
+    run = 0
+    for b in post:
+        run = run + 1 if beyond(b) else 0
+        if run >= n:
+            return True
+    return False       # replay 10-08/09/12/13: entries after ~14:00 were exhausted (-20..-51pts on 3/4 days)
 
 
 def _get(b, k):
@@ -103,7 +140,8 @@ def trend_state(bars: list[dict], oi: dict | None = None) -> dict:
     if len(or_bars) < 3 or len(post) < VWAP_HOLD_BARS:
         return res
     or_h, or_l = max(b["h"] for b in or_bars), min(b["l"] for b in or_bars)
-    if TWO_SIDED_RANGE and any(b["c"] > or_h for b in post) and any(b["c"] < or_l for b in post):
+    if TWO_SIDED_RANGE and _accepted(post, lambda b: b["c"] > or_h) and _accepted(post, lambda b: b["c"] < or_l) \
+            and not _two_sided_released(bars, post, or_h, or_l):
         return {"state": "RANGE_TWO_SIDED", "since": None,
                 "checks": {"two_sided": True, "or_high": or_h, "or_low": or_l}}
     vw = _vwap_series(bars)
@@ -132,6 +170,68 @@ def trend_state(bars: list[dict], oi: dict | None = None) -> dict:
                               "or_high": or_h, "or_low": or_l, "vwap": round(vw[-1], 2)}}
             return res
     return res
+
+
+def accepted_break(bars: list[dict]) -> dict | None:
+    """The owner's trigger on COMPLETED bars: the first time two consecutive closes sit beyond the 15-min opening range
+    (an ACCEPTED break, not a one-bar poke). {'dir': 'UP'|'DOWN', 'at', 'bars_since', 'valid', 'two_sided'}; valid =
+    the latest close is still beyond that side AND on the same side of VWAP."""
+    or_bars = [b for b in bars if b["t"].time() < OR_END]
+    post = [b for b in bars if b["t"].time() >= OR_END]
+    if len(or_bars) < 3 or len(post) < 2:
+        return None
+    or_h, or_l = max(b["h"] for b in or_bars), min(b["l"] for b in or_bars)
+    first = {}
+    for k in range(1, len(post)):
+        for side, beyond in (("UP", lambda b: b["c"] > or_h), ("DOWN", lambda b: b["c"] < or_l)):
+            if side not in first and beyond(post[k]) and beyond(post[k - 1]):
+                first[side] = k
+    if not first:
+        return None
+    side = min(first, key=first.get) if len(first) == 1 else max(first, key=first.get)   # the latest accepted side
+    k = first[side]
+    last, vw = bars[-1], _vwap_series(bars)[-1]
+    up = side == "UP"
+    valid = (last["c"] > or_h and last["c"] > vw) if up else (last["c"] < or_l and last["c"] < vw)
+    return {"dir": side, "at": post[k]["t"].isoformat(), "bars_since": len(post) - 1 - k, "valid": bool(valid),
+            "two_sided": len(first) == 2, "or_high": or_h, "or_low": or_l}
+
+
+def failed_break(bars: list[dict]) -> dict | None:
+    """FAILED OPENING-RANGE BREAK (a trap) on COMPLETED bars: a close beyond one side of the 15-min opening range, then a
+    later close back INSIDE the range and on the other side of VWAP. Trade the reversal. 2026-10-21: 09:30/09:35 closed
+    above the 15m high (23,087), 09:45 closed back at 23,058 under VWAP -> the -470pt day (owner sold the 23,100 call;
+    +14.6k on 2 lots at 09:45 vs +3k at the agent's 11:50). Pattern lab (361 days): OR_FAIL +0.18R short / +0.30R long.
+    {'dir': reversal 'UP'|'DOWN', 'at', 'bars_since', 'valid', 'trap_extreme'}; valid = latest close still inside/through
+    the range on the reversal side of VWAP."""
+    or_bars = [b for b in bars if b["t"].time() < OR_END]
+    post = [b for b in bars if b["t"].time() >= OR_END]
+    if len(or_bars) < 3 or len(post) < 2:
+        return None
+    or_h, or_l = max(b["h"] for b in or_bars), min(b["l"] for b in or_bars)
+    vw = _vwap_series(bars)
+    off = len(bars) - len(post)
+    best = None
+    for side in ("UP", "DOWN"):
+        k0 = next((k for k, b in enumerate(post) if (b["c"] > or_h if side == "UP" else b["c"] < or_l)), None)
+        if k0 is None:
+            continue
+        for k in range(k0 + 1, len(post)):
+            b, v = post[k], vw[off + k]
+            back = (b["c"] < or_h and b["c"] < v) if side == "UP" else (b["c"] > or_l and b["c"] > v)
+            if back:
+                ext = max(x["h"] for x in post[k0:k + 1]) if side == "UP" else min(x["l"] for x in post[k0:k + 1])
+                ev = {"dir": "DOWN" if side == "UP" else "UP", "at": b["t"].isoformat(), "k": k, "trap_extreme": ext}
+                if best is None or k > best["k"]:
+                    best = ev
+                break
+    if best is None:
+        return None
+    last, v = bars[-1], vw[-1]
+    down = best["dir"] == "DOWN"
+    valid = (last["c"] < or_h and last["c"] < v) if down else (last["c"] > or_l and last["c"] > v)
+    return {"dir": best["dir"], "at": best["at"], "bars_since": len(post) - 1 - best.pop("k"), "valid": bool(valid),
+            "trap_extreme": best["trap_extreme"], "or_high": or_h, "or_low": or_l}
 
 
 def trigger(bars: list[dict], state: dict, *, last_trigger_at: datetime | None = None) -> dict | None:
@@ -206,4 +306,5 @@ def evaluate(bars: Sequence[Any], now: datetime, oi: dict | None = None,
     if tg is not None:
         tg = dict(tg, at=tg["at"].isoformat())
     return {"state": st["state"], "since": st["since"].isoformat() if st["since"] else None,
-            "checks": st["checks"], "trigger": tg}
+            "checks": st["checks"], "trigger": tg, "accepted_break": accepted_break(cb),
+            "failed_break": failed_break(cb)}

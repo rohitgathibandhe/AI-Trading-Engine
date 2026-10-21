@@ -868,7 +868,84 @@ def _fade_exit_levels(m: dict[str, Any], direction: str, entry_spot: float) -> t
 def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> StrategyChoice:
     choice = _select_strategy_core(metadata, spot, now_time=now_time)
     choice = _trend_day_structure(choice, metadata, now_time)
-    return _edge_only(choice, metadata, now_time)
+    choice = _edge_only(choice, metadata, now_time)
+    choice = _failed_break_entry(choice, metadata, now_time)
+    return _accepted_break_entry(choice, metadata, now_time)
+
+
+# FAILED-BREAK ENTRY (SEL_FAILED_BREAK=1): trade the reversal of a failed opening-range break (trend_day.failed_break),
+# within SEL_FAILED_BREAK_BARS bars of the failure, 09:35-13:30, never against a confirmed opposite trend day. It
+# overrides the two-sided veto by design: a trap followed by the reversal IS the trend day that veto used to block.
+_FAIL_BREAK = os.environ.get("SEL_FAILED_BREAK", "0") == "1"
+_FAIL_BREAK_BARS = int(os.environ.get("SEL_FAILED_BREAK_BARS", "6") or 6)
+_FAIL_BREAK_SIDES = os.environ.get("SEL_FAILED_BREAK_SIDES", "BOTH").upper()
+
+
+def _failed_break_entry(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> StrategyChoice:
+    if not _FAIL_BREAK or choice.structures:
+        return choice
+    td = metadata.get("trend_day") or {}
+    fb = td.get("failed_break") or {}
+    side = fb.get("dir")
+    if not side or not fb.get("valid") or int(fb.get("bars_since", 99)) > _FAIL_BREAK_BARS:
+        return choice
+    if _FAIL_BREAK_SIDES != "BOTH" and side != _FAIL_BREAK_SIDES:
+        return choice
+    if str(td.get("state") or "") == ("TREND_DOWN" if side == "UP" else "TREND_UP"):
+        return choice
+    if now_time is not None and not (time(9, 35) <= now_time <= time(13, 30)):
+        return choice
+    if _DEBIT_BLACKOUT is not None and now_time is not None and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1]:
+        return choice
+    for k in ("seller_exit", "conf_bull_sell_closer", "is_fade"):
+        metadata.pop(k, None)
+    metadata["failed_break_entry"] = fb.get("at")
+    choice.condition = f"BREAKOUT_{side}"
+    choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, [_ACC_DEBIT[side]]
+    choice.executable_today = True        # the stand-aside choice it replaces was flagged not executable
+    choice.rationale = (choice.rationale or "") + (f" [FAILED BREAK -> {side}: the opening-range break failed at "
+                                                   f"{str(fb.get('at'))[11:16]} (trap extreme {fb.get('trap_extreme')}) — "
+                                                   f"buy the {_ACC_DEBIT[side]}]")
+    return choice
+
+
+# ACCEPTED-BREAK ENTRY (SEL_ACCEPTED_BREAK=1): the owner's trigger as its own entry path. Day audit of all 363
+# sessions (2026-10-20): the disciplined rules made >= 40 pts live on 71 days; the agent caught 13 (all late) and
+# missed 49, mostly because the classifier still called the session "no confluence" / chop when the opening range
+# had already been accepted (two closes beyond it). Within SEL_ACCEPTED_BREAK_BARS bars of the first accepted break,
+# with the close still beyond the range and on the VWAP side, not two-sided, and no opposing confirmed trend day,
+# buy the debit spread in the break direction (enter on the close; no retrace wait).
+_ACC_BREAK = os.environ.get("SEL_ACCEPTED_BREAK", "0") == "1"
+_ACC_BREAK_BARS = int(os.environ.get("SEL_ACCEPTED_BREAK_BARS", "6") or 6)
+_ACC_BREAK_SIDES = os.environ.get("SEL_ACCEPTED_BREAK_SIDES", "BOTH").upper()      # BOTH | DOWN | UP
+_ACC_DEBIT = {"UP": "CALL_DEBIT_SPREAD", "DOWN": "PUT_DEBIT_SPREAD"}
+
+
+def _accepted_break_entry(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> StrategyChoice:
+    if not _ACC_BREAK or choice.structures:
+        return choice
+    td = metadata.get("trend_day") or {}
+    ab = td.get("accepted_break") or {}
+    side = ab.get("dir")
+    if not side or not ab.get("valid") or ab.get("two_sided") or int(ab.get("bars_since", 99)) > _ACC_BREAK_BARS:
+        return choice
+    if _ACC_BREAK_SIDES != "BOTH" and side != _ACC_BREAK_SIDES:
+        return choice
+    if str(td.get("state") or "") == ("TREND_DOWN" if side == "UP" else "TREND_UP"):
+        return choice
+    if now_time is not None and not (time(9, 35) <= now_time <= time(14, 30)):
+        return choice
+    if _DEBIT_BLACKOUT is not None and now_time is not None and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1]:
+        return choice
+    for k in ("seller_exit", "conf_bull_sell_closer", "is_fade"):
+        metadata.pop(k, None)
+    metadata["accepted_break_entry"] = ab.get("at")
+    choice.condition = f"BREAKOUT_{side}"
+    choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, [_ACC_DEBIT[side]]
+    choice.executable_today = True        # the stand-aside choice it replaces was flagged not executable
+    choice.rationale = (choice.rationale or "") + (f" [ACCEPTED BREAK {side}: two closes beyond the opening range at "
+                                                   f"{str(ab.get('at'))[11:16]}, close on the VWAP side — buy the {_ACC_DEBIT[side]}]")
+    return choice
 
 
 # EDGE-ONLY MODE (SEL_EDGE_ONLY=1): trade ONLY the setups with a proven net edge after costs and stand aside otherwise.

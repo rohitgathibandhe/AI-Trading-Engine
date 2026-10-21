@@ -53,3 +53,17 @@ def test_gate_off_by_default(monkeypatch):
     monkeypatch.setattr(sel, "_ENTRY_SCORE_MIN", 0.0)
     md = {"entry_score": {"long": 0.01}}
     assert sel._edge_only(_choice("BREAKOUT_UP", "CALL_DEBIT_SPREAD"), md, time(11, 0)).structures == ["CALL_DEBIT_SPREAD"]
+
+
+def test_accepted_break_entry_buys_debit_when_selector_stands_aside(monkeypatch):
+    monkeypatch.setattr(sel, "_ACC_BREAK", True)
+    monkeypatch.setattr(sel, "_DEBIT_BLACKOUT", None)
+    c = _choice("CHOP", "PUT_DEBIT_SPREAD"); c.structures = []
+    md = {"trend_day": {"state": "NONE", "accepted_break": {"dir": "DOWN", "at": "2026-10-01T12:15:00", "bars_since": 1,
+                                                             "valid": True, "two_sided": False}}}
+    out = sel._accepted_break_entry(c, md, time(12, 20))
+    assert out.structures == ["PUT_DEBIT_SPREAD"] and out.condition == "BREAKOUT_DOWN" and md["accepted_break_entry"]
+    assert out.executable_today
+    md["trend_day"]["state"] = "TREND_UP"                            # never against a confirmed opposite trend day
+    c2 = _choice("CHOP", "PUT_DEBIT_SPREAD"); c2.structures = []
+    assert sel._accepted_break_entry(c2, md, time(12, 20)).structures == []

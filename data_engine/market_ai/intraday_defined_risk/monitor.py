@@ -1126,7 +1126,8 @@ class IntradayDefinedRiskAgent:
         # chart — the confluence rule is "price action AND chain agree". Fades are exempt (counter-move by
         # design, own spot-based exit). SEL_CHART_AGREE=0 disables. See decision_justification.chart_opposes.
         if (os.environ.get("SEL_CHART_AGREE", "1") == "1" and choice.structures
-                and choice.family != FAM_STAND_ASIDE and not meta.get("is_fade")):
+                and choice.family != FAM_STAND_ASIDE and not meta.get("is_fade")
+                and not meta.get("failed_break_entry")):   # a failed break IS the chart reversing (like a fade)
             try:
                 from .decision_justification import chart_opposes
                 if chart_opposes(choice.structures[0], _thesis):
@@ -2239,7 +2240,9 @@ def run_live(config: dict[str, object]) -> None:
                     # wall after the move). SEL_BREAKOUT_NO_WAIT=1 lets breakout entries go on the signal.
                     _brk_nowait = (os.environ.get("SEL_BREAKOUT_NO_WAIT", "0") == "1"
                                    and str(decision.metadata.get("playbook") or "").startswith("SEL_BREAKOUT"))
-                    if gate["allowed"] and not decision.metadata.get("trend_day_entry") and not _strong and not _brk_nowait:
+                    if gate["allowed"] and not decision.metadata.get("trend_day_entry") and not _strong and not _brk_nowait \
+                            and not decision.metadata.get("accepted_break_entry") \
+                            and not decision.metadata.get("failed_break_entry"):
                         from .entry_timing import should_wait
                         _wait, _wait_why = should_wait(
                             decision.strategy.value if hasattr(decision.strategy, "value") else str(decision.strategy),
