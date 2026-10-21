@@ -1126,7 +1126,8 @@ class IntradayDefinedRiskAgent:
         # chart — the confluence rule is "price action AND chain agree". Fades are exempt (counter-move by
         # design, own spot-based exit). SEL_CHART_AGREE=0 disables. See decision_justification.chart_opposes.
         if (os.environ.get("SEL_CHART_AGREE", "1") == "1" and choice.structures
-                and choice.family != FAM_STAND_ASIDE and not meta.get("is_fade")):
+                and choice.family != FAM_STAND_ASIDE and not meta.get("is_fade")
+                and not meta.get("failed_break_entry")):   # a failed break IS the chart reversing (like a fade)
             try:
                 from .decision_justification import chart_opposes
                 if chart_opposes(choice.structures[0], _thesis):
