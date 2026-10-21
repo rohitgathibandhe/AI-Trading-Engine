@@ -63,6 +63,7 @@ def test_accepted_break_entry_buys_debit_when_selector_stands_aside(monkeypatch)
                                                              "valid": True, "two_sided": False}}}
     out = sel._accepted_break_entry(c, md, time(12, 20))
     assert out.structures == ["PUT_DEBIT_SPREAD"] and out.condition == "BREAKOUT_DOWN" and md["accepted_break_entry"]
+    assert out.executable_today
     md["trend_day"]["state"] = "TREND_UP"                            # never against a confirmed opposite trend day
     c2 = _choice("CHOP", "PUT_DEBIT_SPREAD"); c2.structures = []
     assert sel._accepted_break_entry(c2, md, time(12, 20)).structures == []

@@ -902,6 +902,7 @@ def _failed_break_entry(choice: StrategyChoice, metadata: dict[str, Any], now_ti
     metadata["failed_break_entry"] = fb.get("at")
     choice.condition = f"BREAKOUT_{side}"
     choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, [_ACC_DEBIT[side]]
+    choice.executable_today = True        # the stand-aside choice it replaces was flagged not executable
     choice.rationale = (choice.rationale or "") + (f" [FAILED BREAK -> {side}: the opening-range break failed at "
                                                    f"{str(fb.get('at'))[11:16]} (trap extreme {fb.get('trap_extreme')}) — "
                                                    f"buy the {_ACC_DEBIT[side]}]")
@@ -941,6 +942,7 @@ def _accepted_break_entry(choice: StrategyChoice, metadata: dict[str, Any], now_
     metadata["accepted_break_entry"] = ab.get("at")
     choice.condition = f"BREAKOUT_{side}"
     choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, [_ACC_DEBIT[side]]
+    choice.executable_today = True        # the stand-aside choice it replaces was flagged not executable
     choice.rationale = (choice.rationale or "") + (f" [ACCEPTED BREAK {side}: two closes beyond the opening range at "
                                                    f"{str(ab.get('at'))[11:16]}, close on the VWAP side — buy the {_ACC_DEBIT[side]}]")
     return choice
