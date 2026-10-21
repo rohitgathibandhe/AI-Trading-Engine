@@ -49,6 +49,27 @@ TWO_SIDED_RANGE = _os.environ.get("TD_TWO_SIDED_RANGE", "1") == "1"
 BREAK_ACCEPT_BARS = int(_os.environ.get("TD_BREAK_ACCEPT_BARS", "0") or 0)
 
 
+# RELEASE (TD_TWO_SIDED_RELEASE_X=x, default 0 = off): a two-sided session stops being a "range" once price closes
+# beyond the LATER-broken side by >= x * the opening-range size, on that side of VWAP — a failed break that reversed
+# into a trend. 2026-10-21: 09:30/09:35 closed above the 15m high, 10:05/10:10 below the low -> RANGE_TWO_SIDED all
+# day; every put debit (11:45, 14:25, 14:45) was vetoed while Nifty fell 150-400 pts below the range (-470 on the day).
+TWO_SIDED_RELEASE_X = float(_os.environ.get("TD_TWO_SIDED_RELEASE_X", "0") or 0)
+
+
+def _two_sided_released(bars: list[dict], post: list[dict], or_h: float, or_l: float) -> bool:
+    if TWO_SIDED_RELEASE_X <= 0 or not post:
+        return False
+    first_up = next((k for k, b in enumerate(post) if b["c"] > or_h), None)
+    first_dn = next((k for k, b in enumerate(post) if b["c"] < or_l), None)
+    if first_up is None or first_dn is None:
+        return False
+    last, vw = bars[-1], _vwap_series(bars)[-1]
+    ext = TWO_SIDED_RELEASE_X * max(or_h - or_l, 1.0)
+    if first_dn > first_up:                                  # down was the later break
+        return last["c"] <= or_l - ext and last["c"] < vw
+    return last["c"] >= or_h + ext and last["c"] > vw
+
+
 def _accepted(post: list[dict], beyond) -> bool:
     n = max(BREAK_ACCEPT_BARS, 1)
     run = 0
@@ -119,7 +140,8 @@ def trend_state(bars: list[dict], oi: dict | None = None) -> dict:
     if len(or_bars) < 3 or len(post) < VWAP_HOLD_BARS:
         return res
     or_h, or_l = max(b["h"] for b in or_bars), min(b["l"] for b in or_bars)
-    if TWO_SIDED_RANGE and _accepted(post, lambda b: b["c"] > or_h) and _accepted(post, lambda b: b["c"] < or_l):
+    if TWO_SIDED_RANGE and _accepted(post, lambda b: b["c"] > or_h) and _accepted(post, lambda b: b["c"] < or_l) \
+            and not _two_sided_released(bars, post, or_h, or_l):
         return {"state": "RANGE_TWO_SIDED", "since": None,
                 "checks": {"two_sided": True, "or_high": or_h, "or_low": or_l}}
     vw = _vwap_series(bars)
