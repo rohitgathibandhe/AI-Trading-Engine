@@ -510,6 +510,36 @@ def _select_debit_spread(
                 best_score = score
                 best = (long_q, short_q, width, debit, max_profit, rr)
 
+    # WIDTH FALLBACK (SEL_DEBIT_WIDTH_FALLBACK=1): more than ~4 days from expiry the 0.04-0.18-delta short sits 350-400pt
+    # from the ~0.45 long, beyond every allowed width, so NO debit is buildable (2026-10-21, DTE 6: the -470pt day's put
+    # debits were all NO_DEBIT_STRUCTURE; 07-08 x94). Allowing 300-400pt widths tested worse (bigger debits). Instead
+    # keep the validated widths and let the short leg's delta rise to 0.32.
+    if best is None and os.environ.get("SEL_DEBIT_WIDTH_FALLBACK", "0") == "1":
+        for long_q in quotes:
+            if long_q.delta is None or long_q.mid_price is None or not (long_band[0] <= abs(long_q.delta) <= long_band[1]):
+                continue
+            for short_q in quotes:
+                if short_q.delta is None or short_q.mid_price is None or not (0.04 <= abs(short_q.delta) <= 0.32):
+                    continue
+                if option_type == OptionType.CALL and short_q.strike <= long_q.strike:
+                    continue
+                if option_type == OptionType.PUT and short_q.strike >= long_q.strike:
+                    continue
+                width = abs(short_q.strike - long_q.strike)
+                if width not in widths or width > 250.0:
+                    continue
+                debit = long_q.mid_price - short_q.mid_price
+                if debit <= 0 or debit >= width * 0.70:
+                    continue
+                max_profit = width - debit
+                rr = max_profit / debit
+                score = rr - long_q.spread_ratio - short_q.spread_ratio
+                if score > best_score:
+                    best_score = score
+                    best = (long_q, short_q, width, debit, max_profit, rr)
+        if best is not None:
+            report["width_fallback"] = True
+
     if best is None:
         report["canonical_rejection_reason"] = "NO_DEBIT_STRUCTURE"
         return None, ["Debit spread: no long/short pair met delta/width/RR rules."], report
