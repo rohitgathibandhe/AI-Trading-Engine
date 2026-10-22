@@ -337,7 +337,8 @@ def mark_to_market_value_points(position: OpenPosition, quotes_by_leg: list[Stra
 
 # ── Debit-spread exit engine (mirror of the credit logic) ───────────────────
 DEBIT_TP_CAPTURE = float(os.environ.get("DEBIT_TP_CAPTURE", "0.60") or 0.60)   # take profit at this share of max profit (>1 = no fixed target; the spot trail exits)
-DEBIT_STOP_FRAC = 0.50        # stop when 50% of the debit is lost
+DEBIT_STOP_FRAC = float(os.environ.get("DEBIT_STOP_FRAC", "0.50") or 0.50)   # premium stop: share of the debit lost
+DEBIT_CHART_STOP = os.environ.get("DEBIT_CHART_STOP", "0") == "1"   # spot stop at the chart level (strategy_selector._set_chart_stop)
 DEBIT_MIN_HOLD = 10           # min minutes before the stop can fire (noise guard)
 # A neutral theta structure is entered when trend_efficiency < this (low follow-through = range-like).
 # Its RANGE_INVALIDATION exit must use the SAME bar, so it only fires when real follow-through returns
@@ -515,7 +516,14 @@ def _evaluate_debit_exit(
     if max_profit > 0 and profit_captured >= DEBIT_TP_CAPTURE * max_profit:
         return ExitDecision(True, "DEBIT_TARGET", value, pnl)
 
-    # Hard stop: lost >= 50% of the debit (after a short breathe)
+    # Chart stop: spot through the level that proves the trade wrong (no min hold — the level IS the invalidation)
+    _cs = (position.metadata or {}).get("chart_stop_spot")
+    if DEBIT_CHART_STOP and _cs and current_snapshot is not None and not position.metadata.get("is_fade"):
+        _sp = float(current_snapshot.option_chain.spot)
+        if (_sp >= float(_cs)) if position.structure.strategy == StrategyType.PUT_DEBIT_SPREAD else (_sp <= float(_cs)):
+            return ExitDecision(True, "DEBIT_CHART_STOP", value, pnl)
+
+    # Hard stop: lost >= DEBIT_STOP_FRAC of the debit (after a short breathe)
     if elapsed_minutes >= DEBIT_MIN_HOLD and value <= entry_debit * (1.0 - DEBIT_STOP_FRAC):
         return ExitDecision(True, "DEBIT_STOP", value, pnl)
 

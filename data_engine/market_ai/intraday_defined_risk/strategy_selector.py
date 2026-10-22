@@ -870,7 +870,40 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     choice = _trend_day_structure(choice, metadata, now_time)
     choice = _edge_only(choice, metadata, now_time)
     choice = _failed_break_entry(choice, metadata, now_time)
-    return _accepted_break_entry(choice, metadata, now_time)
+    choice = _accepted_break_entry(choice, metadata, now_time)
+    _set_chart_stop(choice, metadata, spot)
+    return choice
+
+
+# CHART STOP (DEBIT_CHART_STOP=1, see execution._evaluate_debit_exit): a directional debit's stop is WHERE THE CHART
+# SAYS THE TRADE IS WRONG — beyond the failed break's trap extreme, else beyond the last confirmed swing against
+# the trade — clamped to DEBIT_CHART_STOP_MIN..MAX pts from entry. 18-month autopsy (2026-10-22): the premium stop
+# (50% of debit lost) fired 65 times for -327,767 (avg -5,043 vs avg win +2,528); 19 of them with spot < 40 pts
+# against (theta/IV bleed), while other trades sat 130-220 pts against and were never stopped.
+_CHART_STOP_MIN = float(os.environ.get("DEBIT_CHART_STOP_MIN", "20") or 20)
+_CHART_STOP_MAX = float(os.environ.get("DEBIT_CHART_STOP_MAX", "80") or 80)
+_CHART_STOP_BUF = 5.0
+
+
+def _set_chart_stop(choice: StrategyChoice, metadata: dict[str, Any], spot: float) -> None:
+    metadata.pop("chart_stop_spot", None)
+    if not choice.structures or choice.structures[0] not in ("PUT_DEBIT_SPREAD", "CALL_DEBIT_SPREAD") \
+            or metadata.get("is_fade") or not spot:
+        return
+    td = metadata.get("trend_day") or {}
+    sw = td.get("swings") or {}
+    fb = td.get("failed_break") or {}
+    down = choice.structures[0] == "PUT_DEBIT_SPREAD"
+    lvl = None
+    if metadata.get("failed_break_entry") and fb.get("trap_extreme"):
+        lvl = float(fb["trap_extreme"])
+    elif down and sw.get("high") and float(sw["high"]) > spot:
+        lvl = float(sw["high"])
+    elif not down and sw.get("low") and float(sw["low"]) < spot:
+        lvl = float(sw["low"])
+    dist = (abs(lvl - spot) + _CHART_STOP_BUF) if lvl is not None else _CHART_STOP_MAX
+    dist = min(max(dist, _CHART_STOP_MIN), _CHART_STOP_MAX)
+    metadata["chart_stop_spot"] = round(spot + dist if down else spot - dist, 2)
 
 
 # FAILED-BREAK ENTRY (SEL_FAILED_BREAK=1): trade the reversal of a failed opening-range break (trend_day.failed_break),
