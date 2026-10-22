@@ -40,6 +40,37 @@ import requests
 STATE = Path(__file__).resolve().parents[1] / "data_engine" / "market_ai" / "state"
 CREDS = STATE / "creds.json"
 RUNNER_LOG = STATE / "intraday_v83_runner.log"
+HEARTBEAT = STATE / "intraday_v83_heartbeat.json"
+DECISIONS_LOG = STATE / "intraday_v83_paper_live_validation_decisions.jsonl"
+PAPER_STATE = STATE / "intraday_v83_paper_state.json"
+
+
+def _other_liveness_age(now) -> float | None:
+    """Seconds since the agent last proved it is looping: heartbeat file or the decision log. While it MANAGES an
+    open position the runner log carries no decision lines, which on 2026-10-22 read as STALE_DECISIONS from 10:42
+    and the watchdog restarted the agent twice mid-trade although the decision log never paused > 3 min."""
+    ages = []
+    try:
+        ts = json.loads(HEARTBEAT.read_text()).get("timestamp")
+        if ts:
+            ages.append((now - datetime.fromisoformat(str(ts)).replace(tzinfo=None)).total_seconds())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        last = _tail_lines(DECISIONS_LOG, 20_000)[-1]
+        ts = json.loads(last).get("timestamp")
+        if ts:
+            ages.append((now - datetime.fromisoformat(str(ts)).replace(tzinfo=None)).total_seconds())
+    except Exception:  # noqa: BLE001
+        pass
+    return min(ages) if ages else None
+
+
+def _position_open() -> bool:
+    try:
+        return bool(json.loads(PAPER_STATE.read_text()).get("active_position"))
+    except Exception:  # noqa: BLE001
+        return False
 HEAL_STATE = STATE / "self_heal_state.json"
 HEAL_LOG = STATE / "self_heal.jsonl"
 LABEL = "com.algoagent.intraday_v83"
@@ -190,7 +221,10 @@ def assess(now: datetime) -> dict:
             age = (now - datetime.fromisoformat(str(newest_em)).replace(tzinfo=None)).total_seconds()
             detail["decision_age_secs"] = round(age)
             if age > STALE_DECISION_SECS:
-                return {"healthy": False, "reason": "STALE_DECISIONS", "detail": detail}
+                other = _other_liveness_age(now)
+                detail["liveness_age_secs"] = None if other is None else round(other)
+                if other is None or other > STALE_DECISION_SECS:
+                    return {"healthy": False, "reason": "STALE_DECISIONS", "detail": detail}
         except Exception:  # noqa: BLE001
             pass
 
@@ -328,6 +362,14 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             cooldown_ok = True
 
+    if consec >= 2 and cooldown_ok and _position_open():
+        # never restart under an open position (a restart mid-trade risks the position's management state)
+        if not state.get("position_alerted"):
+            _alert(f"⚠️ SELF-HEAL: {result['reason']} while a POSITION IS OPEN — NOT restarting. Check the agent.")
+            state["position_alerted"] = True
+        _save_state(state)
+        _log({**base, "action": "NO_RESTART_POSITION_OPEN"})
+        return 0
     if consec >= 2 and cooldown_ok:
         ok = _restart_agent()
         state["last_restart_ts"] = now.isoformat()
