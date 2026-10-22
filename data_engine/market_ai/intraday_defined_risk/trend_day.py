@@ -197,6 +197,19 @@ def accepted_break(bars: list[dict]) -> dict | None:
             "two_sided": len(first) == 2, "or_high": or_h, "or_low": or_l}
 
 
+def last_swings(bars: list[dict]) -> dict:
+    """Last CONFIRMED 5m swing high / low (a bar whose high/low beats the two bars either side), for chart stops."""
+    hi = lo = None
+    for k in range(2, len(bars) - 2):
+        b = bars[k]
+        if b["h"] >= max(bars[k - 2]["h"], bars[k - 1]["h"], bars[k + 1]["h"], bars[k + 2]["h"]):
+            hi = b["h"]
+        if b["l"] <= min(bars[k - 2]["l"], bars[k - 1]["l"], bars[k + 1]["l"], bars[k + 2]["l"]):
+            lo = b["l"]
+    return {"high": hi, "low": lo, "day_high": max((b["h"] for b in bars), default=None),
+            "day_low": min((b["l"] for b in bars), default=None)}
+
+
 def failed_break(bars: list[dict]) -> dict | None:
     """FAILED OPENING-RANGE BREAK (a trap) on COMPLETED bars: a close beyond one side of the 15-min opening range, then a
     later close back INSIDE the range and on the other side of VWAP. Trade the reversal. 2026-10-21: 09:30/09:35 closed
@@ -307,4 +320,4 @@ def evaluate(bars: Sequence[Any], now: datetime, oi: dict | None = None,
         tg = dict(tg, at=tg["at"].isoformat())
     return {"state": st["state"], "since": st["since"].isoformat() if st["since"] else None,
             "checks": st["checks"], "trigger": tg, "accepted_break": accepted_break(cb),
-            "failed_break": failed_break(cb)}
+            "failed_break": failed_break(cb), "swings": last_swings(cb)}

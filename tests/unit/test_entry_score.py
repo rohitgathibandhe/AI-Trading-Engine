@@ -67,3 +67,13 @@ def test_accepted_break_entry_buys_debit_when_selector_stands_aside(monkeypatch)
     md["trend_day"]["state"] = "TREND_UP"                            # never against a confirmed opposite trend day
     c2 = _choice("CHOP", "PUT_DEBIT_SPREAD"); c2.structures = []
     assert sel._accepted_break_entry(c2, md, time(12, 20)).structures == []
+
+
+def test_chart_stop_uses_trap_extreme_and_clamps():
+    c = _choice("BREAKOUT_DOWN", "PUT_DEBIT_SPREAD")
+    md = {"failed_break_entry": "x", "trend_day": {"failed_break": {"trap_extreme": 23121}, "swings": {}}}
+    sel._set_chart_stop(c, md, 23069)
+    assert md["chart_stop_spot"] == 23069 + 57          # 52 to the trap high + 5 buffer
+    md = {"trend_day": {"swings": {"low": 22000}}}
+    sel._set_chart_stop(_choice("BREAKOUT_UP", "CALL_DEBIT_SPREAD"), md, 22500)
+    assert md["chart_stop_spot"] == 22500 - sel._CHART_STOP_MAX
