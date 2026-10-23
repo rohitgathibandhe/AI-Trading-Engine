@@ -46,3 +46,16 @@ def test_failed_break_up_trap_gives_down_reversal():
     bars = [{"t": t0 + timedelta(minutes=5 * k), "o": c, "h": c + 3, "l": c - 3, "c": c, "v": 0} for k, c in enumerate(closes)]
     fb = td.failed_break(bars)
     assert fb["dir"] == "DOWN" and fb["valid"] and fb["trap_extreme"] == 113
+
+
+def test_fib_pullback_long_into_618_zone():
+    from datetime import datetime, timedelta
+    from market_ai.intraday_defined_risk import trend_day as td
+    t0 = datetime(2026, 10, 23, 9, 15)
+    # OR, then impulse 1000 -> 1100, pullback to ~1035 (61.8-68% zone 1032-1038), strong green close off it
+    seq = [(1000, 1003, 997, 1001)] * 3 + [(1001, 1021, 1000, 1020), (1020, 1051, 1019, 1050), (1050, 1081, 1049, 1080),
+          (1080, 1101, 1079, 1100), (1100, 1101, 1070, 1072), (1072, 1074, 1040, 1042), (1042, 1044, 1033, 1036),
+          (1036, 1056, 1035, 1055)]
+    bars = [{"t": t0 + timedelta(minutes=5 * k), "o": o, "h": h, "l": l, "c": c, "v": 0} for k, (o, h, l, c) in enumerate(seq)]
+    f = td.fib_pullback(bars)
+    assert f and f["dir"] == "UP" and f["zone"][0] <= 1036 <= f["zone"][1] + 5

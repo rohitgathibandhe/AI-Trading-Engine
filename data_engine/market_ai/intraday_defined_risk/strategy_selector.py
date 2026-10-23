@@ -871,8 +871,91 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     choice = _edge_only(choice, metadata, now_time)
     choice = _failed_break_entry(choice, metadata, now_time)
     choice = _accepted_break_entry(choice, metadata, now_time)
+    choice = _prev_day_break_entry(choice, metadata, now_time)
+    choice = _fib_wall_entry(choice, metadata, now_time)
     _set_chart_stop(choice, metadata, spot)
     return choice
+
+
+def _strong(bar: dict | None, up: bool) -> bool:
+    if not bar:
+        return False
+    rng = max(float(bar["h"]) - float(bar["l"]), 0.5)
+    body = (float(bar["c"]) - float(bar["o"])) * (1 if up else -1) / rng
+    pos = ((float(bar["c"]) - float(bar["l"])) if up else (float(bar["h"]) - float(bar["c"]))) / rng
+    return body >= 0.5 and pos >= 0.7
+
+
+def _new_entry_ok(side: str, td: dict, now_time) -> bool:
+    if str(td.get("state") or "") == ("TREND_DOWN" if side == "UP" else "TREND_UP"):
+        return False
+    if now_time is not None and not (time(9, 35) <= now_time <= time(14, 30)):
+        return False
+    if _DEBIT_BLACKOUT is not None and now_time is not None and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1]:
+        return False
+    return True
+
+
+def _take(choice: StrategyChoice, metadata: dict[str, Any], side: str, tag: str, why: str) -> StrategyChoice:
+    for k in ("seller_exit", "conf_bull_sell_closer", "is_fade"):
+        metadata.pop(k, None)
+    metadata[tag] = True
+    choice.condition = f"BREAKOUT_{side}"
+    choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, [_ACC_DEBIT[side]]
+    choice.executable_today = True
+    choice.rationale = (choice.rationale or "") + f" [{why}]"
+    return choice
+
+
+# PREVIOUS-DAY HIGH/LOW BREAK (SEL_PDL_BREAK=1): a STRONG closed 5m candle crossing yesterday's high (low) — previous
+# close on the other side — on the VWAP side of the break, buys the debit in the break direction. Stop: back across the level.
+def _prev_day_break_entry(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> StrategyChoice:
+    if os.environ.get("SEL_PDL_BREAK", "0") != "1" or choice.structures:
+        return choice
+    pd = metadata.get("prev_day") or {}
+    td = metadata.get("trend_day") or {}
+    lb, pb = td.get("last_bar"), td.get("prev_close_bar")
+    pvw = metadata.get("price_vs_vwap")
+    if not pd or not lb or not pb:
+        return choice
+    for side, lvl in (("UP", pd.get("h")), ("DOWN", pd.get("l"))):
+        if lvl is None:
+            continue
+        lvl = float(lvl)
+        up = side == "UP"
+        crossed = (float(lb["c"]) > lvl >= float(pb["c"])) if up else (float(lb["c"]) < lvl <= float(pb["c"]))
+        vw_ok = pvw is None or ((float(pvw) > 0) if up else (float(pvw) < 0))
+        if crossed and vw_ok and _strong(lb, up) and _new_entry_ok(side, td, now_time):
+            metadata["level_stop_spot"] = lvl
+            return _take(choice, metadata, side, "pd_break_entry",
+                         f"PREV-DAY {'HIGH' if up else 'LOW'} {lvl:.0f} broken on a strong close — buy the {_ACC_DEBIT[side]}")
+    return choice
+
+
+# FIB 61.8-68% + OI WALL (SEL_FIB_WALL=1): trend_day.fib_pullback fired (strong candle off the 61.8-68% zone of an
+# impulse) AND the defending OI wall (put wall for a long, call wall for a short) sits within SEL_FIB_WALL_PTS of the
+# zone. Stop: beyond the 78.6% level.
+def _fib_wall_entry(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> StrategyChoice:
+    if os.environ.get("SEL_FIB_WALL", "0") != "1" or choice.structures:
+        return choice
+    td = metadata.get("trend_day") or {}
+    fb = td.get("fib") or {}
+    side = fb.get("dir")
+    if not side or not _new_entry_ok(side, td, now_time):
+        return choice
+    wall = (metadata.get("multi_session_put_wall") or metadata.get("current_put_wall")) if side == "UP" else \
+           (metadata.get("multi_session_call_wall") or metadata.get("current_call_wall"))
+    tol = float(os.environ.get("SEL_FIB_WALL_PTS", "30") or 30)
+    lo, hi = fb["zone"]
+    try:
+        near = wall is not None and (float(lo) - tol) <= float(wall) <= (float(hi) + tol)
+    except (TypeError, ValueError):
+        near = False
+    if not near:
+        return choice
+    metadata["level_stop_spot"] = float(fb["inval"])
+    return _take(choice, metadata, side, "fib_wall_entry",
+                 f"FIB 61.8-68% ZONE {lo:.0f}-{hi:.0f} + OI wall {float(wall):.0f} — strong candle off the zone, buy the {_ACC_DEBIT[side]}")
 
 
 # CHART STOP (DEBIT_CHART_STOP=1, see execution._evaluate_debit_exit): a directional debit's stop is WHERE THE CHART
@@ -887,6 +970,8 @@ _CHART_STOP_BUF = 5.0
 
 def _set_chart_stop(choice: StrategyChoice, metadata: dict[str, Any], spot: float) -> None:
     metadata.pop("chart_stop_spot", None)
+    if not (metadata.get("pd_break_entry") or metadata.get("fib_wall_entry")):
+        metadata.pop("level_stop_spot", None)
     if not choice.structures or choice.structures[0] not in ("PUT_DEBIT_SPREAD", "CALL_DEBIT_SPREAD") \
             or metadata.get("is_fade") or not spot:
         return
@@ -895,7 +980,9 @@ def _set_chart_stop(choice: StrategyChoice, metadata: dict[str, Any], spot: floa
     fb = td.get("failed_break") or {}
     down = choice.structures[0] == "PUT_DEBIT_SPREAD"
     lvl = None
-    if metadata.get("failed_break_entry") and fb.get("trap_extreme"):
+    if metadata.get("level_stop_spot") and (metadata.get("pd_break_entry") or metadata.get("fib_wall_entry")):
+        lvl = float(metadata["level_stop_spot"])
+    elif metadata.get("failed_break_entry") and fb.get("trap_extreme"):
         lvl = float(fb["trap_extreme"])
     elif down and sw.get("high") and float(sw["high"]) > spot:
         lvl = float(sw["high"])
