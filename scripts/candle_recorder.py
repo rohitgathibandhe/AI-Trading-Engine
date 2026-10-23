@@ -8,11 +8,14 @@ Before the recorder started, the morning is approximated from the option-chain r
 ~5 min: O=prev spot, C=spot, H/L=max/min of the two) and marked approx in a side file. Exits by itself as soon as the
 real chart endpoint answers again (so it never overwrites real candles) or after 15:31.
 
-  PYTHONPATH=data_engine python scripts/candle_recorder.py
+  PYTHONPATH=data_engine python scripts/candle_recorder.py              (fallback mode: exits when charts recover)
+  PYTHONPATH=data_engine python scripts/candle_recorder.py --standing   (daily from 09:13 via launchd: records LTP
+      ticks all session so the opening range is exact; writes candles only while the chart API fails)
 """
 from __future__ import annotations
 
 import json
+import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -92,13 +95,19 @@ def main():
     (STATE / f"candle_cache_{day}_APPROX_UNTIL.txt").write_text(first_tick.isoformat())
     last_check = 0.0
     print(f"recorder start {datetime.now():%H:%M:%S}; seed points {len(seed)}", flush=True)
+    standing = "--standing" in sys.argv          # daily mode: always record ticks, write candles only while charts fail
+    chart_down = not standing
     while datetime.now().strftime("%H%M") <= "1531":
         if time.time() - last_check > 60:
             last_check = time.time()
             try:
-                if _chart_ok(h, day):
+                ok = _chart_ok(h, day)
+                if ok and not standing:
                     print(f"{datetime.now():%H:%M:%S} Dhan chart endpoint is back — recorder exits", flush=True)
                     return
+                if ok != (not chart_down):
+                    print(f"{datetime.now():%H:%M:%S} Dhan chart endpoint {'OK' if ok else 'FAILING — writing fallback candles'}", flush=True)
+                chart_down = not ok
             except Exception:  # noqa: BLE001
                 pass
         try:
@@ -109,9 +118,10 @@ def main():
                 f.write(json.dumps({"t": now.isoformat(), "p": p}) + "\n")
         except Exception as e:  # noqa: BLE001
             print(f"ltp fail {e}", flush=True)
-        pts = [x for x in seed if x[0] < first_tick] + ticks
-        for m in (5, 15):
-            (STATE / f"candle_cache_{day}_{m}m.json").write_text(json.dumps(_bars(pts, m)))
+        if chart_down:
+            pts = [x for x in seed if x[0] < first_tick] + ticks
+            for m in (5, 15):
+                (STATE / f"candle_cache_{day}_{m}m.json").write_text(json.dumps(_bars(pts, m)))
         time.sleep(POLL_S)
 
 
