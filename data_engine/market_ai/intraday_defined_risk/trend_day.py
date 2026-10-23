@@ -210,6 +210,55 @@ def last_swings(bars: list[dict]) -> dict:
             "day_low": min((b["l"] for b in bars), default=None)}
 
 
+def fib_pullback(bars: list[dict], min_impulse: float = 80.0) -> dict | None:
+    """Owner's setup: after an impulse leg (>= min_impulse pts), price pulls back into the 61.8-68% retracement zone
+    and the LAST CLOSED candle is a strong candle off the zone in the impulse direction. Invalid if price closed
+    beyond the 78.6% level. {'dir': 'UP'|'DOWN', 'zone': (lo, hi), 'inval', 'impulse': (from, to), 'bars_since_touch'}"""
+    post = [b for b in bars if b["t"].time() >= OR_END]
+    if len(post) < 6:
+        return None
+    last = post[-1]
+    rng = max(last["h"] - last["l"], 0.5)
+    out = None
+    for up in (True, False):
+        if up:      # impulse UP: lowest low, then highest high after it
+            i0 = min(range(len(post) - 1), key=lambda k: post[k]["l"])
+            if i0 >= len(post) - 3:
+                continue
+            i1 = max(range(i0, len(post) - 1), key=lambda k: post[k]["h"])
+            a, z = post[i0]["l"], post[i1]["h"]
+        else:
+            i0 = max(range(len(post) - 1), key=lambda k: post[k]["h"])
+            if i0 >= len(post) - 3:
+                continue
+            i1 = min(range(i0, len(post) - 1), key=lambda k: post[k]["l"])
+            a, z = post[i0]["h"], post[i1]["l"]
+        imp = abs(z - a)
+        if imp < min_impulse or i1 >= len(post) - 1:
+            continue
+        lvl = (lambda f: z - f * (z - a))
+        z618, z68, z786 = lvl(0.618), lvl(0.68), lvl(0.786)
+        lo, hi = min(z618, z68), max(z618, z68)
+        after = post[i1 + 1:]
+        if up:
+            if any(b["c"] < z786 for b in after):
+                continue
+            touch = [k for k, b in enumerate(after) if b["l"] <= hi]
+            strong = (last["c"] - last["o"]) / rng >= 0.5 and (last["c"] - last["l"]) / rng >= 0.7 and last["c"] > hi
+        else:
+            if any(b["c"] > z786 for b in after):
+                continue
+            touch = [k for k, b in enumerate(after) if b["h"] >= lo]
+            strong = (last["o"] - last["c"]) / rng >= 0.5 and (last["h"] - last["c"]) / rng >= 0.7 and last["c"] < lo
+        if not touch:
+            continue
+        since = len(after) - 1 - touch[-1]
+        if strong and since <= 3:
+            out = {"dir": "UP" if up else "DOWN", "zone": (round(lo, 2), round(hi, 2)), "inval": round(z786, 2),
+                   "impulse": (round(a, 2), round(z, 2)), "bars_since_touch": since, "at": last["t"].isoformat()}
+    return out
+
+
 def failed_break(bars: list[dict]) -> dict | None:
     """FAILED OPENING-RANGE BREAK (a trap) on COMPLETED bars: a close beyond one side of the 15-min opening range, then a
     later close back INSIDE the range and on the other side of VWAP. Trade the reversal. 2026-10-21: 09:30/09:35 closed
@@ -320,4 +369,7 @@ def evaluate(bars: Sequence[Any], now: datetime, oi: dict | None = None,
         tg = dict(tg, at=tg["at"].isoformat())
     return {"state": st["state"], "since": st["since"].isoformat() if st["since"] else None,
             "checks": st["checks"], "trigger": tg, "accepted_break": accepted_break(cb),
-            "failed_break": failed_break(cb), "swings": last_swings(cb)}
+            "failed_break": failed_break(cb), "swings": last_swings(cb),
+            "last_bar": ({k: cb[-1][k] for k in ("o", "h", "l", "c")} if cb else None),
+            "prev_close_bar": ({k: cb[-2][k] for k in ("o", "h", "l", "c")} if len(cb) > 1 else None),
+            "fib": fib_pullback(cb)}

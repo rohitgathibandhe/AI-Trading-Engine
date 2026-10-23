@@ -3187,6 +3187,14 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                                                     daily=_daily.bars if _daily is not None else None)
     except Exception:  # noqa: BLE001
         metadata["entry_score"] = {}
+    # PREVIOUS-DAY LEVELS (high / low / close of the last completed session) for PDH/PDL breaks and stops
+    try:
+        _pd = [b for b in ((getattr(snapshot, "nifty_daily", None) or None) and snapshot.nifty_daily.bars or [])
+               if b.timestamp.date() < snapshot.timestamp.date()]
+        metadata["prev_day"] = ({"h": float(_pd[-1].high), "l": float(_pd[-1].low), "c": float(_pd[-1].close),
+                                 "date": _pd[-1].timestamp.date().isoformat()} if _pd else None)
+    except Exception:  # noqa: BLE001
+        metadata["prev_day"] = None
     metadata["higher_low_confirmed"] = higher_low_confirmed
     metadata["lower_high_confirmed"] = lower_high_confirmed
     if bool(metadata.get("higher_lows_5m")) and bool(metadata.get("higher_highs_5m")):
