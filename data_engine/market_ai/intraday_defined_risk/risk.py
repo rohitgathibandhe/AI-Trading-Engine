@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import math
 from pathlib import Path
 
@@ -28,7 +29,8 @@ def _compute_kelly_lot_cap(playbook: str, base_lots: int, max_lots: int) -> int:
     try:
         data = json.loads(perf_path.read_text())
         stats = data.get("performance", {}).get(playbook)
-        if stats is None or int(stats.get("samples", 0)) < 5:
+        # 5 samples (and a last-5 loss average) is noise: on 2026-10-22 one -4,987 trade cut every BREAKOUT_UP to ~15% size.
+        if stats is None or int(stats.get("samples", 0)) < int(os.environ.get("KELLY_MIN_SAMPLES", "30") or 30):
             return base_lots
         win_rate = float(stats.get("win_rate", 0.5))
         avg_mfe = float(stats.get("avg_mfe", 0.0))
