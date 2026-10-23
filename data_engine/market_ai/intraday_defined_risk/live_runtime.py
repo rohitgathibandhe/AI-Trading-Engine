@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -92,6 +93,17 @@ def _candle_to_bar(row: dict[str, Any]) -> OhlcvBar | None:
         close=close,
         volume=_as_float(row.get("volume")),
     )
+
+
+def _closed_only(bars: list[OhlcvBar], interval_min: int, now: datetime) -> list[OhlcvBar]:
+    """Only candles whose window has CLOSED at `now`. Dhan's intraday endpoint also returns the still-forming candle
+    (2026-10-22: the cache written at 14:27:54 held the 14:25 bar), so the live agent read a half-built candle's current
+    price as a "close" — while every replay/validation serves closed candles only (replay_provider). LIVE_CLOSED_CANDLES=0
+    restores the old behaviour."""
+    if os.environ.get("LIVE_CLOSED_CANDLES", "1") != "1":
+        return bars
+    cut = now.replace(tzinfo=None)
+    return [b for b in bars if b.timestamp.replace(tzinfo=None) + timedelta(minutes=interval_min) <= cut]
 
 
 def _bars_from_candles(candles: list[dict[str, Any]]) -> list[OhlcvBar]:
@@ -445,8 +457,8 @@ class DhanLiveMarketDataProvider:
     def current_snapshot(self) -> MarketSnapshot:
         now = _now_ist_naive()
         today = now.date()
-        bars_5m = self._candles(interval=5, today=today)
-        bars_15m = self._candles(interval=15, today=today)
+        bars_5m = _closed_only(self._candles(interval=5, today=today), 5, now)
+        bars_15m = _closed_only(self._candles(interval=15, today=today), 15, now)
         bars_daily = self._daily_candles(today)
         if len(bars_5m) < self.min_5m_candles:
             self._raise_insufficient(
