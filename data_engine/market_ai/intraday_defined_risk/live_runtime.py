@@ -391,8 +391,13 @@ class DhanLiveMarketDataProvider:
                 self._candle_mem_cache[cache_key] = bars
                 self._save_candle_disk(interval, today, bars)
             return bars
-        # Fetch returned empty — try in-memory cache first
+        # Fetch returned empty — prefer the disk cache when it holds MORE bars than memory: an external fallback recorder
+        # (scripts/candle_recorder.py, used when Dhan's chart API fails — 2026-10-23 DH-905) keeps extending it.
         cached = self._candle_mem_cache.get(cache_key)
+        _disk = self._load_candle_disk(interval, today)
+        if _disk and len(_disk) > len(cached or []):
+            self._candle_mem_cache[cache_key] = _disk
+            return _disk
         if cached:
             logging.getLogger("intraday_defined_risk.v83").warning(
                 "[candles] live fetch returned 0 bars for %dm; using %d cached bars from memory",
