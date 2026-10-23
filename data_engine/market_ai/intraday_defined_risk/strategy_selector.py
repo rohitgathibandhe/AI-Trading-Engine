@@ -1020,6 +1020,22 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
         choice.rationale = (choice.rationale or "") + (f" [EDGE-ONLY: {choice.condition} {first} has no proven net edge"
                                                        + (" (debit blackout window)" if ok else "") + " — stand aside]")
         return choice
+    # STRONG-CANDLE BREAKOUT (SEL_STRONG_CANDLE=1): the last CLOSED 5m candle must be a strong candle in the breakout
+    # direction (body >= 50% of its range, close in the outer 30%). A doji / rejection-wick candle is not a breakout.
+    if os.environ.get("SEL_STRONG_CANDLE", "0") == "1":
+        _lb = (metadata.get("trend_day") or {}).get("last_bar") or {}
+        try:
+            _rng = max(float(_lb["h"]) - float(_lb["l"]), 0.5)
+            _up = want[0] == "CALL_DEBIT_SPREAD"
+            _body = (float(_lb["c"]) - float(_lb["o"])) * (1 if _up else -1) / _rng
+            _pos = ((float(_lb["c"]) - float(_lb["l"])) if _up else (float(_lb["h"]) - float(_lb["c"]))) / _rng
+            if _body < 0.5 or _pos < 0.7:
+                metadata["edge_only_skip"] = f"{choice.condition}/{first} weak candle (body {_body:.2f}, close pos {_pos:.2f})"
+                choice.family, choice.structures = FAM_STAND_ASIDE, []
+                choice.rationale = (choice.rationale or "") + " [WEAK BREAKOUT CANDLE — wait for a strong close]"
+                return choice
+        except (KeyError, TypeError, ValueError):
+            pass
     if first != want[0]:
         for k in ("seller_exit", "conf_bull_sell_closer", "is_fade"):
             metadata.pop(k, None)

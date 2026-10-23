@@ -320,4 +320,5 @@ def evaluate(bars: Sequence[Any], now: datetime, oi: dict | None = None,
         tg = dict(tg, at=tg["at"].isoformat())
     return {"state": st["state"], "since": st["since"].isoformat() if st["since"] else None,
             "checks": st["checks"], "trigger": tg, "accepted_break": accepted_break(cb),
-            "failed_break": failed_break(cb), "swings": last_swings(cb)}
+            "failed_break": failed_break(cb), "swings": last_swings(cb),
+            "last_bar": ({k: cb[-1][k] for k in ("o", "h", "l", "c")} if cb else None)}
