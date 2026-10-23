@@ -1084,6 +1084,18 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
         return choice
     want = _EDGE_MAP.get(str(choice.condition or ""))
     first = choice.structures[0]
+    # TREND-DAY ACCEPT (SEL_EDGE_TREND_DAY=1): on a CONFIRMED trend day (trend_day state TREND_UP/DOWN) a debit in the
+    # trend direction is accepted whatever the classifier's label (CHOP / STRONG_TREND / ZONE). 2026-10-23: TREND_DOWN
+    # from 10:00, put debit chosen at 10:40/10:45/11:00/11:45 but rejected as "CHOP/STRONG_TREND has no proven edge";
+    # entered only at 11:50 after ~300 of the 415 pts. Same on 07-08.
+    _tds = str((metadata.get("trend_day") or {}).get("state") or "")
+    _td_want = {"TREND_DOWN": ("PUT_DEBIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD"),
+                "TREND_UP": ("CALL_DEBIT_SPREAD", "BULL_PUT_CREDIT_SPREAD")}.get(_tds)
+    _td_accept = False
+    if os.environ.get("SEL_EDGE_TREND_DAY", "0") == "1" and _td_want and first in _td_want and \
+            (want is None or first not in want):
+        want, _td_accept = _td_want, True
+        metadata["edge_trend_day_accept"] = _tds
     ok = want is not None and first in want
     # A breakout on a session that has already broken BOTH sides of the opening range is a range-day fake-out:
     # real chains, edge-only replay — breakout debits on two-sided days 6 trades -16,786 net vs trend days +25,384.
@@ -1101,6 +1113,9 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
             metadata["entry_score_skip"] = True
     in_blackout = (_DEBIT_BLACKOUT is not None and now_time is not None
                    and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1])
+    if in_blackout and os.environ.get("SEL_TREND_DAY_NO_BLACKOUT", "0") == "1" and _tds in ("TREND_UP", "TREND_DOWN") \
+            and want is not None and _td_want is not None and want[0] == _td_want[0]:
+        in_blackout = False                    # a confirmed trend day does not wait out the 10:00-10:30 window
     if not ok or in_blackout:
         metadata["edge_only_skip"] = f"{choice.condition}/{first}"
         choice.family, choice.structures = FAM_STAND_ASIDE, []
