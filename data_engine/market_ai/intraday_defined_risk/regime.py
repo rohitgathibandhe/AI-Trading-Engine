@@ -1215,6 +1215,10 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
 
     rv30_pct = realized_volatility_pct(bars_5m)
     or_length = adaptive_or_length_minutes(rv30_pct, params.rv_high_cutoff, params.rv_mid_cutoff)
+    # FIXED OR (OR_FIXED_MIN=15): on volatile days the adaptive 30/45-min range hid the breakout until 09:45-10:00, after
+    # which the 10:00-10:30 debit blackout delayed entry to 10:30+ (entry-lag study 2026-10-24: median 45 min late).
+    if int(os.environ.get("OR_FIXED_MIN", "0") or 0) in (15, 30, 45):
+        or_length = int(os.environ["OR_FIXED_MIN"])
     opening_range = None
     if snapshot.or_levels and or_length in snapshot.or_levels:
         opening_range = snapshot.or_levels[or_length]
