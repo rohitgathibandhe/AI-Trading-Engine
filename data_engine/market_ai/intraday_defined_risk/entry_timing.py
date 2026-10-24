@@ -148,6 +148,13 @@ def should_wait(strategy_name: str, spot: float, now: datetime) -> tuple[bool, s
             _why = "thesis confirmed" if is_seller else "better price"
             return False, (f"ENTRY_WAIT_FILLED: spot {spot:,.0f} reached {target:,.0f} "
                            f"after {waited:.0f}m — entering ({_why})")
+        # CONTINUATION (ENTRY_CONTINUATION_PTS>0): the move kept going past the signal instead of pulling back — the
+        # trend is not waiting, enter now (owner 2026-10-24: "every time we can't wait, the movement already happened").
+        _cont = float(os.environ.get("ENTRY_CONTINUATION_PTS", "0") or 0)
+        if _cont > 0 and ((spot <= s0 - _cont) if direction > 0 else (spot >= s0 + _cont)):
+            clear()
+            return False, (f"ENTRY_WAIT_CONTINUATION: spot {spot:,.0f} moved {_cont:.0f}+ pts past the signal "
+                           f"{s0:,.0f} — trend not pulling back, entering")
         if waited >= _TIMEOUT_MIN:
             clear()
             return False, (f"ENTRY_WAIT_TIMEOUT: no {abs(target - s0):.0f}pt retrace in "
