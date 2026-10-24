@@ -563,6 +563,14 @@ def _evaluate_debit_exit(
         if pnl <= floor_pnl_rs:
             return ExitDecision(True, 'DEBIT_RS_TRAIL', value, pnl)
 
+    # PEAK LOCK (DEBIT_PEAK_LOCK_RS>0): once the trade has been up >= DEBIT_PEAK_LOCK_RS, never let it fall below
+    # DEBIT_PEAK_LOCK_FRAC of its best P&L. A runner keeps raising its peak and is never cut by this; it only protects
+    # profit already made. 2026-10-23: peak +3,035, exit +702 (23% kept) on a 44-pt bounce late in a 415-pt fall.
+    _pl_arm = float(os.environ.get("DEBIT_PEAK_LOCK_RS", "0") or 0)
+    if _pl_arm > 0 and not position.metadata.get("is_fade") and peak_pnl_rs >= _pl_arm:
+        if pnl <= float(os.environ.get("DEBIT_PEAK_LOCK_FRAC", "0.5") or 0.5) * peak_pnl_rs:
+            return ExitDecision(True, "DEBIT_PEAK_LOCK", value, pnl)
+
     # Profit trail: once armed at 40% of max profit, exit on a 35% giveback of peak
     peak = max(float(position.metadata.get("debit_peak_value") or entry_debit), value)
     position.metadata["debit_peak_value"] = peak
