@@ -1169,6 +1169,32 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
                 return choice
         except (KeyError, TypeError, ValueError):
             pass
+    # CHART-READ MISTAKES (18-month chart-read study 2026-10-26, 446 entries): entering on a REJECTION-wick candle
+    # against the trade (12 trades, avg -2,351) and with < 30 pts of room to the previous-day level ahead (30, -246 avg)
+    # were the only reading errors that lost money. SEL_NO_REJECTION=1 / SEL_MIN_ROOM_PTS=<pts>.
+    _lb2 = (metadata.get("trend_day") or {}).get("last_bar") or {}
+    _upx = want[0] == "CALL_DEBIT_SPREAD"
+    try:
+        if os.environ.get("SEL_NO_REJECTION", "0") == "1" and _lb2:
+            _r2 = max(float(_lb2["h"]) - float(_lb2["l"]), 0.5)
+            _wk = ((float(_lb2["h"]) - max(float(_lb2["c"]), float(_lb2["o"]))) if _upx
+                   else (min(float(_lb2["c"]), float(_lb2["o"])) - float(_lb2["l"]))) / _r2
+            if _wk >= 0.45:
+                metadata["edge_only_skip"] = f"{choice.condition}/{first} rejection wick {_wk:.2f}"
+                choice.family, choice.structures = FAM_STAND_ASIDE, []
+                choice.rationale = (choice.rationale or "") + " [REJECTION CANDLE against the trade — stand aside]"
+                return choice
+        _room_min = float(os.environ.get("SEL_MIN_ROOM_PTS", "0") or 0)
+        _pd = metadata.get("prev_day") or {}
+        if _room_min > 0 and _pd and _lb2:
+            _room = (float(_pd["h"]) - float(_lb2["c"])) if _upx else (float(_lb2["c"]) - float(_pd["l"]))
+            if 0 <= _room < _room_min:
+                metadata["edge_only_skip"] = f"{choice.condition}/{first} no room {_room:.0f} to prev-day level"
+                choice.family, choice.structures = FAM_STAND_ASIDE, []
+                choice.rationale = (choice.rationale or "") + f" [NO ROOM: {_room:.0f} pts to the previous-day level — stand aside]"
+                return choice
+    except (KeyError, TypeError, ValueError):
+        pass
     if first != want[0]:
         for k in ("seller_exit", "conf_bull_sell_closer", "is_fade"):
             metadata.pop(k, None)
