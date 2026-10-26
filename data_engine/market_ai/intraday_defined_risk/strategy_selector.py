@@ -1195,7 +1195,8 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
         return choice
     # STRONG-CANDLE BREAKOUT (SEL_STRONG_CANDLE=1): the last CLOSED 5m candle must be a strong candle in the breakout
     # direction (body >= 50% of its range, close in the outer 30%). A doji / rejection-wick candle is not a breakout.
-    if os.environ.get("SEL_STRONG_CANDLE", "0") == "1":
+    if os.environ.get("SEL_STRONG_CANDLE", "0") == "1" and not (
+            _td_accept and os.environ.get("SEL_STRONG_CANDLE_BREAKOUT_ONLY", "0") == "1"):
         _lb = (metadata.get("trend_day") or {}).get("last_bar") or {}
         try:
             _rng = max(float(_lb["h"]) - float(_lb["l"]), 0.5)
