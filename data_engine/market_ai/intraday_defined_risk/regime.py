@@ -395,6 +395,19 @@ def _opening_range_break_state(
         return "UP"
     if below_count >= 2 and (vwap is None or last.close < vwap):
         return "DOWN"
+    # ONE STRONG CLOSE (ORB_STRONG_SINGLE=1): a single STRONG, above-normal-size candle closing beyond the range counts as
+    # the break — 2026-10-26: the 09:50 candle (+90, full body, ~3x normal) closed above the OR high but the 2nd close
+    # came at 10:00, inside the 10:00-10:30 debit blackout, and the +300 pt reversal was missed.
+    if os.environ.get("ORB_STRONG_SINGLE", "0") == "1" and len(bars) >= 13:
+        rng = max(last.high - last.low, 0.5)
+        avg = sum(b.high - b.low for b in bars[-13:-1]) / 12
+        big = rng >= float(os.environ.get("ORB_STRONG_SIZE", "1.2") or 1.2) * avg
+        if big and last.close > opening_range_high and (last.close - last.open) / rng >= 0.5 \
+                and (last.close - last.low) / rng >= 0.7 and (vwap is None or last.close > vwap):
+            return "UP"
+        if big and last.close < opening_range_low and (last.open - last.close) / rng >= 0.5 \
+                and (last.high - last.close) / rng >= 0.7 and (vwap is None or last.close < vwap):
+            return "DOWN"
     if broke_up and last.close < opening_range_high and (vwap is None or last.close < vwap):
         return "FAILED_UP"
     if broke_down and last.close > opening_range_low and (vwap is None or last.close > vwap):
