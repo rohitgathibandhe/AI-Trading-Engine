@@ -259,6 +259,44 @@ def fib_pullback(bars: list[dict], min_impulse: float = 80.0) -> dict | None:
     return out
 
 
+def mw_neckline_break(bars: list[dict], lookback: int = 30, tol_frac: float = 0.0025) -> dict | None:
+    """M top / W bottom (incl. the LOWER-high M / HIGHER-low W) with a neckline break on the LAST CLOSED candle.
+    Owner's 2026-02-01 read: top 25,441 (11:05), dip to 25,356 (11:20), lower top 25,403 (11:25-11:30), 11:40 strong close
+    25,312 through the neckline -> -740 pts. First top: a swing high (2 bars each side); second top: the highest high
+    after the trough, confirmed by 1 bar each side, not above the first and within tol_frac of it; neckline: lowest
+    low between them; trigger: last close through the neckline, previous close not. {'dir','neckline','top','at'}"""
+    if len(bars) < 12:
+        return None
+    seg = bars[-lookback:]
+    last, prev = seg[-1], seg[-2]
+    n = len(seg)
+    for down in (True, False):
+        hi = (lambda x: x["h"]) if down else (lambda x: -x["l"])     # mirror W into M
+        p1 = [k for k in range(2, n - 4) if hi(seg[k]) >= max(hi(seg[k - 2]), hi(seg[k - 1]), hi(seg[k + 1]), hi(seg[k + 2]))]
+        for k1 in reversed(p1):
+            t1 = hi(seg[k1])
+            lo = (lambda x: x["l"]) if down else (lambda x: -x["h"])
+            span = list(range(k1 + 1, n - 3))
+            if not span:
+                continue
+            kt = min(span, key=lambda k: lo(seg[k]))                 # the dip (neckline) after the first top
+            rest = list(range(kt + 1, n - 2))
+            if not rest:
+                continue
+            k2 = max(rest, key=lambda k: hi(seg[k]))                 # the second (lower) top after the dip
+            t2 = hi(seg[k2])
+            if not (hi(seg[k2 - 1]) <= t2 >= hi(seg[k2 + 1])) or t2 > t1 or (t1 - t2) > tol_frac * abs(t1):
+                continue
+            neck = seg[kt]["l"] if down else seg[kt]["h"]
+            crossed = (last["c"] < neck <= prev["c"]) if down else (last["c"] > neck >= prev["c"])
+            if crossed:
+                top = max(seg[k1]["h"], seg[k2]["h"]) if down else min(seg[k1]["l"], seg[k2]["l"])
+                return {"dir": "DOWN" if down else "UP", "neckline": round(neck, 2), "top": round(top, 2),
+                        "at": last["t"].isoformat()}
+            break
+    return None
+
+
 def failed_break(bars: list[dict]) -> dict | None:
     """FAILED OPENING-RANGE BREAK (a trap) on COMPLETED bars: a close beyond one side of the 15-min opening range, then a
     later close back INSIDE the range and on the other side of VWAP. Trade the reversal. 2026-10-21: 09:30/09:35 closed
@@ -372,4 +410,5 @@ def evaluate(bars: Sequence[Any], now: datetime, oi: dict | None = None,
             "failed_break": failed_break(cb), "swings": last_swings(cb),
             "last_bar": ({k: cb[-1][k] for k in ("o", "h", "l", "c")} if cb else None),
             "prev_close_bar": ({k: cb[-2][k] for k in ("o", "h", "l", "c")} if len(cb) > 1 else None),
-            "fib": fib_pullback(cb)}
+            "fib": fib_pullback(cb), "mw": mw_neckline_break(cb),
+            "avg_range12": (sum(b["h"] - b["l"] for b in cb[-13:-1]) / 12 if len(cb) >= 13 else None)}

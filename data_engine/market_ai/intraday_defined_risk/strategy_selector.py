@@ -873,14 +873,20 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     choice = _accepted_break_entry(choice, metadata, now_time)
     choice = _prev_day_break_entry(choice, metadata, now_time)
     choice = _fib_wall_entry(choice, metadata, now_time)
+    choice = _mw_entry(choice, metadata, now_time)
     _set_chart_stop(choice, metadata, spot)
     return choice
 
 
-def _strong(bar: dict | None, up: bool) -> bool:
+def _strong(bar: dict | None, up: bool, avg_range: float | None = None) -> bool:
     if not bar:
         return False
     rng = max(float(bar["h"]) - float(bar["l"]), 0.5)
+    # SIZE (SEL_STRONG_CANDLE_SIZE=x): a strong candle must also be >= x * the average range of the last 12 candles —
+    # a 20-pt candle with a nice body is not strength (owner, 2026-02-01: "no strong candle till 11:00").
+    _sz = float(os.environ.get("SEL_STRONG_CANDLE_SIZE", "0") or 0)
+    if _sz > 0 and avg_range and rng < _sz * float(avg_range):
+        return False
     body = (float(bar["c"]) - float(bar["o"])) * (1 if up else -1) / rng
     pos = ((float(bar["c"]) - float(bar["l"])) if up else (float(bar["h"]) - float(bar["c"]))) / rng
     return body >= 0.5 and pos >= 0.7
@@ -905,6 +911,27 @@ def _take(choice: StrategyChoice, metadata: dict[str, Any], side: str, tag: str,
     choice.executable_today = True
     choice.rationale = (choice.rationale or "") + f" [{why}]"
     return choice
+
+
+# M/W NECKLINE BREAK (SEL_MW_BREAK=1): a strong (and, with SEL_STRONG_CANDLE_SIZE, above-normal-size) closed candle
+# through the neckline of an M top / W bottom (trend_day.mw_neckline_break), on the VWAP side. Stop: beyond the top.
+def _mw_entry(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> StrategyChoice:
+    if os.environ.get("SEL_MW_BREAK", "0") != "1" or choice.structures:
+        return choice
+    td = metadata.get("trend_day") or {}
+    mw = td.get("mw") or {}
+    side = mw.get("dir")
+    pvw = metadata.get("price_vs_vwap")
+    if not side or not _new_entry_ok(side, td, now_time):
+        return choice
+    up = side == "UP"
+    if pvw is not None and ((float(pvw) <= 0) if up else (float(pvw) >= 0)):
+        return choice
+    if not _strong(td.get("last_bar"), up, td.get("avg_range12")):
+        return choice
+    metadata["level_stop_spot"] = float(mw["top"])
+    return _take(choice, metadata, side, "mw_break_entry",
+                 f"{'W BOTTOM' if up else 'M TOP'} neckline {float(mw['neckline']):.0f} broken on a strong close — buy the {_ACC_DEBIT[side]}")
 
 
 # PREVIOUS-DAY HIGH/LOW BREAK (SEL_PDL_BREAK=1): a STRONG closed 5m candle crossing yesterday's high (low) — previous
@@ -970,7 +997,7 @@ _CHART_STOP_BUF = 5.0
 
 def _set_chart_stop(choice: StrategyChoice, metadata: dict[str, Any], spot: float) -> None:
     metadata.pop("chart_stop_spot", None)
-    if not (metadata.get("pd_break_entry") or metadata.get("fib_wall_entry")):
+    if not (metadata.get("pd_break_entry") or metadata.get("fib_wall_entry") or metadata.get("mw_break_entry")):
         metadata.pop("level_stop_spot", None)
     if not choice.structures or choice.structures[0] not in ("PUT_DEBIT_SPREAD", "CALL_DEBIT_SPREAD") \
             or metadata.get("is_fade") or not spot:
@@ -980,7 +1007,8 @@ def _set_chart_stop(choice: StrategyChoice, metadata: dict[str, Any], spot: floa
     fb = td.get("failed_break") or {}
     down = choice.structures[0] == "PUT_DEBIT_SPREAD"
     lvl = None
-    if metadata.get("level_stop_spot") and (metadata.get("pd_break_entry") or metadata.get("fib_wall_entry")):
+    if metadata.get("level_stop_spot") and (metadata.get("pd_break_entry") or metadata.get("fib_wall_entry")
+                                            or metadata.get("mw_break_entry")):
         lvl = float(metadata["level_stop_spot"])
     elif metadata.get("failed_break_entry") and fb.get("trap_extreme"):
         lvl = float(fb["trap_extreme"])
@@ -1131,7 +1159,10 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
             _up = want[0] == "CALL_DEBIT_SPREAD"
             _body = (float(_lb["c"]) - float(_lb["o"])) * (1 if _up else -1) / _rng
             _pos = ((float(_lb["c"]) - float(_lb["l"])) if _up else (float(_lb["h"]) - float(_lb["c"]))) / _rng
-            if _body < 0.5 or _pos < 0.7:
+            _sz = float(os.environ.get("SEL_STRONG_CANDLE_SIZE", "0") or 0)
+            _avg = (metadata.get("trend_day") or {}).get("avg_range12")
+            _small = bool(_sz > 0 and _avg and _rng < _sz * float(_avg))
+            if _body < 0.5 or _pos < 0.7 or _small:
                 metadata["edge_only_skip"] = f"{choice.condition}/{first} weak candle (body {_body:.2f}, close pos {_pos:.2f})"
                 choice.family, choice.structures = FAM_STAND_ASIDE, []
                 choice.rationale = (choice.rationale or "") + " [WEAK BREAKOUT CANDLE — wait for a strong close]"
