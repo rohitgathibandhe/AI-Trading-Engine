@@ -3193,6 +3193,14 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                                                     daily=_daily.bars if _daily is not None else None)
     except Exception:  # noqa: BLE001
         metadata["entry_score"] = {}
+    # DAYS TO EXPIRY of the traded (front) weekly expiry
+    try:
+        from datetime import date as _date
+        _ex = snapshot.option_chain.expiry
+        _ex = _ex if isinstance(_ex, _date) else _date.fromisoformat(str(_ex)[:10])
+        metadata["dte_days"] = (_ex - snapshot.timestamp.date()).days
+    except Exception:  # noqa: BLE001
+        metadata["dte_days"] = None
     # PREVIOUS-DAY LEVELS (high / low / close of the last completed session) for PDH/PDL breaks and stops
     try:
         _pd = [b for b in ((getattr(snapshot, "nifty_daily", None) or None) and snapshot.nifty_daily.bars or [])

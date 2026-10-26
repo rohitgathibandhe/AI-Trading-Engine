@@ -874,7 +874,50 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     choice = _prev_day_break_entry(choice, metadata, now_time)
     choice = _fib_wall_entry(choice, metadata, now_time)
     choice = _mw_entry(choice, metadata, now_time)
+    choice = _option_data_gate(choice, metadata, spot)
     _set_chart_stop(choice, metadata, spot)
+    return choice
+
+
+# OPTION-DATA GATE (real-chain dossier 2026-10-26, 64 trades): PCR on the trade's side (long & PCR >= 1 / short & PCR < 1)
+# 44 trades +175k 59% vs against 20 trades -22k 35%; OI wall ahead 50-200 pts 23 trades +184k 70% vs < 50 pts -4k and
+# > 200 pts -19k. SEL_PCR_ALIGN=1, SEL_WALL_ROOM="50,200". SEL_OPT_GATE_MIN_DTE=n applies them only when DTE >= n
+# (DTE 4-9: 38 trades earned +5.8k in total).
+def _option_data_gate(choice: StrategyChoice, metadata: dict[str, Any], spot: float) -> StrategyChoice:
+    if not choice.structures or choice.structures[0] not in ("PUT_DEBIT_SPREAD", "CALL_DEBIT_SPREAD") or metadata.get("is_fade"):
+        return choice
+    _min_dte = os.environ.get("SEL_OPT_GATE_MIN_DTE")
+    if _min_dte not in (None, ""):
+        try:
+            if metadata.get("dte_days") is None or int(metadata["dte_days"]) < int(_min_dte):
+                return choice
+        except (TypeError, ValueError):
+            return choice
+    up = choice.structures[0] == "CALL_DEBIT_SPREAD"
+    why = None
+    if os.environ.get("SEL_PCR_ALIGN", "0") == "1":
+        pcr = metadata.get("pcr_by_oi")
+        if pcr is not None and ((float(pcr) < 1.0) if up else (float(pcr) >= 1.0)):
+            why = f"PCR {float(pcr):.2f} against the {'long' if up else 'short'}"
+    _room = os.environ.get("SEL_WALL_ROOM")
+    if why is None and _room:
+        try:
+            lo, hi = (float(x) for x in _room.split(","))
+            wall = metadata.get("current_call_wall") if up else metadata.get("current_put_wall")
+            if wall is not None and spot:
+                d = (float(wall) - spot) if up else (spot - float(wall))
+                if d < 0 or not (lo <= d <= hi):
+                    why = f"OI wall ahead {d:.0f} pts (want {lo:.0f}-{hi:.0f})"
+        except (TypeError, ValueError):
+            pass
+    if why:
+        metadata["option_gate_skip"] = why
+        choice.family, choice.structures = FAM_STAND_ASIDE, []
+        choice.rationale = (choice.rationale or "") + f" [OPTION DATA: {why} — stand aside]"
+        return choice
+    wall = metadata.get("current_call_wall") if up else metadata.get("current_put_wall")
+    if wall is not None:
+        metadata["wall_target_spot"] = float(wall)          # DEBIT_WALL_TARGET exit reference
     return choice
 
 
