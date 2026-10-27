@@ -131,6 +131,41 @@ def _fifteen(bars: list[dict]) -> list[dict]:
             for k, g in sorted(groups.items()) if len(g) == 3]
 
 
+# FAILED-BREAK RESET (TD_FAILED_RESETS=1): once a side's break FAILED (failed_break), that side's level becomes the trap
+# extreme + TD_RESET_MARGIN_OR x OR range, and it counts as broken again only after 2 consecutive closes beyond it.
+# 2026-10-27: the 09:45 up-break failed at 10:20 (trap 22,804) yet at 12:30-12:45 the trend detector and accepted_break
+# reused the morning closes -> stale TREND_UP -> 12:45 call at the range top (-3,398) while the classifier said RANGE.
+FAILED_RESETS = _os.environ.get("TD_FAILED_RESETS", "0") == "1"
+RESET_MARGIN_OR = float(_os.environ.get("TD_RESET_MARGIN_OR", "0.25") or 0.25)
+
+
+def _reset_levels(bars: list[dict], or_h: float, or_l: float) -> tuple[float, float, dict]:
+    """Effective (up_level, down_level) after failed breaks; also which sides were reset."""
+    if not FAILED_RESETS:
+        return or_h, or_l, {}
+    post = [b for b in bars if b["t"].time() >= OR_END]
+    vw = _vwap_series(bars)
+    off = len(bars) - len(post)
+    up_lvl, dn_lvl, info = or_h, or_l, {}
+    margin = RESET_MARGIN_OR * max(or_h - or_l, 1.0)
+    for side in ("UP", "DOWN"):
+        lvl = or_h if side == "UP" else or_l
+        k0 = next((k for k, b in enumerate(post) if (b["c"] > lvl if side == "UP" else b["c"] < lvl)), None)
+        if k0 is None:
+            continue
+        for k in range(k0 + 1, len(post)):
+            b, v = post[k], vw[off + k]
+            if (b["c"] < lvl and b["c"] < v) if side == "UP" else (b["c"] > lvl and b["c"] > v):
+                ext = max(x["h"] for x in post[k0:k + 1]) if side == "UP" else min(x["l"] for x in post[k0:k + 1])
+                if side == "UP":
+                    up_lvl = ext + margin
+                else:
+                    dn_lvl = ext - margin
+                info[side] = {"failed_at": b["t"].isoformat(), "trap": ext}
+                break
+    return up_lvl, dn_lvl, info
+
+
 def trend_state(bars: list[dict], oi: dict | None = None) -> dict:
     """{'state': 'TREND_UP'|'TREND_DOWN'|'NONE', 'since': datetime|None, 'checks': {...}} on COMPLETED bars."""
     oi = oi or {}
@@ -140,6 +175,7 @@ def trend_state(bars: list[dict], oi: dict | None = None) -> dict:
     if len(or_bars) < 3 or len(post) < VWAP_HOLD_BARS:
         return res
     or_h, or_l = max(b["h"] for b in or_bars), min(b["l"] for b in or_bars)
+    lv_h, lv_l, _reset = _reset_levels(bars, or_h, or_l)
     if TWO_SIDED_RANGE and _accepted(post, lambda b: b["c"] > or_h) and _accepted(post, lambda b: b["c"] < or_l) \
             and not _two_sided_released(bars, post, or_h, or_l):
         return {"state": "RANGE_TWO_SIDED", "since": None,
@@ -148,7 +184,12 @@ def trend_state(bars: list[dict], oi: dict | None = None) -> dict:
     f15 = _fifteen(bars)
     for side in ("UP", "DOWN"):
         up = side == "UP"
-        orb = any((b["c"] > or_h) if up else (b["c"] < or_l) for b in post)
+        if (side in _reset):            # failed earlier: needs 2 consecutive closes beyond the trap level (after the failure)
+            _fa = _reset[side]["failed_at"]
+            _after = [b for b in post if b["t"].isoformat() > _fa]
+            orb = _accepted(_after, (lambda b: b["c"] > lv_h) if up else (lambda b: b["c"] < lv_l)) if len(_after) >= 2 else False
+        else:
+            orb = any((b["c"] > or_h) if up else (b["c"] < or_l) for b in post)
         tail = list(zip(bars, vw))[-VWAP_HOLD_BARS:]
         hold = all((b["c"] > v) if up else (b["c"] < v) for b, v in tail)
         # vs the 15m bar TWO back: a single pullback bar makes a lower low by definition, and comparing with the
@@ -188,6 +229,20 @@ def accepted_break(bars: list[dict]) -> dict | None:
                 first[side] = k
     if not first:
         return None
+    if FAILED_RESETS:
+        _uh, _dl, _rs = _reset_levels(bars, or_h, or_l)
+        for _sd in list(first):
+            if _sd in _rs:
+                _after = [b for b in post if b["t"].isoformat() > _rs[_sd]["failed_at"]]
+                _lvl = _uh if _sd == "UP" else _dl
+                _re = next((k for k in range(1, len(_after)) if ((_after[k]["c"] > _lvl and _after[k - 1]["c"] > _lvl) if _sd == "UP"
+                                                                 else (_after[k]["c"] < _lvl and _after[k - 1]["c"] < _lvl))), None)
+                if _re is None:
+                    del first[_sd]
+                else:
+                    first[_sd] = post.index(_after[_re])
+        if not first:
+            return None
     side = min(first, key=first.get) if len(first) == 1 else max(first, key=first.get)   # the latest accepted side
     k = first[side]
     last, vw = bars[-1], _vwap_series(bars)[-1]

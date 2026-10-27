@@ -385,6 +385,27 @@ def _opening_range_break_state(
 ) -> str:
     if not bars or opening_range_high is None or opening_range_low is None:
         return "NONE"
+    # FAILED-BREAK RESET (TD_FAILED_RESETS=1, see trend_day._reset_levels): a side whose break already FAILED today is only
+    # "broken" again beyond its trap extreme (+margin), counting closes after the failure — not the original OR level.
+    if os.environ.get("TD_FAILED_RESETS", "0") == "1":
+        try:
+            from .trend_day import _reset_levels
+            _db = [{"t": b.timestamp.replace(tzinfo=None), "o": b.open, "h": b.high, "l": b.low, "c": b.close, "v": b.volume or 0}
+                   for b in bars]
+            _uh, _dl, _rs = _reset_levels(_db, opening_range_high, opening_range_low)
+            _last6 = bars[-6:]
+            if "UP" in _rs:
+                _after = [b for b in _last6 if b.timestamp.replace(tzinfo=None).isoformat() > _rs["UP"]["failed_at"]]
+                if sum(1 for b in _after if b.close > _uh) >= 2 and (vwap is None or bars[-1].close > vwap):
+                    return "UP"
+                opening_range_high = max(opening_range_high, _uh)       # the up level is now the trap (+margin)
+            if "DOWN" in _rs:
+                _after = [b for b in _last6 if b.timestamp.replace(tzinfo=None).isoformat() > _rs["DOWN"]["failed_at"]]
+                if sum(1 for b in _after if b.close < _dl) >= 2 and (vwap is None or bars[-1].close < vwap):
+                    return "DOWN"
+                opening_range_low = min(opening_range_low, _dl)
+        except Exception:  # noqa: BLE001
+            pass
     recent = bars[-6:]
     last = recent[-1]
     above_count = sum(1 for bar in recent if bar.close > opening_range_high)

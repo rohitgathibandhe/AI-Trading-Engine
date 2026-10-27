@@ -59,3 +59,17 @@ def test_fib_pullback_long_into_618_zone():
     bars = [{"t": t0 + timedelta(minutes=5 * k), "o": o, "h": h, "l": l, "c": c, "v": 0} for k, (o, h, l, c) in enumerate(seq)]
     f = td.fib_pullback(bars)
     assert f and f["dir"] == "UP" and f["zone"][0] <= 1036 <= f["zone"][1] + 5
+
+
+def test_failed_up_break_resets_trend_until_trap_is_cleared(monkeypatch):
+    from datetime import datetime, timedelta
+    from market_ai.intraday_defined_risk import trend_day as td
+    monkeypatch.setattr(td, "FAILED_RESETS", True)
+    t0 = datetime(2026, 10, 27, 9, 15)
+    # OR 100-110; up-break closes 112/115 (trap high ~118); fails to 104 under VWAP; drifts back to 113-114 (< trap+margin)
+    closes = [100, 108, 105, 112, 115, 104, 103, 106, 110, 113, 114, 113]
+    bars = [{"t": t0 + timedelta(minutes=5 * k), "o": c, "h": c + 3, "l": c - 3, "c": c, "v": 0} for k, c in enumerate(closes)]
+    st = td.trend_state(bars)
+    assert st["state"] != "TREND_UP"
+    ab = td.accepted_break(bars)
+    assert not ab or ab["dir"] != "UP" or not ab["valid"]
