@@ -67,6 +67,10 @@ def _jsonl(path: Path, day: str, now: datetime, n: int = 400_000) -> list[dict]:
         except Exception:  # noqa: BLE001 — a tail can start mid-line
             continue
         ts = str(j.get("timestamp") or "")
+        # the line must BELONG to today (its own timestamp / session_date) — on an expiry day the expiry field also
+        # contains today's date (2026-10-27: old trades were re-sent as new)
+        if not (ts.startswith(day) or str(j.get("session_date") or "") == day):
+            continue
         try:
             if ts and datetime.fromisoformat(ts).replace(tzinfo=None) > now:
                 continue
