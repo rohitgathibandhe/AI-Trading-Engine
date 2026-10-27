@@ -873,14 +873,63 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     choice = _accepted_break_entry(choice, metadata, now_time)
     choice = _prev_day_break_entry(choice, metadata, now_time)
     choice = _fib_wall_entry(choice, metadata, now_time)
+    choice = _mw_entry(choice, metadata, now_time)
+    choice = _option_data_gate(choice, metadata, spot)
     _set_chart_stop(choice, metadata, spot)
     return choice
 
 
-def _strong(bar: dict | None, up: bool) -> bool:
+# OPTION-DATA GATE (real-chain dossier 2026-10-26, 64 trades): PCR on the trade's side (long & PCR >= 1 / short & PCR < 1)
+# 44 trades +175k 59% vs against 20 trades -22k 35%; OI wall ahead 50-200 pts 23 trades +184k 70% vs < 50 pts -4k and
+# > 200 pts -19k. SEL_PCR_ALIGN=1, SEL_WALL_ROOM="50,200". SEL_OPT_GATE_MIN_DTE=n applies them only when DTE >= n
+# (DTE 4-9: 38 trades earned +5.8k in total).
+def _option_data_gate(choice: StrategyChoice, metadata: dict[str, Any], spot: float) -> StrategyChoice:
+    if not choice.structures or choice.structures[0] not in ("PUT_DEBIT_SPREAD", "CALL_DEBIT_SPREAD") or metadata.get("is_fade"):
+        return choice
+    _min_dte = os.environ.get("SEL_OPT_GATE_MIN_DTE")
+    if _min_dte not in (None, ""):
+        try:
+            if metadata.get("dte_days") is None or int(metadata["dte_days"]) < int(_min_dte):
+                return choice
+        except (TypeError, ValueError):
+            return choice
+    up = choice.structures[0] == "CALL_DEBIT_SPREAD"
+    why = None
+    if os.environ.get("SEL_PCR_ALIGN", "0") == "1":
+        pcr = metadata.get("pcr_by_oi")
+        if pcr is not None and ((float(pcr) < 1.0) if up else (float(pcr) >= 1.0)):
+            why = f"PCR {float(pcr):.2f} against the {'long' if up else 'short'}"
+    _room = os.environ.get("SEL_WALL_ROOM")
+    if why is None and _room:
+        try:
+            lo, hi = (float(x) for x in _room.split(","))
+            wall = metadata.get("current_call_wall") if up else metadata.get("current_put_wall")
+            if wall is not None and spot:
+                d = (float(wall) - spot) if up else (spot - float(wall))
+                if d < 0 or not (lo <= d <= hi):
+                    why = f"OI wall ahead {d:.0f} pts (want {lo:.0f}-{hi:.0f})"
+        except (TypeError, ValueError):
+            pass
+    if why:
+        metadata["option_gate_skip"] = why
+        choice.family, choice.structures = FAM_STAND_ASIDE, []
+        choice.rationale = (choice.rationale or "") + f" [OPTION DATA: {why} — stand aside]"
+        return choice
+    wall = metadata.get("current_call_wall") if up else metadata.get("current_put_wall")
+    if wall is not None:
+        metadata["wall_target_spot"] = float(wall)          # DEBIT_WALL_TARGET exit reference
+    return choice
+
+
+def _strong(bar: dict | None, up: bool, avg_range: float | None = None) -> bool:
     if not bar:
         return False
     rng = max(float(bar["h"]) - float(bar["l"]), 0.5)
+    # SIZE (SEL_STRONG_CANDLE_SIZE=x): a strong candle must also be >= x * the average range of the last 12 candles —
+    # a 20-pt candle with a nice body is not strength (owner, 2026-02-01: "no strong candle till 11:00").
+    _sz = float(os.environ.get("SEL_STRONG_CANDLE_SIZE", "0") or 0)
+    if _sz > 0 and avg_range and rng < _sz * float(avg_range):
+        return False
     body = (float(bar["c"]) - float(bar["o"])) * (1 if up else -1) / rng
     pos = ((float(bar["c"]) - float(bar["l"])) if up else (float(bar["h"]) - float(bar["c"]))) / rng
     return body >= 0.5 and pos >= 0.7
@@ -905,6 +954,27 @@ def _take(choice: StrategyChoice, metadata: dict[str, Any], side: str, tag: str,
     choice.executable_today = True
     choice.rationale = (choice.rationale or "") + f" [{why}]"
     return choice
+
+
+# M/W NECKLINE BREAK (SEL_MW_BREAK=1): a strong (and, with SEL_STRONG_CANDLE_SIZE, above-normal-size) closed candle
+# through the neckline of an M top / W bottom (trend_day.mw_neckline_break), on the VWAP side. Stop: beyond the top.
+def _mw_entry(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> StrategyChoice:
+    if os.environ.get("SEL_MW_BREAK", "0") != "1" or choice.structures:
+        return choice
+    td = metadata.get("trend_day") or {}
+    mw = td.get("mw") or {}
+    side = mw.get("dir")
+    pvw = metadata.get("price_vs_vwap")
+    if not side or not _new_entry_ok(side, td, now_time):
+        return choice
+    up = side == "UP"
+    if pvw is not None and ((float(pvw) <= 0) if up else (float(pvw) >= 0)):
+        return choice
+    if not _strong(td.get("last_bar"), up, td.get("avg_range12")):
+        return choice
+    metadata["level_stop_spot"] = float(mw["top"])
+    return _take(choice, metadata, side, "mw_break_entry",
+                 f"{'W BOTTOM' if up else 'M TOP'} neckline {float(mw['neckline']):.0f} broken on a strong close — buy the {_ACC_DEBIT[side]}")
 
 
 # PREVIOUS-DAY HIGH/LOW BREAK (SEL_PDL_BREAK=1): a STRONG closed 5m candle crossing yesterday's high (low) — previous
@@ -970,7 +1040,7 @@ _CHART_STOP_BUF = 5.0
 
 def _set_chart_stop(choice: StrategyChoice, metadata: dict[str, Any], spot: float) -> None:
     metadata.pop("chart_stop_spot", None)
-    if not (metadata.get("pd_break_entry") or metadata.get("fib_wall_entry")):
+    if not (metadata.get("pd_break_entry") or metadata.get("fib_wall_entry") or metadata.get("mw_break_entry")):
         metadata.pop("level_stop_spot", None)
     if not choice.structures or choice.structures[0] not in ("PUT_DEBIT_SPREAD", "CALL_DEBIT_SPREAD") \
             or metadata.get("is_fade") or not spot:
@@ -980,7 +1050,8 @@ def _set_chart_stop(choice: StrategyChoice, metadata: dict[str, Any], spot: floa
     fb = td.get("failed_break") or {}
     down = choice.structures[0] == "PUT_DEBIT_SPREAD"
     lvl = None
-    if metadata.get("level_stop_spot") and (metadata.get("pd_break_entry") or metadata.get("fib_wall_entry")):
+    if metadata.get("level_stop_spot") and (metadata.get("pd_break_entry") or metadata.get("fib_wall_entry")
+                                            or metadata.get("mw_break_entry")):
         lvl = float(metadata["level_stop_spot"])
     elif metadata.get("failed_break_entry") and fb.get("trap_extreme"):
         lvl = float(fb["trap_extreme"])
@@ -1124,20 +1195,50 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
         return choice
     # STRONG-CANDLE BREAKOUT (SEL_STRONG_CANDLE=1): the last CLOSED 5m candle must be a strong candle in the breakout
     # direction (body >= 50% of its range, close in the outer 30%). A doji / rejection-wick candle is not a breakout.
-    if os.environ.get("SEL_STRONG_CANDLE", "0") == "1":
+    if os.environ.get("SEL_STRONG_CANDLE", "0") == "1" and not (
+            _td_accept and os.environ.get("SEL_STRONG_CANDLE_BREAKOUT_ONLY", "0") == "1"):
         _lb = (metadata.get("trend_day") or {}).get("last_bar") or {}
         try:
             _rng = max(float(_lb["h"]) - float(_lb["l"]), 0.5)
             _up = want[0] == "CALL_DEBIT_SPREAD"
             _body = (float(_lb["c"]) - float(_lb["o"])) * (1 if _up else -1) / _rng
             _pos = ((float(_lb["c"]) - float(_lb["l"])) if _up else (float(_lb["h"]) - float(_lb["c"]))) / _rng
-            if _body < 0.5 or _pos < 0.7:
+            _sz = float(os.environ.get("SEL_STRONG_CANDLE_SIZE", "0") or 0)
+            _avg = (metadata.get("trend_day") or {}).get("avg_range12")
+            _small = bool(_sz > 0 and _avg and _rng < _sz * float(_avg))
+            if _body < 0.5 or _pos < 0.7 or _small:
                 metadata["edge_only_skip"] = f"{choice.condition}/{first} weak candle (body {_body:.2f}, close pos {_pos:.2f})"
                 choice.family, choice.structures = FAM_STAND_ASIDE, []
                 choice.rationale = (choice.rationale or "") + " [WEAK BREAKOUT CANDLE — wait for a strong close]"
                 return choice
         except (KeyError, TypeError, ValueError):
             pass
+    # CHART-READ MISTAKES (18-month chart-read study 2026-10-26, 446 entries): entering on a REJECTION-wick candle
+    # against the trade (12 trades, avg -2,351) and with < 30 pts of room to the previous-day level ahead (30, -246 avg)
+    # were the only reading errors that lost money. SEL_NO_REJECTION=1 / SEL_MIN_ROOM_PTS=<pts>.
+    _lb2 = (metadata.get("trend_day") or {}).get("last_bar") or {}
+    _upx = want[0] == "CALL_DEBIT_SPREAD"
+    try:
+        if os.environ.get("SEL_NO_REJECTION", "0") == "1" and _lb2:
+            _r2 = max(float(_lb2["h"]) - float(_lb2["l"]), 0.5)
+            _wk = ((float(_lb2["h"]) - max(float(_lb2["c"]), float(_lb2["o"]))) if _upx
+                   else (min(float(_lb2["c"]), float(_lb2["o"])) - float(_lb2["l"]))) / _r2
+            if _wk >= 0.45:
+                metadata["edge_only_skip"] = f"{choice.condition}/{first} rejection wick {_wk:.2f}"
+                choice.family, choice.structures = FAM_STAND_ASIDE, []
+                choice.rationale = (choice.rationale or "") + " [REJECTION CANDLE against the trade — stand aside]"
+                return choice
+        _room_min = float(os.environ.get("SEL_MIN_ROOM_PTS", "0") or 0)
+        _pd = metadata.get("prev_day") or {}
+        if _room_min > 0 and _pd and _lb2:
+            _room = (float(_pd["h"]) - float(_lb2["c"])) if _upx else (float(_lb2["c"]) - float(_pd["l"]))
+            if 0 <= _room < _room_min:
+                metadata["edge_only_skip"] = f"{choice.condition}/{first} no room {_room:.0f} to prev-day level"
+                choice.family, choice.structures = FAM_STAND_ASIDE, []
+                choice.rationale = (choice.rationale or "") + f" [NO ROOM: {_room:.0f} pts to the previous-day level — stand aside]"
+                return choice
+    except (KeyError, TypeError, ValueError):
+        pass
     if first != want[0]:
         for k in ("seller_exit", "conf_bull_sell_closer", "is_fade"):
             metadata.pop(k, None)

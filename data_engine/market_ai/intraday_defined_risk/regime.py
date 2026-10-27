@@ -395,6 +395,19 @@ def _opening_range_break_state(
         return "UP"
     if below_count >= 2 and (vwap is None or last.close < vwap):
         return "DOWN"
+    # ONE STRONG CLOSE (ORB_STRONG_SINGLE=1): a single STRONG, above-normal-size candle closing beyond the range counts as
+    # the break — 2026-10-26: the 09:50 candle (+90, full body, ~3x normal) closed above the OR high but the 2nd close
+    # came at 10:00, inside the 10:00-10:30 debit blackout, and the +300 pt reversal was missed.
+    if os.environ.get("ORB_STRONG_SINGLE", "0") == "1" and len(bars) >= 13:
+        rng = max(last.high - last.low, 0.5)
+        avg = sum(b.high - b.low for b in bars[-13:-1]) / 12
+        big = rng >= float(os.environ.get("ORB_STRONG_SIZE", "1.2") or 1.2) * avg
+        if big and last.close > opening_range_high and (last.close - last.open) / rng >= 0.5 \
+                and (last.close - last.low) / rng >= 0.7 and (vwap is None or last.close > vwap):
+            return "UP"
+        if big and last.close < opening_range_low and (last.open - last.close) / rng >= 0.5 \
+                and (last.high - last.close) / rng >= 0.7 and (vwap is None or last.close < vwap):
+            return "DOWN"
     if broke_up and last.close < opening_range_high and (vwap is None or last.close < vwap):
         return "FAILED_UP"
     if broke_down and last.close > opening_range_low and (vwap is None or last.close > vwap):
@@ -3193,6 +3206,14 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                                                     daily=_daily.bars if _daily is not None else None)
     except Exception:  # noqa: BLE001
         metadata["entry_score"] = {}
+    # DAYS TO EXPIRY of the traded (front) weekly expiry
+    try:
+        from datetime import date as _date
+        _ex = snapshot.option_chain.expiry
+        _ex = _ex if isinstance(_ex, _date) else _date.fromisoformat(str(_ex)[:10])
+        metadata["dte_days"] = (_ex - snapshot.timestamp.date()).days
+    except Exception:  # noqa: BLE001
+        metadata["dte_days"] = None
     # PREVIOUS-DAY LEVELS (high / low / close of the last completed session) for PDH/PDL breaks and stops
     try:
         _pd = [b for b in ((getattr(snapshot, "nifty_daily", None) or None) and snapshot.nifty_daily.bars or [])

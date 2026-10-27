@@ -2245,7 +2245,8 @@ def run_live(config: dict[str, object]) -> None:
                             and not decision.metadata.get("accepted_break_entry") \
                             and not decision.metadata.get("failed_break_entry") \
                             and not decision.metadata.get("pd_break_entry") \
-                            and not decision.metadata.get("fib_wall_entry"):
+                            and not decision.metadata.get("fib_wall_entry") \
+                            and not decision.metadata.get("mw_break_entry"):
                         from .entry_timing import should_wait
                         _wait, _wait_why = should_wait(
                             decision.strategy.value if hasattr(decision.strategy, "value") else str(decision.strategy),

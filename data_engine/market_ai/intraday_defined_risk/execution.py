@@ -516,6 +516,16 @@ def _evaluate_debit_exit(
     if max_profit > 0 and profit_captured >= DEBIT_TP_CAPTURE * max_profit:
         return ExitDecision(True, "DEBIT_TARGET", value, pnl)
 
+    # WALL TARGET (DEBIT_WALL_TARGET=1): book the profit when spot reaches the OI wall the trade is heading into (stored
+    # at entry) — real-chain dossier: trades kept 36% of their peak; peaks form mid-day, often at the wall, then reverse.
+    _wt = (position.metadata or {}).get("wall_target_spot")
+    if os.environ.get("DEBIT_WALL_TARGET", "0") == "1" and _wt and current_snapshot is not None \
+            and not position.metadata.get("is_fade") and pnl > 0:
+        _sp = float(current_snapshot.option_chain.spot)
+        _buf = float(os.environ.get("DEBIT_WALL_TARGET_BUF", "5") or 5)
+        if (_sp <= float(_wt) + _buf) if position.structure.strategy == StrategyType.PUT_DEBIT_SPREAD else (_sp >= float(_wt) - _buf):
+            return ExitDecision(True, "DEBIT_WALL_TARGET", value, pnl)
+
     # Chart stop: spot through the level that proves the trade wrong (no min hold — the level IS the invalidation)
     _cs = (position.metadata or {}).get("chart_stop_spot")
     if DEBIT_CHART_STOP and _cs and current_snapshot is not None and not position.metadata.get("is_fade"):
