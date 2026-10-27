@@ -1046,6 +1046,8 @@ def evaluate_entry_gate(
     # fastest-theta day to sell into. Blocking them cost real money (2026-07-28: iron_fly +3,446
     # skipped). EXPIRY_ALLOW_DEFINED_SELLERS=0 restores the block-everything behaviour.
     _EXPIRY_DEFINED_SELLERS = {"IRON_FLY", "IRON_CONDOR", "BULL_PUT_CREDIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD"}
+    if os.environ.get("EXPIRY_ALLOW_DEBITS", "0") == "1":     # defined-risk debits on expiry day (with LIVE_SAME_DAY_EXPIRY)
+        _EXPIRY_DEFINED_SELLERS = _EXPIRY_DEFINED_SELLERS | {"CALL_DEBIT_SPREAD", "PUT_DEBIT_SPREAD"}
     try:
         chain_expiry = snapshot.option_chain.expiry
         _expiry_today = isinstance(chain_expiry, date) and chain_expiry == snapshot.timestamp.date()
@@ -1195,7 +1197,9 @@ def evaluate_paper_context_override_gate(
         chain_expiry = snapshot.option_chain.expiry
         _ovr_strategy = decision.strategy.value if isinstance(decision.strategy, StrategyType) else str(decision.strategy)
         _allow_exp = (os.environ.get("EXPIRY_ALLOW_DEFINED_SELLERS", "1") == "1"
-                      and _ovr_strategy in {"IRON_FLY", "IRON_CONDOR", "BULL_PUT_CREDIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD"})
+                      and _ovr_strategy in ({"IRON_FLY", "IRON_CONDOR", "BULL_PUT_CREDIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD"}
+                                            | ({"CALL_DEBIT_SPREAD", "PUT_DEBIT_SPREAD"}
+                                               if os.environ.get("EXPIRY_ALLOW_DEBITS", "0") == "1" else set())))
         if isinstance(chain_expiry, date) and chain_expiry == snapshot.timestamp.date() and not _allow_exp:
             reasons.append("EXPIRY_DAY_BLOCKED")
     except Exception:
