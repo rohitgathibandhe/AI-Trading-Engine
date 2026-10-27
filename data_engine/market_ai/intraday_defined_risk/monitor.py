@@ -1139,6 +1139,20 @@ class IntradayDefinedRiskAgent:
                     meta["chart_gate_blocked"] = True
             except NameError:      # _thesis not built (justification failed) — don't block on missing data
                 pass
+        # THESIS GATE (SEL_THESIS_ALIGN=1): the agent's own multi-source thesis (option chain + chart + levels) must lean
+        # the SAME way as a directional debit. Real chains (52 trades): thesis agrees 36 trades +150k 58% win; thesis
+        # NEUTRAL 15 trades -3.5k 40%. 2026-10-27 12:45 call (thesis NEUTRAL, confluence 1/3, chain bearish) -3,398.
+        if (os.environ.get("SEL_THESIS_ALIGN", "0") == "1" and choice.structures
+                and choice.structures[0] in ("CALL_DEBIT_SPREAD", "PUT_DEBIT_SPREAD") and not meta.get("is_fade")):
+            try:
+                _want_bias = "BULLISH" if choice.structures[0] == "CALL_DEBIT_SPREAD" else "BEARISH"
+                if str(_thesis.net_bias).upper() != _want_bias:
+                    choice.rationale = (f"THESIS {_thesis.net_bias} (confluence {_thesis.confluence}) does not support the "
+                                        f"{choice.structures[0]} — stand aside. [was: {choice.rationale}]")
+                    choice.family, choice.structures = FAM_STAND_ASIDE, []
+                    meta["thesis_gate_blocked"] = True
+            except NameError:
+                pass
         # Stand aside: chop / high-vol-undirected / not-yet-executable structure
         if choice.family == FAM_STAND_ASIDE or not choice.executable_today or not choice.structures:
             self._current_features = {"playbook": f"SEL_{choice.condition}", "selector_family": choice.family}
