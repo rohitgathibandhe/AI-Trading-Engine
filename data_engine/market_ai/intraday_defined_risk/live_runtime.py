@@ -164,12 +164,15 @@ def _front_expiry(dw: Any, *, underlying_id: int, underlying_seg: str, today: da
             expiry = date.fromisoformat(str(item).split("T", 1)[0])
         except Exception:
             continue
-        if expiry > today:  # strictly greater: skip same-day expiry
+        # LIVE_SAME_DAY_EXPIRY=1: on expiry day trade TODAY's expiry, as every real-chain replay/validation does (the
+        # recorder stores today's chain on expiry day). Same-day expiry-day debits: 13 trades +140k on real chains;
+        # live was trading next week's options instead (2026-10-27).
+        if expiry > today or (expiry == today and os.environ.get("LIVE_SAME_DAY_EXPIRY", "0") == "1"):
             valid.append(expiry)
     if not valid:
         raise RuntimeError("No future NIFTY option expiry available from Dhan.")
     chosen = sorted(valid)[0]
-    if chosen == today:
+    if chosen == today and os.environ.get("LIVE_SAME_DAY_EXPIRY", "0") != "1":
         # Defensive fallback: if somehow today slipped through, grab the next one
         valid2 = [e for e in sorted(valid) if e > today]
         if valid2:
