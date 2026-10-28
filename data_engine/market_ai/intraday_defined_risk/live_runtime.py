@@ -438,6 +438,9 @@ class DhanLiveMarketDataProvider:
             underlying_seg=self.underlying_seg,
             today=today,
         )
+        if close is None:                 # API down: last disk-built session close, and retry next cycle
+            fb = self._daily_from_disk(today)
+            return fb[-1].close if fb else None
         self._previous_close_cache = (today, close)
         return close
 
@@ -459,8 +462,31 @@ class DhanLiveMarketDataProvider:
             bars = _bars_from_candles(raw or [])
         except Exception:
             bars = []
+        if not bars:
+            # 2026-10-28: Dhan's /charts/historical answered DH-905 all morning (as on 10-23) -> no daily bars meant no
+            # previous-day levels / daily context for the whole day (the empty result was cached). Build the daily bars
+            # from the agent's own per-day 5m disk caches and retry the API on the next cycle.
+            bars = self._daily_from_disk(today)
+            if bars:
+                logging.getLogger("intraday_defined_risk.v83").warning(
+                    "[daily] historical fetch failed; built %d daily bars from the 5m disk caches", len(bars))
+            self._daily_bars_cache = None
+            return bars
         self._daily_bars_cache = (today, bars)
         return bars
+
+    def _daily_from_disk(self, today: date) -> list[OhlcvBar]:
+        out: list[OhlcvBar] = []
+        for k in range(90, 0, -1):
+            d = today - timedelta(days=k)
+            five = self._load_candle_disk(5, d)
+            five = [b for b in five if b.timestamp.time() >= datetime.strptime("09:15", "%H:%M").time()]
+            if len(five) < 40:            # partial / holiday file
+                continue
+            out.append(OhlcvBar(timestamp=datetime(d.year, d.month, d.day), open=five[0].open,
+                                high=max(b.high for b in five), low=min(b.low for b in five), close=five[-1].close,
+                                volume=sum(b.volume for b in five)))
+        return out
 
     def current_snapshot(self) -> MarketSnapshot:
         now = _now_ist_naive()
