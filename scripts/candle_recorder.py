@@ -65,6 +65,9 @@ def _bars(points, minutes):
     out = {}
     prev = None
     for t, p in sorted(points):
+        if t.time() < datetime.strptime("09:15", "%H:%M").time():
+            prev = p          # the pre-open price IS the 09:15 open, but must not form a 09:10 bar
+            continue          # pre-open ticks (09:13 start) made a 09:10 bar that shifted the opening range (2026-10-28)
         k = t.replace(second=0, microsecond=0)
         k = k - timedelta(minutes=(k.minute - 15) % minutes if minutes == 15 else k.minute % minutes)
         b = out.get(k)
