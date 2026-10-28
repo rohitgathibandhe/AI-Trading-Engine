@@ -133,7 +133,12 @@ def _vwap_from_bars(bars: list[OhlcvBar]) -> float | None:
         denominator += vol
     if denominator > 0.0:
         return numerator / denominator
-    return bars[-1].close if bars else None
+    # No volume (fallback LTP candles when Dhan's chart API is down, 10-23 / 10-28): equal-weight typical price, as
+    # trend_day._vwap_series does. Returning the last close made VWAP == price, so every "close beyond VWAP" check
+    # failed and the 10:15/10:20 breakdown below the OR low on 10-28 read as ORB NONE.
+    if bars:
+        return sum((b.high + b.low + b.close) / 3.0 for b in bars) / len(bars)
+    return None
 
 
 class LiveDataReadinessError(RuntimeError):
