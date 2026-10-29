@@ -550,6 +550,17 @@ def _evaluate_debit_exit(
     # the extreme and is never touched; a fader is cut as the index turns. Fades keep their own exits.
     if DEBIT_TRAIL_MODE == "SPOT" and not position.metadata.get("is_fade") and current_snapshot is not None:
         _spot = float(current_snapshot.option_chain.spot)
+        # LIVE/REPLAY PARITY (DEBIT_TRAIL_ON_CLOSE=1): trail on the last CLOSED 5m close. The trail was validated in the
+        # replay, whose spot is a ~5-min chain sample; live used every 5-s LTP tick, so tick extremes made it far
+        # twitchier. 2026-10-28: live exited the call debit at +307 (tick high 22,637 -> 22,603.6 = 33 pts); the replay of
+        # the same trade, same rule, held to 13:24 for +5,918.
+        if os.environ.get("DEBIT_TRAIL_ON_CLOSE", "0") == "1":
+            try:
+                _cb = list(current_snapshot.nifty_5m.bars)
+                if _cb:
+                    _spot = float(_cb[-1].close)
+            except Exception:  # noqa: BLE001
+                pass
         _down = position.structure.strategy == StrategyType.PUT_DEBIT_SPREAD
         _ext = position.metadata.get("debit_fav_spot")
         _ext = _spot if _ext is None else (min(float(_ext), _spot) if _down else max(float(_ext), _spot))
