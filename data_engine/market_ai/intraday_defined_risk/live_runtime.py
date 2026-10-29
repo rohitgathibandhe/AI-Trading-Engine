@@ -266,7 +266,7 @@ def _previous_close(dw: Any, *, underlying_id: int, underlying_seg: str, today: 
     if not hasattr(dw, "get_daily_candles"):
         return None
     start = (today - timedelta(days=10)).isoformat()
-    end = (today - timedelta(days=1)).isoformat()
+    end = today.isoformat()            # toDate is exclusive (see _daily_candles) — "today - 1" dropped yesterday
     candles = dw.get_daily_candles(
         underlying_id,
         underlying_seg,
@@ -274,7 +274,7 @@ def _previous_close(dw: Any, *, underlying_id: int, underlying_seg: str, today: 
         from_date=start,
         to_date=end,
     )
-    bars = _bars_from_candles(candles or [])
+    bars = [b for b in _bars_from_candles(candles or []) if b.timestamp.date() < today]
     return bars[-1].close if bars else None
 
 
@@ -456,7 +456,10 @@ class DhanLiveMarketDataProvider:
             return []
         try:
             start = (today - timedelta(days=90)).isoformat()
-            end = (today - timedelta(days=1)).isoformat()
+            # Dhan /charts/historical toDate is EXCLUSIVE (verified 2026-10-29: toDate=10-28 returns up to 10-27), so
+            # "today - 1" silently dropped YESTERDAY: prev-day levels were the day before yesterday on every normal
+            # day, while the replay (where the PDH/PDL room + break rules were validated) uses the real previous day.
+            end = today.isoformat()
             raw = self._dw.get_daily_candles(
                 self.underlying_id,
                 self.underlying_seg,
@@ -464,7 +467,7 @@ class DhanLiveMarketDataProvider:
                 from_date=start,
                 to_date=end,
             )
-            bars = _bars_from_candles(raw or [])
+            bars = [b for b in _bars_from_candles(raw or []) if b.timestamp.date() < today]
         except Exception:
             bars = []
         if not bars:
