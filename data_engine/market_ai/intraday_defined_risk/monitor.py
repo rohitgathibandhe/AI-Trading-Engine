@@ -2185,8 +2185,27 @@ def run_live(config: dict[str, object]) -> None:
                     # Normal exit decision
                     exit_decision = position_decision
                     reason = exit_decision.rationale[-2] if len(exit_decision.rationale) >= 2 else "EXIT"
+                    _live_exit_ok = True
+                    if runtime_config.mode == RuntimeMode.PAPER_LIVE and os.environ.get("SHADOW_LIVE_ORDERS", "0") == "1":
+                        from .live_runtime import shadow_live_record
+                        shadow_live_record("EXIT", position=current_position, reason=reason,
+                                           config=getattr(executor, "config", None))
+                    if runtime_config.mode == RuntimeMode.MICRO_LIVE and runtime_config.live_arm \
+                            and current_position.metadata.get("live_real"):
+                        _res = executor.exit_trade(current_position, reason) or {}
+                        if _res.get("status") != "OK":
+                            # A leg failed: the real position is still (partly) open. Keep managing it — restore the
+                            # position and remember which legs are already closed so the retry does not re-close them.
+                            current_position.metadata["live_closed_legs"] = list(current_position.metadata.get("live_closed_legs") or []) + [
+                                [o["option_type"], o["strike"]] for o in (_res.get("orders") or [])]
+                            agent.open_position = current_position
+                            _live_exit_ok = False
+                    if not _live_exit_ok:
+                        log_validation_decision(exit_decision, snapshot=snapshot, block_reason="LIVE_EXIT_PARTIAL_RETRY", event_type="EXIT")
+                        _emit_decision(exit_decision)
+                        sleep(poll_seconds)
+                        continue
                     if runtime_config.mode == RuntimeMode.MICRO_LIVE and runtime_config.live_arm:
-                        executor.exit_trade(current_position, reason)
                         record_runtime_trade_exit(
                             current_position,
                             snapshot,
@@ -2279,6 +2298,9 @@ def run_live(config: dict[str, object]) -> None:
                         position = open_position_from_decision(decision, snapshot)
                         agent.open_position = position
                         record_paper_entry(position, decision=decision, snapshot=snapshot, gate=gate)
+                        if os.environ.get("SHADOW_LIVE_ORDERS", "0") == "1":
+                            from .live_runtime import shadow_live_record
+                            shadow_live_record("ENTRY", decision=decision, config=getattr(executor, "config", None))
                         log_validation_decision(
                             decision,
                             snapshot=snapshot,
@@ -2295,8 +2317,20 @@ def run_live(config: dict[str, object]) -> None:
                         # real capital by accident (fail-closed if promotion_state.json is empty).
                         from .promotion import real_money_eligible
                         if real_money_eligible(decision.strategy):
-                            executor.enter_trade(decision)
+                            _res = executor.enter_trade(decision) or {}
+                            if _res.get("status") != "OK":
+                                # FAILED = nothing placed; PARTIAL = flatten the placed leg(s). Either way no position.
+                                if _res.get("status") == "PARTIAL":
+                                    executor.unwind(_res.get("orders") or [])
+                                log_validation_decision(decision, snapshot=snapshot, block_reason=f"LIVE_ENTRY_{_res.get('status')}",
+                                                        actual_trade_created=False, decision_origin="V83_APPROVED")
+                                _emit_decision(decision)
+                                sleep(poll_seconds)
+                                continue
                             agent.start_position(snapshot, decision)
+                            if agent.open_position is not None:
+                                agent.open_position.metadata["live_real"] = True
+                                agent.open_position.metadata["live_expiry"] = _res.get("expiry")
                             record_runtime_trade_entry(decision, snapshot, decision_origin="V83_APPROVED")
                             log_validation_decision(
                                 decision,
