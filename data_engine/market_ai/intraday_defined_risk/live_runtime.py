@@ -702,6 +702,35 @@ class DhanLiveMarketDataProvider:
         return self.current_snapshot()
 
 
+SHADOW_LIVE_LOG = Path(__file__).resolve().parents[1] / "state" / "shadow_live_orders.jsonl"
+
+
+def shadow_live_record(kind: str, *, decision: DecisionOutput | None = None, position: OpenPosition | None = None,
+                       reason: str = "", config: dict[str, object] | None = None, _cache: dict = {}) -> dict:
+    """SHADOW-LIVE (SHADOW_LIVE_ORDERS=1, paper mode): for every paper entry/exit, build the EXACT real Dhan orders the
+    live executor would send (expiry, security ids, qty, leg sequence) and log them — nothing is sent. Proves the
+    real-order path on real decisions before real money. Never raises into the trading loop."""
+    rec: dict[str, Any] = {"ts": datetime.now().isoformat(timespec="seconds"), "kind": kind, "reason": reason}
+    try:
+        ex = _cache.get("ex") or DhanLiveExecutor(dict(config or {}), dry_run=True)
+        _cache["ex"] = ex
+        if kind == "ENTRY" and decision is not None:
+            rec["strategy"] = decision.strategy.value if hasattr(decision.strategy, "value") else str(decision.strategy)
+            rec["plan"] = ex.plan_entry(decision)
+        elif position is not None:
+            rec["strategy"] = position.structure.strategy.value
+            rec["plan"] = ex.plan_exit(position)
+        rec["ok"] = True
+    except Exception as exc:  # noqa: BLE001
+        rec["ok"], rec["error"] = False, f"{type(exc).__name__}: {exc}"
+    try:
+        with SHADOW_LIVE_LOG.open("a") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+    return rec
+
+
 class PaperOnlyExecutor:
     def __init__(self, config: dict[str, object]) -> None:
         self.config = dict(config or {})
@@ -731,9 +760,10 @@ class DhanLiveExecutor:
 
     EXCH_SEG = "NSE_FNO"
 
-    def __init__(self, config: dict[str, object]) -> None:
+    def __init__(self, config: dict[str, object], dry_run: bool = False) -> None:
         from market_ai.dhan_wrapper import DhanWrapper
         self.config = dict(config or {})
+        self.dry_run = bool(dry_run)          # SHADOW-LIVE: build every real order, never send one
         self._log = logging.getLogger("intraday_defined_risk.live_exec")
         self._dw = DhanWrapper(logger=self._log)
         self.underlying_id = int(self.config.get("underlying_id") or 13)
@@ -742,8 +772,9 @@ class DhanLiveExecutor:
         self.max_lots = max(1, int(self.config.get("live_max_lots") or 1))       # 1-lot ramp by default
         self.product_type = str(self.config.get("live_product_type") or "INTRADAY").upper()
         self.symbol = str(self.config.get("live_symbol") or "NIFTY")
-        self._log.warning("DhanLiveExecutor ARMED (REAL ORDERS) — max_lots=%s lot_size=%s product=%s",
-                          self.max_lots, self.lot_size, self.product_type)
+        if not self.dry_run:
+            self._log.warning("DhanLiveExecutor ARMED (REAL ORDERS) — max_lots=%s lot_size=%s product=%s",
+                              self.max_lots, self.lot_size, self.product_type)
 
     def _expiry(self) -> str:
         override = str(self.config.get("expiry") or "")
@@ -778,55 +809,85 @@ class DhanLiveExecutor:
             self._log.warning("get_positions_raw failed: %s", exc)
             return []
 
-    def enter_trade(self, decision: DecisionOutput) -> dict[str, object]:
+    def plan_entry(self, decision: DecisionOutput) -> dict[str, object]:
+        """The exact real orders an entry would send (resolved ids, qty, sequence) — nothing is sent."""
         expiry = self._expiry()
-        legs = self._norm_legs(decision.legs)
         qty = self.max_lots * self.lot_size
-        strat = decision.strategy.value if hasattr(decision.strategy, "value") else str(decision.strategy)
         # LONG (BUY) leg first — never leave a naked short if the second order fails.
-        legs_sorted = sorted(legs, key=lambda l: 0 if l[0] == "BUY" else 1)
+        legs = sorted(self._norm_legs(decision.legs), key=lambda l: 0 if l[0] == "BUY" else 1)
+        orders = [{"seq": i + 1, "side": action, "option_type": ot, "strike": strike,
+                   "security_id": self._sid(expiry, strike, ot),          # raises (pre-order) if unresolved
+                   "quantity": qty, "order_type": "MARKET", "product_type": self.product_type,
+                   "exchange_seg": self.EXCH_SEG}
+                  for i, (action, ot, strike) in enumerate(legs)]
+        return {"expiry": expiry, "lots": self.max_lots, "quantity": qty, "orders": orders}
+
+    def plan_exit(self, position: OpenPosition) -> dict[str, object]:
+        """The exact real orders an exit would send. Legs already closed by an earlier PARTIAL exit are skipped."""
+        expiry = str(position.metadata.get("live_expiry") or self._expiry())
+        qty = min(self.max_lots, int(position.lots or 1)) * self.lot_size
+        done = {(str(x[0]), float(x[1])) for x in (position.metadata.get("live_closed_legs") or [])}
+        # Close the SHORT (original SELL) leg first — buy back the obligation before selling the long.
+        legs = sorted(self._norm_legs(position.structure.legs), key=lambda l: 0 if l[0] == "SELL" else 1)
+        orders = [{"seq": i + 1, "side": "BUY" if action == "SELL" else "SELL", "option_type": ot, "strike": strike,
+                   "security_id": self._sid(expiry, strike, ot), "quantity": qty, "order_type": "MARKET",
+                   "product_type": self.product_type, "exchange_seg": self.EXCH_SEG}
+                  for i, (action, ot, strike) in enumerate(legs) if (ot, strike) not in done]
+        return {"expiry": expiry, "quantity": qty, "orders": orders}
+
+    def _send(self, o: dict[str, Any]) -> Any:
+        if self.dry_run:
+            raise RuntimeError("dry_run executor never sends orders")
+        return self._dw.place_order(side=o["side"], exchange_seg=o["exchange_seg"], security_id=o["security_id"],
+                                    quantity=o["quantity"], product_type=o["product_type"], order_type=o["order_type"])
+
+    def enter_trade(self, decision: DecisionOutput) -> dict[str, object]:
+        plan = self.plan_entry(decision)
+        strat = decision.strategy.value if hasattr(decision.strategy, "value") else str(decision.strategy)
         placed: list[dict[str, Any]] = []
-        for action, ot, strike in legs_sorted:
-            sid = self._sid(expiry, strike, ot)   # raises (pre-order) if unresolved
+        for o in plan["orders"]:
             try:
-                resp = self._dw.place_order(side=action, exchange_seg=self.EXCH_SEG, security_id=sid,
-                                            quantity=qty, product_type=self.product_type, order_type="MARKET")
+                resp = self._send(o)
             except Exception as exc:  # noqa: BLE001
                 if not placed:
-                    self._alert(f"🚨 LIVE ENTRY aborted — first leg {action} {ot} {strike:.0f} failed: {exc}. "
-                                f"NO position opened (safe).")
-                    raise
-                self._alert(f"🚨 LIVE ENTRY PARTIAL — {action} {ot} {strike:.0f} failed after {len(placed)} "
-                            f"leg(s) placed: {exc}. Holding a LONG-only leg (defined risk) — REVIEW NOW.")
-                return {"status": "PARTIAL", "expiry": expiry, "orders": placed, "error": str(exc)}
-            placed.append({"action": action, "option_type": ot, "strike": strike, "security_id": sid,
-                           "quantity": qty, "response": resp})
-        self._alert(f"✅ LIVE ENTRY {strat} exp {expiry} x{self.max_lots}lot ({qty}q): "
-                    + ", ".join(f"{p['action']} {p['option_type']} {p['strike']:.0f}" for p in placed))
-        return {"status": "OK", "expiry": expiry, "orders": placed, "lots": self.max_lots}
+                    self._alert(f"🚨 LIVE ENTRY aborted — first leg {o['side']} {o['option_type']} {o['strike']:.0f} "
+                                f"failed: {exc}. NO position opened (safe).")
+                    return {"status": "FAILED", "expiry": plan["expiry"], "orders": [], "error": str(exc)}
+                self._alert(f"🚨 LIVE ENTRY PARTIAL — {o['side']} {o['option_type']} {o['strike']:.0f} failed after "
+                            f"{len(placed)} leg(s) placed: {exc}. Unwinding the placed leg(s).")
+                return {"status": "PARTIAL", "expiry": plan["expiry"], "orders": placed, "error": str(exc)}
+            placed.append(dict(o, response=resp))
+        self._alert(f"✅ LIVE ENTRY {strat} exp {plan['expiry']} x{self.max_lots}lot ({plan['quantity']}q): "
+                    + ", ".join(f"{p['side']} {p['option_type']} {p['strike']:.0f}" for p in placed))
+        return {"status": "OK", "expiry": plan["expiry"], "orders": placed, "lots": self.max_lots}
+
+    def unwind(self, orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Flatten legs placed by a PARTIAL entry (opposite side, MARKET). Returns what could NOT be flattened."""
+        left = []
+        for o in reversed(orders or []):
+            try:
+                self._send(dict(o, side="SELL" if o["side"] == "BUY" else "BUY"))
+            except Exception as exc:  # noqa: BLE001
+                left.append(dict(o, error=str(exc)))
+        self._alert("✅ LIVE PARTIAL ENTRY unwound — flat." if not left else
+                    f"🚨 LIVE UNWIND FAILED for {len(left)} leg(s): "
+                    + ", ".join(f"{x['option_type']} {x['strike']:.0f}" for x in left) + " — CLOSE MANUALLY NOW.")
+        return left
 
     def exit_trade(self, position: OpenPosition, reason: str) -> dict[str, object]:
-        expiry = self._expiry()
-        legs = self._norm_legs(position.structure.legs)
-        qty = min(self.max_lots, int(position.lots or 1)) * self.lot_size
-        # Close the SHORT (original SELL) leg first — buy back the obligation before selling the long.
-        legs_sorted = sorted(legs, key=lambda l: 0 if l[0] == "SELL" else 1)
+        plan = self.plan_exit(position)
         placed: list[dict[str, Any]] = []
-        for action, ot, strike in legs_sorted:
-            close_side = "BUY" if action == "SELL" else "SELL"
-            sid = self._sid(expiry, strike, ot)
+        for o in plan["orders"]:
             try:
-                resp = self._dw.place_order(side=close_side, exchange_seg=self.EXCH_SEG, security_id=sid,
-                                            quantity=qty, product_type=self.product_type, order_type="MARKET")
+                resp = self._send(o)
             except Exception as exc:  # noqa: BLE001
-                self._alert(f"🚨 LIVE EXIT PARTIAL ({reason}) — {close_side} {ot} {strike:.0f} failed: {exc}. "
-                            f"Closed {len(placed)} leg(s). REVIEW NOW.")
-                return {"status": "PARTIAL", "expiry": expiry, "orders": placed, "error": str(exc)}
-            placed.append({"close_side": close_side, "option_type": ot, "strike": strike,
-                           "security_id": sid, "quantity": qty, "response": resp})
-        self._alert(f"✅ LIVE EXIT ({reason}) exp {expiry}: closed "
+                self._alert(f"🚨 LIVE EXIT PARTIAL ({reason}) — {o['side']} {o['option_type']} {o['strike']:.0f} failed: "
+                            f"{exc}. Closed {len(placed)} leg(s); the agent keeps the position and retries.")
+                return {"status": "PARTIAL", "expiry": plan["expiry"], "orders": placed, "error": str(exc)}
+            placed.append(dict(o, response=resp))
+        self._alert(f"✅ LIVE EXIT ({reason}) exp {plan['expiry']}: closed "
                     + ", ".join(f"{p['option_type']} {p['strike']:.0f}" for p in placed))
-        return {"status": "OK", "expiry": expiry, "orders": placed}
+        return {"status": "OK", "expiry": plan["expiry"], "orders": placed}
 
     def _alert(self, msg: str) -> None:
         self._log.warning(msg)
