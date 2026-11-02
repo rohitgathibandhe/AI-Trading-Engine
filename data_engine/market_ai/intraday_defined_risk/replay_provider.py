@@ -18,6 +18,7 @@ the live state folder.
 """
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,12 @@ class ReplayMarketDataProvider:
         self._daily = {d: _Bar(timestamp=datetime.combine(d, datetime.min.time()), open=bs[0].open,
                                high=max(b.high for b in bs), low=min(b.low for b in bs), close=bs[-1].close,
                                volume=0.0) for d, bs in sorted(self._bars5.items()) if len(bs) >= 60}
+        _dp = config.get("replay_daily_path")
+        if _dp and Path(str(_dp)).exists():
+            from .live_runtime import _bars_from_candles
+            _real = _bars_from_candles(json.loads(Path(str(_dp)).read_text()) or [])
+            if _real:          # live parity: the official Dhan daily candles, not ones rebuilt from 5m bars
+                self._daily = {b.timestamp.date(): b for b in _real}
         # identical to DhanLiveMarketDataProvider.current_snapshot (same run_live config keys)
         self._risk = AccountRiskLimits(
             max_risk_rupees_per_trade=float(config.get("max_risk_rupees_per_trade") or 10_000.0),
