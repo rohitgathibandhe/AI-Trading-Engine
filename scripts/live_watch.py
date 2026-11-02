@@ -105,6 +105,17 @@ def main() -> None:
         elif r.get("event") == "PAPER_EXIT":
             _tg(f"AGENT EXIT {str(r.get('timestamp'))[11:16]}: {r.get('strategy')} P&L Rs {float(r.get('realized_paper_pnl') or 0):,.0f}"
                 f" — {r.get('exit_reason')}\n{legs}")
+            # AUTO ROOT-CAUSE on a real loss (owner 2026-11-03: "analyse the issue the moment the agent makes a loss"):
+            # replay today on the live code, diff the entry decision input-by-input, Telegram it. No AI step to stall.
+            _pnl = float(r.get("realized_paper_pnl") or 0)
+            if _pnl <= -3000 and not DRY:
+                _hhmm = str(r.get("entry_timestamp") or "")[11:16]
+                subprocess.Popen([PY, "/Users/Rohit/trading_research/parity/decision_diff.py", day, _hhmm, "--tg"],
+                                 cwd="/Users/Rohit/trading_research/parity", start_new_session=True,
+                                 stdout=open("/Users/Rohit/trading_research/parity/auto_rootcause.log", "a"),
+                                 stderr=subprocess.STDOUT)
+                _tg(f"LOSS Rs {_pnl:,.0f} — automatic root-cause started (live vs replay at the {_hhmm} entry); "
+                    f"result follows in ~3 min.")
     st["seen_trades"] = len(trades)
 
     # 2) data health
