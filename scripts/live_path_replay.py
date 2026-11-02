@@ -138,6 +138,8 @@ def main() -> int:
             env[k] = v
         proc = subprocess.run([PY, "-c", RUNNER, str(cfg_path)], cwd=str(wt / "data_engine"), env=env,
                               capture_output=True, text=True, timeout=6 * 3600)
+        if a.keep:   # keep every emitted decision (full metadata) for live-vs-replay diffs
+            (work / "decisions.log").write_text(proc.stdout)
         for ln in proc.stdout.splitlines():
             if ln.startswith("AGENT_CRASH") or ln.startswith("REPLAY_FINISHED"):
                 print(ln)
