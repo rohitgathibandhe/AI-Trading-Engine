@@ -1239,6 +1239,15 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
                 return choice
     except (KeyError, TypeError, ValueError):
         pass
+    # SEL_NO_FADE_TO_DEBIT=1: a range FADE the scorer wants to SELL is not converted into a BUY (debit) unless the
+    # trend-day model confirms that direction. 2026-11-02 12:15: W-bottom fade at 23,325, scorer SELL 6-0, converted to a
+    # call debit in chop on DTE 1, re-entered 3 min after an exit -> -7,605 at the chart stop.
+    if first != want[0] and os.environ.get("SEL_NO_FADE_TO_DEBIT", "0") == "1" and metadata.get("is_fade") \
+            and _tds != ("TREND_UP" if want[0] == "CALL_DEBIT_SPREAD" else "TREND_DOWN"):
+        metadata["edge_only_skip"] = f"{choice.condition}/{first} fade not converted to a debit (no trend-day)"
+        choice.family, choice.structures = FAM_STAND_ASIDE, []
+        choice.rationale = (choice.rationale or "") + " [FADE -> DEBIT blocked: no trend-day confirmation — stand aside]"
+        return choice
     if first != want[0]:
         for k in ("seller_exit", "conf_bull_sell_closer", "is_fade"):
             metadata.pop(k, None)

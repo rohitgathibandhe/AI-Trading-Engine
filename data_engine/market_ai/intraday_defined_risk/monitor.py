@@ -1964,6 +1964,7 @@ def run_live(config: dict[str, object]) -> None:
     if runtime_config.mode == RuntimeMode.PAPER_LIVE:
         agent.open_position = load_paper_position()
     poll_seconds = int(config.get("poll_seconds", 30))
+    _last_exit_ts: list = [None]          # SEL_REENTRY_COOLDOWN_MIN: time of the last paper exit
     _ops_poll_counter = 0
     _last_live_cycle_at: datetime | None = None
     _wake_resync_left = 0
@@ -2123,6 +2124,8 @@ def run_live(config: dict[str, object]) -> None:
             _prior_paper = agent.open_position
             paper_position = manage_paper_position(snapshot)
             agent.open_position = paper_position
+            if _prior_paper is not None and paper_position is None:
+                _last_exit_ts[0] = snapshot.timestamp
             # SHADOW-LIVE exit: paper exits happen inside manage_paper_position (not the agent exit branch), so log the
             # real closing orders when a held paper position disappears (2026-11-02: the 12:12 exit had no shadow order).
             if _prior_paper is not None and paper_position is None and os.environ.get("SHADOW_LIVE_ORDERS", "0") == "1":
@@ -2299,6 +2302,16 @@ def run_live(config: dict[str, object]) -> None:
                             )
                             _update_runtime_decision_state(decision, runtime_config=runtime_config,
                                                            snapshot=snapshot, block_reason=_wait_why)
+                    # RE-ENTRY COOLDOWN (SEL_REENTRY_COOLDOWN_MIN=<m>): no new entry within m minutes of an exit.
+                    # 2026-11-02: exit 12:12 (+618), same-strike re-entry 12:15 -> -7,605.
+                    _cd = float(os.environ.get("SEL_REENTRY_COOLDOWN_MIN", "0") or 0)
+                    if not _wait and gate["allowed"] and _cd > 0 and _last_exit_ts[0] is not None \
+                            and (snapshot.timestamp - _last_exit_ts[0]).total_seconds() < _cd * 60:
+                        _wait = "REENTRY_COOLDOWN"
+                        log_validation_decision(decision, snapshot=snapshot, block_reason=_wait,
+                                                actual_trade_created=False, decision_origin="V83_ENTRY_WAIT")
+                        _update_runtime_decision_state(decision, runtime_config=runtime_config,
+                                                       snapshot=snapshot, block_reason=_wait)
                     if _wait:
                         pass          # hold this cycle; re-evaluated next cycle at a fresh price
                     elif gate["allowed"] and runtime_config.mode == RuntimeMode.PAPER_LIVE:
