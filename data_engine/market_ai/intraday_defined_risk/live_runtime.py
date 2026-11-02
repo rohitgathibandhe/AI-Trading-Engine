@@ -121,6 +121,23 @@ def _bar_summary(bars: list[OhlcvBar], *, minimum_required: int) -> dict[str, An
     }
 
 
+def _aged_previous_chain(hist: list, current, fallback):
+    """PREV_CHAIN_MIN_AGE_S=<s>: the 'previous' chain for OI-flow deltas = the latest chain at least <s> seconds older
+    than the current one (same session + expiry), not simply the last poll. Live polls every ~30 s while the replay's
+    chain is a ~5-min sample, so 'OI change since the previous chain' meant a 30-s delta live vs a 5-min (or zero)
+    delta in replay — 2026-11-02 the trend-day OI check flickered TREND_UP/NONE every cycle. 0 = old behaviour."""
+    try:
+        age = float(os.environ.get("PREV_CHAIN_MIN_AGE_S", "0") or 0)
+    except ValueError:
+        age = 0.0
+    if age <= 0:
+        return fallback
+    cut = current.timestamp - timedelta(seconds=age)
+    ok = [c for c in hist if c.timestamp <= cut and c.expiry == current.expiry
+          and c.timestamp.date() == current.timestamp.date()]
+    return ok[-1] if ok else None
+
+
 def _vwap_from_bars(bars: list[OhlcvBar]) -> float | None:
     numerator = 0.0
     denominator = 0.0
@@ -298,6 +315,7 @@ class DhanLiveMarketDataProvider:
             setattr(self._dw.http, "max_retries", max(1, http_retries))
         setattr(self._dw, "option_chain_attempts", max(1, option_chain_attempts))
         self._previous_chain: OptionsChainSnapshot | None = None
+        self._chain_hist: list[OptionsChainSnapshot] = []      # for PREV_CHAIN_MIN_AGE_S
         self._front_expiry_cache: tuple[date, str] | None = None
         self._previous_close_cache: tuple[date, float | None] | None = None
         self._daily_bars_cache: tuple[date, list[OhlcvBar]] | None = None
@@ -595,11 +613,12 @@ class DhanLiveMarketDataProvider:
             live_vwap=_vwap_from_bars(bars_5m),
             lot_size=self.lot_size,
             slippage_points=self.slippage_points,
-            previous_option_chain=self._previous_chain,
+            previous_option_chain=_aged_previous_chain(self._chain_hist, chain, self._previous_chain),
             previous_session_close=self._cached_previous_close(today),
         )
         snapshot.validate()
         self._previous_chain = chain
+        self._chain_hist = (self._chain_hist + [chain])[-40:]
 
         # Phase 6: Fetch auxiliary market context (India VIX + BankNifty) best-effort.
         # Written to state/market_context.json for regime.py to read each cycle.
