@@ -2120,8 +2120,15 @@ def run_live(config: dict[str, object]) -> None:
             sleep(poll_seconds)
             continue
         if runtime_config.mode == RuntimeMode.PAPER_LIVE:
+            _prior_paper = agent.open_position
             paper_position = manage_paper_position(snapshot)
             agent.open_position = paper_position
+            # SHADOW-LIVE exit: paper exits happen inside manage_paper_position (not the agent exit branch), so log the
+            # real closing orders when a held paper position disappears (2026-11-02: the 12:12 exit had no shadow order).
+            if _prior_paper is not None and paper_position is None and os.environ.get("SHADOW_LIVE_ORDERS", "0") == "1":
+                from .live_runtime import shadow_live_record
+                shadow_live_record("EXIT", position=_prior_paper, reason="PAPER_EXIT",
+                                   config=getattr(executor, "config", None))
             if paper_position is not None:
                 decision = build_no_trade_decision(
                     RegimeLabel.NO_TRADE.value,
