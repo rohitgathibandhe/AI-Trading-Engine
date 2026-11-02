@@ -95,6 +95,20 @@ def main() -> int:
             print(f"learned state: snapshot {snaps[-1].name}")
         else:
             print("learned state: today's files (no snapshot before --start yet — sizing may differ from what live had)")
+        if (LIVE_STATE / "fii_history.jsonl").exists():           # after the snapshot: history is point-in-time
+            shutil.copy2(LIVE_STATE / "fii_history.jsonl", st / "fii_history.jsonl")
+        # the SAME daily candles live uses (Dhan /charts/historical), not bars rebuilt from the 5m dataset
+        try:
+            sys.path.insert(0, str(ROOT / "data_engine"))
+            from market_ai.dhan_wrapper import DhanWrapper
+            from datetime import date as _d, timedelta as _td
+            _raw = DhanWrapper().get_daily_candles(13, "IDX_I", "INDEX",
+                                                   from_date=(_d.fromisoformat(a.start) - _td(days=130)).isoformat(),
+                                                   to_date=(_d.fromisoformat(a.end) + _td(days=1)).isoformat())
+            (work / "daily_bars.json").write_text(json.dumps(_raw or [], default=str))
+            print(f"daily bars: {len(_raw or [])} Dhan daily candles")
+        except Exception as _exc:  # noqa: BLE001
+            print(f"daily bars: Dhan fetch failed ({_exc}) — replay falls back to bars rebuilt from 5m")
         cfg = json.loads((st / "intraday_v83_run_live_config.json").read_text())
         # every absolute path in the live config must point into the scratch state — the live config's
         # learning_db_path is ABSOLUTE and would otherwise make the replay write into the live learning DB
@@ -102,7 +116,8 @@ def main() -> int:
             if isinstance(v, str) and v.startswith(str(LIVE_STATE)):
                 cfg[k] = str(st / Path(v).name)
         cfg.update({"provider_class": "market_ai.intraday_defined_risk.replay_provider:ReplayMarketDataProvider",
-                    "replay_data_path": str(data), "replay_start": a.start, "replay_end": a.end})
+                    "replay_data_path": str(data), "replay_start": a.start, "replay_end": a.end,
+                    "replay_daily_path": str(work / "daily_bars.json")})
         for kv in a.cfg:
             k, _, v = kv.partition("=")
             if k in ("executor_class", "trade_mode", "live_arm"):

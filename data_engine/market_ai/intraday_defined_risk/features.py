@@ -2098,6 +2098,27 @@ def read_fii_bias(as_of=None, max_lag_days: int = 5) -> dict:
     refresh on 2026-10-13 changed a regime test's outcome mid-session.
     Keys: date, fii_net_crores, dii_net_crores, bias (STRONG_BULLISH/BULLISH/NEUTRAL/BEARISH/STRONG_BEARISH).
     """
+    # POINT-IN-TIME HISTORY (2026-11-03): live refreshes fii_bias.json intraday (~09:57) while the replay used the
+    # evening-before snapshot -> on 11-02 live read FII STRONG_BULLISH (30-Oct flow), the replay BEARISH (29-Oct),
+    # flipping the thesis and both trades. Pick the latest flow FETCHED at or before as_of.
+    _hist = _FII_BIAS_PATH.with_name("fii_history.jsonl")
+    if as_of is not None and _hist.exists():
+        try:
+            _asof = as_of.replace(tzinfo=None)
+            best = None
+            for _ln in _hist.read_text().splitlines():
+                try:
+                    _r = json.loads(_ln)
+                    _ft = datetime.fromisoformat(str(_r.get("fetched_at"))).replace(tzinfo=None)
+                    _fd = datetime.strptime(str(_r.get("date")), "%d-%b-%Y").date()
+                except Exception:  # noqa: BLE001
+                    continue
+                _lag = (_asof.date() - _fd).days
+                if _ft <= _asof and 1 <= _lag <= max_lag_days and (best is None or (_fd, _ft) >= best[0]):
+                    best = ((_fd, _ft), _r)
+            return dict(best[1]) if best else {}
+        except Exception:  # noqa: BLE001
+            pass
     try:
         if _FII_BIAS_PATH.exists():
             data = json.loads(_FII_BIAS_PATH.read_text())

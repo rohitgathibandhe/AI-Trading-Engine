@@ -1058,6 +1058,9 @@ def _fetch_fii_bias() -> None:
             "updated_at": datetime.now(IST).isoformat(),
         }
         _FII_BIAS.write_text(json.dumps(payload, indent=2))
+        # point-in-time history (read_fii_bias as_of): one row per fetch; live and replay read what was KNOWN then
+        with (_STATE / "fii_history.jsonl").open("a") as _fh:
+            _fh.write(json.dumps(dict(payload, fetched_at=payload["updated_at"])) + "\n")
         _log(f"FII bias: {bias} (FII net={fii_net:.0f} cr, DII net={dii_net:.0f} cr, date={payload['date']})")
     except Exception as exc:
         _log(f"FII bias fetch error: {exc}")
