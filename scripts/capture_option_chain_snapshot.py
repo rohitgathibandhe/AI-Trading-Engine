@@ -111,6 +111,21 @@ def main() -> int:
     with out_file.open("a") as f:
         f.write(json.dumps(record) + "\n")
     print(f"[capture] wrote snapshot {now_ist:%H:%M:%S} exp={expiry} strikes={len(oc)} -> {out_file}")
+    # EXPIRY DAY: live trades NEXT week's contract (live_runtime._front_expiry, LIVE_SAME_DAY_EXPIRY off), so record
+    # that chain too — 2026-11-03 the replay only had the expiring chain (walls 23,600/23,700 vs live 23,500/23,800)
+    # and took the opposite decisions. build_live_dataset uses chain_snapshots_next.jsonl on such days.
+    if expiry == today_str and len(future) > 1:
+        import time as _t
+        _t.sleep(3.2)                                   # Dhan option-chain rate limit (1 per 3 s)
+        try:
+            resp2 = dw.get_option_chain(INDEX_SECURITY_ID, INDEX_SEG, future[1])
+            oc2 = (((resp2 or {}).get("data") or {}).get("data") or {}).get("oc") or {}
+            if oc2:
+                with (out_dir / "chain_snapshots_next.jsonl").open("a") as f:
+                    f.write(json.dumps(dict(record, expiry=future[1], response=resp2)) + "\n")
+                print(f"[capture] expiry day: also wrote next-week chain exp={future[1]} strikes={len(oc2)}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[capture] next-week chain failed: {exc}")
     return 0
 
 

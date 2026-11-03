@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -36,6 +37,10 @@ def build(out_dir: Path) -> None:
     spot_by_ts: dict[datetime, float] = {}
     for day_dir in sorted(LIVE.iterdir()):
         f = day_dir / "chain_snapshots.jsonl"
+        # expiry day: live trades next week's contract unless LIVE_SAME_DAY_EXPIRY=1 — use the recorded next-week chain
+        _nx = day_dir / "chain_snapshots_next.jsonl"
+        if _nx.exists() and os.environ.get("LIVE_SAME_DAY_EXPIRY", "0") != "1":
+            f = _nx
         if not f.exists():
             continue
         # keep the LAST snapshot per 5-min bucket
