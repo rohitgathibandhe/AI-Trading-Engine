@@ -18,6 +18,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import time
 import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -109,6 +110,30 @@ def main() -> int:
             print(f"daily bars: {len(_raw or [])} Dhan daily candles")
         except Exception as _exc:  # noqa: BLE001
             print(f"daily bars: Dhan fetch failed ({_exc}) — replay falls back to bars rebuilt from 5m")
+        # real India VIX (IDX_I 21) + BankNifty (IDX_I 25) 5m series — live reads them every cycle
+        try:
+            import requests as _rq
+            from datetime import date as _d2, datetime as _dt2, timedelta as _td2
+            _cr = json.loads((LIVE_STATE / "creds.json").read_text())
+            _hd = {"access-token": _cr["access_token"], "client-id": str(_cr["client_id"]),
+                   "Content-Type": "application/json", "Accept": "application/json"}
+            _ser = {"vix": [], "bank": []}
+            _s0, _e0 = _d2.fromisoformat(a.start), _d2.fromisoformat(a.end)
+            for _name, _sid in (("vix", "21"), ("bank", "25")):
+                _c = _s0
+                while _c <= _e0:
+                    _ce = min(_c + _td2(days=80), _e0)
+                    time.sleep(1.2)
+                    _j = _rq.post("https://api.dhan.co/v2/charts/intraday", headers=_hd, timeout=20, json={
+                        "securityId": _sid, "exchangeSegment": "IDX_I", "instrument": "INDEX", "interval": "5",
+                        "oi": False, "fromDate": f"{_c} 09:15:00", "toDate": f"{_ce} 15:30:00"}).json()
+                    for _t, _cl in zip(_j.get("timestamp") or [], _j.get("close") or []):
+                        _ser[_name].append((_dt2.fromtimestamp(float(_t)).isoformat(), float(_cl)))
+                    _c = _ce + _td2(days=1)
+            (work / "market_series.json").write_text(json.dumps(_ser))
+            print(f"market series: VIX {len(_ser['vix'])} / BankNifty {len(_ser['bank'])} 5m bars")
+        except Exception as _exc:  # noqa: BLE001
+            print(f"market series: fetch failed ({_exc}) — replay falls back to the chain-IV VIX proxy")
         cfg = json.loads((st / "intraday_v83_run_live_config.json").read_text())
         # every absolute path in the live config must point into the scratch state — the live config's
         # learning_db_path is ABSOLUTE and would otherwise make the replay write into the live learning DB
@@ -117,7 +142,8 @@ def main() -> int:
                 cfg[k] = str(st / Path(v).name)
         cfg.update({"provider_class": "market_ai.intraday_defined_risk.replay_provider:ReplayMarketDataProvider",
                     "replay_data_path": str(data), "replay_start": a.start, "replay_end": a.end,
-                    "replay_daily_path": str(work / "daily_bars.json")})
+                    "replay_daily_path": str(work / "daily_bars.json"),
+                    "replay_market_series_path": str(work / "market_series.json")})
         for kv in a.cfg:
             k, _, v = kv.partition("=")
             if k in ("executor_class", "trade_mode", "live_arm"):
