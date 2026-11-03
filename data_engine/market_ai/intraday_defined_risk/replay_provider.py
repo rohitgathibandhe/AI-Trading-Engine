@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from .data_models import AccountRiskLimits, AccountState, MarketSnapshot, OhlcvSeries
-from .live_runtime import _vwap_from_bars
+from .live_runtime import _aged_previous_chain, _vwap_from_bars
 
 IST = timezone(timedelta(hours=5, minutes=30))
 SNAPSHOT_OFFSET = timedelta(minutes=4)
@@ -121,6 +121,7 @@ class ReplayMarketDataProvider:
         self._slippage = float(config.get("slippage_points") or 0.0)
         self._i = -1
         self._prev_chain = None
+        self._chain_hist = []
         _PROVIDER = self
         self.advance()
 
@@ -166,8 +167,11 @@ class ReplayMarketDataProvider:
             option_chain=chain, risk_limits=self._risk,
             account_state=AccountState(realised_pnl_rupees=0.0, margin_used_rupees=0.0),
             live_vwap=_vwap_from_bars(closed5), lot_size=self._lot_size, slippage_points=self._slippage,
-            previous_option_chain=self._prev_chain, previous_session_close=self._prev_close.get(day))
+            previous_option_chain=_aged_previous_chain(self._chain_hist, chain, self._prev_chain),
+            previous_session_close=self._prev_close.get(day))
         self._prev_chain = chain
+        if not self._chain_hist or self._chain_hist[-1].timestamp != chain.timestamp:
+            self._chain_hist = (self._chain_hist + [chain])[-40:]
         self._write_market_context(chain, stamp)
         return snap
 
