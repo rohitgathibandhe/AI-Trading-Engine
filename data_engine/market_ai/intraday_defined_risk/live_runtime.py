@@ -645,11 +645,23 @@ class DhanLiveMarketDataProvider:
                     _ctx = json.loads(_ctx_path.read_text())
                 except Exception:
                     _ctx = {}
-            # Shift current → prev before overwriting so regime.py can compute % change
-            if "nifty_spot" in _ctx:
-                _ctx["nifty_spot_prev"] = _ctx["nifty_spot"]
-            if "banknifty_spot" in _ctx:
-                _ctx["banknifty_spot_prev"] = _ctx["banknifty_spot"]
+            # prev = the value >= 5 min old (MARKET_CTX_PREV_AGE_S), not the last 30-s poll: the replay sees 5-min
+            # samples, so a 30-s change made BankNifty divergence mean something different live (2026-11-03 audit).
+            _age = float(os.environ.get("MARKET_CTX_PREV_AGE_S", "0") or 0)
+            if _age > 0:
+                _hist = getattr(self, "_ctx_hist", [])
+                _cut = now - timedelta(seconds=_age)
+                _old = [h for h in _hist if h[0] <= _cut and h[0].date() == now.date()]
+                if _old:
+                    _ctx["nifty_spot_prev"], _ctx["banknifty_spot_prev"] = _old[-1][1], _old[-1][2]
+                else:
+                    _ctx.pop("nifty_spot_prev", None); _ctx.pop("banknifty_spot_prev", None)
+            else:
+                # Shift current → prev before overwriting so regime.py can compute % change
+                if "nifty_spot" in _ctx:
+                    _ctx["nifty_spot_prev"] = _ctx["nifty_spot"]
+                if "banknifty_spot" in _ctx:
+                    _ctx["banknifty_spot_prev"] = _ctx["banknifty_spot"]
             _ctx["nifty_spot"] = spot
             # India VIX realistically sits ~8-40 (never >100). The old ~22k reads were the wrong sec-id
             # (1 = NIFTY MIDCAP 150), now fixed; keep the clamp as a guard against any bad tick, which
@@ -688,6 +700,17 @@ class DhanLiveMarketDataProvider:
                     _ctx["banknifty_spot_prev"] = float(_bank_ltp)
             _ctx["updated_at"] = now.isoformat()
             _ctx_path.write_text(json.dumps(_ctx))
+            self._ctx_hist = (getattr(self, "_ctx_hist", []) + [(now, spot, _ctx.get("banknifty_spot"))])[-60:]
+            # dated record of exactly what live saw — replays use it (same VIX/BankNifty as live)
+            try:
+                _hd = STATE_ROOT / "market_context_history"
+                _hd.mkdir(exist_ok=True)
+                with (_hd / f"{now.date().isoformat()}.jsonl").open("a") as _fh:
+                    _fh.write(json.dumps({"t": now.isoformat(), "vix": _ctx.get("india_vix"),
+                                          "vix_src": _ctx.get("india_vix_source"),
+                                          "bank": _ctx.get("banknifty_spot"), "nifty": spot}) + "\n")
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:
             pass
 

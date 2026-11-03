@@ -105,6 +105,16 @@ class ReplayMarketDataProvider:
         self._daily = {d: _Bar(timestamp=datetime.combine(d, datetime.min.time()), open=bs[0].open,
                                high=max(b.high for b in bs), low=min(b.low for b in bs), close=bs[-1].close,
                                volume=0.0) for d, bs in sorted(self._bars5.items()) if len(bs) >= 60}
+        # recorded VIX / BankNifty 5m series (scripts/live_path_replay.py fetches them from Dhan)
+        self._mseries = {}
+        _mp = config.get("replay_market_series_path")
+        if _mp and Path(str(_mp)).exists():
+            try:
+                _raw = json.loads(Path(str(_mp)).read_text())
+                for _n in ("vix", "bank"):
+                    self._mseries[_n] = sorted((datetime.fromisoformat(t), float(c)) for t, c in (_raw.get(_n) or []))
+            except Exception:  # noqa: BLE001
+                self._mseries = {}
         _dp = config.get("replay_daily_path")
         if _dp and Path(str(_dp)).exists():
             from .live_runtime import _bars_from_candles
@@ -173,7 +183,45 @@ class ReplayMarketDataProvider:
         if not self._chain_hist or self._chain_hist[-1].timestamp != chain.timestamp:
             self._chain_hist = (self._chain_hist + [chain])[-40:]
         self._write_market_context(chain, stamp)
+        self._archive_oi(chain, stamp)
         return snap
+
+    def _series_at(self, name, stamp, lag_min=0):
+        """Last closed 5m close of a recorded series (VIX / BankNifty) at or before stamp - lag."""
+        ser = getattr(self, "_mseries", {}).get(name) or []
+        cut = stamp - timedelta(minutes=lag_min)
+        val = None
+        for t, c in ser:                      # sorted
+            if t + timedelta(minutes=5) <= cut:
+                val = c
+            else:
+                break
+        return val
+
+    def _archive_oi(self, chain, stamp) -> None:
+        """Mirror live: oi_today.json each cycle; at a new session the previous session's last OI is archived to
+        oi_snapshots.json (the watchdog does this at 15:35 live) — the replay used a frozen pre-start archive and
+        never had today's OI (2026-11-03 audit)."""
+        try:
+            from .live_runtime import STATE_ROOT
+            day = stamp.date().isoformat()
+            last = getattr(self, "_oi_last", None)
+            if last and last["date"] != day:
+                arc_p = STATE_ROOT / "oi_snapshots.json"
+                arc = json.loads(arc_p.read_text()) if arc_p.exists() else []
+                arc = [a for a in arc if str(a.get("date")) < last["date"]] + [last]
+                arc_p.write_text(json.dumps(arc[-10:]))
+            by = {}
+            for q in chain.quotes:
+                if q.oi:
+                    k = str(int(q.strike))
+                    by.setdefault(k, {"ce_oi": 0, "pe_oi": 0})
+                    by[k]["ce_oi" if str(getattr(q.option_type, "value", q.option_type)).upper().startswith("C") else "pe_oi"] += int(q.oi)
+            snap = {"date": day, "spot": chain.spot, "expiry": str(chain.expiry), "strikes": by}
+            (STATE_ROOT / "oi_today.json").write_text(json.dumps(snap))
+            self._oi_last = snap
+        except Exception:  # noqa: BLE001
+            pass
 
     def _write_market_context(self, chain, stamp) -> None:
         """Publish market_context.json each cycle like DhanLiveMarketDataProvider (VIX via the same ATM-IV
@@ -184,6 +232,17 @@ class ReplayMarketDataProvider:
             ivs = [float(q.iv) for q in chain.quotes if q.iv and q.ltp > 0 and abs(q.strike - chain.spot) <= 200.0]
             ctx = {"nifty_spot": chain.spot, "updated_at": stamp.isoformat(),
                    "india_vix": round(sum(ivs) / len(ivs), 2) if ivs else None, "india_vix_source": "chain_iv_proxy"}
+            _vix = self._series_at("vix", stamp)
+            if _vix and 5.0 <= _vix <= 100.0:            # live uses the real India VIX; so does the replay now
+                ctx["india_vix"], ctx["india_vix_source"] = round(_vix, 2), "dhan_api"
+            _bk, _bk5 = self._series_at("bank", stamp), self._series_at("bank", stamp, lag_min=5)
+            if _bk:
+                ctx["banknifty_spot"] = _bk
+                ctx["banknifty_spot_prev"] = _bk5 or _bk
+            _sp = [c for c in getattr(self, "_spot_hist", []) if c[0] <= stamp - timedelta(minutes=5)]
+            if _sp:
+                ctx["nifty_spot_prev"] = _sp[-1][1]
+            self._spot_hist = (getattr(self, "_spot_hist", []) + [(stamp, chain.spot)])[-30:]
             (STATE_ROOT / "market_context.json").write_text(json.dumps(ctx))
         except Exception:
             pass
