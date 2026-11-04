@@ -397,7 +397,14 @@ def zone_bos(bars: list[dict], levels: dict, lookback: int = 36) -> dict | None:
             strong = (last["o"] - last["c"]) / rng >= 0.6 and (last["h"] - last["c"]) / rng >= 0.7
         if not (crossed and strong):
             continue
+        # DISPLACEMENT: a real break of structure comes on an expanded candle (11-04 winner 46 vs avg 25 = 1.8x; the four
+        # losers 08-06/09-25/10-14 broke micro-swings on ordinary 1.0-1.4x candles)
+        if rng < float(levels.get("disp_mult") or 1.5) * avg:
+            continue
         sweep = min(seg[k1]["l"], seg[k2]["l"]) if up else max(seg[k1]["h"], seg[k2]["h"])
+        # RISK CAP: the stop sits beyond the sweep — skip when it is too far (10-14 13:00: 128 pts)
+        if abs(last["c"] - sweep) > float(levels.get("max_risk") or 90.0):
+            continue
         zones = {k: v for k, v in (levels.get("demand") if up else levels.get("supply") or {}).items() if v}
         hit = [(k, v) for k, v in zones.items() if abs(sweep - float(v)) <= near]
         if not hit:
