@@ -147,6 +147,13 @@ class ReplayMarketDataProvider:
         nxt = CLOCK.now + STEP
         day = CLOCK.now.date()
         day_last = max(t for t in self._times if t.date() == day) + SNAPSHOT_OFFSET
+        eod = datetime.combine(day, datetime.min.time()).replace(hour=15, minute=16)
+        if nxt.replace(tzinfo=None) > day_last + STEP and day_last < eod and CLOCK.now.replace(tzinfo=None) < eod:
+            # the day's recording ended early (25 of 66 recorded days stop before 15:15): live's clock keeps running
+            # and its 15:15 time exit / EOD guardian closes on the last mark. One final cycle at 15:16 on the last
+            # recorded snapshot does the same — before this, open positions rode overnight ("STALE_OVERNIGHT_EXIT").
+            CLOCK.now = eod.replace(tzinfo=IST)
+            return
         if nxt.replace(tzinfo=None) > day_last + STEP:
             later = [t for t in self._times if t.date() > day]
             if not later:
