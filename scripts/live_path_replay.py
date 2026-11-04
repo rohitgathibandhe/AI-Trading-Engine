@@ -80,6 +80,11 @@ def main() -> int:
         # (e.g. the exact commit that was live on a past day) can be replayed for a fidelity check.
         shutil.copy2(ROOT / "data_engine" / "market_ai" / "intraday_defined_risk" / "replay_provider.py",
                      wt / "data_engine" / "market_ai" / "intraday_defined_risk" / "replay_provider.py")
+        # the injected provider imports utils.market_calendar (PR #78); an older --ref lacks it -> every cycle crashed
+        # (2026-11-05: three overnight A/Bs aborted with ModuleNotFoundError). Inject it when missing.
+        _mc = wt / "data_engine" / "market_ai" / "utils" / "market_calendar.py"
+        if not _mc.exists():
+            shutil.copy2(ROOT / "data_engine" / "market_ai" / "utils" / "market_calendar.py", _mc)
         st = wt / "data_engine" / "market_ai" / "state"
         st.mkdir(parents=True, exist_ok=True)
         (wt / "data_engine" / "state").mkdir(parents=True, exist_ok=True)     # day_thesis.py writes here
