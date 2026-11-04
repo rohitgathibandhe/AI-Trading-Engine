@@ -352,6 +352,62 @@ def mw_neckline_break(bars: list[dict], lookback: int = 30, tol_frac: float = 0.
     return None
 
 
+def zone_bos(bars: list[dict], levels: dict, lookback: int = 36) -> dict | None:
+    """PRO STRUCTURE ENTRY (owner 2026-11-05): price pulls back into a ZONE (impulse origin = day open, previous-day
+    high/low/close, put/call wall), forms a W (two swing lows; the 2nd may SWEEP the 1st — the classic liquidity grab)
+    / M at supply, then the last CLOSED 5m candle is a STRONG candle closing through the swing high/low between them
+    (break of structure). 2026-11-04: 09:15 impulse 23,742->23,870 through PDH 23,811; range 09:30-10:10; 10:15 break
+    down into the origin zone; W lows 23,759 (11:55) / 23,737 (12:15, sweep); 12:25 strong close 23,816 > swing high
+    23,795 -> close 23,961. Returns {'dir','neck','sweep','zone','zone_lvl','at'} or None. Direction filtering (with the
+    higher-timeframe trend) is the caller's job."""
+    if len(bars) < 12:
+        return None
+    seg = bars[-lookback:]
+    n = len(seg)
+    last, prev = seg[-1], seg[-2]
+    rng = max(last["h"] - last["l"], 0.5)
+    avg = sum(b["h"] - b["l"] for b in seg[-13:-1]) / max(len(seg[-13:-1]), 1)
+    tol = max(25.0, 1.0 * avg)                       # two lows "equal" within this
+    sweep_max = max(30.0, 1.2 * avg)                 # the 2nd low may undercut the 1st by up to this
+    near = float(levels.get("zone_tol") or 30.0)
+    for up in (True, False):
+        lo = (lambda b: b["l"]) if up else (lambda b: -b["h"])
+        piv = [k for k in range(2, n - 2) if lo(seg[k]) <= min(lo(seg[k - 2]), lo(seg[k - 1]), lo(seg[k + 1]), lo(seg[k + 2]))]
+        # the 2nd low may be the bar before the trigger (only 1 bar to its right): allow k = n-3 with 1 right bar
+        if n >= 4 and lo(seg[n - 3]) <= min(lo(seg[n - 4]), lo(seg[n - 2])) and (n - 3) not in piv:
+            piv.append(n - 3)
+        piv = sorted(set(piv))
+        if len(piv) < 2:
+            continue
+        k1, k2 = piv[-2], piv[-1]
+        if k2 - k1 < 2:
+            continue
+        l1, l2 = lo(seg[k1]), lo(seg[k2])
+        if not (l2 >= l1 - sweep_max and abs(l2 - l1) <= max(tol, sweep_max)):
+            continue
+        between = seg[k1 + 1:k2]
+        if not between:
+            continue
+        neck = max(b["h"] for b in between) if up else min(b["l"] for b in between)
+        if up:
+            crossed = last["c"] > neck >= prev["c"]
+            strong = (last["c"] - last["o"]) / rng >= 0.6 and (last["c"] - last["l"]) / rng >= 0.7
+        else:
+            crossed = last["c"] < neck <= prev["c"]
+            strong = (last["o"] - last["c"]) / rng >= 0.6 and (last["h"] - last["c"]) / rng >= 0.7
+        if not (crossed and strong):
+            continue
+        sweep = min(seg[k1]["l"], seg[k2]["l"]) if up else max(seg[k1]["h"], seg[k2]["h"])
+        zones = {k: v for k, v in (levels.get("demand") if up else levels.get("supply") or {}).items() if v}
+        hit = [(k, v) for k, v in zones.items() if abs(sweep - float(v)) <= near]
+        if not hit:
+            continue
+        zk, zv = min(hit, key=lambda kv: abs(sweep - float(kv[1])))
+        return {"dir": "UP" if up else "DOWN", "neck": round(neck, 2), "sweep": round(sweep, 2), "zone": zk,
+                "zone_lvl": round(float(zv), 2), "at": last["t"].isoformat()}
+    return None
+
+
 def failed_break(bars: list[dict]) -> dict | None:
     """FAILED OPENING-RANGE BREAK (a trap) on COMPLETED bars: a close beyond one side of the 15-min opening range, then a
     later close back INSIDE the range and on the other side of VWAP. Trade the reversal. 2026-10-21: 09:30/09:35 closed

@@ -874,6 +874,7 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     choice = _prev_day_break_entry(choice, metadata, now_time)
     choice = _fib_wall_entry(choice, metadata, now_time)
     choice = _mw_entry(choice, metadata, now_time)
+    choice = _zone_bos_entry(choice, metadata, now_time)
     choice = _option_data_gate(choice, metadata, spot)
     _set_chart_stop(choice, metadata, spot)
     return choice
@@ -1070,6 +1071,37 @@ def _set_chart_stop(choice: StrategyChoice, metadata: dict[str, Any], spot: floa
 _FAIL_BREAK = os.environ.get("SEL_FAILED_BREAK", "0") == "1"
 _FAIL_BREAK_BARS = int(os.environ.get("SEL_FAILED_BREAK_BARS", "6") or 6)
 _FAIL_BREAK_SIDES = os.environ.get("SEL_FAILED_BREAK_SIDES", "BOTH").upper()
+
+
+def _zone_bos_entry(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> StrategyChoice:
+    """SEL_ZONE_BOS=1: trend_day.zone_bos — pullback into a zone, W/M (sweep allowed), strong break-of-structure close.
+    Only in the higher-timeframe direction (daily trend; no opposing trend day). Stop just beyond the sweep."""
+    if os.environ.get("SEL_ZONE_BOS", "0") != "1" or choice.structures:
+        return choice
+    zb = metadata.get("zone_bos") or {}
+    side = zb.get("dir")
+    if not side:
+        return choice
+    daily = str(metadata.get("daily_trend") or "").upper()
+    if os.environ.get("SEL_ZONE_BOS_ALIGN", "1") == "1" and daily != ("BULLISH" if side == "UP" else "BEARISH"):
+        return choice
+    if str((metadata.get("trend_day") or {}).get("state") or "") == ("TREND_DOWN" if side == "UP" else "TREND_UP"):
+        return choice
+    if now_time is not None and not (time(9, 45) <= now_time <= time(14, 30)):
+        return choice
+    if _DEBIT_BLACKOUT is not None and now_time is not None and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1]:
+        return choice
+    for k in ("seller_exit", "conf_bull_sell_closer", "is_fade"):
+        metadata.pop(k, None)
+    metadata["zone_bos_entry"] = zb.get("at")
+    metadata["level_stop_spot"] = float(zb["sweep"]) - 5.0 if side == "UP" else float(zb["sweep"]) + 5.0
+    choice.condition = f"BREAKOUT_{side}"
+    choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, [_ACC_DEBIT[side]]
+    choice.executable_today = True
+    choice.rationale = (choice.rationale or "") + (f" [ZONE+{'W' if side == 'UP' else 'M'}+BOS {side}: sweep {zb['sweep']} at "
+                                                   f"{zb['zone']} {zb['zone_lvl']}, strong close through {zb['neck']} "
+                                                   f"(daily {daily}) — buy the {_ACC_DEBIT[side]}]")
+    return choice
 
 
 def _failed_break_entry(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> StrategyChoice:
