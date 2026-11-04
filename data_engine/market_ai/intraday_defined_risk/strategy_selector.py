@@ -935,10 +935,19 @@ def _strong(bar: dict | None, up: bool, avg_range: float | None = None) -> bool:
     return body >= 0.5 and pos >= 0.7
 
 
+def _entry_end() -> time:
+    """Latest new entry (ENTRY_END_HHMM, default 14:30). 11-02/11-03 both trended +100..+190 pts after 14:30."""
+    try:
+        h, m = str(os.environ.get("ENTRY_END_HHMM", "14:30") or "14:30").split(":")
+        return time(int(h), int(m))
+    except ValueError:
+        return time(14, 30)
+
+
 def _new_entry_ok(side: str, td: dict, now_time) -> bool:
     if str(td.get("state") or "") == ("TREND_DOWN" if side == "UP" else "TREND_UP"):
         return False
-    if now_time is not None and not (time(9, 35) <= now_time <= time(14, 30)):
+    if now_time is not None and not (time(9, 35) <= now_time <= _entry_end()):
         return False
     if _DEBIT_BLACKOUT is not None and now_time is not None and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1]:
         return False
@@ -1124,7 +1133,7 @@ def _accepted_break_entry(choice: StrategyChoice, metadata: dict[str, Any], now_
         return choice
     if str(td.get("state") or "") == ("TREND_DOWN" if side == "UP" else "TREND_UP"):
         return choice
-    if now_time is not None and not (time(9, 35) <= now_time <= time(14, 30)):
+    if now_time is not None and not (time(9, 35) <= now_time <= _entry_end()):
         return choice
     if _DEBIT_BLACKOUT is not None and now_time is not None and _DEBIT_BLACKOUT[0] <= now_time < _DEBIT_BLACKOUT[1]:
         return choice
