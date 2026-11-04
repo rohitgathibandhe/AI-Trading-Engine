@@ -1167,6 +1167,13 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
             (want is None or first not in want):
         want, _td_accept = _td_want, True
         metadata["edge_trend_day_accept"] = _tds
+    # RANGE-DAY FADE CREDIT (SEL_EDGE_ALLOW_FADE_CREDIT=1): a fade the scorer SELLS (bear-call at a rejected call wall /
+    # bull-put at a held put wall) is allowed on a NON-trend day — the agent had no range-day trade at all
+    # (2026-11-04: 23,942 rejection under the 24,000 wall ran 205 pts, then 23,737 bounced 180; nothing traded).
+    if os.environ.get("SEL_EDGE_ALLOW_FADE_CREDIT", "0") == "1" and metadata.get("is_fade") \
+            and first in ("BEAR_CALL_CREDIT_SPREAD", "BULL_PUT_CREDIT_SPREAD") and _tds not in ("TREND_UP", "TREND_DOWN"):
+        metadata["edge_fade_credit"] = True
+        return choice
     ok = want is not None and first in want
     # A breakout on a session that has already broken BOTH sides of the opening range is a range-day fake-out:
     # real chains, edge-only replay — breakout debits on two-sided days 6 trades -16,786 net vs trend days +25,384.
