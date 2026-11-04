@@ -100,11 +100,17 @@ def main():
     print(f"recorder start {datetime.now():%H:%M:%S}; seed points {len(seed)}", flush=True)
     standing = "--standing" in sys.argv          # daily mode: always record ticks, write candles only while charts fail
     chart_down = not standing
+    fails = 0
     while datetime.now().strftime("%H%M") <= "1531":
         if time.time() - last_check > 60:
             last_check = time.time()
             try:
                 ok = _chart_ok(h, day)
+                # 2026-11-04: ONE failed check (rate-limited at 12:52) flipped the standing recorder into fallback and it
+                # overwrote the agent's real candle cache with zero-volume LTP bars. Require 3 consecutive failures.
+                fails = 0 if ok else fails + 1
+                if not ok and fails < 3:
+                    ok = True
                 if ok and not standing:
                     print(f"{datetime.now():%H:%M:%S} Dhan chart endpoint is back — recorder exits", flush=True)
                     return
@@ -124,7 +130,16 @@ def main():
         if chart_down:
             pts = [x for x in seed if x[0] < first_tick] + ticks
             for m in (5, 15):
-                (STATE / f"candle_cache_{day}_{m}m.json").write_text(json.dumps(_bars(pts, m)))
+                cp = STATE / f"candle_cache_{day}_{m}m.json"
+                try:      # never overwrite real (volume-bearing) candles the agent fetched — only extend or fill
+                    cur = json.loads(cp.read_text()) if cp.exists() else []
+                except Exception:  # noqa: BLE001
+                    cur = []
+                new = _bars(pts, m)
+                if any((b.get("volume") or 0) > 0 for b in cur):
+                    have = {b["timestamp"] for b in cur}
+                    new = cur + [b for b in new if b["timestamp"] not in have and b["timestamp"] > cur[-1]["timestamp"]]
+                cp.write_text(json.dumps(new))
         time.sleep(POLL_S)
 
 
