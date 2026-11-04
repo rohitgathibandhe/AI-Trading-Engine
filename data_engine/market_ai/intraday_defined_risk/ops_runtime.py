@@ -904,7 +904,10 @@ def _second_trade_block_reason(
     now: datetime,
     config: RuntimeConfig,
 ) -> str | None:
-    if not config.risk.second_trade_requires_first_trade_profit:
+    # SECOND_TRADE_GAP_ALWAYS=1: the min-gap is its own rule. It used to sit behind the profit requirement, so turning
+    # that off (live config) silently disabled the 90-min gap too — 2026-11-02 re-entered 3 min after an exit (-7,605).
+    _gap_always = os.environ.get("SECOND_TRADE_GAP_ALWAYS", "0") == "1"
+    if not config.risk.second_trade_requires_first_trade_profit and not _gap_always:
         return None
     if int(state.get("session_trade_count") or 0) < 1:
         return None
@@ -918,7 +921,7 @@ def _second_trade_block_reason(
         return "SECOND_TRADE_FIRST_RESULT_MISSING"
     if first_exit is None:
         return "SECOND_TRADE_FIRST_NOT_COMPLETED"
-    if float(first.get("pnl_rupees") or 0.0) <= 0.0:
+    if config.risk.second_trade_requires_first_trade_profit and float(first.get("pnl_rupees") or 0.0) <= 0.0:
         return "SECOND_TRADE_REQUIRES_FIRST_PROFIT"
     if first_entry.tzinfo is None and now.tzinfo is not None:
         first_entry = first_entry.replace(tzinfo=now.tzinfo)
