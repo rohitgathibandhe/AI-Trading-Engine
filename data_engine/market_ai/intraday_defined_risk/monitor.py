@@ -2302,6 +2302,15 @@ def run_live(config: dict[str, object]) -> None:
                             )
                             _update_runtime_decision_state(decision, runtime_config=runtime_config,
                                                            snapshot=snapshot, block_reason=_wait_why)
+                    # EVENT GUARD (EVENT_GUARD=1): no new entry inside a scheduled event window (RBI policy 09:45-10:45,
+                    # Budget 09:15-13:30 ...; utils/market_calendar.py + state/market_calendar.json).
+                    if not _wait and gate["allowed"] and os.environ.get("EVENT_GUARD", "0") == "1":
+                        from ..utils.market_calendar import event_block as _evb
+                        _ev = _evb(snapshot.timestamp)
+                        if _ev:
+                            _wait = f"EVENT_WINDOW:{_ev.get('label')}"
+                            log_validation_decision(decision, snapshot=snapshot, block_reason=_wait,
+                                                    actual_trade_created=False, decision_origin="V83_ENTRY_WAIT")
                     # RE-ENTRY COOLDOWN (SEL_REENTRY_COOLDOWN_MIN=<m>): no new entry within m minutes of an exit.
                     # 2026-11-02: exit 12:12 (+618), same-strike re-entry 12:15 -> -7,605.
                     _cd = float(os.environ.get("SEL_REENTRY_COOLDOWN_MIN", "0") or 0)

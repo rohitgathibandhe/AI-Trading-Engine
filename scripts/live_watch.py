@@ -84,6 +84,9 @@ def main() -> None:
     now = datetime.fromisoformat(os.environ["LIVE_WATCH_NOW"]) if os.environ.get("LIVE_WATCH_NOW") else datetime.now()
     if now.weekday() >= 5 or not ("0915" <= now.strftime("%H%M") <= "1530"):
         return
+    from market_ai.utils.market_calendar import is_trading_day
+    if not is_trading_day(now.date()):          # NSE holiday: no session, nothing to watch
+        return
     day = now.date().isoformat()
     st = json.loads(WSTATE.read_text()) if WSTATE.exists() else {}
     if st.get("day") != day:
