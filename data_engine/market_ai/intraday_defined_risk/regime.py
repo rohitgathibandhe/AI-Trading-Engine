@@ -1714,9 +1714,9 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     # Phase 6C: Monthly expiry gate — last Thursday of month carries extreme gamma risk.
     # Monthly expiry = last TUESDAY since 2025-09-01 (last Thursday before) — the gate keyed on the last
     # Thursday, so live it fired two days late (e.g. Oct-2026: 29th instead of the 27th).
-    from ..utils.index_calendar import monthly_expiry_date
+    from ..utils.market_calendar import monthly_expiry as _monthly_expiry   # holiday-adjusted (11-24 holiday -> 11-23)
     _today = snapshot.timestamp.date()
-    _days_to_monthly = (monthly_expiry_date(_today) - _today).days
+    _days_to_monthly = (_monthly_expiry(_today) - _today).days
     if _days_to_monthly == 0:
         bullish_entry_score -= 0.8
         bearish_entry_score -= 0.8
@@ -1777,9 +1777,10 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     _pin_pts = _gamma.get("spot_to_pin_pts")
     _pin_risk_active = False
     if _pin_pts is not None:
-        _weekday_pin = snapshot.timestamp.weekday()
-        _is_expiry_day_pin = (_weekday_pin == 1)   # Tuesday
-        _is_pre_expiry_pin = (_weekday_pin == 0)   # Monday
+        from ..utils import market_calendar as _mcal_pin   # holiday-aware expiry (not "Tuesday")
+        _dpin = snapshot.timestamp.date()
+        _is_expiry_day_pin = _mcal_pin.is_expiry_day(_dpin)
+        _is_pre_expiry_pin = _mcal_pin.is_expiry_day(_mcal_pin.next_trading_day(_dpin))
         _abs_pin = abs(_pin_pts)
         if _is_expiry_day_pin and _abs_pin < 30:
             bullish_entry_score -= 0.5
@@ -2290,9 +2291,12 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
     # This is the ideal IC deployment day: full theta ahead, manageable gamma.
     # Relax the range_balance threshold slightly to let the IC fire in the morning window.
     _weekday = snapshot.timestamp.weekday()  # 0=Mon 1=Tue 2=Wed 3=Thu 4=Fri
-    _is_expiry_day = _weekday == 1           # Tuesday = expiry
-    _is_post_expiry_day = _weekday == 2      # Wednesday = day 1 of new weekly series (best IC day)
-    _is_pre_expiry_day = _weekday == 0       # Monday = day before expiry (high gamma caution)
+    # holiday-aware (2026-11-05): Tue 11-10 / Tue 11-24 are NSE holidays -> expiry Mon 11-09 / Mon 11-23
+    from ..utils import market_calendar as _mcal
+    _d0 = snapshot.timestamp.date()
+    _is_expiry_day = _mcal.is_expiry_day(_d0)
+    _is_post_expiry_day = _mcal.is_expiry_day(_mcal.previous_trading_day(_d0))   # day 1 of the new weekly series
+    _is_pre_expiry_day = _mcal.is_expiry_day(_mcal.next_trading_day(_d0))        # day before expiry
     metadata["is_expiry_day"] = _is_expiry_day
     metadata["is_post_expiry_day"] = _is_post_expiry_day
     metadata["weekly_series_day"] = _weekday

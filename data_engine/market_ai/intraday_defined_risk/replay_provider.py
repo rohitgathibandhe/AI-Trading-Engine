@@ -120,7 +120,8 @@ class ReplayMarketDataProvider:
             from .live_runtime import _bars_from_candles
             _real = _bars_from_candles(json.loads(Path(str(_dp)).read_text()) or [])
             if _real:          # live parity: the official Dhan daily candles, not ones rebuilt from 5m bars
-                self._daily = {b.timestamp.date(): b for b in _real}
+                from ..utils.market_calendar import special_sessions as _ss
+                self._daily = {b.timestamp.date(): b for b in _real if b.timestamp.date() not in _ss()}
         # identical to DhanLiveMarketDataProvider.current_snapshot (same run_live config keys)
         self._risk = AccountRiskLimits(
             max_risk_rupees_per_trade=float(config.get("max_risk_rupees_per_trade") or 10_000.0),

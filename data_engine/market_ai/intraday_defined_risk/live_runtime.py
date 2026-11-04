@@ -291,7 +291,8 @@ def _previous_close(dw: Any, *, underlying_id: int, underlying_seg: str, today: 
         from_date=start,
         to_date=end,
     )
-    bars = [b for b in _bars_from_candles(candles or []) if b.timestamp.date() < today]
+    from ..utils.market_calendar import special_sessions as _ss
+    bars = [b for b in _bars_from_candles(candles or []) if b.timestamp.date() < today and b.timestamp.date() not in _ss()]
     return bars[-1].close if bars else None
 
 
@@ -485,7 +486,9 @@ class DhanLiveMarketDataProvider:
                 from_date=start,
                 to_date=end,
             )
-            bars = [b for b in _bars_from_candles(raw or []) if b.timestamp.date() < today]
+            from ..utils.market_calendar import special_sessions as _ss
+            bars = [b for b in _bars_from_candles(raw or []) if b.timestamp.date() < today
+                    and b.timestamp.date() not in _ss()]       # Muhurat (~1 h) must not become "previous day"
         except Exception:
             bars = []
         if not bars:
@@ -505,6 +508,9 @@ class DhanLiveMarketDataProvider:
         out: list[OhlcvBar] = []
         for k in range(90, 0, -1):
             d = today - timedelta(days=k)
+            from ..utils.market_calendar import special_sessions as _ss
+            if d in _ss():
+                continue
             five = self._load_candle_disk(5, d)
             five = [b for b in five if b.timestamp.time() >= datetime.strptime("09:15", "%H:%M").time()]
             if len(five) < 40:            # partial / holiday file
