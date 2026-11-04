@@ -848,7 +848,21 @@ def record_runtime_trade_exit(
         exit_reason=exit_reason,
     )
     state["last_exit_reason"] = exit_reason
+    # REAL trades must count toward the daily loss lock too — before 2026-11-05 only paper exits (manage_paper_position)
+    # added to realized_pnl_rupees, so in MICRO_LIVE the daily loss lock could never trip.
+    state["realized_pnl_rupees"] = round(float(state.get("realized_pnl_rupees") or 0.0) + float(pnl_rupees or 0.0), 2)
+    state["total_pnl_rupees"] = state["realized_pnl_rupees"]
+    if state["realized_pnl_rupees"] <= -_daily_loss_cap(config):
+        state["daily_lock"] = {"active": True, "reason": "DAILY_REALIZED_LOSS_LOCK", "locked_at": snapshot.timestamp.isoformat()}
     save_runtime_state(state, paths=paths)
+
+
+def _daily_loss_cap(config: "RuntimeConfig") -> float:
+    """Daily realized-loss lock. Real money (MICRO_LIVE) uses the tighter LIVE_MAX_DAILY_LOSS_RUPEES (default 2,500)."""
+    cap = abs(float(config.risk.max_daily_realized_loss_rupees))
+    if getattr(config, "mode", None) == RuntimeMode.MICRO_LIVE:
+        cap = min(cap, abs(float(os.environ.get("LIVE_MAX_DAILY_LOSS_RUPEES", "2500") or 2500)))
+    return cap
 
 
 def _score_margin_required(
@@ -1036,7 +1050,7 @@ def evaluate_entry_gate(
             reasons.append(second_trade_reason)
     if int(decision.lots or 0) > config.risk.max_lots_per_trade:
         reasons.append("LOTS_EXCEED_RUNTIME_LIMIT")
-    if float(state.get("realized_pnl_rupees") or 0.0) <= -abs(config.risk.max_daily_realized_loss_rupees):
+    if float(state.get("realized_pnl_rupees") or 0.0) <= -_daily_loss_cap(config):
         reasons.append("DAILY_REALIZED_LOSS_LOCK")
     if float(state.get("total_pnl_rupees") or 0.0) <= -abs(config.risk.max_daily_total_loss_rupees):
         reasons.append("DAILY_TOTAL_LOSS_LOCK")
@@ -1186,7 +1200,7 @@ def evaluate_paper_context_override_gate(
             reasons.append(second_trade_reason)
     if int(decision.lots or 0) > config.risk.max_lots_per_trade:
         reasons.append("LOTS_EXCEED_RUNTIME_LIMIT")
-    if float(state.get("realized_pnl_rupees") or 0.0) <= -abs(config.risk.max_daily_realized_loss_rupees):
+    if float(state.get("realized_pnl_rupees") or 0.0) <= -_daily_loss_cap(config):
         reasons.append("DAILY_REALIZED_LOSS_LOCK")
     if float(state.get("total_pnl_rupees") or 0.0) <= -abs(config.risk.max_daily_total_loss_rupees):
         reasons.append("DAILY_TOTAL_LOSS_LOCK")
