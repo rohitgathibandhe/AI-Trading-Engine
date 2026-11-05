@@ -1248,6 +1248,14 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
         choice.family, choice.structures = FAM_STAND_ASIDE, []
         choice.rationale = (choice.rationale or "") + " [FADE -> DEBIT blocked: no trend-day confirmation — stand aside]"
         return choice
+    # SEL_NO_SELL_CONVERT=1: the scorer voted SELL and no confirmed trend day backs a buy -> stand aside, do not convert the
+    # credit into a debit. 2026-11-05 09:55: SELL 3-1, no trend day, light volume -> converted call debit, never green.
+    if first != want[0] and os.environ.get("SEL_NO_SELL_CONVERT", "0") == "1" and not _td_accept \
+            and _tds not in ("TREND_UP", "TREND_DOWN"):
+        metadata["edge_only_skip"] = f"{choice.condition}/{first} scorer voted sell, no trend day: not converted"
+        choice.family, choice.structures = FAM_STAND_ASIDE, []
+        choice.rationale = (choice.rationale or "") + " [SELL VOTE, NO TREND DAY — not converted to a debit; stand aside]"
+        return choice
     if first != want[0]:
         for k in ("seller_exit", "conf_bull_sell_closer", "is_fade"):
             metadata.pop(k, None)
