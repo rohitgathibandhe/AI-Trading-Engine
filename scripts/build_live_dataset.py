@@ -23,6 +23,11 @@ STATE = ROOT / "data_engine" / "market_ai" / "state"
 LIVE = STATE / "rolling_option_live"
 
 
+def _snap_price(snap: dict) -> float | None:
+    price = ((snap.get("response") or {}).get("data") or {}).get("data", {}).get("last_price")
+    return float(price) if price else None
+
+
 def _floor5(ts: datetime) -> datetime:
     return ts.replace(second=0, microsecond=0, minute=(ts.minute // 5) * 5)
 
@@ -45,10 +50,17 @@ def build(out_dir: Path) -> None:
             continue
         # keep the LAST snapshot per 5-min bucket
         by_bucket: dict[datetime, dict] = {}
-        for line in f.read_text().splitlines():
-            if not line.strip():
+        day_snaps = [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
+        # Dhan occasionally returns another instrument's chain for the Nifty request (last_price ~7,000): 10 of 3,564
+        # snapshots. On 2026-09-29 one read as spot 6,914 and fired a chart stop at Rs 0 on what was really a -11k trade.
+        day_prices = [_snap_price(s) for s in day_snaps]
+        day_prices = sorted(p for p in day_prices if p)
+        day_median = day_prices[len(day_prices) // 2] if day_prices else None
+        for snap in day_snaps:
+            price = _snap_price(snap)
+            if price and day_median and abs(price / day_median - 1.0) > 0.03:
+                print(f"skipping wrong-underlying snapshot {snap.get('captured_at')} last_price={price}")
                 continue
-            snap = json.loads(line)
             try:
                 ts = _floor5(_parse_ts(snap["captured_at"]).replace(tzinfo=None))
             except Exception:

@@ -121,6 +121,31 @@ def _bar_summary(bars: list[OhlcvBar], *, minimum_required: int) -> dict[str, An
     }
 
 
+CHAIN_PRICE_MAX_DEVIATION = 0.03
+
+
+def _chain_last_price(payload) -> float | None:
+    node = payload
+    for _ in range(3):
+        if not isinstance(node, dict):
+            return None
+        if node.get("last_price") is not None:
+            try:
+                return float(node["last_price"])
+            except (TypeError, ValueError):
+                return None
+        node = node.get("data")
+    return None
+
+
+# WRONG-UNDERLYING CHAIN: Dhan occasionally answers a Nifty chain request with another instrument's chain (10 of 3,564
+# recorded snapshots, last_price ~7,000, strikes 4,000-10,600 at 200 steps). It parses as a healthy chain, so treat it as
+# an outage: walls, OI and marks from those strikes would be garbage.
+def _chain_price_mismatch(payload, spot: float) -> bool:
+    price = _chain_last_price(payload)
+    return bool(price and spot and abs(price / spot - 1.0) > CHAIN_PRICE_MAX_DEVIATION)
+
+
 def _aged_previous_chain(hist: list, current, fallback):
     """PREV_CHAIN_MIN_AGE_S=<s>: the 'previous' chain for OI-flow deltas = the latest chain at least <s> seconds older
     than the current one (same session + expiry), not simply the last poll. Live polls every ~30 s while the replay's
@@ -576,6 +601,10 @@ class DhanLiveMarketDataProvider:
         quotes = [_quote_from_row(dict(row)) for row in chain_rows]
         quotes = [quote for quote in quotes if quote is not None]
         _log = logging.getLogger("intraday_defined_risk.v83")
+        if _chain_price_mismatch(chain_raw, spot):
+            _log.warning("[option_chain] rejected: chain price is not this underlying (spot %.2f, payload %s)",
+                         spot, _chain_last_price(chain_raw))
+            quotes = []
         if not quotes:
             self._chain_miss_streak += 1
             if self._chain_miss_streak == 5:
