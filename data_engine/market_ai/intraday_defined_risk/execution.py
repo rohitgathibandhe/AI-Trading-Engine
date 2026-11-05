@@ -530,7 +530,20 @@ def _evaluate_debit_exit(
     _cs = (position.metadata or {}).get("chart_stop_spot")
     if DEBIT_CHART_STOP and _cs and current_snapshot is not None and not position.metadata.get("is_fade"):
         _sp = float(current_snapshot.option_chain.spot)
-        if (_sp >= float(_cs)) if position.structure.strategy == StrategyType.PUT_DEBIT_SPREAD else (_sp <= float(_cs)):
+        _pd = position.structure.strategy == StrategyType.PUT_DEBIT_SPREAD
+        # LIVE/REPLAY PARITY (DEBIT_CHART_STOP_BASIS, default SPOT): live's spot is a tick, the replay's a ~5-min chain sample,
+        # so the same stop can fire in one and not the other. 2026-11-05: live stop 24,355 hit on a 10:44 tick (-4,336); the
+        # replay's stop 24,351 saw samples of 24,372 and 24,354.5 and held to +5,553. CLOSE = last closed 5m close in both;
+        # EXTREME = that bar's low/high (a touch, what ticks see), to measure what the replay's sampling has been missing.
+        _basis = os.environ.get("DEBIT_CHART_STOP_BASIS", "SPOT").upper()
+        if _basis in ("CLOSE", "EXTREME"):
+            try:
+                _cb = list(current_snapshot.nifty_5m.bars)
+                if _cb:
+                    _sp = float(_cb[-1].close) if _basis == "CLOSE" else float(_cb[-1].high if _pd else _cb[-1].low)
+            except Exception:  # noqa: BLE001
+                pass
+        if (_sp >= float(_cs)) if _pd else (_sp <= float(_cs)):
             return ExitDecision(True, "DEBIT_CHART_STOP", value, pnl)
 
     # Hard stop: lost >= DEBIT_STOP_FRAC of the debit (after a short breathe)
