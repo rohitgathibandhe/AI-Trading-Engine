@@ -23,7 +23,8 @@ from pathlib import Path
 import requests
 
 STATE = Path(__file__).resolve().parents[1] / "data_engine" / "market_ai" / "state"
-POLL_S = 5
+POLL_S = 15      # was 5: on top of the agent's own calls this drew Dhan 429s ("user may be blocked", 2026-11-05)
+MAX_BACKOFF_S = 120
 
 
 def _creds():
@@ -101,6 +102,7 @@ def main():
     standing = "--standing" in sys.argv          # daily mode: always record ticks, write candles only while charts fail
     chart_down = not standing
     fails = 0
+    ltp_fails = 0
     while datetime.now().strftime("%H%M") <= "1531":
         if time.time() - last_check > 60:
             last_check = time.time()
@@ -125,7 +127,9 @@ def main():
             ticks.append((now, p))
             with tick_file.open("a") as f:
                 f.write(json.dumps({"t": now.isoformat(), "p": p}) + "\n")
+            ltp_fails = 0
         except Exception as e:  # noqa: BLE001
+            ltp_fails += 1
             print(f"ltp fail {e}", flush=True)
         if chart_down:
             pts = [x for x in seed if x[0] < first_tick] + ticks
@@ -140,7 +144,7 @@ def main():
                     have = {b["timestamp"] for b in cur}
                     new = cur + [b for b in new if b["timestamp"] not in have and b["timestamp"] > cur[-1]["timestamp"]]
                 cp.write_text(json.dumps(new))
-        time.sleep(POLL_S)
+        time.sleep(min(POLL_S * (2 ** ltp_fails), MAX_BACKOFF_S))   # back off while Dhan refuses
 
 
 if __name__ == "__main__":
