@@ -590,6 +590,24 @@ def _evaluate_debit_exit(
                     _thr = max(_thr, _mult * sum(b.high - b.low for b in _rb) / len(_rb))
             except Exception:  # noqa: BLE001
                 pass
+        # TREND HOLD (DEBIT_TREND_HOLD=1): while trend_day.trend_state (ORB + closes holding the VWAP side + 15m structure)
+        # agrees with the trade, a pullback is the trend breathing, not a reversal — skip the trail; exit only on a 5m close
+        # through the last confirmed swing. The moment the state breaks, the normal trail is back. Skill report 11-06:
+        # on TREND_UP days the trail cost -11,110 (10-26), -8,333 (10-13), -2,876 vs holding; on MIXED days it SAVED money,
+        # and trend_state is NONE there, so those exits are untouched.
+        if os.environ.get("DEBIT_TREND_HOLD", "0") == "1":
+            try:
+                from .trend_day import _norm as _td_norm, trend_state as _td_state, last_swings as _td_swings
+                _tb = _td_norm(list(current_snapshot.nifty_5m.bars))
+                _tb = [b for b in _tb if b["t"].date() == now.date()]
+                if _tb and _td_state(_tb)["state"] == ("TREND_DOWN" if _down else "TREND_UP"):
+                    _sw = _td_swings(_tb)["high" if _down else "low"]
+                    _c = _tb[-1]["c"]
+                    if _sw is not None and pnl > 0 and ((_c > _sw) if _down else (_c < _sw)):
+                        return ExitDecision(True, "DEBIT_TREND_SWING", value, pnl)
+                    _thr = float("inf")
+            except Exception:  # noqa: BLE001
+                pass
         if pnl > 0 and _retrace >= _thr:
             return ExitDecision(True, "DEBIT_SPOT_REVERSAL", value, pnl)
     elif peak_pnl_rs >= DEBIT_RS_TRAIL_ARM:
