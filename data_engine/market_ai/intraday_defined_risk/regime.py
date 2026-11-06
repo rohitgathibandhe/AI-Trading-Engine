@@ -3247,6 +3247,21 @@ def classify_regime(snapshot: MarketSnapshot, params: AdaptiveParameters | None 
                                  "date": _pd[-1].timestamp.date().isoformat()} if _pd else None)
     except Exception:  # noqa: BLE001
         metadata["prev_day"] = None
+    # ZONE + W/M + BREAK-OF-STRUCTURE setup (SEL_ZONE_BOS consumes it): zones = impulse origin (day open),
+    # previous-day high/low/close, OI walls.
+    try:
+        from .trend_day import zone_bos as _zone_bos, _norm as _td_norm
+        _pdz = metadata.get("prev_day") or {}
+        _bz = _td_norm(bars_5m)
+        _open = _bz[0]["o"] if _bz else None
+        metadata["zone_bos"] = _zone_bos(_bz, {
+            "demand": {"day_open": _open, "pdh": _pdz.get("h"), "pdc": _pdz.get("c"), "pdl": _pdz.get("l"),
+                       "put_wall": metadata.get("current_put_wall"), "ms_put_wall": metadata.get("multi_session_put_wall")},
+            "supply": {"day_open": _open, "pdl": _pdz.get("l"), "pdc": _pdz.get("c"), "pdh": _pdz.get("h"),
+                       "call_wall": metadata.get("current_call_wall"), "ms_call_wall": metadata.get("multi_session_call_wall")},
+        }) if len(_bz) >= 12 else None
+    except Exception:  # noqa: BLE001
+        metadata["zone_bos"] = None
     metadata["higher_low_confirmed"] = higher_low_confirmed
     metadata["lower_high_confirmed"] = lower_high_confirmed
     if bool(metadata.get("higher_lows_5m")) and bool(metadata.get("higher_highs_5m")):
