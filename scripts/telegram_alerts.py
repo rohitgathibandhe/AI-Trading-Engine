@@ -2,7 +2,7 @@
 """Standalone Telegram alert helper.
 
 Handles two jobs:
-  1. token_expiry_check  — auto-renew the Dhan token when <6h left (Dhan Web tokens only), else
+  1. token_expiry_check  — auto-renew the Dhan token when <20h left (Dhan Web tokens only), else
                            warn when it expires within N hours
   2. send               — send an arbitrary message (used by other scripts)
 
@@ -30,7 +30,7 @@ ALERT_STATE_FILE = STATE_DIR / "token_expiry_alert_state.json"
 
 IST = timezone(timedelta(hours=5, minutes=30))
 RENEW_URL = "https://api.dhan.co/v2/RenewToken"
-RENEW_WHEN_HOURS_LEFT = 6.0   # job runs hourly; renewing inside this window survives a few missed (asleep) runs
+RENEW_WHEN_HOURS_LEFT = 20.0  # hourly job; 6h failed 11-06 (Mac asleep 00:30-09:05 skipped the whole window, token died 08:31)
 
 
 def _load_creds() -> dict:
