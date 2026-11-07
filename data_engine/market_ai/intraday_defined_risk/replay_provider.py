@@ -18,17 +18,31 @@ the live state folder.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
+import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .data_models import AccountRiskLimits, AccountState, MarketSnapshot, OhlcvSeries
+from .data_models import AccountRiskLimits, AccountState, MarketSnapshot, OhlcvSeries, OptionType
 from .live_runtime import _aged_previous_chain, _vwap_from_bars
 
 IST = timezone(timedelta(hours=5, minutes=30))
 SNAPSHOT_OFFSET = timedelta(minutes=4)
 STEP = timedelta(seconds=60)
+
+
+def _shift_quote(q, ds: float, spot: float):
+    """Quote moved by a spot change of ds: first-order delta, never below intrinsic at the new spot or 0.05."""
+    if not ds or q.delta is None:
+        return q
+    intr = max(spot - q.strike, 0.0) if q.option_type == OptionType.CALL else max(q.strike - spot, 0.0)
+
+    def _px(v):
+        return v if (v is None or v <= 0) else max(v + q.delta * ds, intr, 0.05)
+    bid, ask, ltp = _px(q.bid), _px(q.ask), _px(q.ltp)
+    return dataclasses.replace(q, bid=bid, ask=max(ask, bid) if (ask and bid) else ask, ltp=ltp)
 
 
 class ReplayFinished(Exception):
@@ -176,7 +190,15 @@ class ReplayMarketDataProvider:
                                          diagnostics={"replay": True})
         prior_daily = [b for d, b in self._daily.items() if day - timedelta(days=90) <= d < day]
         chain = self._chains[ts]
-        chain = type(chain)(timestamp=stamp, expiry=chain.expiry, spot=chain.spot, quotes=chain.quotes,
+        _spot, _quotes = chain.spot, chain.quotes
+        if os.environ.get("REPLAY_FRESH_SPOT", "0") == "1" and closed5:
+            # The chain served here was recorded 4-9 min ago (SNAPSHOT_OFFSET), so every entry, stop and exit priced off
+            # it lags live, which marks at the current price. 2025-05-08: a 15:10 exit filled on the 15:05 chain (spot
+            # 24,287) when spot was 24,318. Move the chain to the last closed 5m close, shifting each quote by its delta
+            # (floored at intrinsic) — the price the agent's own candles say it would have seen.
+            _spot = float(closed5[-1].close)
+            _quotes = [_shift_quote(q, _spot - float(chain.spot), _spot) for q in chain.quotes]
+        chain = type(chain)(timestamp=stamp, expiry=chain.expiry, spot=_spot, quotes=_quotes,
                             margin_estimate_per_lot=chain.margin_estimate_per_lot)
         snap = MarketSnapshot(
             nifty_5m=OhlcvSeries(timeframe_minutes=5, bars=closed5),
