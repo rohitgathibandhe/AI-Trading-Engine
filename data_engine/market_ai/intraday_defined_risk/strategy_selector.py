@@ -1269,6 +1269,28 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
                 choice.family, choice.structures = FAM_STAND_ASIDE, []
                 choice.rationale = (choice.rationale or "") + f" [NO ROOM: {_room:.0f} pts to the previous-day level — stand aside]"
                 return choice
+        # NO CHASE (SEL_NO_CHASE=<frac>, e.g. 0.85): don't buy at the top / sell at the bottom of the day's range so far.
+        # Loss study 11-07, 61 live directional trades: entries beyond the 85%/15% line 37 trades, 38% win, avg +62;
+        # the rest 24 trades, 54% win, avg +619.
+        _nc = float(os.environ.get("SEL_NO_CHASE", "0") or 0)
+        _sw = (metadata.get("trend_day") or {}).get("swings") or {}
+        if _nc > 0 and _lb2 and _sw.get("day_high") is not None and _sw.get("day_low") is not None:
+            _dh, _dl = float(_sw["day_high"]), float(_sw["day_low"])
+            if _dh > _dl:
+                _loc = (float(_lb2["c"]) - _dl) / (_dh - _dl)
+                if (_loc > _nc) if _upx else (_loc < 1.0 - _nc):
+                    metadata["edge_only_skip"] = f"{choice.condition}/{first} chasing: at {_loc:.2f} of the day's range"
+                    choice.family, choice.structures = FAM_STAND_ASIDE, []
+                    choice.rationale = (choice.rationale or "") + f" [NO CHASE: entry at {_loc:.0%} of the day's range — stand aside]"
+                    return choice
+        # RESPECT THE DAY THESIS (SEL_THESIS_RANGE_BLOCK=RANGE_PREMIUM[,UNCERTAIN]): no directional debit while the agent's
+        # own day thesis reads a range. 01-13 (RANGE_PREMIUM 0.2): call breakout at 10:34 -> premium stop -6,379.
+        _trb = {s.strip() for s in os.environ.get("SEL_THESIS_RANGE_BLOCK", "").split(",") if s.strip()}
+        if _trb and str(metadata.get("day_thesis_type") or "") in _trb:
+            metadata["edge_only_skip"] = f"{choice.condition}/{first} day thesis {metadata.get('day_thesis_type')}"
+            choice.family, choice.structures = FAM_STAND_ASIDE, []
+            choice.rationale = (choice.rationale or "") + f" [DAY THESIS {metadata.get('day_thesis_type')} — no directional debit]"
+            return choice
     except (KeyError, TypeError, ValueError):
         pass
     # SEL_NO_FADE_TO_DEBIT=1: a range FADE the scorer wants to SELL is not converted into a BUY (debit) unless the
