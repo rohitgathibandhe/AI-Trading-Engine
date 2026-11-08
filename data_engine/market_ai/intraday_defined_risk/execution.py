@@ -526,6 +526,17 @@ def _evaluate_debit_exit(
         if (_sp <= float(_wt) + _buf) if position.structure.strategy == StrategyType.PUT_DEBIT_SPREAD else (_sp >= float(_wt) - _buf):
             return ExitDecision(True, "DEBIT_WALL_TARGET", value, pnl)
 
+    # GREEN-TO-RED GUARD (DEBIT_BE_ARM_RS>0, default off): once a non-fade debit has been up >= DEBIT_BE_ARM_RS, never
+    # let it round-trip into a full chart/premium stop — exit when P&L falls back to DEBIT_BE_FLOOR_RS (default 0).
+    # 17-month fresh-spot replay (2026-11-08): 60 trades peaked >= Rs1,000 and still closed <= 0 for -319k; the spot
+    # trail only fires while green, so a fast retrace through entry rode to the chart stop (avg -4.3k).
+    _be_arm = float(os.environ.get("DEBIT_BE_ARM_RS", "0") or 0)
+    if _be_arm > 0 and not position.metadata.get("is_fade"):
+        _be_peak = max(float(position.metadata.get("debit_peak_pnl_rupees") or 0.0), pnl)
+        position.metadata["debit_peak_pnl_rupees"] = _be_peak
+        if _be_peak >= _be_arm and pnl <= float(os.environ.get("DEBIT_BE_FLOOR_RS", "0") or 0):
+            return ExitDecision(True, "DEBIT_BREAKEVEN", value, pnl)
+
     # Chart stop: spot through the level that proves the trade wrong (no min hold — the level IS the invalidation)
     _cs = (position.metadata or {}).get("chart_stop_spot")
     if DEBIT_CHART_STOP and _cs and current_snapshot is not None and not position.metadata.get("is_fade"):
