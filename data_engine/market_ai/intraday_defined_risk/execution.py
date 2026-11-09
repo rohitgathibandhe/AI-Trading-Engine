@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import asdict
 from datetime import datetime, time, timedelta, timezone
@@ -391,6 +392,44 @@ def _current_debit_value(
     return max(long_mark - short_mark, 0.0)
 
 
+_BAD_MARK_CUSHION_PTS = 25.0   # allowance beyond the spot move (a spread's delta is < 1, so this is generous)
+_BAD_MARK_MAX_REJECTS = 3      # a jump that persists is real: never hold a stale mark for more than 3 polls
+
+
+def _guard_debit_mark(position: OpenPosition, value: float, snapshot: MarketSnapshot | None, entry_debit: float) -> float:
+    """DEBIT_BAD_MARK_GUARD=1: ignore a one-poll spread value that moved more than spot could explain.
+    2026-11-09: the put-debit's recorded peak was +21,710 (value ~202) while spot moved ~10 pts in its favour and the
+    spread stayed near 90 on every recorded chain. A peak like that would poison peak-based exits and could book a fake
+    target. Keeps the last good value and logs both leg quotes so the source of the bad quote can be identified."""
+    if os.environ.get("DEBIT_BAD_MARK_GUARD", "0") != "1":
+        return value
+    md = position.metadata
+    try:
+        spot = float(snapshot.option_chain.spot)
+    except Exception:
+        return value
+    last = md.get("debit_last_mark")
+    last_spot = md.get("debit_last_mark_spot")
+    if last is None or last_spot is None:
+        last, last_spot = float(entry_debit), spot
+    jump, allowed = abs(value - float(last)), abs(spot - float(last_spot)) + _BAD_MARK_CUSHION_PTS
+    rejects = int(md.get("debit_bad_marks") or 0)
+    if jump > allowed and rejects < _BAD_MARK_MAX_REJECTS:
+        md["debit_bad_marks"] = rejects + 1
+        md["debit_last_mark"], md["debit_last_mark_spot"] = float(last), float(last_spot)
+        quotes = []
+        for leg in position.structure.legs:
+            q = snapshot.option_chain.find_quote(leg.strike, leg.option_type)
+            quotes.append((leg.action, leg.strike, getattr(q, "bid", None), getattr(q, "ask", None), getattr(q, "ltp", None)))
+        logging.getLogger("intraday_defined_risk.v83").warning(
+            "[bad_mark] ignored spread value %.2f (last %.2f, spot %.2f vs %.2f, reject %d): %s",
+            value, float(last), spot, float(last_spot), rejects + 1, quotes)
+        return float(last)
+    md["debit_bad_marks"] = 0
+    md["debit_last_mark"], md["debit_last_mark_spot"] = float(value), spot
+    return value
+
+
 _FADE_MIN_HOLD_MIN = 3   # small breathe so a rejection wick's own noise doesn't insta-stop the fade
 
 # SEL_CHOP patience gate: if the trade hasn't shown Rs200 of profit within 45 minutes, the
@@ -504,6 +543,8 @@ def _evaluate_debit_exit(
     value = _current_debit_value(position, current_snapshot, current_structure)
     if value is None:
         value = entry_debit  # no data → mark at breakeven
+    else:
+        value = _guard_debit_mark(position, value, current_snapshot, entry_debit)
     pnl = (value - entry_debit) * position.lot_size * position.lots
     profit_captured = value - entry_debit
 
