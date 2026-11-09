@@ -875,6 +875,7 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     choice = _fib_wall_entry(choice, metadata, now_time)
     choice = _mw_entry(choice, metadata, now_time)
     choice = _zone_bos_entry(choice, metadata, now_time)
+    choice = _chop_overlap_gate(choice, metadata)
     choice = _option_data_gate(choice, metadata, spot)
     _set_chart_stop(choice, metadata, spot)
     return choice
@@ -884,6 +885,22 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
 # 44 trades +175k 59% vs against 20 trades -22k 35%; OI wall ahead 50-200 pts 23 trades +184k 70% vs < 50 pts -4k and
 # > 200 pts -19k. SEL_PCR_ALIGN=1, SEL_WALL_ROOM="50,200". SEL_OPT_GATE_MIN_DTE=n applies them only when DTE >= n
 # (DTE 4-9: 38 trades earned +5.8k in total).
+# CHOP-OVERLAP GATE (SEL_MAX_OVERLAP>0, default off): no directional debit while recent 5m candles overlap this much
+# (regime._recent_path_quality). Fresh-spot replay 2026-11-09: overlap >= 0.55 lost in every sample (both halves of 17
+# months and real chains) and no big trend-day winner was above 0.48. Runs after every entry path, so none can skip it.
+def _chop_overlap_gate(choice: StrategyChoice, metadata: dict[str, Any]) -> StrategyChoice:
+    _max = float(os.environ.get("SEL_MAX_OVERLAP", "0") or 0)
+    if _max <= 0 or not choice.structures or choice.structures[0] not in ("PUT_DEBIT_SPREAD", "CALL_DEBIT_SPREAD"):
+        return choice
+    _ov = metadata.get("candle_overlap_ratio")
+    if _ov is None or float(_ov) < _max:
+        return choice
+    metadata["chop_overlap_skip"] = float(_ov)
+    choice.family, choice.structures = FAM_STAND_ASIDE, []
+    choice.rationale = (choice.rationale or "") + f" [CHOP: candle overlap {float(_ov):.2f} >= {_max:.2f} — stand aside]"
+    return choice
+
+
 def _option_data_gate(choice: StrategyChoice, metadata: dict[str, Any], spot: float) -> StrategyChoice:
     if not choice.structures or choice.structures[0] not in ("PUT_DEBIT_SPREAD", "CALL_DEBIT_SPREAD") or metadata.get("is_fade"):
         return choice
