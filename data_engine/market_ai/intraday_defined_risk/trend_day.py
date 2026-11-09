@@ -526,7 +526,7 @@ def day_read(bars: list[dict]) -> dict:
     side = 0
     for n, b in enumerate(bars, 1):
         tp += (b["h"] + b["l"] + b["c"]) / 3
-        side += 1 if b["c"] > tp / n else -1
+        side += (b["c"] > tp / n) - (b["c"] < tp / n)
     return {"move_pct": round((c - o) / o * 100, 3), "efficiency": round(abs(c - o) / rng, 3),
             "side": round(side / len(bars), 3), "bars": len(bars)}
 
