@@ -3448,6 +3448,7 @@ def _watchdog_health_status() -> Dict[str, Any]:
     elif hb_status == "STARTING" and active_running and hb_pid == active_pid:
         watchdog["status"] = "STARTING"
     watchdog["pid_alive"] = bool(hb_pid and _is_process_alive(hb_pid))
+    watchdog["heartbeat_pid"] = hb_pid or None
     watchdog["active_pid"] = active_pid or None
     watchdog["active_pid_running"] = active_running
     return watchdog
@@ -3557,7 +3558,9 @@ def _preflight_status() -> Dict[str, Any]:
     try:
         wd = _watchdog_health_status()
         st = str(wd.get("status") or "").upper()
-        alive = bool(wd.get("pid_alive") or wd.get("active_pid_running"))
+        # The heartbeat pid is the trading agent. PID_FILE's active_pid is the orchestrator (start_agent.py), which can be
+        # alive while the agent is dead, so it only counts when there is no heartbeat pid to check.
+        alive = bool(wd.get("pid_alive")) if wd.get("heartbeat_pid") else bool(wd.get("active_pid_running"))
         stopped = (st == "STOPPED") or (not alive)
         fresh_ok = st not in ("STALE", "STOPPED")
         if stopped:
@@ -3566,7 +3569,7 @@ def _preflight_status() -> Dict[str, Any]:
             add("process", "Agent running", False, f"status={st} during market hours — heartbeat stalled")
         else:
             note = st if fresh_ok else f"{st} (idle pre-open — normal)"
-            add("process", "Agent running", True, f"status={note}, pid={wd.get('active_pid') or '—'}")
+            add("process", "Agent running", True, f"status={note}, pid={wd.get('heartbeat_pid') or wd.get('active_pid') or '—'}")
     except Exception as exc:
         add("process", "Agent running", False, f"error: {str(exc)[:80]}")
 
