@@ -876,6 +876,7 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     choice = _mw_entry(choice, metadata, now_time)
     choice = _zone_bos_entry(choice, metadata, now_time)
     choice = _chop_overlap_gate(choice, metadata)
+    choice = _day_read_gate(choice, metadata)
     choice = _option_data_gate(choice, metadata, spot)
     _set_chart_stop(choice, metadata, spot)
     return choice
@@ -898,6 +899,25 @@ def _chop_overlap_gate(choice: StrategyChoice, metadata: dict[str, Any]) -> Stra
     metadata["chop_overlap_skip"] = float(_ov)
     choice.family, choice.structures = FAM_STAND_ASIDE, []
     choice.rationale = (choice.rationale or "") + f" [CHOP: candle overlap {float(_ov):.2f} >= {_max:.2f} — stand aside]"
+    return choice
+
+
+# DAY-READ GATE (SEL_DAY_READ_GATE="eff,move_pct,side", default off): a directional debit only when the rolling day read
+# (trend_day.day_read) already shows a trend its way. Runs after every entry path, so none can skip it.
+def _day_read_gate(choice: StrategyChoice, metadata: dict[str, Any]) -> StrategyChoice:
+    _cfg = os.environ.get("SEL_DAY_READ_GATE", "")
+    if not _cfg or not choice.structures or choice.structures[0] not in ("PUT_DEBIT_SPREAD", "CALL_DEBIT_SPREAD"):
+        return choice
+    _eff, _mv, _side = (float(x) for x in _cfg.split(","))
+    _r = (metadata.get("trend_day") or {}).get("day_read")
+    if not _r:
+        return choice
+    _sign = 1 if choice.structures[0] == "CALL_DEBIT_SPREAD" else -1
+    if _r["efficiency"] >= _eff and _sign * _r["move_pct"] >= _mv and _sign * _r["side"] >= _side:
+        return choice
+    metadata["day_read_skip"] = _r
+    choice.family, choice.structures = FAM_STAND_ASIDE, []
+    choice.rationale = (choice.rationale or "") + f" [DAY READ: not a trend this way {_r} — stand aside]"
     return choice
 
 
