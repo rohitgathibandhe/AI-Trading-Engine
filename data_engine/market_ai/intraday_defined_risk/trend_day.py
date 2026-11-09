@@ -513,6 +513,24 @@ def note_trigger_used(at_iso: str) -> None:
         pass
 
 
+def day_read(bars: list[dict]) -> dict:
+    """One rolling read of the day from completed session 5m bars, treating up and down the same way.
+
+    move_pct: open to last close. efficiency: |move| / range so far. side: share of closes above the running typical-price
+    mean minus the share below (-1..1). No option data, walls or fixed time: re-read on every call."""
+    if len(bars) < 3:
+        return {"move_pct": 0.0, "efficiency": 0.0, "side": 0.0, "bars": len(bars)}
+    o, c = bars[0]["o"], bars[-1]["c"]
+    rng = max(max(b["h"] for b in bars) - min(b["l"] for b in bars), 1.0)
+    tp = 0.0
+    side = 0
+    for n, b in enumerate(bars, 1):
+        tp += (b["h"] + b["l"] + b["c"]) / 3
+        side += (b["c"] > tp / n) - (b["c"] < tp / n)
+    return {"move_pct": round((c - o) / o * 100, 3), "efficiency": round(abs(c - o) / rng, 3),
+            "side": round(side / len(bars), 3), "bars": len(bars)}
+
+
 def evaluate(bars: Sequence[Any], now: datetime, oi: dict | None = None,
              last_trigger_at: datetime | None = None) -> dict:
     """One call for the live path: state + trigger on completed bars at `now`."""
@@ -525,7 +543,7 @@ def evaluate(bars: Sequence[Any], now: datetime, oi: dict | None = None,
         tg = dict(tg, at=tg["at"].isoformat())
     return {"state": st["state"], "since": st["since"].isoformat() if st["since"] else None,
             "checks": st["checks"], "trigger": tg, "accepted_break": accepted_break(cb),
-            "failed_break": failed_break(cb), "swings": last_swings(cb),
+            "failed_break": failed_break(cb), "day_read": day_read(cb), "swings": last_swings(cb),
             "last_bar": ({k: cb[-1][k] for k in ("o", "h", "l", "c")} if cb else None),
             "prev_close_bar": ({k: cb[-2][k] for k in ("o", "h", "l", "c")} if len(cb) > 1 else None),
             "fib": fib_pullback(cb), "mw": mw_neckline_break(cb),
