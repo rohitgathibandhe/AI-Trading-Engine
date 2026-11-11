@@ -1229,6 +1229,17 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
     # from 10:00, put debit chosen at 10:40/10:45/11:00/11:45 but rejected as "CHOP/STRONG_TREND has no proven edge";
     # entered only at 11:50 after ~300 of the 415 pts. Same on 07-08.
     _tds = str((metadata.get("trend_day") or {}).get("state") or "")
+    # EDGE FADE (SEL_EDGE_FADE=1, default off): on a non-breakout read, keep a confirmed range fade as a debit with its
+    # own spot target/stop instead of standing aside (11-11: W/M rejections at 25,347/25,372 all day, zero trades).
+    if os.environ.get("SEL_EDGE_FADE", "0") == "1" and want is None and metadata.get("is_fade") \
+            and metadata.get("fade_stop_spot") is not None and _tds not in ("TREND_UP", "TREND_DOWN"):
+        _deb = {"BULL_PUT_CREDIT_SPREAD": "CALL_DEBIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD": "PUT_DEBIT_SPREAD"}.get(first, first)
+        if _deb in ("CALL_DEBIT_SPREAD", "PUT_DEBIT_SPREAD"):
+            metadata.pop("seller_exit", None)
+            metadata["edge_fade_keep"] = first
+            choice.family, choice.structures = FAM_DIRECTIONAL_DEBIT, [_deb]
+            choice.rationale = (choice.rationale or "") + f" [EDGE-FADE: range fade kept as {_deb}]"
+            return choice
     _td_want = {"TREND_DOWN": ("PUT_DEBIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD"),
                 "TREND_UP": ("CALL_DEBIT_SPREAD", "BULL_PUT_CREDIT_SPREAD")}.get(_tds)
     _td_accept = False
@@ -1240,8 +1251,17 @@ def _edge_only(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> St
     # A breakout on a session that has already broken BOTH sides of the opening range is a range-day fake-out:
     # real chains, edge-only replay — breakout debits on two-sided days 6 trades -16,786 net vs trend days +25,384.
     if ok and str((metadata.get("trend_day") or {}).get("state") or "") == "RANGE_TWO_SIDED":
-        ok = False
-        metadata["edge_only_two_sided"] = True
+        # SEL_TWO_SIDED_DAYREAD="eff,move_pct" (default off): keep the breakout when the rolling day read already shows
+        # a trend its way, e.g. 11-11 a 09:55 failed poke up made the day two-sided, then a 13:35 breakdown (eff 0.61).
+        _tsd = os.environ.get("SEL_TWO_SIDED_DAYREAD", "")
+        _dr = (metadata.get("trend_day") or {}).get("day_read") or {}
+        _sg = -1 if want[0] == "PUT_DEBIT_SPREAD" else 1
+        if _tsd and _dr and _dr.get("efficiency", 0) >= float(_tsd.split(",")[0]) \
+                and _sg * _dr.get("move_pct", 0) >= float(_tsd.split(",")[1]):
+            metadata["two_sided_dayread_keep"] = _dr
+        else:
+            ok = False
+            metadata["edge_only_two_sided"] = True
     # ENTRY-SCORE GATE (SEL_ENTRY_SCORE=<min p>): take the breakout only when the learned entry score for its
     # direction clears the bar (entry_score.py / scripts/entry_lab.py). No score (no swing stop / no model) = skip.
     if ok and _ENTRY_SCORE_MIN > 0:
