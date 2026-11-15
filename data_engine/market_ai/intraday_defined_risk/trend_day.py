@@ -531,6 +531,15 @@ def day_read(bars: list[dict]) -> dict:
             "side": round(side / len(bars), 3), "bars": len(bars)}
 
 
+def extreme_age(bars: list[dict]) -> dict:
+    """Completed bars since the session high / low was set (0 = the last bar made it). Ties keep the latest bar."""
+    if not bars:
+        return {"high_bars": None, "low_bars": None}
+    hi = max(range(len(bars)), key=lambda k: (bars[k]["h"], k))
+    lo = min(range(len(bars)), key=lambda k: (bars[k]["l"], -k))
+    return {"high_bars": len(bars) - 1 - hi, "low_bars": len(bars) - 1 - lo}
+
+
 def evaluate(bars: Sequence[Any], now: datetime, oi: dict | None = None,
              last_trigger_at: datetime | None = None) -> dict:
     """One call for the live path: state + trigger on completed bars at `now`."""
@@ -543,7 +552,7 @@ def evaluate(bars: Sequence[Any], now: datetime, oi: dict | None = None,
         tg = dict(tg, at=tg["at"].isoformat())
     return {"state": st["state"], "since": st["since"].isoformat() if st["since"] else None,
             "checks": st["checks"], "trigger": tg, "accepted_break": accepted_break(cb),
-            "failed_break": failed_break(cb), "day_read": day_read(cb), "swings": last_swings(cb),
+            "failed_break": failed_break(cb), "day_read": day_read(cb), "extreme_age": extreme_age(cb), "swings": last_swings(cb),
             "last_bar": ({k: cb[-1][k] for k in ("o", "h", "l", "c")} if cb else None),
             "prev_close_bar": ({k: cb[-2][k] for k in ("o", "h", "l", "c")} if len(cb) > 1 else None),
             "fib": fib_pullback(cb), "mw": mw_neckline_break(cb),

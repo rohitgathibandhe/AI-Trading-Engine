@@ -875,8 +875,11 @@ def select_strategy(metadata: dict[str, Any], spot: float, now_time=None) -> Str
     choice = _fib_wall_entry(choice, metadata, now_time)
     choice = _mw_entry(choice, metadata, now_time)
     choice = _zone_bos_entry(choice, metadata, now_time)
+    choice = _retest_entry(choice, metadata, now_time)
     choice = _chop_overlap_gate(choice, metadata)
     choice = _day_read_gate(choice, metadata)
+    choice = _stale_extreme_gate(choice, metadata)
+    choice = _extended_break_gate(choice, metadata, now_time)
     choice = _option_data_gate(choice, metadata, spot)
     _set_chart_stop(choice, metadata, spot)
     return choice
@@ -918,6 +921,102 @@ def _day_read_gate(choice: StrategyChoice, metadata: dict[str, Any]) -> Strategy
     metadata["day_read_skip"] = _r
     choice.family, choice.structures = FAM_STAND_ASIDE, []
     choice.rationale = (choice.rationale or "") + f" [DAY READ: not a trend this way {_r} — stand aside]"
+    return choice
+
+
+# Entries that wait for a pullback on purpose; their trade-side extreme is old by design.
+_PULLBACK_ENTRIES = ("failed_break_entry", "fib_wall_entry", "zone_bos_entry", "mw_break_entry", "pd_break_entry",
+                     "retest_entry")
+
+
+def _stand_aside(choice: StrategyChoice, why: str) -> StrategyChoice:
+    choice.family, choice.structures = FAM_STAND_ASIDE, []
+    choice.rationale = (choice.rationale or "") + f" [{why} — stand aside]"
+    return choice
+
+
+# STALE-EXTREME GATE (SEL_STALE_EXTREME=n, default off): a breakout / trend-day debit only while the session extreme in
+# its direction is at most n completed 5m bars old. 2026-11-12 (call at 10:40, high 7 bars old, lower high in: -1,974)
+# and 2026-11-13 (call at 10:35 into the unbroken 09:55 high: -3,711) were trend reads after the move had stalled.
+# Pullback entries are exempt. Runs after every entry path.
+def _stale_extreme_gate(choice: StrategyChoice, metadata: dict[str, Any]) -> StrategyChoice:
+    _n = int(os.environ.get("SEL_STALE_EXTREME", "0") or 0)
+    if _n <= 0 or not choice.structures or choice.structures[0] not in ("PUT_DEBIT_SPREAD", "CALL_DEBIT_SPREAD") \
+            or metadata.get("is_fade") or any(metadata.get(k) for k in _PULLBACK_ENTRIES):
+        return choice
+    ea = (metadata.get("trend_day") or {}).get("extreme_age") or {}
+    age = ea.get("high_bars" if choice.structures[0] == "CALL_DEBIT_SPREAD" else "low_bars")
+    if age is None or int(age) <= _n:
+        return choice
+    metadata["stale_extreme_skip"] = int(age)
+    return _stand_aside(choice, f"STALE EXTREME: the day's {'high' if choice.structures[0] == 'CALL_DEBIT_SPREAD' else 'low'} "
+                                f"is {int(age)} bars old (> {_n})")
+
+
+# EXTENDED BREAK -> RETEST (SEL_RETEST_ENTRY="ext,tol", default off): a breakout debit whose spot is already more than
+# `ext` pts beyond the broken opening-range level is not chased (2026-11-11 replay: put at 13:50, 76 pts past the 25,264
+# OR low, stopped on the normal retest to 25,261 at -2,424, then -150 pts). It is armed instead; a later closed candle
+# that comes back within `tol` pts of the level, closes back on the break side and closes the trade's way enters, with the
+# stop just beyond the level. Once per side per day; 09:35-14:30.
+_RETEST_ARMED: dict[str, dict] = {}
+
+
+def _retest_cfg():
+    _c = os.environ.get("SEL_RETEST_ENTRY", "")
+    if not _c:
+        return None
+    a, b = (float(x) for x in _c.split(","))
+    return a, b
+
+
+def _session_key(metadata: dict[str, Any]) -> str:
+    ab = (metadata.get("trend_day") or {}).get("accepted_break") or {}
+    return str(ab.get("at") or "")[:10]
+
+
+def _extended_break_gate(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> StrategyChoice:
+    cfg = _retest_cfg()
+    if cfg is None or not choice.structures or choice.structures[0] not in ("PUT_DEBIT_SPREAD", "CALL_DEBIT_SPREAD") \
+            or metadata.get("is_fade") or any(metadata.get(k) for k in _PULLBACK_ENTRIES):
+        return choice
+    td = metadata.get("trend_day") or {}
+    ab = td.get("accepted_break") or {}
+    lb = td.get("last_bar") or {}
+    down = choice.structures[0] == "PUT_DEBIT_SPREAD"
+    lvl = ab.get("or_low" if down else "or_high")
+    if lvl is None or not lb or ab.get("dir") != ("DOWN" if down else "UP"):
+        return choice
+    ext = (float(lvl) - float(lb["c"])) if down else (float(lb["c"]) - float(lvl))
+    if ext <= cfg[0]:
+        return choice
+    side = "DOWN" if down else "UP"
+    key = f"{_session_key(metadata)}:{side}"
+    _RETEST_ARMED.setdefault(key, {"level": float(lvl), "used": False})
+    metadata["extended_break_skip"] = round(ext, 1)
+    return _stand_aside(choice, f"EXTENDED BREAK: {ext:.0f} pts past the {lvl:.0f} level — wait for the retest")
+
+
+def _retest_entry(choice: StrategyChoice, metadata: dict[str, Any], now_time) -> StrategyChoice:
+    cfg = _retest_cfg()
+    if cfg is None or choice.structures:
+        return choice
+    td = metadata.get("trend_day") or {}
+    lb = td.get("last_bar") or {}
+    if not lb:
+        return choice
+    for side in ("DOWN", "UP"):
+        arm = _RETEST_ARMED.get(f"{_session_key(metadata)}:{side}")
+        if not arm or arm["used"] or not _new_entry_ok(side, td, now_time):
+            continue
+        lvl, down = arm["level"], side == "DOWN"
+        h, l, o, c = (float(lb[k]) for k in ("h", "l", "o", "c"))
+        touched = (h >= lvl - cfg[1]) if down else (l <= lvl + cfg[1])
+        held = (c < lvl and c < o) if down else (c > lvl and c > o)
+        if touched and held:
+            arm["used"] = True
+            metadata["level_stop_spot"] = lvl
+            return _take(choice, metadata, side, "retest_entry",
+                         f"RETEST {side}: back to the broken {lvl:.0f} and rejected — enter, stop beyond the level")
     return choice
 
 
@@ -1078,7 +1177,8 @@ _CHART_STOP_BUF = 5.0
 
 def _set_chart_stop(choice: StrategyChoice, metadata: dict[str, Any], spot: float) -> None:
     metadata.pop("chart_stop_spot", None)
-    if not (metadata.get("pd_break_entry") or metadata.get("fib_wall_entry") or metadata.get("mw_break_entry")):
+    if not (metadata.get("pd_break_entry") or metadata.get("fib_wall_entry") or metadata.get("mw_break_entry")
+            or metadata.get("retest_entry")):
         metadata.pop("level_stop_spot", None)
     if not choice.structures or choice.structures[0] not in ("PUT_DEBIT_SPREAD", "CALL_DEBIT_SPREAD") \
             or metadata.get("is_fade") or not spot:
@@ -1089,7 +1189,7 @@ def _set_chart_stop(choice: StrategyChoice, metadata: dict[str, Any], spot: floa
     down = choice.structures[0] == "PUT_DEBIT_SPREAD"
     lvl = None
     if metadata.get("level_stop_spot") and (metadata.get("pd_break_entry") or metadata.get("fib_wall_entry")
-                                            or metadata.get("mw_break_entry")):
+                                            or metadata.get("mw_break_entry") or metadata.get("retest_entry")):
         lvl = float(metadata["level_stop_spot"])
     elif metadata.get("failed_break_entry") and fb.get("trap_extreme"):
         lvl = float(fb["trap_extreme"])
