@@ -944,6 +944,9 @@ def _stale_extreme_gate(choice: StrategyChoice, metadata: dict[str, Any]) -> Str
     if _n <= 0 or not choice.structures or choice.structures[0] not in ("PUT_DEBIT_SPREAD", "CALL_DEBIT_SPREAD") \
             or metadata.get("is_fade") or any(metadata.get(k) for k in _PULLBACK_ENTRIES):
         return choice
+    _sides = os.environ.get("SEL_STALE_EXTREME_SIDES", "BOTH").upper()      # BOTH | UP | DOWN
+    if _sides != "BOTH" and _sides != ("UP" if choice.structures[0] == "CALL_DEBIT_SPREAD" else "DOWN"):
+        return choice
     ea = (metadata.get("trend_day") or {}).get("extreme_age") or {}
     age = ea.get("high_bars" if choice.structures[0] == "CALL_DEBIT_SPREAD" else "low_bars")
     if age is None or int(age) <= _n:
