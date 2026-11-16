@@ -114,7 +114,9 @@ class RuntimeRiskGovernance:
             stop_after_first_full_loss=bool(payload.get("stop_after_first_full_loss", True)),
             require_manual_live_arm=bool(payload.get("require_manual_live_arm", True)),
             live_only_bearish=bool(payload.get("live_only_bearish", True)),
-            second_trade_requires_first_trade_profit=bool(payload.get("second_trade_requires_first_trade_profit", True)),
+            # ONE_LOSS_STOP=1 overrides the file: after a losing first trade, no more entries that day (owner, 2026-11-16).
+            second_trade_requires_first_trade_profit=(os.environ.get("ONE_LOSS_STOP", "0") == "1"
+                                                      or bool(payload.get("second_trade_requires_first_trade_profit", True))),
             second_trade_min_gap_minutes=max(0, int(float(payload.get("second_trade_min_gap_minutes", 90) or 0))),
         )
 
