@@ -157,7 +157,12 @@ def main() -> None:
         st["trend_since"] = None
     last_entry = max((datetime.fromisoformat(str(r["timestamp"])).replace(tzinfo=None) for r in trades
                       if r.get("event") == "PAPER_ENTRY"), default=None)
-    if (st.get("trend_since") and not pos_open and now - datetime.fromisoformat(st["trend_since"]) >= timedelta(minutes=15)
+    # A trend already traded today in its own direction is not a miss (2026-11-17: call 09:55-12:40 +3,910 on a
+    # TREND_UP day, then flat after the exit -> "MISSED TREND ... agent FLAT").
+    _with = ("CALL_DEBIT_SPREAD", "BULL_PUT_CREDIT_SPREAD") if state == "TREND_UP" else ("PUT_DEBIT_SPREAD", "BEAR_CALL_CREDIT_SPREAD")
+    traded_trend = any(r.get("event") == "PAPER_ENTRY" and r.get("strategy") in _with for r in trades)
+    if (st.get("trend_since") and not pos_open and not traded_trend
+            and now - datetime.fromisoformat(st["trend_since"]) >= timedelta(minutes=15)
             and (last_entry is None or now - last_entry >= timedelta(minutes=30))):
         why = Counter()
         _rl = [l for l in _tail(STATE / "intraday_v83_runner.log", 6_000_000 if DRY else 200_000) if l.startswith("{")]
