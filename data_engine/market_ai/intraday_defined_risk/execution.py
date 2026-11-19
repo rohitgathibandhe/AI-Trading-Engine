@@ -587,6 +587,39 @@ def _evaluate_debit_exit(
         if (_sp >= float(_cs)) if _pd else (_sp <= float(_cs)):
             return ExitDecision(True, "DEBIT_CHART_STOP", value, pnl)
 
+    # RANGE PROFIT LOCK (DEBIT_RANGE_LOCK="frac,lock_pts", default off): once spot has moved >= frac x the session range
+    # at entry in the trade's favour, the stop moves to entry +/- lock_pts (in profit). Scales with the day: a narrow day
+    # locks early, a wide trend day keeps room. 2026-11-18: put at 25,198 on a 205-pt day, +57 pts (+2,208) at 13:05,
+    # then one 70-pt candle -> chart stop at -3,983. Same CLOSE/SPOT basis as the chart stop.
+    _rl = os.environ.get("DEBIT_RANGE_LOCK", "")
+    _md = position.metadata or {}
+    if _rl and current_snapshot is not None and not _md.get("is_fade") and _md.get("entry_day_range") and _md.get("entry_spot_ref"):
+        try:
+            _frac, _lock = (float(x) for x in _rl.split(","))
+            _pd = position.structure.strategy == StrategyType.PUT_DEBIT_SPREAD
+            _e = float(_md["entry_spot_ref"])
+            _spx = float(current_snapshot.option_chain.spot)
+            _ref = _spx
+            _cb = []
+            try:
+                _cb = list(current_snapshot.nifty_5m.bars)
+            except Exception:  # noqa: BLE001
+                _cb = []
+            if os.environ.get("DEBIT_CHART_STOP_BASIS", "SPOT").upper() == "CLOSE" and _cb:
+                _ref = float(_cb[-1].close)
+            _fav_now = max((_e - _spx) if _pd else (_spx - _e), 0.0)
+            if _cb:
+                _fav_now = max(_fav_now, (_e - float(_cb[-1].low)) if _pd else (float(_cb[-1].high) - _e))
+            _best = max(float(_md.get("range_lock_best_pts") or 0.0), _fav_now)
+            position.metadata["range_lock_best_pts"] = _best
+            if _best >= _frac * float(_md["entry_day_range"]):
+                position.metadata["range_lock_armed"] = True
+                _lvl = (_e - _lock) if _pd else (_e + _lock)
+                if (_ref >= _lvl) if _pd else (_ref <= _lvl):
+                    return ExitDecision(True, "DEBIT_RANGE_LOCK", value, pnl)
+        except (TypeError, ValueError):
+            pass
+
     # Hard stop: lost >= DEBIT_STOP_FRAC of the debit (after a short breathe)
     if elapsed_minutes >= DEBIT_MIN_HOLD and value <= entry_debit * (1.0 - DEBIT_STOP_FRAC):
         return ExitDecision(True, "DEBIT_STOP", value, pnl)

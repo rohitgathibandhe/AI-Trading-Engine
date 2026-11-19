@@ -1100,6 +1100,10 @@ def _set_chart_stop(choice: StrategyChoice, metadata: dict[str, Any], spot: floa
     dist = (abs(lvl - spot) + _CHART_STOP_BUF) if lvl is not None else _CHART_STOP_MAX
     dist = min(max(dist, _CHART_STOP_MIN), _CHART_STOP_MAX)
     metadata["chart_stop_spot"] = round(spot + dist if down else spot - dist, 2)
+    # Range profit lock reference (execution DEBIT_RANGE_LOCK): the session range and spot at entry.
+    if sw.get("day_high") is not None and sw.get("day_low") is not None:
+        metadata["entry_day_range"] = round(float(sw["day_high"]) - float(sw["day_low"]), 2)
+        metadata["entry_spot_ref"] = round(float(spot), 2)
 
 
 # FAILED-BREAK ENTRY (SEL_FAILED_BREAK=1): trade the reversal of a failed opening-range break (trend_day.failed_break),
